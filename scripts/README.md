@@ -104,6 +104,34 @@ python scripts/s5_website.py repo/mshrl --subdir mshrl
 - 响应式设计
 - 代码高亮
 
+### s6_fast_dir_search.py
+高效多进程目录搜索工具 - 在大型文件系统（如 /mnt/moonfs）中快速搜索指定名称的目录。
+
+**特点**:
+- 多进程并行扫描，充分利用多核 CPU
+- 只扫描目录名称，不读取文件内容
+- 实时进度条显示
+- 支持快速模式和深度搜索模式
+
+```bash
+# 快速模式：只搜索前 2 层目录（推荐，速度最快）
+python scripts/s6_fast_dir_search.py Megatron-LM --fast
+
+# 深度搜索：搜索到指定深度
+python scripts/s6_fast_dir_search.py Megatron-LM --max-depth 5
+
+# 自定义工作进程数
+python scripts/s6_fast_dir_search.py Megatron-LM --workers 32
+
+# 在其他目录搜索
+python scripts/s6_fast_dir_search.py checkpoints --root /mnt/moonfs/limo-m3
+```
+
+**性能说明**:
+- 快速模式（`--fast`）：约 20-30 秒完成
+- 深度搜索（`--max-depth 3`）：约 20-30 秒完成
+- 深度搜索（`--max-depth 10`）：根据目录结构，可能需要几分钟
+
 ## 工具函数 (utils.py)
 
 提供通用的工具函数：
