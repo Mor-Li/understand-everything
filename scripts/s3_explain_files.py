@@ -73,7 +73,7 @@ def get_top_files(repo_path: str, subdir: str, top_n: int | None = None) -> list
 
     Args:
         repo_path: 仓库路径
-        subdir: 子目录（相对于仓库根目录）
+        subdir: 子目录（相对于仓库根目录，空字符串或"."表示整个仓库）
         top_n: 返回前 N 个文件，None 表示返回全部
 
     Returns:
@@ -82,7 +82,13 @@ def get_top_files(repo_path: str, subdir: str, top_n: int | None = None) -> list
     repo = git.Repo(repo_path)
     file_change_count = defaultdict(int)
 
-    print(f"📊 分析 {subdir}/ 下的文件修改历史...")
+    # 处理 subdir 参数
+    if not subdir or subdir == ".":
+        print("📊 分析整个仓库的文件修改历史...")
+        filter_prefix = None
+    else:
+        print(f"📊 分析 {subdir}/ 下的文件修改历史...")
+        filter_prefix = subdir + "/"
 
     for commit in repo.iter_commits():
         try:
@@ -90,8 +96,10 @@ def get_top_files(repo_path: str, subdir: str, top_n: int | None = None) -> list
                 diffs = commit.parents[0].diff(commit)
                 for diff in diffs:
                     file_path = diff.a_path or diff.b_path
-                    if file_path and file_path.startswith(subdir + "/"):
-                        file_change_count[file_path] += 1
+                    if file_path:
+                        # 如果指定了 subdir，只统计该目录下的文件
+                        if filter_prefix is None or file_path.startswith(filter_prefix):
+                            file_change_count[file_path] += 1
         except Exception:
             continue
 
@@ -255,7 +263,7 @@ async def main_async():
     """异步主函数"""
     parser = argparse.ArgumentParser(description="解释代码文件（异步版本）")
     parser.add_argument("repo_path", help="Git 仓库路径")
-    parser.add_argument("--subdir", default="mshrl", help="要分析的子目录")
+    parser.add_argument("--subdir", default="", help="要分析的子目录（默认为空，分析整个仓库）")
     parser.add_argument("--top", type=int, help="解释 top N 个文件（与 --percent 互斥）")
     parser.add_argument("--percent", type=int, help="解释前 N%% 的文件（按修改次数排序，与 --top 互斥）")
     parser.add_argument("--output", "-o", help="输出目录（默认：output/<repo_name>/explain-<date>）")
@@ -267,7 +275,9 @@ async def main_async():
 
     # 默认输出路径：output/<repo_name>/explain-<date>
     if args.output is None:
-        args.output = get_output_path(args.repo_path, args.subdir, "explain")
+        # 使用仓库名作为 subdir 参数传给 get_output_path
+        repo_name = Path(args.repo_path).name
+        args.output = get_output_path(args.repo_path, repo_name, "explain")
 
     # 检查参数
     if args.top is None and args.percent is None:
@@ -287,10 +297,16 @@ async def main_async():
     if args.percent is not None:
         n_files = max(1, int(len(all_files) * args.percent / 100))
         selected_files = all_files[:n_files]
-        print(f"🚀 开始解释 {args.repo_path}/{args.subdir}/ 下前 {args.percent}% 的文件 ({n_files}/{len(all_files)} 个)")
+        if args.subdir:
+            print(f"🚀 开始解释 {args.repo_path}/{args.subdir}/ 下前 {args.percent}% 的文件 ({n_files}/{len(all_files)} 个)")
+        else:
+            print(f"🚀 开始解释 {args.repo_path} 下前 {args.percent}% 的文件 ({n_files}/{len(all_files)} 个)")
     else:
         selected_files = all_files[:args.top]
-        print(f"🚀 开始解释 {args.repo_path}/{args.subdir}/ 下的 top {args.top} 文件")
+        if args.subdir:
+            print(f"🚀 开始解释 {args.repo_path}/{args.subdir}/ 下的 top {args.top} 文件")
+        else:
+            print(f"🚀 开始解释 {args.repo_path} 下的 top {args.top} 文件")
 
     # 显示选中的文件
     print()
