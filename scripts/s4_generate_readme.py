@@ -139,7 +139,7 @@ def collect_folder_content(folder_path: Path, explain_base: Path) -> str:
     return "".join(result)
 
 
-def ask_gemini(folder_path: str, content: str, model: str = "gemini-2.5-pro") -> str:
+def ask_gemini(folder_path: str, content: str, model: str = "gemini-3-pro-preview") -> str:
     """
     调用 Gemini API 生成 README
 
@@ -184,7 +184,7 @@ def generate_readme_recursive(
     folder_path: Path,
     explain_base: Path,
     force: bool = False,
-    model: str = "gemini-2.5-pro",
+    model: str = "gemini-3-pro-preview",
 ) -> bool:
     """
     递归生成 README.md（自底向上）
@@ -277,7 +277,7 @@ def main():
     parser.add_argument("--subdir", default="mshrl", help="要分析的子目录")
     parser.add_argument("--output", "-o", help="输出目录（默认：output/<repo_name>/explain）")
     parser.add_argument("--force", action="store_true", help="强制重新生成")
-    parser.add_argument("--model", "-m", default="gemini-2.5-pro", help="使用的模型")
+    parser.add_argument("--model", "-m", default="gemini-3-pro-preview", help="使用的模型")
 
     args = parser.parse_args()
 

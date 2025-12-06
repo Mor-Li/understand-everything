@@ -31,7 +31,7 @@ async def ask_gemini_async(
     file_path: str,
     file_content: str,
     client: AsyncOpenAI,
-    model: str = "gemini-2.5-pro"
+    model: str = "gemini-3-pro-preview"
 ) -> str:
     """
     异步调用 Gemini API 解释文件内容
@@ -268,7 +268,7 @@ async def main_async():
     parser.add_argument("--percent", type=int, help="解释前 N%% 的文件（按修改次数排序，与 --top 互斥）")
     parser.add_argument("--output", "-o", help="输出目录（默认：output/<repo_name>/explain-<date>）")
     parser.add_argument("--force", action="store_true", help="强制重新生成")
-    parser.add_argument("--model", "-m", default="gemini-2.5-pro", help="使用的模型")
+    parser.add_argument("--model", "-m", default="gemini-3-pro-preview", help="使用的模型")
     parser.add_argument("--workers", "-w", type=int, default=16, help="最大并发数（默认：16）")
 
     args = parser.parse_args()
