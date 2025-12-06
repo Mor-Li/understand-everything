@@ -1,16 +1,17 @@
 """
 s4_generate_readme.py
-递归生成各层级目录的 README.md（自底向上）
+递归生成各层级目录的 README.md（自底向上，异步版本）
 """
 
 import argparse
+import asyncio
 import logging
 import os
 from pathlib import Path
 
 import tiktoken
-from openai import OpenAI
-from tqdm import tqdm
+from openai import AsyncOpenAI
+from tqdm.asyncio import tqdm as async_tqdm
 
 from utils import get_output_path
 
@@ -42,7 +43,7 @@ README_PROMPT = """以下是 {folder_path} 目录下的内容：
 
 def count_tokens(text: str) -> int:
     """计算文本的 token 数量"""
-    return len(tokenizer.encode(text))
+    return len(tokenizer.encode(text, disallowed_special=()))
 
 
 def truncate_content(contents: list[tuple[str, str, int]], target_tokens: int) -> list[tuple[str, str]]:
@@ -69,7 +70,7 @@ def truncate_content(contents: list[tuple[str, str, int]], target_tokens: int) -
         keep_tokens = int(token_count * ratio)
 
         # 编码后截断，再解码
-        tokens = tokenizer.encode(content)
+        tokens = tokenizer.encode(content, disallowed_special=())
         truncated_tokens = tokens[:keep_tokens]
         truncated_content = tokenizer.decode(truncated_tokens)
 
@@ -139,30 +140,28 @@ def collect_folder_content(folder_path: Path, explain_base: Path) -> str:
     return "".join(result)
 
 
-def ask_gemini(folder_path: str, content: str, model: str = "gemini-3-pro-preview") -> str:
+async def ask_gemini_async(
+    folder_path: str,
+    content: str,
+    client: AsyncOpenAI,
+    model: str = "gemini-3-pro-preview"
+) -> str:
     """
-    调用 Gemini API 生成 README
+    异步调用 Gemini API 生成 README
 
     Args:
         folder_path: 文件夹路径
         content: 文件夹内容
+        client: AsyncOpenAI 客户端
         model: 使用的模型
 
     Returns:
         README 内容（Markdown 格式）
     """
-    api_key = os.getenv("OPENAI_API_KEY")
-    base_url = os.getenv("OPENAI_BASE_URL")
-
-    if not api_key:
-        raise ValueError("需要设置环境变量 OPENAI_API_KEY")
-
-    client = OpenAI(api_key=api_key, base_url=base_url)
-
     prompt = README_PROMPT.format(folder_path=folder_path, content=content)
 
     try:
-        response = client.chat.completions.create(
+        response = await client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=32000,
@@ -180,59 +179,83 @@ def ask_gemini(folder_path: str, content: str, model: str = "gemini-3-pro-previe
         return f"# README 生成失败\n\n错误信息: {str(e)}"
 
 
-def generate_readme_recursive(
+async def generate_readme_async(
     folder_path: Path,
     explain_base: Path,
+    client: AsyncOpenAI,
     force: bool = False,
     model: str = "gemini-3-pro-preview",
-) -> bool:
+    semaphore: asyncio.Semaphore | None = None,
+) -> tuple[Path, bool]:
     """
-    递归生成 README.md（自底向上）
+    异步生成单个文件夹的 README.md
 
     Args:
         folder_path: 当前文件夹路径（相对于 repo 根目录）
         explain_base: explain 输出的基础路径
+        client: AsyncOpenAI 客户端
         force: 是否强制重新生成
         model: 使用的模型
+        semaphore: 信号量，用于控制并发数
 
     Returns:
-        是否成功
+        (文件夹路径, 是否成功)
+    """
+    # 使用信号量控制并发
+    if semaphore:
+        async with semaphore:
+            return await _generate_readme_impl(
+                folder_path, explain_base, client, force, model
+            )
+    else:
+        return await _generate_readme_impl(
+            folder_path, explain_base, client, force, model
+        )
+
+
+async def _generate_readme_impl(
+    folder_path: Path,
+    explain_base: Path,
+    client: AsyncOpenAI,
+    force: bool,
+    model: str,
+) -> tuple[Path, bool]:
+    """
+    实际的 README 生成实现
     """
     explain_folder = explain_base / folder_path
 
     if not explain_folder.exists():
-        return False
-
-    # 先递归处理所有子文件夹
-    for subfolder in sorted(explain_folder.iterdir()):
-        if subfolder.is_dir():
-            sub_rel_path = folder_path / subfolder.name
-            generate_readme_recursive(sub_rel_path, explain_base, force, model)
+        return (folder_path, False)
 
     # 检查当前文件夹是否已有 README.md
     readme_path = explain_folder / "README.md"
     if readme_path.exists() and not force:
-        logger.info(f"⏭️  跳过 {folder_path}（已存在 README.md）")
-        return True
+        return (folder_path, True)  # 跳过，视为成功
 
     # 收集当前文件夹的内容
     content = collect_folder_content(folder_path, explain_base)
 
     if not content:
-        logger.info(f"⏭️  跳过 {folder_path}（没有内容）")
-        return False
+        return (folder_path, False)
 
-    # 调用 Gemini 生成 README
-    logger.info(f"🤖 正在生成 {folder_path} 的 README...")
-    readme_content = ask_gemini(str(folder_path), content, model)
+    # 调用 Gemini（异步）
+    try:
+        readme_content = await ask_gemini_async(str(folder_path), content, client, model)
+    except Exception as e:
+        logger.error(f"❌ API 调用失败 {folder_path}: {e}")
+        return (folder_path, False)
 
-    # 保存 README.md
-    with open(readme_path, "w", encoding="utf-8") as f:
-        f.write(f"# {folder_path}\n\n")
-        f.write(readme_content)
-
-    logger.info(f"✓ 已保存到 {readme_path}")
-    return True
+    # 保存结果
+    try:
+        readme_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(readme_path, "w", encoding="utf-8") as f:
+            f.write(f"# {folder_path}\n\n")
+            f.write(readme_content)
+        return (folder_path, True)
+    except Exception as e:
+        logger.error(f"❌ 保存失败 {folder_path}: {e}")
+        return (folder_path, False)
 
 
 def find_all_folders(explain_base: Path, root_folder: Path) -> list[Path]:
@@ -271,24 +294,81 @@ def find_all_folders(explain_base: Path, root_folder: Path) -> list[Path]:
     return folders
 
 
-def main():
-    parser = argparse.ArgumentParser(description="递归生成各层级目录的 README.md")
+async def process_folders_batch(
+    folders: list[Path],
+    explain_base: Path,
+    force: bool,
+    model: str,
+    max_workers: int = 8,
+):
+    """
+    批量异步处理文件夹
+
+    Args:
+        folders: 文件夹列表（按深度从深到浅排序）
+        explain_base: explain 输出的基础路径
+        force: 是否强制重新生成
+        model: 使用的模型
+        max_workers: 最大并发数（默认 8）
+    """
+    api_key = os.getenv("OPENAI_API_KEY")
+    base_url = os.getenv("OPENAI_BASE_URL")
+
+    if not api_key:
+        raise ValueError("需要设置环境变量 OPENAI_API_KEY")
+
+    # 创建异步客户端
+    client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+
+    # 创建信号量控制并发数
+    semaphore = asyncio.Semaphore(max_workers)
+
+    # 创建所有任务
+    tasks = [
+        generate_readme_async(
+            folder_path, explain_base, client, force, model, semaphore
+        )
+        for folder_path in folders
+    ]
+
+    # 使用 tqdm 异步进度条
+    print(f"\n⚡ 使用 {max_workers} 个并发 worker 处理 {len(tasks)} 个文件夹")
+    print()
+
+    results = []
+    for coro in async_tqdm.as_completed(tasks, desc="生成 README", unit="folder"):
+        result = await coro
+        results.append(result)
+
+    # 统计结果
+    success_count = sum(1 for _, success in results if success)
+    return success_count, len(results)
+
+
+async def main_async():
+    """异步主函数"""
+    parser = argparse.ArgumentParser(description="递归生成各层级目录的 README.md（异步版本）")
     parser.add_argument("repo_path", help="Git 仓库路径")
-    parser.add_argument("--subdir", default="mshrl", help="要分析的子目录")
+    parser.add_argument("--subdir", default="", help="要分析的子目录（默认为空，分析整个仓库）")
     parser.add_argument("--output", "-o", help="输出目录（默认：output/<repo_name>/explain）")
     parser.add_argument("--force", action="store_true", help="强制重新生成")
     parser.add_argument("--model", "-m", default="gemini-3-pro-preview", help="使用的模型")
+    parser.add_argument("--workers", "-w", type=int, default=8, help="最大并发数（默认：8）")
 
     args = parser.parse_args()
 
     # 默认输出路径：output/<repo_name>/explain-<date>
     if args.output is None:
-        args.output = get_output_path(args.repo_path, args.subdir, "explain")
+        # 使用仓库名作为 subdir 参数传给 get_output_path
+        repo_name = Path(args.repo_path).name
+        args.output = get_output_path(args.repo_path, repo_name, "explain")
 
     explain_base = Path(args.output)
-    root_folder = Path(args.subdir)
 
-    print(f"🚀 开始为 {args.subdir}/ 生成层级 README")
+    # 如果 subdir 为空，使用 "." 表示根目录
+    root_folder = Path(args.subdir) if args.subdir else Path(".")
+
+    print(f"🚀 开始为 {args.subdir if args.subdir else '整个仓库'}/ 生成层级 README")
     print()
 
     # 找到所有文件夹（自底向上）
@@ -301,15 +381,21 @@ def main():
     print(f"📊 找到 {len(folders)} 个文件夹（自底向上）")
     print()
 
-    # 逐个生成 README（带进度条）
-    success_count = 0
-    with tqdm(total=len(folders), desc="生成 README", unit="folder") as pbar:
-        for folder_path in folders:
-            if generate_readme_recursive(folder_path, explain_base, args.force, args.model):
-                success_count += 1
-            pbar.update(1)
+    # 异步批量处理
+    success_count, total_count = await process_folders_batch(
+        folders,
+        explain_base,
+        args.force,
+        args.model,
+        args.workers,
+    )
 
-    print(f"\n🎉 完成！成功生成 {success_count}/{len(folders)} 个 README")
+    print(f"\n🎉 完成！成功生成 {success_count}/{total_count} 个 README")
+
+
+def main():
+    """同步入口，运行异步主函数"""
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":

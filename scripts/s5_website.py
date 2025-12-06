@@ -685,14 +685,15 @@ function escapeHtml(text) {
 def main():
     parser = argparse.ArgumentParser(description="生成代码解读静态网站")
     parser.add_argument("repo_path", help="Git 仓库路径")
-    parser.add_argument("--subdir", default="mshrl", help="要分析的子目录")
+    parser.add_argument("--subdir", default="", help="要分析的子目录（默认为空，分析整个仓库）")
     parser.add_argument("--explain", help="explain 输出目录（默认：output/<repo_name>/explain）")
     parser.add_argument("--output", "-o", help="网站输出目录（默认：output/<repo_name>/website）")
 
     args = parser.parse_args()
 
     repo_path = Path(args.repo_path)
-    subdir = Path(args.subdir)
+    subdir = Path(args.subdir) if args.subdir else Path(".")
+    repo_name = repo_path.name
 
     # 默认路径
     if args.explain is None:
