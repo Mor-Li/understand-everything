@@ -52,7 +52,7 @@ uvpe
 设置环境变量（用于 Gemini API）：
 ```bash
 export OPENAI_API_KEY="your-api-key"
-export OPENAI_BASE_URL="your-"
+export OPENAI_BASE_URL="your-openai-base-url"
 ```
 
 ### 3. 完整分析流程
@@ -84,7 +84,7 @@ python utils/s2_analyze_stats.py repo/your-project
 
 启动本地服务器查看网站：
 ```bash
-cd output/mshrl/website
+cd output/verl/website
 python -m http.server 8000
 # 浏览器打开 http://localhost:8000
 ```
@@ -112,7 +112,7 @@ python scripts/s1_explain_files.py <repo_path> [options]
 python scripts/s1_explain_files.py repo/Megatron-LM --workers 8 --percent 100
 
 # 解读前 50% 的文件
-python scripts/s1_explain_files.py repo/mshrl --percent 50
+python scripts/s1_explain_files.py repo/verl --percent 50
 
 # 强制重新生成
 python scripts/s1_explain_files.py repo/verl --percent 100 --force
@@ -137,7 +137,7 @@ python scripts/s1_explain_files.py repo/verl --percent 100 --force
 python scripts/s2_generate_readme.py <repo_path> [options]
 
 # 示例
-python scripts/s2_generate_readme.py repo/mshrl
+python scripts/s2_generate_readme.py repo/verl
 
 # 强制重新生成
 python scripts/s2_generate_readme.py repo/Megatron-LM --force
@@ -165,7 +165,7 @@ python scripts/s2_generate_readme.py repo/Megatron-LM --force
 python scripts/s3_website.py <repo_path> [options]
 
 # 示例
-python scripts/s3_website.py repo/mshrl
+python scripts/s3_website.py repo/verl
 python scripts/s3_website.py repo/Megatron-LM
 python scripts/s3_website.py repo/SELF-PARAM
 ```

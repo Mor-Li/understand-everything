@@ -157,7 +157,7 @@ def analyze_repo_stats(repo_path: str, subdir: str):
 def main():
     parser = argparse.ArgumentParser(description="分析仓库子目录的统计信息")
     parser.add_argument("repo_path", help="Git 仓库路径")
-    parser.add_argument("--subdir", default="mshrl", help="要分析的子目录")
+    parser.add_argument("--subdir", default="verl", help="要分析的子目录")
 
     args = parser.parse_args()
 

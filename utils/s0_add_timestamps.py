@@ -108,7 +108,7 @@ def main():
     # 处理每个仓库
     repos = {
         "Megatron-LM": "repo/Megatron-LM",
-        "mshrl": "repo/mshrl",
+        "verl": "repo/verl",
     }
 
     print("🚀 开始处理 output 目录...\n")

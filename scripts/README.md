@@ -37,7 +37,7 @@ python scripts/s1_repo_heatmap_tree.py repo/Megatron-LM \
 分析指定子目录下文件的 git 修改统计信息。
 
 ```bash
-python scripts/s2_analyze_stats.py repo/mshrl --subdir mshrl
+python scripts/s2_analyze_stats.py repo/verl --subdir verl
 ```
 
 **输出**: 打印统计信息到控制台，包括：
@@ -56,22 +56,22 @@ python scripts/s2_analyze_stats.py repo/mshrl --subdir mshrl
 
 ```bash
 # 解释 top 5 个文件（默认）
-python scripts/s3_explain_files.py repo/mshrl --subdir mshrl
+python scripts/s3_explain_files.py repo/verl --subdir verl
 
 # 解释 top N 个文件
-python scripts/s3_explain_files.py repo/mshrl --subdir mshrl --top 10
+python scripts/s3_explain_files.py repo/verl --subdir verl --top 10
 
 # 解释前 N% 的文件（按修改次数排序）
-python scripts/s3_explain_files.py repo/mshrl --subdir mshrl --percent 20
+python scripts/s3_explain_files.py repo/verl --subdir verl --percent 20
 
 # 自定义并发数（默认 16）
-python scripts/s3_explain_files.py repo/mshrl --subdir mshrl --workers 32
+python scripts/s3_explain_files.py repo/verl --subdir verl --workers 32
 
 # 强制重新生成
-python scripts/s3_explain_files.py repo/mshrl --subdir mshrl --force
+python scripts/s3_explain_files.py repo/verl --subdir verl --force
 
 # 使用不同模型
-python scripts/s3_explain_files.py repo/mshrl --subdir mshrl --model gemini-2.5-flash
+python scripts/s3_explain_files.py repo/verl --subdir verl --model gemini-2.5-flash
 ```
 
 **输出**: `output/<repo_name>/explain-<date>/<file_path>.md`
@@ -90,10 +90,10 @@ python scripts/s3_explain_files.py repo/mshrl --subdir mshrl --model gemini-2.5-
 
 ```bash
 # 生成 README
-python scripts/s4_generate_readme.py repo/mshrl --subdir mshrl
+python scripts/s4_generate_readme.py repo/verl --subdir verl
 
 # 强制重新生成
-python scripts/s4_generate_readme.py repo/mshrl --subdir mshrl --force
+python scripts/s4_generate_readme.py repo/verl --subdir verl --force
 ```
 
 **输出**: `output/<repo_name>/explain-<date>/<path>/README.md`
@@ -106,7 +106,7 @@ python scripts/s4_generate_readme.py repo/mshrl --subdir mshrl --force
 生成 Read the Docs 风格的静态网站，展示代码解读和层级结构。
 
 ```bash
-python scripts/s5_website.py repo/mshrl --subdir mshrl
+python scripts/s5_website.py repo/verl --subdir verl
 ```
 
 **输出**: `output/<repo_name>/website-<date>/`
@@ -161,10 +161,10 @@ output/
 │   ├── explain-2025-03-20/      # 代码解读（带 git commit 日期）
 │   ├── website-2025-03-20/      # 静态网站（带 git commit 日期）
 │   └── s1_heatmap.png          # 热力图
-└── mshrl/
+└── verl/
     ├── explain-2025-12-06/
     ├── website-2025-12-06/
-    └── s1_mshrl_fixed.png
+    └── s1_verl_fixed.png
 ```
 
 **时间戳说明**:
@@ -179,22 +179,22 @@ output/
 source .venv/bin/activate
 
 # 2. 生成热力图（可选）
-python scripts/s1_repo_heatmap_tree.py repo/mshrl
+python scripts/s1_repo_heatmap_tree.py repo/verl
 
 # 3. 查看统计信息（可选）
-python scripts/s2_analyze_stats.py repo/mshrl --subdir mshrl
+python scripts/s2_analyze_stats.py repo/verl --subdir verl
 
 # 4. 解释代码文件
-python scripts/s3_explain_files.py repo/mshrl --subdir mshrl --percent 20
+python scripts/s3_explain_files.py repo/verl --subdir verl --percent 20
 
 # 5. 生成层级 README
-python scripts/s4_generate_readme.py repo/mshrl --subdir mshrl
+python scripts/s4_generate_readme.py repo/verl --subdir verl
 
 # 6. 生成静态网站
-python scripts/s5_website.py repo/mshrl --subdir mshrl
+python scripts/s5_website.py repo/verl --subdir verl
 
 # 7. 预览网站
-cd output/mshrl/website-2025-12-06
+cd output/verl/website-2025-12-06
 python -m http.server 8000
 # 访问 http://localhost:8000
 ```
