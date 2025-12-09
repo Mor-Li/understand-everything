@@ -1,6 +1,6 @@
-# Understanding Everything
+# Understand Every Repo
 
-通过 Git 历史和 AI 分析，将代码仓库转换为通俗易懂的"武林秘籍"。
+通过 Git 历史和 AI 分析，将任何代码仓库转换为通俗易懂的交互式文档。
 
 ## 项目简介
 
@@ -18,16 +18,19 @@
 
 ```
 understanding-everything/
-├── scripts/              # 5 个核心脚本（按执行顺序命名）
+├── scripts/              # 3 个核心脚本（按执行顺序命名）
+│   ├── s1_explain_files.py        # AI 解读代码文件
+│   ├── s2_generate_readme.py      # 生成层级 README
+│   └── s3_website.py              # 生成交互式网站
+├── utils/               # 工具脚本
+│   ├── s0_add_timestamps.py       # 添加时间戳
 │   ├── s1_repo_heatmap_tree.py    # 生成仓库结构热力图
 │   ├── s2_analyze_stats.py        # 分析统计信息
-│   ├── s3_explain_files.py        # AI 解读代码文件
-│   ├── s4_generate_readme.py      # 生成层级 README
-│   └── s5_website.py              # 生成交互式网站
-├── repo/                 # 待分析的仓库（.gitignore 已忽略）
+│   ├── s4_fast_dir_search.py      # 快速目录搜索
+│   └── utils.py                   # 通用工具函数
+├── repo/                # 待分析的仓库（.gitignore 已忽略）
 ├── output/              # 生成的所有输出（.gitignore 已忽略）
 │   └── <repo_name>/
-│       ├── s1_heatmap.png        # 热力图
 │       ├── explain/              # AI 解读的 markdown
 │       └── website/              # 静态网站
 └── pyproject.toml       # 项目配置
@@ -54,23 +57,27 @@ export OPENAI_BASE_URL="https://openai.app.msh.team/v1"
 
 ### 3. 完整分析流程
 
-假设要分析 `repo/mshrl` 仓库：
+假设要分析 `repo/your-project` 仓库：
 
 ```bash
-# Step 1: 生成热力图（可视化修改频率）
-python scripts/s1_repo_heatmap_tree.py repo/mshrl
+# Step 1: AI 解读文件（生成通俗解释）
+python scripts/s1_explain_files.py repo/your-project --workers 8 --percent 100
 
-# Step 2: 分析统计信息（了解代码规模）
-python scripts/s2_analyze_stats.py repo/mshrl --subdir mshrl
+# Step 2: 生成层级 README（自底向上汇总）
+python scripts/s2_generate_readme.py repo/your-project
 
-# Step 3: AI 解读文件（生成通俗解释）
-python scripts/s3_explain_files.py repo/mshrl --subdir mshrl --percent 100
+# Step 3: 生成交互式网站（最终产物）
+python scripts/s3_website.py repo/your-project
+```
 
-# Step 4: 生成层级 README（自底向上汇总）
-python scripts/s4_generate_readme.py repo/mshrl --subdir mshrl
+**可选工具脚本**：
 
-# Step 5: 生成交互式网站（最终产物）
-python scripts/s5_website.py repo/mshrl --subdir mshrl
+```bash
+# 生成仓库热力图（可视化修改频率）
+python utils/s1_repo_heatmap_tree.py repo/your-project
+
+# 分析统计信息（了解代码规模）
+python utils/s2_analyze_stats.py repo/your-project
 ```
 
 ### 4. 查看结果
@@ -84,95 +91,38 @@ python -m http.server 8000
 
 ---
 
-## 脚本详细说明
+## 核心脚本详细说明
 
-### S1 - 生成仓库结构热力图
-
-**功能**：可视化展示仓库结构和文件修改频率
-
-**特点**：
-- 树状显示目录和文件
-- 颜色编码：白色 → 黄色 → 橙色 → 红色（修改次数递增）
-- 自适应图片大小
-- 限制深度和文件数，避免过于复杂
-
-**使用**：
-```bash
-python scripts/s1_repo_heatmap_tree.py <repo_path> [options]
-
-# 示例
-python scripts/s1_repo_heatmap_tree.py repo/mshrl \
-  --max-depth 5 \
-  --max-files 20 \
-  -o output/custom_heatmap.png
-```
-
-**输出**：`output/<repo_name>/s1_heatmap.png`
-
----
-
-### S2 - 分析统计信息
-
-**功能**：统计代码规模、修改分布、Token 数量
-
-**特点**：
-- 使用 `tiktoken o200k_base` 精确计算 Token 数
-- 显示修改次数的分位数分布（P50, P75, P90, P95, P99）
-- 按百分比展示文件分层统计（1%, 5%, 10%, ...）
-- 列出 Top 10 最频繁修改的文件
-
-**使用**：
-```bash
-python scripts/s2_analyze_stats.py <repo_path> --subdir <subdir>
-
-# 示例
-python scripts/s2_analyze_stats.py repo/mshrl --subdir mshrl
-```
-
-**输出示例**：
-```
-📊 总体统计:
-   - 总文件数: 85
-   - 总 Token 数: 183,600 (~183.6K tokens)
-   - 平均每文件: 2160 tokens
-
-📊 修改次数分位数:
-   - P50: 6 次
-   - P90: 61 次
-   - P99: 439 次
-```
-
----
-
-### S3 - AI 解读代码文件
+### S1 - AI 解读代码文件
 
 **功能**：使用 Gemini 2.5 Pro 为每个文件生成通俗易懂的中文解释
 
 **特点**：
+- 异步并发处理，支持 `--workers N` 设置并发数（默认 16）
 - 支持 `--top N` 或 `--percent N` 选择要解读的文件
-- 自动跳过已解读的文件
-- 使用 `tqdm` 显示进度条
+- 自动跳过已解读的文件（使用 `--force` 强制重新生成）
+- 使用 `tqdm` 显示实时进度条
 - Prompt 优化为"step-by-step 讲解"风格
 
 **使用**：
 ```bash
-python scripts/s3_explain_files.py <repo_path> --subdir <subdir> [options]
+python scripts/s1_explain_files.py <repo_path> [options]
 
-# 解读前 10 个文件
-python scripts/s3_explain_files.py repo/mshrl --subdir mshrl --top 10
+# 解读所有文件，使用 8 个并发
+python scripts/s1_explain_files.py repo/Megatron-LM --workers 8 --percent 100
 
 # 解读前 50% 的文件
-python scripts/s3_explain_files.py repo/mshrl --subdir mshrl --percent 50
+python scripts/s1_explain_files.py repo/mshrl --percent 50
 
 # 强制重新生成
-python scripts/s3_explain_files.py repo/mshrl --subdir mshrl --percent 100 --force
+python scripts/s1_explain_files.py repo/verl --percent 100 --force
 ```
 
-**输出**：`output/<repo_name>/explain/<subdir>/*.md`
+**输出**：`output/<repo_name>/explain-<date>/*.md`
 
 ---
 
-### S4 - 生成层级 README
+### S2 - 生成层级 README
 
 **功能**：递归地为每个文件夹生成汇总 README（自底向上）
 
@@ -184,36 +134,40 @@ python scripts/s3_explain_files.py repo/mshrl --subdir mshrl --percent 100 --for
 
 **使用**：
 ```bash
-python scripts/s4_generate_readme.py <repo_path> --subdir <subdir> [options]
+python scripts/s2_generate_readme.py <repo_path> [options]
 
 # 示例
-python scripts/s4_generate_readme.py repo/mshrl --subdir mshrl
+python scripts/s2_generate_readme.py repo/mshrl
 
 # 强制重新生成
-python scripts/s4_generate_readme.py repo/mshrl --subdir mshrl --force
+python scripts/s2_generate_readme.py repo/Megatron-LM --force
 ```
 
-**输出**：在每个文件夹下生成 `README.md`
+**输出**：在解读目录的每个文件夹下生成 `README.md`
 
 ---
 
-### S5 - 生成交互式网站
+### S3 - 生成交互式网站
 
 **功能**：生成 Read the Docs 风格的静态网站
 
 **特点**：
-- 左侧可折叠文件树导航
+- 左侧可折叠文件树导航，固定缩进对齐
 - 点击文件夹显示 README 汇总
 - 点击文件显示 AI 解读 + 原始代码（带语法高亮）
+- 支持所有文件类型（.py, .cu, .cpp, .h, .md 等）
+- 显示隐藏文件（除 .git 目录外）
 - 使用 Prism.js 进行代码高亮
 - 响应式设计，移动端友好
 
 **使用**：
 ```bash
-python scripts/s5_website.py <repo_path> --subdir <subdir> [options]
+python scripts/s3_website.py <repo_path> [options]
 
 # 示例
-python scripts/s5_website.py repo/mshrl --subdir mshrl
+python scripts/s3_website.py repo/mshrl
+python scripts/s3_website.py repo/Megatron-LM
+python scripts/s3_website.py repo/SELF-PARAM
 ```
 
 **输出**：
@@ -246,15 +200,16 @@ python -m http.server 8000
 ## 设计理念
 
 1. **极简主义**：每个脚本专注一件事，代码简洁明了
-2. **顺序清晰**：s1 → s2 → s3 → s4 → s5，按执行顺序命名
+2. **顺序清晰**：s1 → s2 → s3，按执行顺序命名
 3. **可中断**：每一步都可独立运行，支持增量更新
-4. **数据驱动**：基于真实项目（mshrl、Megatron-LM）验证
+4. **并发高效**：异步处理，支持多 worker 并发
 
 ## 示例项目
 
-已成功分析的项目：
-- ✅ **mshrl** (85 files, 183.6K tokens) - 强化学习训练框架
-- ✅ **Megatron-LM** (Top 10%, 17 files, 116.3K tokens) - 大规模语言模型训练
+已成功分析的开源项目：
+- ✅ **Megatron-LM** (1330 files) - NVIDIA 大规模语言模型训练框架
+- ✅ **verl** (1100 files) - Volcano Engine 强化学习框架
+- ✅ **SELF-PARAM** (185 files) - LLM 对话推荐系统研究
 
 ## 许可证
 
