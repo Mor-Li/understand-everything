@@ -139,7 +139,9 @@ function loadContent(node) {
 async function loadReadme(readmePath, folderName) {
     try {
         const htmlPath = readmePath.replace('.md', '.html');
-        const response = await fetch(`explanations/${htmlPath}`);
+        // Encode path components to handle special characters and dots
+        const encodedPath = htmlPath.split('/').map(encodeURIComponent).join('/');
+        const response = await fetch(`explanations/${encodedPath}`);
 
         // Check if fetch was successful
         if (!response.ok) {
@@ -187,7 +189,9 @@ async function loadFile(node) {
         // 加载解读
         if (node.explanation) {
             const htmlPath = node.explanation.replace('.md', '.html');
-            const response = await fetch(`explanations/${htmlPath}`);
+            // Encode path components to handle special characters and dots
+            const encodedPath = htmlPath.split('/').map(encodeURIComponent).join('/');
+            const response = await fetch(`explanations/${encodedPath}`);
             const explanationHtml = await response.text();
 
             html += `
@@ -202,7 +206,9 @@ async function loadFile(node) {
 
         // 加载源代码
         if (node.source) {
-            const sourceResponse = await fetch(`sources/${node.source}`);
+            // Encode path components to handle special characters and dots
+            const encodedSource = node.source.split('/').map(encodeURIComponent).join('/');
+            const sourceResponse = await fetch(`sources/${encodedSource}`);
             const sourceCode = await sourceResponse.text();
 
             html += `
