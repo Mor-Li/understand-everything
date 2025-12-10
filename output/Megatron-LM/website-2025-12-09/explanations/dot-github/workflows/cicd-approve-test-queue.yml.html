@@ -1,0 +1,98 @@
+<h1>.github/workflows/cicd-approve-test-queue.yml</h1>
+<p>这份文件其实是一个 <strong>“自动化的交通指挥员”</strong>。</p>
+<p>它的核心作用是：<strong>防止太多的测试任务同时运行，把机器挤爆。</strong></p>
+<p>在一个大型开源项目（如 NVIDIA Megatron-LM）中，会有很多人提交代码（PR）。如果每个人提交代码后立刻触发大规模测试，服务器资源（GPU）不够用，任务就会全部卡死或排队太久。</p>
+<p>这个脚本每 5 分钟醒来一次，看看现在的“交通状况”，如果路没堵，就放行几个排队的测试任务。</p>
+<p>下面我按照你要求的 <strong>Task Todo List</strong> 形式，一步步拆解这个脚本在干什么：</p>
+<hr />
+<h3>🤖 机器人的任务清单 (Todo List)</h3>
+<h4>第一阶段：准备工作</h4>
+<ol>
+<li><strong>⏰ 设定闹钟</strong>：哪怕没人理我，我也要每 <strong>5分钟</strong> 自动醒来检查一次 (<code>cron: "*/5 * * * *"</code> )。</li>
+<li><strong>📂 领取任务分类</strong>：我要同时分身成三个我，分别负责盯着三个不同的车道（分支）：<ul>
+<li>目标是合入 <code>main</code> 分支的 PR。</li>
+<li>目标是合入 <code>dev</code> 分支的 PR。</li>
+<li>目标是合入 <code>others</code> (其他) 分支的 PR。</li>
+<li><em>(这是代码中 <code>strategy: matrix</code> 的作用)</em></li>
+</ul>
+</li>
+<li><strong>🛠️ 准备工具</strong>：安装 Python 环境和 <code>requests</code> 库（用来给 GitHub 发消息）。</li>
+</ol>
+<h4>第二阶段：检查路况 (运行 Python 脚本)</h4>
+<ol>
+<li><strong>🔍 询问当前拥堵情况</strong>：<ul>
+<li>向 GitHub 查询：现在有多少个名字叫 <code>CICD Megatron-LM</code> 的任务正在<strong>排队 (queued)</strong> 或 <strong>运行中 (in_progress)</strong>？</li>
+<li><em>筛选条件</em>：只数那些属于我当前负责车道（比如 <code>main</code>）的任务。</li>
+</ul>
+</li>
+<li><strong>🧮 计算并发数</strong>：<ul>
+<li>算出总数 = 正在跑的 + 正在排队的。</li>
+<li>读取设定的最大允许数量 (<code>MAX_CONCURRENCY</code>)。</li>
+</ul>
+</li>
+<li><strong>🛑 做出判断</strong>：<ul>
+<li><strong>如果 (当前总数 &gt;= 最大允许数量)</strong>：路堵死了！直接下班 (<code>exit(0)</code>)，不再放行任何新任务。</li>
+<li><strong>如果 (没满)</strong>：继续下一步。</li>
+</ul>
+</li>
+</ol>
+<h4>第三阶段：放行任务</h4>
+<ol>
+<li><strong>📋 获取等待名单</strong>：<ul>
+<li>去问 GitHub：有哪些任务处于 <strong>"Waiting" (等待审批)</strong> 状态？</li>
+<li><em>筛选条件</em>：必须是 <code>CICD Megatron-LM</code> 且属于我负责的车道。</li>
+</ul>
+</li>
+<li><strong>⏳ 排个序</strong>：按照创建时间排序，先来的先处理（Oldest first）。</li>
+<li><strong>✅ 盖章放行</strong>：<ul>
+<li>开始循环处理等待名单。</li>
+<li>只要还没达到最大并发数，就给这个任务发一个 <strong>"Approved" (批准)</strong> 的指令。</li>
+<li>每批准一个，就在心里的小本本上把“当前总数”加 1。</li>
+<li>如果加 1 后满了，就停止批准，剩下的下次再说。</li>
+</ul>
+</li>
+</ol>
+<h4>第四阶段：异常处理</h4>
+<ol>
+<li><strong>🚨 报警</strong>：如果上面那个指挥交通的过程（Python 脚本）崩了/报错了，立刻发一个 Slack 消息通知管理员 (<code>notify</code> job)。</li>
+</ol>
+<hr />
+<h3>关键代码段落对照解释</h3>
+<p>为了让你更清楚，我把代码里对应的部分摘出来解释：</p>
+<p><strong>1. 分身术 (Matrix Strategy)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="w">    </span><span class="nt">strategy</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">matrix</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">branch</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">main</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">dev</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">others</span><span class="p p-Indicator">]</span><span class="w"> </span><span class="c1"># 这里的代码会让整个任务裂变成三个并行任务</span>
+</code></pre></div>
+
+<p>这意味着脚本会运行三次，一次专门管 <code>main</code> 分支的流量，一次管 <code>dev</code>，一次管其他。这样可以保证 <code>main</code> 分支的测试不会被其他杂乱分支的测试挤掉资源。</p>
+<p><strong>2. 识别 PR 的目标分支</strong>
+脚本里有一个函数 <code>is_pr_targeting_branch</code>。
+它的逻辑是：
+*   拿到一个正在跑的任务。
+*   看它是哪个 PR 触发的。
+*   查这个 PR 想合并到哪里？(比如想合并到 <code>main</code>)。
+*   如果这个 PR 的目标和你当前负责的 <code>matrix.branch</code> 一致，才把它算进你的计数里。</p>
+<p><strong>3. 核心限流逻辑</strong></p>
+<div class="codehilite"><pre><span></span><code>          <span class="c1"># 统计现在的任务数量</span>
+          <span class="n">total_workflows</span> <span class="o">=</span> <span class="n">queued_workflows</span> <span class="o">+</span> <span class="n">in_progress_workflows</span>
+
+          <span class="c1"># 如果满了，直接退出，啥也不干</span>
+          <span class="k">if</span> <span class="n">total_workflows</span> <span class="o">&gt;=</span> <span class="n">MAX_CONCURRENCY</span><span class="p">:</span>
+              <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;Maximum concurrency reached, no new approvals will be made&quot;</span><span class="p">)</span>
+              <span class="n">exit</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>4. 审批放行</strong></p>
+<div class="codehilite"><pre><span></span><code>              <span class="c1"># 告诉 GitHub：这个环境 ID 我批准了</span>
+              <span class="n">status_data</span> <span class="o">=</span> <span class="p">{</span>
+                  <span class="s2">&quot;environment_ids&quot;</span><span class="p">:</span> <span class="p">[</span><span class="n">environment_id</span><span class="p">],</span>
+                  <span class="s2">&quot;state&quot;</span><span class="p">:</span> <span class="s2">&quot;approved&quot;</span><span class="p">,</span> <span class="c1"># 关键动作：批准</span>
+                  <span class="s2">&quot;comment&quot;</span><span class="p">:</span> <span class="s2">&quot;Automatically approved by queue manager&quot;</span>
+              <span class="p">}</span>
+              <span class="c1"># 发送请求</span>
+              <span class="n">result</span> <span class="o">=</span> <span class="n">make_request</span><span class="p">(</span><span class="n">deployment_url</span><span class="p">,</span> <span class="n">method</span><span class="o">=</span><span class="s2">&quot;POST&quot;</span><span class="p">,</span> <span class="n">data</span><span class="o">=</span><span class="n">status_data</span><span class="p">)</span>
+</code></pre></div>
+
+<h3>总结</h3>
+<p>这个文件的作用就是<strong>“错峰出行”</strong>。它确保了 Megatron-LM 项目的测试集群不会因为突发的大量代码提交而瘫痪，保证资源优先分配给先提交的人，且不同分支之间互不干扰。</p>

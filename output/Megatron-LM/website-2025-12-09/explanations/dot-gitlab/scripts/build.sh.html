@@ -1,0 +1,150 @@
+<h1>.gitlab/scripts/build.sh</h1>
+<p>这份脚本确实看起来比较复杂，因为它混合了 <strong>数据准备</strong>、<strong>逻辑判断</strong> 和 <strong>复杂的 Docker 构建命令</strong>。</p>
+<p>简单来说，这是一个 <strong>GitLab CI/CD 的自动化构建脚本</strong>。它的最终目的是：<strong>在一个干净的环境里准备好数据，然后根据当前的分支（Branch）或合并请求（MR）的情况，构建并推送（Push）一个 Docker 镜像。</strong></p>
+<p>为了让你看懂，我把这个脚本拆解成一个 <strong>6步的 To-Do List（任务清单）</strong>，我们一步一步来完成这个构建任务。</p>
+<hr />
+<h3>📋 构建任务清单 (To-Do List)</h3>
+<h4>✅ Task 1: 初始化与环境检查</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nb">set</span><span class="w"> </span>-x
+env
+<span class="nb">eval</span><span class="w"> </span><span class="s2">&quot;IMAGE=\$</span><span class="nv">$IMAGE</span><span class="s2">&quot;</span>
+</code></pre></div>
+
+<ul>
+<li><strong>他在做什么：</strong><ul>
+<li><code>set -x</code>: 打开“调试模式”，这样脚本运行的每一行命令都会打印在屏幕上，方便出错时排查。</li>
+<li><code>env</code>: 打印当前所有的环境变量（看看 CI 给我们传了什么参数）。</li>
+<li><code>eval ...</code>: 这是一个动态变量赋值的操作，用来确定最终的镜像名称变量。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: “借鸡生蛋” —— 准备测试数据</h4>
+<p>这是脚本里最“绕”的一段。为了构建镜像，我们需要一些测试数据（assets），但 CI 机器上可能没有 Python 环境或者不想弄脏环境。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 启动一个临时的 Python 容器，起名叫 download_test_data</span>
+docker<span class="w"> </span>run<span class="w"> </span>-d<span class="w"> </span>--name<span class="w"> </span>download_test_data<span class="w"> </span>-w<span class="w"> </span>/workdir/<span class="w"> </span>python:3.12-slim<span class="w"> </span>bash<span class="w"> </span>-c<span class="w"> </span><span class="s1">&#39;sleep infinity&#39;</span>
+
+<span class="c1"># 2. 把本地的 tests 文件夹复制进这个容器</span>
+docker<span class="w"> </span>cp<span class="w"> </span>tests/.<span class="w"> </span>download_test_data:/workdir/tests
+
+<span class="c1"># 3. 在容器里安装依赖，并运行 Python 脚本下载数据</span>
+docker<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>download_test_data<span class="w"> </span>bash<span class="w"> </span>-c<span class="w"> </span><span class="s1">&#39;</span>
+<span class="s1">    ls -al /workdir/</span>
+<span class="s1">    pip install --no-cache-dir click requests</span>
+<span class="s1">    python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets</span>
+<span class="s1">&#39;</span>
+
+<span class="c1"># 4. 把下载好的 assets 数据从容器里复制回宿主机（当前目录）</span>
+docker<span class="w"> </span>cp<span class="w"> </span>download_test_data:/workdir/assets<span class="w"> </span>./
+
+<span class="c1"># 5. 杀鸡取卵：删掉这个临时容器</span>
+docker<span class="w"> </span>rm<span class="w"> </span>-f<span class="w"> </span>download_test_data
+</code></pre></div>
+
+<ul>
+<li><strong>他在做什么：</strong><ul>
+<li>因为本地环境可能不纯净，它启动了一个临时的 Python 容器。</li>
+<li>在容器里运行下载脚本 <code>download_unit_tests_dataset.py</code>。</li>
+<li>下载完后，把文件拿出来（<code>docker cp</code>），放在当前目录下备用。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 升级装备 —— 配置 Docker Buildx</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code>docker<span class="w"> </span>context<span class="w"> </span>create<span class="w"> </span>tls-environment
+docker<span class="w"> </span>buildx<span class="w"> </span>create<span class="w"> </span>--name<span class="w"> </span>container<span class="w"> </span>--driver<span class="o">=</span>docker-container<span class="w"> </span>--use<span class="w"> </span>tls-environment
+</code></pre></div>
+
+<ul>
+<li><strong>他在做什么：</strong><ul>
+<li>普通的 <code>docker build</code> 有点慢且功能少。这里创建了一个 <code>buildx</code> 环境（下一代构建工具）。</li>
+<li>这能支持更高级的缓存（Cache）功能，让下次构建更快。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 制定策略 —— 决定标签和缓存 (If/Else 逻辑)</h4>
+<p>根据代码是运行在 <code>main</code> 分支、<code>dev</code> 分支，还是一个普通的 Merge Request (MR)，构建的参数是不一样的。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nv">ADDITIONAL_PARAMS</span><span class="o">=()</span><span class="w"> </span><span class="c1"># 初始化一个空参数列表</span>
+
+<span class="c1"># 情况 A: 如果是主分支(main/dev) 或 特定重构分支</span>
+<span class="k">if</span><span class="w"> </span><span class="o">[[</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$CI_COMMIT_BRANCH</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="s2">&quot;ci-rebuild-mcore-nemo-image&quot;</span><span class="w"> </span>...<span class="w"> </span><span class="o">]]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">    </span><span class="nv">ADDITIONAL_PARAMS</span><span class="o">+=(</span><span class="s2">&quot;--pull&quot;</span><span class="o">)</span><span class="w">  </span><span class="c1"># 强制拉取最新基础镜像</span>
+<span class="w">    </span><span class="nv">ADDITIONAL_PARAMS</span><span class="o">+=(</span><span class="s2">&quot;--cache-to ... mode=max&quot;</span><span class="o">)</span><span class="w"> </span><span class="c1"># 把缓存存到 registry，方便下次用</span>
+<span class="w">    </span><span class="nv">ADDITIONAL_PARAMS</span><span class="o">+=(</span><span class="s2">&quot;-t </span><span class="si">${</span><span class="nv">IMAGE</span><span class="si">}</span><span class="s2">:</span><span class="si">${</span><span class="nv">CI_COMMIT_BRANCH</span><span class="si">}</span><span class="s2">&quot;</span><span class="o">)</span><span class="w"> </span><span class="c1"># 打标签：image:main</span>
+
+<span class="c1"># 情况 B: 如果这是一个 Merge Request (代码合并请求)</span>
+<span class="k">elif</span><span class="w"> </span><span class="o">[[</span><span class="w"> </span>-n<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$CI_MERGE_REQUEST_IID</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">]]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">    </span><span class="nv">ADDITIONAL_PARAMS</span><span class="o">+=(</span><span class="s2">&quot;--cache-to ...&quot;</span><span class="o">)</span><span class="w"> </span><span class="c1"># 把缓存存到 registry</span>
+<span class="w">    </span><span class="nv">ADDITIONAL_PARAMS</span><span class="o">+=(</span><span class="s2">&quot;-t </span><span class="si">${</span><span class="nv">IMAGE</span><span class="si">}</span><span class="s2">:</span><span class="si">${</span><span class="nv">CI_MERGE_REQUEST_IID</span><span class="si">}</span><span class="s2">&quot;</span><span class="o">)</span><span class="w"> </span><span class="c1"># 打标签：image:123 (MR的ID)</span>
+<span class="k">fi</span>
+
+<span class="c1"># 情况 C: 如果是每晚构建 (Nightly)</span>
+<span class="k">if</span><span class="w"> </span><span class="o">[[</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$CI_COMMIT_BRANCH</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="s2">&quot;ci-nightly&quot;</span><span class="w"> </span><span class="o">]]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">    </span><span class="nv">ADDITIONAL_PARAMS</span><span class="o">+=(</span><span class="s2">&quot;-t </span><span class="si">${</span><span class="nv">IMAGE</span><span class="si">}</span><span class="s2">:nightly&quot;</span><span class="o">)</span><span class="w"> </span><span class="c1"># 额外加个标签：image:nightly</span>
+<span class="k">fi</span>
+
+<span class="c1"># 情况 D: 如果有 Transformer Engine 的引用</span>
+<span class="k">if</span><span class="w"> </span><span class="o">[[</span><span class="w"> </span>-n<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$TE_GIT_REF</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">]]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">    </span><span class="nv">ADDITIONAL_PARAMS</span><span class="o">+=(</span><span class="s2">&quot;--build-arg TE_COMMIT=</span><span class="si">${</span><span class="nv">TE_GIT_REF</span><span class="si">}</span><span class="s2">&quot;</span><span class="o">)</span><span class="w"> </span><span class="c1"># 传个构建参数进去</span>
+<span class="k">fi</span>
+</code></pre></div>
+
+<ul>
+<li><strong>他在做什么：</strong><ul>
+<li>他在拼凑 <code>ADDITIONAL_PARAMS</code> 这个数组。</li>
+<li>如果是<strong>主分支</strong>：我们要生成缓存，标签叫 <code>main</code>。</li>
+<li>如果是<strong>测试分支</strong>：我们只生成针对这个 MR 的缓存，标签叫 MR ID。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 获取情报 —— 抓取最新组件版本</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nv">JET_API_VERSION</span><span class="o">=</span><span class="k">$(</span>curl<span class="w"> </span>-s<span class="w"> </span>-u<span class="w"> </span>...<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>...<span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-n1<span class="k">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>他在做什么：</strong><ul>
+<li>它用 <code>curl</code> 访问了 NVIDIA 的内部服务器（Artifactory）。</li>
+<li>它去查 <code>jet-api</code> 这个包目前最新的版本号是多少。</li>
+<li>结果存入变量 <code>$JET_API_VERSION</code>，稍后构建时用到。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 6: 最终决战 —— 执行 Docker Build</h4>
+<p>所有准备工作做完，开始真正的构建。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nv">DOCKER_BUILDKIT</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>docker<span class="w"> </span>build<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--secret<span class="w"> </span><span class="nv">id</span><span class="o">=</span>JET_INDEX_URLS<span class="w"> </span><span class="se">\ </span><span class="w">        </span><span class="c1"># 传入机密信息（如下载链接）</span>
+<span class="w">    </span>--secret<span class="w"> </span><span class="nv">id</span><span class="o">=</span>LOGGER_INDEX_URL<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--target<span class="w"> </span><span class="nv">$STAGE</span><span class="w"> </span><span class="se">\ </span><span class="w">                   </span><span class="c1"># 指定构建 Dockerfile 的哪个阶段</span>
+<span class="w">    </span>-f<span class="w"> </span>docker/<span class="nv">$FILE</span><span class="w"> </span><span class="se">\ </span><span class="w">                   </span><span class="c1"># 指定 Dockerfile 文件路径</span>
+<span class="w">    </span>-t<span class="w"> </span><span class="si">${</span><span class="nv">IMAGE</span><span class="si">}</span>:<span class="si">${</span><span class="nv">CI_PIPELINE_ID</span><span class="si">}</span><span class="w"> </span><span class="se">\ </span><span class="w">     </span><span class="c1"># 打一个唯一的流水线ID标签</span>
+<span class="w">    </span>--builder<span class="o">=</span>container<span class="w"> </span><span class="se">\ </span><span class="w">               </span><span class="c1"># 使用刚才创建的 buildx 构建器</span>
+<span class="w">    </span>--build-arg<span class="w"> </span><span class="nv">JET_API_VERSION</span><span class="o">=</span><span class="nv">$JET_API_VERSION</span><span class="w"> </span><span class="se">\ </span><span class="c1"># 传入 Task 5 抓到的版本号</span>
+<span class="w">    </span>--cache-from<span class="w"> </span><span class="nv">type</span><span class="o">=</span>registry,ref<span class="o">=</span><span class="si">${</span><span class="nv">IMAGE</span><span class="si">}</span>-buildcache:<span class="si">${</span><span class="nv">CI_MERGE_REQUEST_IID</span><span class="si">}</span><span class="w"> </span><span class="se">\ </span><span class="c1"># 尝试读取 MR 缓存</span>
+<span class="w">    </span>--cache-from<span class="w"> </span><span class="nv">type</span><span class="o">=</span>registry,ref<span class="o">=</span><span class="si">${</span><span class="nv">IMAGE</span><span class="si">}</span>-buildcache:dev<span class="w"> </span><span class="se">\ </span><span class="w"> </span><span class="c1"># 尝试读取 dev 缓存</span>
+<span class="w">    </span>--cache-from<span class="w"> </span><span class="nv">type</span><span class="o">=</span>registry,ref<span class="o">=</span><span class="si">${</span><span class="nv">IMAGE</span><span class="si">}</span>-buildcache:main<span class="w"> </span><span class="se">\ </span><span class="c1"># 尝试读取 main 缓存</span>
+<span class="w">    </span>--build-arg<span class="w"> </span><span class="nv">FROM_IMAGE_NAME</span><span class="o">=</span><span class="nv">$BASE_IMAGE</span><span class="w"> </span><span class="se">\ </span><span class="c1"># 传入基础镜像名</span>
+<span class="w">    </span>--push<span class="w"> </span><span class="se">\ </span><span class="w">                            </span><span class="c1"># 构建完直接推送到仓库</span>
+<span class="w">    </span>--progress<span class="w"> </span>plain<span class="w"> </span><span class="se">\ </span><span class="w">                  </span><span class="c1"># 打印纯文本日志</span>
+<span class="w">    </span><span class="si">${</span><span class="nv">ADDITIONAL_PARAMS</span><span class="p">[@]</span><span class="si">}</span><span class="w"> </span>.<span class="w">            </span><span class="c1"># 加上 Task 4 里拼凑的额外参数</span>
+</code></pre></div>
+
+<ul>
+<li><strong>他在做什么：</strong><ul>
+<li>这是最核心的一步。它把之前准备好的所有东西（下载的数据、计算出的版本号、决定的标签策略、缓存配置）一股脑塞给 Docker。</li>
+<li><strong>关键点</strong>：它使用了多层缓存策略（<code>--cache-from</code>），先找 MR 自己的缓存，没有就找 dev 的，再没有就找 main 的，这样能大大加快构建速度。</li>
+<li>最后 <code>--push</code> 会把镜像上传到服务器。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个脚本的逻辑流是：
+1.  <strong>准备环境</strong> (Python 容器下载数据)。
+2.  <strong>配置工具</strong> (设置 Docker Buildx)。
+3.  <strong>计算参数</strong> (根据是主分支还是测试分支，决定标签名字和缓存策略)。
+4.  <strong>获取依赖</strong> (去网上查最新版本号)。
+5.  <strong>一键构建</strong> (带缓存、带参数、带密钥地构建并推送镜像)。</p>
