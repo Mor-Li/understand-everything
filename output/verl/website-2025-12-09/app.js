@@ -100,7 +100,11 @@ function loadDefaultContent() {
             <div class="content-header">
                 <h1>${treeData.name}</h1>
             </div>
-            <p>欢迎查看代码解读！请从左侧导航栏选择文件或文件夹。</p>
+            <div class="markdown-content">
+                <p style="color: #666; padding: 20px; background: #f9f9f9; border-radius: 5px; border-left: 4px solid #3498db;">
+                    欢迎查看代码解读！请从左侧导航栏选择文件或文件夹。
+                </p>
+            </div>
         `;
     }
 }
@@ -118,7 +122,11 @@ function loadContent(node) {
                 <div class="content-header">
                     <h1>📁 ${node.name}</h1>
                 </div>
-                <p>该文件夹暂无说明文档。</p>
+                <div class="markdown-content">
+                    <p style="color: #666; padding: 20px; background: #f9f9f9; border-radius: 5px; border-left: 4px solid #e67e22;">
+                        该文件夹暂无说明文档。
+                    </p>
+                </div>
             `;
         }
     } else {
@@ -132,6 +140,12 @@ async function loadReadme(readmePath, folderName) {
     try {
         const htmlPath = readmePath.replace('.md', '.html');
         const response = await fetch(`explanations/${htmlPath}`);
+
+        // Check if fetch was successful
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+
         const html = await response.text();
 
         document.getElementById('content-area').innerHTML = `
@@ -143,11 +157,16 @@ async function loadReadme(readmePath, folderName) {
             </div>
         `;
     } catch (error) {
+        // Show consistent error message with same layout as normal content
         document.getElementById('content-area').innerHTML = `
             <div class="content-header">
                 <h1>📁 ${folderName}</h1>
             </div>
-            <p>加载失败：${error.message}</p>
+            <div class="markdown-content">
+                <p style="color: #666; padding: 20px; background: #f9f9f9; border-radius: 5px; border-left: 4px solid #e67e22;">
+                    该文件夹暂无说明文档。
+                </p>
+            </div>
         `;
     }
 }
@@ -201,9 +220,14 @@ async function loadFile(node) {
     } catch (error) {
         contentArea.innerHTML = `
             <div class="content-header">
-                <h1>❌ 加载失败</h1>
+                <h1>📄 ${node.name}</h1>
+                <p style="color: #666; margin-top: 10px;">${node.path}</p>
             </div>
-            <p>${error.message}</p>
+            <div class="markdown-content">
+                <p style="color: #666; padding: 20px; background: #fff5f5; border-radius: 5px; border-left: 4px solid #e74c3c;">
+                    加载失败：${error.message}
+                </p>
+            </div>
         `;
     }
 }
