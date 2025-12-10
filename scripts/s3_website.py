@@ -79,13 +79,8 @@ def build_tree_structure(repo_path: Path, subdir: Path, explain_base: Path) -> d
             }
 
             # 检查是否有对应的解读 .md 文件
-            # 对于 .md 文件，解读文件名是 filename.md（不加额外后缀）
-            # 对于其他文件，解读文件名是 filename.ext.md
-            if file.suffix == ".md":
-                explain_md = current_explain / file.name
-            else:
-                explain_md = current_explain / (file.name + ".md")
-
+            # 所有文件的解读都是 filename.ext.md（包括 .md 文件变成 filename.md.md）
+            explain_md = current_explain / (file.name + ".md")
             if explain_md.exists():
                 file_node["explanation"] = str(explain_md.relative_to(explain_base))
 
