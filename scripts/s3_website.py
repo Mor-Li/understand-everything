@@ -16,6 +16,26 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from utils.utils import get_output_path
 
 
+def sanitize_dotfile_path(path: Path) -> Path:
+    """
+    将路径中以 . 开头的目录/文件名改为 _ 开头
+    GitHub Pages 不提供 .github 等 dotfile 目录的静态文件
+
+    Args:
+        path: 原始路径
+
+    Returns:
+        处理后的路径
+    """
+    parts = []
+    for part in path.parts:
+        if part.startswith('.') and part != '.' and part != '..':
+            parts.append('_' + part[1:])  # .github -> _github
+        else:
+            parts.append(part)
+    return Path(*parts) if parts else path
+
+
 def build_tree_structure(repo_path: Path, subdir: Path, explain_base: Path) -> dict[str, Any]:
     """
     构建文件树结构
@@ -47,7 +67,9 @@ def build_tree_structure(repo_path: Path, subdir: Path, explain_base: Path) -> d
         # 检查是否有 README.md
         readme_path = current_explain / "README.md"
         if readme_path.exists():
-            node["readme"] = str(readme_path.relative_to(explain_base))
+            # 对路径进行 dotfile 处理（.github -> _github）
+            sanitized_readme = sanitize_dotfile_path(readme_path.relative_to(explain_base))
+            node["readme"] = str(sanitized_readme)
 
         # 收集子文件夹
         folders = []
@@ -71,18 +93,22 @@ def build_tree_structure(repo_path: Path, subdir: Path, explain_base: Path) -> d
 
         # 处理文件
         for file in files:
+            # 对路径进行 dotfile 处理（.github -> _github）
+            sanitized_source = sanitize_dotfile_path(file.relative_to(repo_path))
             file_node = {
                 "name": file.name,
                 "type": "file",
                 "path": str(file.relative_to(repo_path)),
-                "source": str(file.relative_to(repo_path))
+                "source": str(sanitized_source)
             }
 
             # 检查是否有对应的解读 .md 文件
             # 所有文件的解读都是 filename.ext.md（包括 .md 文件变成 filename.md.md）
             explain_md = current_explain / (file.name + ".md")
             if explain_md.exists():
-                file_node["explanation"] = str(explain_md.relative_to(explain_base))
+                # 对路径进行 dotfile 处理（.github -> _github）
+                sanitized_explain = sanitize_dotfile_path(explain_md.relative_to(explain_base))
+                file_node["explanation"] = str(sanitized_explain)
 
             node["children"].append(file_node)
 
@@ -127,7 +153,9 @@ def copy_source_files(repo_path: Path, subdir: Path, output_dir: Path):
     # 复制所有文件
     for source_file in all_files:
         rel_path = source_file.relative_to(source_folder)
-        dest_file = output_source / rel_path
+        # 对路径进行 dotfile 处理（.github -> _github）
+        sanitized_rel_path = sanitize_dotfile_path(rel_path)
+        dest_file = output_source / sanitized_rel_path
 
         dest_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -156,7 +184,9 @@ def copy_explanation_files(explain_base: Path, subdir: Path, output_dir: Path):
 
     for md_file in explain_folder.rglob("*.md"):
         rel_path = md_file.relative_to(explain_folder)
-        dest_file = output_explain / rel_path
+        # 对路径进行 dotfile 处理（.github -> _github）
+        sanitized_rel_path = sanitize_dotfile_path(rel_path)
+        dest_file = output_explain / sanitized_rel_path
 
         dest_file.parent.mkdir(parents=True, exist_ok=True)
 

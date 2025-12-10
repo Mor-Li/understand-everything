@@ -65,7 +65,13 @@ async def ask_gemini_async(
         if finish_reason == "length":
             content += "\n\n_（注：响应因长度限制被截断）_"
 
-        return content.strip()
+        content = content.strip()
+
+        # 检查响应是否为空
+        if not content:
+            return "# 解释生成失败\n\n该文件的 AI 解读内容为空，可能是 API 返回了空响应。请尝试使用 --force 参数重新生成。"
+
+        return content
     except Exception as e:
         return f"# 解释失败\n\n错误信息: {str(e)}"
 
@@ -180,7 +186,16 @@ async def _explain_file_impl(
 
     # 检查是否已存在
     if output_file.exists() and not force:
-        return (file_rel_path, True)  # 跳过，视为成功
+        # 检查文件是否有效（不是空文件或只有标题的失败文件）
+        try:
+            existing_content = output_file.read_text(encoding="utf-8")
+            # 如果文件太小（小于100字节），可能是空响应的结果，需要重新生成
+            if len(existing_content) < 100:
+                print(f"⚠️  {file_rel_path} 的解读文件太小，将重新生成")
+            else:
+                return (file_rel_path, True)  # 跳过，视为成功
+        except Exception:
+            pass  # 读取失败，继续重新生成
 
     # 读取文件内容
     try:
