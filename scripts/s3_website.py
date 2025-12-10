@@ -55,8 +55,8 @@ def build_tree_structure(repo_path: Path, subdir: Path, explain_base: Path) -> d
 
         if current_path.exists():
             for item in sorted(current_path.iterdir()):
-                # Skip .git and all hidden files/folders (starting with .)
-                if item.name.startswith("."):
+                # Skip .git directory only (not source code)
+                if item.name == ".git":
                     continue
 
                 if item.is_dir():
