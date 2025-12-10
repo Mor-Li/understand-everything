@@ -1,5 +1,7 @@
 # Understand Everything
 
+![Understand Everything Banner](assets/promotional-banner.png)
+
 通过 Git 历史和 AI 分析，将任何代码仓库转换为通俗易懂的交互式文档。
 
 ## 项目简介
