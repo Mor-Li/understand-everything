@@ -798,7 +798,7 @@ def main():
     parser.add_argument("repo_path", help="Git 仓库路径")
     parser.add_argument("--subdir", default="", help="要分析的子目录（默认为空，分析整个仓库）")
     parser.add_argument("--explain", help="explain 输出目录（默认：output/<repo_name>/explain）")
-    parser.add_argument("--suffix", "-s", help="输出目录后缀（覆盖默认的日期后缀，如 'early', 'mid', 'current'）")
+    parser.add_argument("--suffix", "-s", help="输出目录后缀（覆盖默认的日期后缀）")
     parser.add_argument("--output", "-o", help="网站输出目录（默认：output/<repo_name>/website）")
 
     args = parser.parse_args()

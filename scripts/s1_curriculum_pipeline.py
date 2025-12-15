@@ -223,11 +223,13 @@ def generate_version_index(repo_name: str, snapshots: list[dict], output_base: P
         stage = snapshot.get('stage', 'other')
         stage_class = stage if stage in ['early', 'mid', 'current'] else 'other'
 
+        # 使用日期作为路径，而不是 stage 名称
+        date = snapshot.get('date', 'Unknown')
         card = VERSION_CARD_TEMPLATE.format(
-            website_path=f"website-{stage}",
+            website_path=f"website-{date}",
             stage_class=stage_class,
             stage_label=stage_labels.get(stage, stage.upper()),
-            date=snapshot.get('date', 'Unknown'),
+            date=date,
             title=stage_titles.get(stage, f'{stage} 版本'),
             file_count=snapshot.get('file_count', '?'),
             commit_short=snapshot.get('commit_hash', '')[:8],
@@ -290,11 +292,11 @@ def process_snapshot(
     """处理单个 snapshot"""
     stage = snapshot['stage']
     commit_hash = snapshot['commit_hash']
-    date = snapshot['date']
+    date = snapshot['date']  # 使用日期作为后缀
     file_count = snapshot.get('file_count', '?')
 
     print(f"\n{'#'*60}")
-    print(f"# Stage: {stage.upper()}")
+    print(f"# Stage: {stage.upper()} ({date})")
     print(f"# Commit: {commit_hash[:8]}...")
     print(f"# Date: {date}")
     print(f"# Files: {file_count}")
@@ -312,19 +314,19 @@ def process_snapshot(
         return False
 
     try:
-        # 2. Run s2_explain_files.py
+        # 2. Run s2_explain_files.py (使用日期作为后缀)
         s1_cmd = [
             sys.executable,
             str(scripts_dir / "s2_explain_files.py"),
             str(repo_path),
-            "--suffix", stage,
+            "--suffix", date,
             "--workers", str(workers),
             "--percent", str(percent),
         ]
         if force:
             s1_cmd.append("--force")
 
-        if not run_command(s1_cmd, description=f"S1: Explain files for {stage}"):
+        if not run_command(s1_cmd, description=f"S2: Explain files for {stage} ({date})"):
             return False
 
         # 3. Run s3_generate_readme.py
@@ -332,13 +334,13 @@ def process_snapshot(
             sys.executable,
             str(scripts_dir / "s3_generate_readme.py"),
             str(repo_path),
-            "--suffix", stage,
+            "--suffix", date,
             "--workers", str(workers),
         ]
         if force:
             s2_cmd.append("--force")
 
-        if not run_command(s2_cmd, description=f"S2: Generate README for {stage}"):
+        if not run_command(s2_cmd, description=f"S3: Generate README for {stage} ({date})"):
             return False
 
         # 4. Run s4_website.py
@@ -346,10 +348,10 @@ def process_snapshot(
             sys.executable,
             str(scripts_dir / "s4_website.py"),
             str(repo_path),
-            "--suffix", stage,
+            "--suffix", date,
         ]
 
-        if not run_command(s3_cmd, description=f"S3: Generate website for {stage}"):
+        if not run_command(s3_cmd, description=f"S4: Generate website for {stage} ({date})"):
             return False
 
         return True
@@ -458,13 +460,14 @@ def main():
     print(f"   Success: {success_count}/{len(snapshots_to_process)} stages")
     print(f"{'='*60}")
 
-    # Show output locations
+    # Show output locations (使用日期作为路径)
     print(f"\n📁 Output locations:")
     for s in snapshots_to_process:
         stage = s['stage']
-        print(f"   {stage}:")
-        print(f"      explain:  output/{repo_name}/explain-{stage}/")
-        print(f"      website:  output/{repo_name}/website-{stage}/")
+        date = s['date']
+        print(f"   {stage} ({date}):")
+        print(f"      explain:  output/{repo_name}/explain-{date}/")
+        print(f"      website:  output/{repo_name}/website-{date}/")
 
     # Generate version selector index.html
     if success_count > 0:

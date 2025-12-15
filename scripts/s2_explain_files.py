@@ -292,7 +292,7 @@ async def main_async():
     parser.add_argument("--top", type=int, help="解释 top N 个文件（与 --percent 互斥）")
     parser.add_argument("--percent", type=int, help="解释前 N%% 的文件（按修改次数排序，与 --top 互斥）")
     parser.add_argument("--output", "-o", help="输出目录（默认：output/<repo_name>/explain-<date>）")
-    parser.add_argument("--suffix", "-s", help="输出目录后缀（覆盖默认的日期后缀，如 'early', 'mid', 'current'）")
+    parser.add_argument("--suffix", "-s", help="输出目录后缀（覆盖默认的日期后缀）")
     parser.add_argument("--force", action="store_true", help="强制重新生成")
     parser.add_argument("--model", "-m", default="gemini-3-pro-preview", help="使用的模型")
     parser.add_argument("--workers", "-w", type=int, default=16, help="最大并发数（默认：16）")
@@ -303,7 +303,7 @@ async def main_async():
     if args.output is None:
         repo_name = Path(args.repo_path).name
         if args.suffix:
-            # 使用自定义后缀（如 early, mid, current）
+            # 使用自定义后缀
             args.output = f"output/{repo_name}/explain-{args.suffix}"
         else:
             # 使用仓库名作为 subdir 参数传给 get_output_path
