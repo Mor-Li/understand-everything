@@ -1,0 +1,135 @@
+<h1>tasks/orqa/supervised/eval_utils.py</h1>
+<p>这份代码是用于 <strong>ORQA (Open Retrieval Question Answering)</strong> 任务中，<strong>评估（Evaluation）</strong> 模型表现的工具代码。</p>
+<p>简单来说，它的核心目的是：<strong>考试</strong>。
+模型训练了一段时间后，我们要拿出一套“模拟题”（验证集），看看模型能不能根据<strong>问题（Query）</strong> 准确地从一堆<strong>文档（Context）</strong> 中找到正确的那个。</p>
+<p>为了让你看懂，我把这个文件的逻辑拆解成一个 <strong>“监考老师的任务清单 (To-Do List)”</strong>。</p>
+<hr />
+<h3>📝 监考老师的任务清单 (Task To-Do List)</h3>
+<p>想象你（这段代码）是监考老师，你需要完成以下步骤来评估考生（模型）：</p>
+<ol>
+<li><strong>📦 整理试卷 (Data Collate)</strong><ul>
+<li>把零散的问题和文章收上来，打包成一摞一摞的（Batch）。</li>
+<li>因为句子长短不一，要把短的补齐（Padding），并贴上标签分类。</li>
+</ul>
+</li>
+<li><strong>🚚 发放试卷 (Process Batch)</strong><ul>
+<li>把整理好的数据搬进考场（GPU/显存）。</li>
+<li>告诉考生哪些部分是题目，哪些部分是空白纸（Mask）。</li>
+</ul>
+</li>
+<li><strong>🏫 组织考试 (Provider)</strong><ul>
+<li>确定考场规则：用哪套题（加载数据集）？考完怎么算分（定义评估函数）？</li>
+</ul>
+</li>
+<li><strong>✍️ 批改打分 (Retrieval Loss - 核心逻辑)</strong><ul>
+<li><strong>让考生作答</strong>：模型分别把“问题”和“文章”转换成数学向量。</li>
+<li><strong>计算匹配度</strong>：看“问题向量”和“文章向量”有多像（点积计算）。</li>
+<li><strong>排名次</strong>：对于每个问题，哪个文章分数最高？</li>
+<li><strong>对答案</strong>：正确答案排在第几名？有没有进前1名 (Top-1)？前5名 (Top-5)？</li>
+<li><strong>汇总成绩</strong>：把所有考场的成绩汇总，算出平均分。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🔍 逐步代码对照讲解</h3>
+<p>现在我们把上面的 List 对应到代码的具体函数中：</p>
+<h4>1. 整理试卷：<code>task_collate_fn(batch_data)</code></h4>
+<ul>
+<li><strong>在做什么</strong>：这是数据加载器（DataLoader）的回调函数。</li>
+<li><strong>通俗解释</strong>：<ul>
+<li>原始数据是一条条的字典。</li>
+<li>这个函数把它们合并成 Tensor（张量）。</li>
+<li>处理 <code>query</code>（问题）、<code>context</code>（正例文章）和 <code>neg_context</code>（负例文章/干扰项）。</li>
+<li><strong>关键点</strong>：它处理了 Padding（填充），保证一个 Batch 里的数据形状整齐。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 发放试卷：<code>process_batch(batch)</code></h4>
+<ul>
+<li><strong>在做什么</strong>：数据预处理。</li>
+<li><strong>通俗解释</strong>：<ul>
+<li><code>.cuda()</code>：把数据从内存搬到显存，因为模型在 GPU 上跑。</li>
+<li>生成 <code>mask</code>：比如一句话只有 5 个词，但这就预留了 10 个空位，Mask 就是告诉模型“后 5 个是空的，别看”。</li>
+<li>它把问题、正例文章、负例文章都准备好了。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 组织考试：<code>accuracy_func_provider(...)</code></h4>
+<ul>
+<li><strong>在做什么</strong>：这是整个评估流程的总指挥（入口）。</li>
+<li><strong>通俗解释</strong>：<ul>
+<li>它加载验证集数据 (<code>build_data_loader</code>)。</li>
+<li>它定义了一个内部函数 <code>metrics_func</code>。<strong>这个函数就是最终给训练主程序调用的接口</strong>。</li>
+<li>当主程序调用 <code>metrics_func</code> 时，它会去执行具体的算分逻辑（如果是 <code>RET-FINETUNE-NQ</code> 任务，就调用 <code>retrieval_loss</code>）。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 批改打分（核心）：<code>retrieval_loss(model, dataloader)</code></h4>
+<p>这是全文件<strong>最重要</strong>的函数，逻辑最复杂。让我们一步步拆解它的 To-Do：</p>
+<ul>
+<li>
+<p><strong>Step 4.1: 准备工作</strong></p>
+<ul>
+<li><code>unwrapped_model.eval()</code>: 喊一声“考试开始”，让模型进入评估模式（不更新参数）。</li>
+<li><code>topk_stats_dict</code>: 准备一个小本本，用来记 Top-1, Top-5, Top-20 的准确率。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 4.2: 模型计算 (Forward)</strong></p>
+<ul>
+<li><code>query_logits, context_logits = unwrapped_model(...)</code>:<ul>
+<li>模型读入“问题”，输出“问题特征向量”。</li>
+<li>模型读入“文章”（包含正例和负例），输出“文章特征向量”。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 4.3: 计算匹配分数</strong></p>
+<ul>
+<li><code>retrieval_scores = torch.matmul(...)</code>:<ul>
+<li>用矩阵乘法（点积）计算相似度。</li>
+<li>简单说就是：<strong>算每一个问题和每一个文章之间的关联得分</strong>。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 4.4: 找正确答案 (Labels)</strong></p>
+<ul>
+<li><code>labels = torch.arange(local_batch_size)</code>:<ul>
+<li>这里有个默认逻辑：第 1 个问题的答案是第 1 篇文章，第 2 个对应第 2 个...</li>
+<li>这就是标准的<strong>对比学习（Contrastive Learning）</strong> 评估方式。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 4.5: 排名与算分</strong></p>
+<ul>
+<li><code>sorted_vals, sorted_indices = torch.topk(...)</code>: 根据分数给文章排序。</li>
+<li><code>topk_accuracy(k)</code>: 检查正确答案是不是在预测的前 k 名里。<ul>
+<li>如果在，记 1 分；不在，记 0 分。</li>
+</ul>
+</li>
+<li><code>get_rank()</code>: 看看正确答案到底排第几名（Rank）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 4.6: 汇总全班成绩</strong></p>
+<ul>
+<li><code>average_losses_across_data_parallel_group(...)</code>:<ul>
+<li>因为可能用了多张显卡（多个考场），这个函数把所有显卡上的成绩收集起来取平均值。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 4.7: 报告</strong></p>
+<ul>
+<li>最后返回 <code>stats_dict</code>，告诉用户：Top-1 准确率是多少，Top-5 是多少，平均排名是多少。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件就是<strong>阅卷机器</strong>。它不负责教模型怎么学习（那是训练代码的事），它只负责在模型学完一个阶段后，通过做题来检测模型现在的水平，并打印出成绩单（Accuracy）。</p>

@@ -1,0 +1,105 @@
+<h1>tasks/orqa/unsupervised/nq.py</h1>
+<p>这份代码确实乍一看很枯燥，因为它属于<strong>底层“苦力”代码</strong>。</p>
+<p>简单来说，这个文件的作用就像是一个<strong>餐厅的备菜员</strong>。它的任务不是“炒菜”（那是模型训练做的事），而是把仓库里的原始食材（文本数据），清洗、切好、摆盘，最后端给大厨（模型）。</p>
+<p>这个文件专门负责处理 <strong>Google NQ (Natural Questions)</strong> 这个数据集。</p>
+<p>为了让你听懂，我把这个“备菜”的过程拆解成一个 <strong>Task Todo List（任务清单）</strong>。代码里的所有函数，其实就是在按顺序完成下面这 5 件事：</p>
+<hr />
+<h3>📋 数据处理 Task Todo List</h3>
+<ol>
+<li><strong>【进货】读取原始文件</strong>：从硬盘上把 CSV 格式的问题和答案读进内存。</li>
+<li><strong>【切菜】文本转数字</strong>：把人类看的“文字”变成机器能懂的“数字ID”（Tokenization）。</li>
+<li><strong>【摆盘】统一长度与修饰</strong>：因为句子有长有短，要给短的补零（Padding），并加上特殊的开头结尾标记（[CLS], [SEP]）。</li>
+<li><strong>【打包】批量组装</strong>：把处理好的一条条数据，打包成一个“批次”（Batch）。</li>
+<li><strong>【上菜】送入显卡</strong>：把打包好的数据搬运到 GPU 上，准备喂给模型。</li>
+</ol>
+<hr />
+<h3>🧐 逐步讲解：代码是如何执行这个 List 的</h3>
+<p>现在我们对照上面的清单，一步步看代码里是谁在干活。</p>
+<h4>第一步：【进货】读取原始文件</h4>
+<p><strong>负责代码：</strong> <code>class NQDataset</code> 和 <code>process_samples_from_single_path</code></p>
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li><strong><code>NQDataset</code> 类</strong>：这是仓库管理员。当你初始化它时，它会调用 <code>process_samples_from_single_path</code>。</li>
+<li><strong><code>process_samples_from_single_path</code> 函数</strong>：它打开一个 <code>.csv</code> 文件（也就是 <code>datapath</code>），一行一行读。</li>
+<li><strong>内容</strong>：每一行里，第1列是“问题”，第2列是“答案”。它把这些存到一个大列表 <code>self.samples</code> 里。</li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<p><strong>代码对应点</strong>：
+```python</p>
+<h1>这里的 reader 读取 csv，row[0]是问题，row[1]是答案</h1>
+<p>reader = csv.reader(ifile, delimiter='\t')
+for row in reader:
+    question = row[0]
+    answers = eval(row[1])
+```</p>
+</blockquote>
+<h4>第二步：【切菜】文本转数字</h4>
+<p><strong>负责代码：</strong> <code>build_tokens_types_paddings_from_text</code></p>
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li>模型看不懂 "Who is Michael Jordan?"，它只认识数字。</li>
+<li>这个函数调用 <code>tokenizer</code>（分词器），把单词切开并查表变成 ID（比如 <code>[2045, 1003, ...]</code>）。</li>
+</ul>
+</li>
+</ul>
+<h4>第三步：【摆盘】统一长度与修饰</h4>
+<p><strong>负责代码：</strong> <code>build_tokens_types_paddings_from_ids</code> 和 <code>build_sample</code></p>
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li><strong>加标记</strong>：BERT 类模型需要知道哪里是开头，哪里是结尾。所以会在句首加 <code>[CLS]</code> (ID通常是101)，句尾加 <code>[SEP]</code> (ID通常是102)。</li>
+<li><strong>统一长度（Padding）</strong>：模型要求大家一样长（比如 <code>max_seq_length</code> 是 128）。如果你的问题只有 10 个词，后面 118 个位置都要填 <code>0</code>（Pad ID）。</li>
+<li><strong>生成 Mask</strong>：<code>make_attention_mask</code> 会生成一个“面具”，告诉模型：“后面填 0 的那些地方是废话，不要把注意力浪费在那里”。</li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<p><strong>代码对应点</strong>：
+```python</p>
+<h1>加头</h1>
+<p>enc_ids.append(cls_id)</p>
+<h1>加中间内容</h1>
+<p>enc_ids.extend(src_ids)</p>
+<h1>加尾巴</h1>
+<p>enc_ids.append(sep_id)</p>
+<h1>补齐长度</h1>
+<p>if padding_length &gt; 0:
+    enc_ids.extend([pad_id] * padding_length)
+```</p>
+</blockquote>
+<h4>第四步：【打包】批量组装</h4>
+<p><strong>负责代码：</strong> <code>CustomDataLoader</code> 和 <code>_collate_fn</code></p>
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li>训练不能一条一条练，太慢。要一次练一批（比如一次 32 条）。</li>
+<li><code>DataLoader</code> 负责把分散的数据抓在一起。</li>
+<li><strong><code>_collate_fn</code></strong>：这是打包员。它收到 32 个独立的样本，把它们对应的字段（token_ids, mask 等）堆叠（Stack）起来，变成一个大的张量（Tensor）。</li>
+<li>比如：原本是 32 个 <code>[128]</code> 长度的列表，现在变成了 <code>[32, 128]</code> 的矩阵。</li>
+</ul>
+</li>
+</ul>
+<h4>第五步：【上菜】送入显卡</h4>
+<p><strong>负责代码：</strong> <code>process_nq_batch</code></p>
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li>数据通常在 CPU 内存里准备好，但模型在 GPU（显卡）上跑。</li>
+<li>这个函数非常简单粗暴，就是把刚才打包好的数据，全部 <code>.cuda()</code>，搬运到显卡显存里。</li>
+<li>它返回的 <code>query_tokens</code>, <code>query_mask</code> 等，就是模型 <code>forward()</code> 函数的直接输入参数。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个文件到底在干嘛？</h3>
+<p>你不需要逐行读懂每一句 Python 语法，你只需要知道：</p>
+<ol>
+<li><strong>输入</strong>：一个包含“问题”和“答案”的文本文件（TSV/CSV格式）。</li>
+<li><strong>黑盒处理</strong>：<ul>
+<li><code>NQDataset</code> 把它读进内存。</li>
+<li><code>get_one_epoch_nq_dataloader</code> 创建了一个传送带。</li>
+<li>传送带在运行过程中，自动把文字变成了补齐长度的数字矩阵。</li>
+</ul>
+</li>
+<li><strong>输出</strong>：位于 GPU 上的 Tensor（张量），可以直接喂给 Megatron-LM 或 BERT 模型去训练或推理。</li>
+</ol>
+<p><strong>核心观点</strong>：这就是一个标准的<strong>NLP 数据流水线（Pipeline）</strong>。如果你要换成自己的数据集，只需要修改“第一步”里的读取逻辑（比如你的文件不是 CSV 而是 JSON），后面的切菜、摆盘、打包逻辑通常都不用变。</p>

@@ -1,0 +1,65 @@
+<h1>fla/module/rmsnorm.py</h1>
+<p>这份代码看起来很吓人，因为它混合了 <strong>PyTorch</strong>（高层逻辑）和 <strong>Triton</strong>（底层GPU加速代码）。</p>
+<p>简单来说，这个文件的核心目的是：<strong>为了让大模型（如 Llama）跑得更快，手动写了一个极速版的“归一化”（Normalization）层，用来替代 PyTorch 自带的慢版本。</strong></p>
+<p>为了让你看懂，我把阅读这份代码拆解成一个 <strong>6步的 To-Do List</strong>，你可以把它想象成一个“任务清单”，我们一步步把这个文件“吃”透。</p>
+<hr />
+<h3>📝 任务清单：从原理到实现的 6 个步骤</h3>
+<h4>✅ Task 1: 搞懂我们在做什么 (核心概念)</h4>
+<p><strong>目标</strong>：理解这个文件实现了哪两种数学公式。
+*   <strong>LayerNorm</strong>: 传统的归一化。要把输入数据减去均值（Mean），再除以标准差（Std）。
+*   <strong>RMSNorm</strong>: 现在大模型（如 Llama）更喜欢用的归一化。<strong>它不减均值，直接除以均方根</strong>。因为它少算一步减法，所以更快，效果也没差。
+*   <strong>Residual (残差连接)</strong>: 深度学习里的 $x = x + \text{residual}$。这个文件把“相加”和“归一化”这两步合二为一了，为了省时间。</p>
+<h4>✅ Task 2: 看懂“标准答案” (Reference)</h4>
+<p><strong>代码位置</strong>: <code>layer_norm_ref</code> 和 <code>rms_norm_ref</code> 函数
+<strong>解读</strong>:
+这是用普通 PyTorch 写的“慢速版”参考实现。
+*   如果你看不懂 Triton 代码，看这就行。
+*   <code>rms_norm_ref</code> 的逻辑就是：
+    1. <code>x</code> (输入) + <code>residual</code> (残差) -&gt; 得到新的 <code>x</code>。
+    2. 算出 <code>rstd</code> (倒数标准差, reciprocal standard deviation)。
+    3. <code>out = x * rstd * weight</code> (归一化并缩放)。
+*   <strong>作用</strong>：用来测试后面写的 Triton 加速代码算得对不对。</p>
+<h4>✅ Task 3: 攻克核心难点——前向传播加速 (Forward Kernel)</h4>
+<p><strong>代码位置</strong>: <code>_layer_norm_fwd_1pass_kernel</code> (Triton内核) 和 <code>_layer_norm_fwd</code> (Python包装)
+<strong>解读</strong>:
+这是这是整个文件最值钱的地方。它是一个在 GPU 上运行的<strong>极速函数</strong>。
+*   <strong>为什么要写这个？</strong> PyTorch 自带的 LayerNorm 会把读数据、算均值、算方差、写回数据分成好几步。这个 Kernel 把它们<strong>融合（Fuse）</strong>成了一步。
+*   <strong>流程</strong>:
+    1.  <strong>Load</strong>: 把数据 <code>X</code> 和残差 <code>RESIDUAL</code> 从显存读进来。
+    2.  <strong>Add</strong>: 在寄存器里直接做 <code>x + residual</code>。
+    3.  <strong>Stats</strong>: 算方差（如果是 LayerNorm 还要算均值）。
+    4.  <strong>Normalize</strong>: 执行 $(x - \text{mean}) \times \text{rstd} \times w + b$。
+    5.  <strong>Store</strong>: 把结果 <code>Y</code> 写回显存。
+*   <strong>关键字 <code>1pass</code></strong>: 意思是一遍过，不用反复读写内存，速度飞快。</p>
+<h4>✅ Task 4: 攻克反向传播 (Backward Kernel)</h4>
+<p><strong>代码位置</strong>: <code>_layer_norm_bwd_kernel</code>
+<strong>解读</strong>:
+训练模型需要反向传播（算梯度）。这也是手写的 Triton 代码。
+*   <strong>难点</strong>: 这里的数学推导很复杂，但你只需要知道它的功能是<strong>根据输出的梯度 (<code>dy</code>)，反推输入的梯度 (<code>dx</code>, <code>dw</code>, <code>db</code>)</strong>。
+*   <strong>Recompute (重计算)</strong>: 注意里面有个 <code>RECOMPUTE_OUTPUT</code>。为了省显存，有些中间结果前向传播时不存，反向传播时顺手再算一遍。</p>
+<h4>✅ Task 5: 包装成 PyTorch 能用的积木 (Autograd Function)</h4>
+<p><strong>代码位置</strong>: <code>class LayerNormFn</code>
+<strong>解读</strong>:
+Triton 的内核 PyTorch 没法直接用，需要用 <code>torch.autograd.Function</code> 包装一下。
+*   <code>forward()</code>: 调用 Task 3 写好的加速前向函数。
+*   <code>backward()</code>: 调用 Task 4 写好的加速反向函数。
+*   它负责处理数据的形状（Reshape），确保数据是连续的（Contiguous），处理数据类型转换。</p>
+<h4>✅ Task 6: 最终成品与“变态”优化 (Module &amp; Linear Fusion)</h4>
+<p><strong>代码位置</strong>:
+1.  <code>class RMSNorm(torch.nn.Module)</code>
+2.  <code>class LayerNormLinearFn</code></p>
+<p><strong>解读</strong>:
+*   <strong><code>RMSNorm</code></strong>: 这是你最终在模型里调用的类。比如 <code>self.norm = RMSNorm(4096)</code>。它里面就是调用了上面写好的 <code>LayerNormFn</code>。
+*   <strong><code>LayerNormLinearFn</code> (变态优化)</strong>: 在 Transformer 结构里，Norm 后面通常紧跟一个 Linear 层（全连接层）。
+    *   这个类试图把 <strong>Norm</strong> 和 <strong>Linear</strong> 进一步融合。
+    *   <strong>省显存技巧</strong>: 在前向传播时，它算完 Norm 直接送进 Linear，<strong>不保存 Norm 的输出结果</strong>。在反向传播时，再重新把 Norm 的结果算一遍。这叫 "Gradient Checkpointing" 或 "Recomputation"，用一点点计算时间换取巨大的显存空间（为了能跑更大的 Batch Size）。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件就是为了<strong>极致的性能</strong>。</p>
+<ol>
+<li>它不想用 PyTorch 自带的慢函数。</li>
+<li>它用 Triton 写了底层的 GPU 代码（Kernel）。</li>
+<li>它把“残差相加”和“归一化”融合了。</li>
+<li>它甚至提供了把“归一化”和“线性层”融合的选项。</li>
+</ol>
+<p><strong>你只需要关注 <code>RMSNorm</code> 这个类怎么用就行，其他的都是为了让它跑得比风还快的底层实现。</strong></p>

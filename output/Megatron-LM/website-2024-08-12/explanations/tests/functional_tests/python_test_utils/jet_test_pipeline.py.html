@@ -1,0 +1,74 @@
+<h1>tests/functional_tests/python_test_utils/jet_test_pipeline.py</h1>
+<p>这份代码其实是一个<strong>自动化测试流水线（Pipeline）的结果检查器</strong>。</p>
+<p>简单来说，它的作用是：<strong>“拿着一个任务ID，去数据库查查这个任务下面所有的子测试跑得怎么样了，把结果打印成表格，如果有人挂了就报错。”</strong></p>
+<p>它是配合 NVIDIA 内部的一个叫 JET 的测试系统使用的。</p>
+<p>为了让你看懂，我把阅读这份代码拆解成 <strong>5 个 Task（任务）</strong>，我们一步步来完成：</p>
+<hr />
+<h3>✅ Task 1: 搞清楚入口和输入 (Main Function)</h3>
+<p><strong>目标</strong>：知道这脚本怎么启动，需要什么参数。</p>
+<p>看代码最下面的 <code>if __name__ == '__main__':</code> 部分：
+1.  <strong>接收参数</strong>：脚本主要需要一个 <code>pipeline_id</code>（流水线ID）。这就像快递单号，用来查某一整批测试的状态。
+2.  <strong>可选参数</strong>：
+    *   <code>--download_scripts_dir</code>：如果你想把测试用的脚本下载下来存到本地，就填个文件夹路径。
+    *   <code>--artifact_links</code>：只是一个标志，用来决定是否生成结果链接。
+3.  <strong>执行流程</strong>：
+    *   拿到 ID -&gt; 查数据库 (<code>query_results</code>)
+    *   去掉重复的运行记录 (<code>dedupe_results</code>)
+    *   (可选) 下载脚本 (<code>save_scripts</code>)
+    *   打印结果表格并判断是否通过 (<code>pretty_print_results</code>)</p>
+<hr />
+<h3>✅ Task 2: 去数据库查数据 (query_results)</h3>
+<p><strong>目标</strong>：理解它向系统问了什么问题。</p>
+<p>看 <code>def query_results(triggering_pipeline_id):</code> 函数：
+1.  <strong>连接服务</strong>：<code>JETInstance().log_service()</code> 连接到日志数据库。
+2.  <strong>过滤条件 (<code>.filter</code>)</strong>：
+    *   找 <code>upstream.l_pipeline_id</code> 等于你输入的那个 ID 的记录。
+    *   找类型是 <code>basic</code> 的工作负载（Workload）。
+3.  <strong>选择字段 (<code>.select</code>)</strong>：它只关心几样东西：
+    *   <code>l_exit_code</code>: 退出码（0表示成功，非0表示失败）。
+    *   <code>nested_assets</code>: 产物（比如日志文件的链接）。
+    *   <code>s_message</code>: 状态信息（比如 "Success" 或 "Failed"）。
+    *   <code>s_name</code>: 测试的名字。
+4.  <strong>排序</strong>：按时间排序。</p>
+<p><strong>人话总结</strong>：它在问数据库：“喂，属于这个 ID 的所有基础测试任务，把它们的测试结果、日志链接和退出码都给我拿来。”</p>
+<hr />
+<h3>✅ Task 3: 清洗数据，去掉重复的 (dedupe_results)</h3>
+<p><strong>目标</strong>：理解为什么要“去重”。</p>
+<p>看 <code>def dedupe_results(results):</code> 函数：
+1.  <strong>背景</strong>：在测试中，有时候某个测试挂了，系统会自动重试（Retry）。这样数据库里就会有同一个测试任务的两条记录（一条失败的旧记录，一条可能成功的新记录）。
+2.  <strong>逻辑</strong>：
+    *   它用 <code>deduped</code> 字典来存数据。
+    *   遍历所有结果，如果发现同一个 <code>key</code>（测试任务名）已经存在了，它会比较 <code>ts_created</code>（创建时间）。
+    *   <strong>只保留时间最新的那一条</strong>。</p>
+<p><strong>人话总结</strong>：如果有重试过的任务，只看最后一次运行的结果，之前的忽略不计。</p>
+<hr />
+<h3>✅ Task 4: (可选) 把测试脚本还原出来 (save_scripts)</h3>
+<p><strong>目标</strong>：理解它是怎么帮开发者“复现”环境的。</p>
+<p>看 <code>def save_scripts(results, save_dir):</code> 函数：
+1.  如果你在 Task 1 传了保存路径，这个函数才运行。
+2.  它遍历每个测试结果，提取出当时运行的脚本内容 (<code>s_script</code>)。
+3.  <strong>封装命令</strong>：它不是直接保存脚本，而是给脚本外面包了一层壳：
+    *   <code>srun</code>：这是高性能计算集群（SLURM）的运行命令。
+    *   <code>--container-image ... pytorch:24.01</code>: 指定了 NVIDIA 的 PyTorch 镜像。
+    *   <code>--container-mounts</code>: 挂载了数据路径。
+4.  最后保存成 <code>.sh</code> 文件。</p>
+<p><strong>人话总结</strong>：它把当时测试用的命令生成为一个 <code>.sh</code> 文件，方便开发人员直接在服务器上运行调试，不用自己手敲复杂的 docker/slurm 命令。</p>
+<hr />
+<h3>✅ Task 5: 打印表格并判决生死 (pretty_print_results)</h3>
+<p><strong>目标</strong>：这是 CI 流水线最关键的一步，决定绿灯还是红灯。</p>
+<p>看 <code>def pretty_print_results(results, summary_jobid):</code> 函数：
+1.  <strong>提取信息</strong>：循环处理每一条数据，提取出：
+    *   退出码 (<code>exit_codes</code>)。
+    *   日志链接 (<code>log_urls</code>) -&gt; 这里调用了 <code>select_asset</code> 辅助函数去找以 <code>.log</code> 结尾的文件。
+    *   测试结果链接 (<code>metrics_file_urls</code>)。
+2.  <strong>画表</strong>：使用 <code>PrettyTable</code> 库，画一个漂亮的文本表格，列出：任务名、结果、JET日志链接、SLURM日志链接、结果数据链接。
+3.  <strong>判决 (关键点)</strong>：
+    *   <code>exit_codes_good = [ec == 0 for ec in exit_codes]</code>：检查是不是所有任务的退出码都是 0。
+    *   <strong>如果列表为空</strong>：抛出异常（Exception），报错“找不到任务”。
+    *   <strong>如果有任何一个不是0</strong>：抛出异常，报错“有些任务失败了”，并把表格打印出来给用户看。
+    *   <strong>如果全也是0</strong>：打印“All jobs completed successfully!”，脚本正常结束。</p>
+<p><strong>人话总结</strong>：把所有结果画成一张表打印在屏幕上。只要有一个测试任务没过（退出码不是0），这个 Python 脚本就会报错退出，从而导致整个 CI 流水线变红（失败）。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件的逻辑流是：
+<strong>输入 ID</strong> -&gt; <strong>查库</strong> -&gt; <strong>去重(取最新)</strong> -&gt; <strong>(可选)存脚本</strong> -&gt; <strong>画表并检查是否全通过</strong>。</p>

@@ -1,0 +1,104 @@
+<h1>verl/workers/rollout/sglang_rollout/sglang_rollout.py</h1>
+<p>这份代码文件 <code>sglang_rollout.py</code> 是 <strong>Verl</strong>（一个强化学习框架）和 <strong>SGLang</strong>（一个高性能的大模型推理引擎）之间的<strong>连接器（Adapter）</strong>。</p>
+<p>它的核心作用是：<strong>接收强化学习算法发来的 Prompt（提示词），指挥 SGLang 引擎去生成回复，处理可能涉及的“工具调用”（Tool Use），最后把生成的结果整理成强化学习训练需要的格式（Tensor）。</strong></p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“任务清单 (Todo List)”</strong>，然后按顺序一步步讲解它是怎么完成这些任务的。</p>
+<hr />
+<h3>📋 SGLang Rollout 的任务清单 (Task Todo)</h3>
+<p>想象这个脚本是一个<strong>项目经理</strong>，他的工作流程如下：</p>
+<ol>
+<li><strong>[初始化] 搭建舞台</strong>：配置多卡环境（分布式环境），修补 SGLang 的一些配置，准备好推理引擎。</li>
+<li><strong>[准备] 注册工具</strong>：如果任务需要用工具（比如计算器、搜索），先把这些工具的说明书加载好。</li>
+<li><strong>[接单] 接收提示词</strong>：拿到一批 Prompt（比如 "天空为什么是蓝的？"）。</li>
+<li><strong>[执行] 生成回复 (核心)</strong>：<ul>
+<li><em>情况 A（简单模式）</em>：直接生成一段话结束。</li>
+<li><em>情况 B（复杂模式/多轮对话）</em>：模型想用工具 -&gt; 暂停生成 -&gt; 执行工具 -&gt; 把结果喂回给模型 -&gt; 继续生成。</li>
+</ul>
+</li>
+<li><strong>[整理] 数据打包</strong>：把生成的文本转回数字 ID，补齐长度（Padding），计算掩码（Mask），算出奖励（Reward），打包成 Tensor 返回给训练器。</li>
+</ol>
+<hr />
+<h3>🚀 逐步解析 (Step-by-Step)</h3>
+<h4>1. [初始化] 搭建舞台 (<code>__init__</code> &amp; <code>_init_inference_engine</code>)</h4>
+<p><strong>观点：</strong> 大模型通常很大，一张显卡装不下，需要多张卡一起跑（Tensor Parallelism, TP）。这个脚本必须处理好“谁是组长，谁是组员”的问题。</p>
+<ul>
+<li><strong>代码行为</strong>：<ul>
+<li><code>_set_envs_and_config</code>: 这是一个“补丁”函数。它强制设置了一些环境变量（比如关闭某些 CUDA 检查），为了让 SGLang 在这个特定环境下跑得更稳。</li>
+<li><code>AsyncEngine</code>: 这里定义了一个异步引擎类。之所以叫 <code>Async</code>，是因为生成过程是耗时的，不能卡死主线程。它还负责在显存不够时“卸载”权重，或者从训练进程“加载”新权重。</li>
+<li><strong>分布式握手</strong>：代码通过 <code>broadcast_pyobj</code> 来同步 IP 和端口。因为 SGLang 引擎只在主进程（Rank 0）上启动，但其他显卡进程需要知道去哪里连它。</li>
+</ul>
+</li>
+</ul>
+<h4>2. [准备] 注册工具 (<code>_initialize_tools</code>)</h4>
+<p><strong>观点：</strong> 现在的 AI 不仅仅是聊天，还要会用工具（Function Calling）。</p>
+<ul>
+<li><strong>代码行为</strong>：<ul>
+<li>它读取配置文件 <code>config.multi_turn.tool_config_path</code>。</li>
+<li>它把工具定义转换成 OpenAI 兼容的 JSON Schema 格式。</li>
+<li>它初始化了一个 <code>FunctionCallParser</code>。这个解析器专门用来盯着模型输出的文本，一旦发现类似 <code>call_tool: calculator</code> 的特殊字符，就准备拦截。</li>
+</ul>
+</li>
+</ul>
+<h4>3. [执行] 生成回复 - 简单模式 (<code>_batch_level_generate_sequences</code>)</h4>
+<p><strong>观点：</strong> 这是最基础的功能。给我一批 Prompt，我给你一批 Response。</p>
+<ul>
+<li><strong>流程</strong>：<ol>
+<li><strong>预处理</strong>：把输入的 Tensor（数字）转成 List（SGLang 喜欢的格式），去掉左边的 Padding（空白填充）。</li>
+<li><strong>调用引擎</strong>：<code>self._engine.async_generate(...)</code>。这一步只在主进程（Rank 0）做。</li>
+<li><strong>广播结果</strong>：主进程拿到结果后，通过 <code>broadcast_pyobj</code> 发送给所有其他显卡进程，保证大家拿到的数据一样。</li>
+<li><strong>后处理</strong>：把生成的文本 ID 拼回到原来的 Prompt 后面，形成完整的句子。</li>
+</ol>
+</li>
+</ul>
+<h4>4. [执行] 生成回复 - 复杂/多轮模式 (<code>_req_level_generate_sequences</code> &amp; <code>_async_rollout_a_request</code>)</h4>
+<p><strong>观点：</strong> 这是全篇最难懂也是最厉害的地方。它实现了一个<strong>状态机</strong>来处理“模型 -&gt; 工具 -&gt; 模型”的循环。</p>
+<ul>
+<li><strong>代码逻辑 (<code>_async_rollout_a_request</code>)</strong>：
+    这是一个 <code>while</code> 循环，直到对话结束或达到最大轮数：<ul>
+<li><strong>State: PENDING</strong>: 刚开始，初始化请求。</li>
+<li><strong>State: RUNNING</strong>: 调用 SGLang 引擎生成文本。<ul>
+<li>如果模型生成了结束符 -&gt; <strong>COMPLETED</strong>。</li>
+<li>如果模型生成了特殊的“工具调用代码” -&gt; 转入 <strong>TOOL_CALLING</strong> 状态。</li>
+</ul>
+</li>
+<li><strong>State: TOOL_CALLING</strong>:<ul>
+<li>代码解析出模型想调用的函数名和参数。</li>
+<li><strong>执行 Python 函数</strong>：<code>self._tool_map[...].execute(...)</code>。</li>
+<li>把工具的运行结果（比如 "1+1=2"）包装成一条新消息，追加到对话历史里。</li>
+<li>转回 <strong>RUNNING</strong> 状态，让模型根据工具结果继续写。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>5. [整理] 数据打包 (Data Proto Construction)</h4>
+<p><strong>观点：</strong> 强化学习训练（PPO）不仅仅需要文本，还需要精确的数据对齐。</p>
+<ul>
+<li><strong>Padding（填充）</strong>：<ul>
+<li>因为一个 Batch 里每句话长度不一样，生成的回复长度也不一样。</li>
+<li>代码使用了 <code>pad_sequence</code>。注意看，Prompt 通常是 <strong>Left Pad</strong>（左边补零），Response 是 <strong>Right Pad</strong>（右边补零）。</li>
+</ul>
+</li>
+<li><strong>Masking（掩码）</strong>：<ul>
+<li>需要生成 <code>attention_mask</code>（告诉模型哪些是真实内容，哪些是填充）。</li>
+<li>需要生成 <code>position_ids</code>（告诉模型每个词的位置，尤其是 Qwen2-VL 这种多模态模型，位置编码很复杂）。</li>
+</ul>
+</li>
+<li><strong>Log Probs</strong>：<ul>
+<li>如果配置要求 <code>calculate_log_probs</code>，它还会返回每个生成 Token 的概率对数值（用于计算 PPO 的 KL 散度）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码在讲什么？</h3>
+<p>这段代码是一个<strong>高级调度员</strong>。</p>
+<ol>
+<li>它<strong>不负责</strong>训练模型（这是 Trainer 的事）。</li>
+<li>它<strong>不负责</strong>底层矩阵运算（这是 SGLang/PyTorch 的事）。</li>
+<li>它<strong>负责</strong>：<ul>
+<li>把 RL 训练中的 Prompt 喂给推理引擎。</li>
+<li>像保姆一样盯着模型：如果模型想用工具，就帮它运行工具再把结果喂回去。</li>
+<li>把乱七八糟的生成结果整理成整整齐齐的 Tensor 表格，交还给 RL 算法去计算 Loss。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话概括：</strong> 这是一个支持<strong>多卡并行</strong>和<strong>工具调用（Function Call）</strong>的 SGLang 推理接口实现。</p>

@@ -1,0 +1,102 @@
+<h1>megatron/core/tensor_parallel/data.py</h1>
+<p>这份代码主要解决的是<strong>大模型训练（Megatron-LM）中“张量并行（Tensor Parallel）”场景下的数据同步问题</strong>。</p>
+<p>简单来说，当多个 GPU 一起合作算一个大矩阵时，通常只有“组长”（Rank 0）手里拿着原始数据（比如输入的一句话），“组员”（其他 Rank）手里是空的。</p>
+<p><strong>这个文件的任务就是：组长把手里的数据“复印”一份，分发给所有组员，并且要保证格式完全一样。</strong></p>
+<p>为了让你彻底看懂，我把这个过程拆解成一个 <strong>5步走的 Todo List</strong>。</p>
+<hr />
+<h3>核心任务 Todo List</h3>
+<ol>
+<li><strong>【准备工作】同步“说明书”（元数据）：</strong> 组员不知道数据长什么样（几行几列？），组长得先发个说明书过去。</li>
+<li><strong>【组长操作】数据打包（Flatten）：</strong> 组长手里有很多零散的小数据，为了发快递方便，把它们拼成一条长长的数据链。</li>
+<li><strong>【组员操作】准备容器：</strong> 组员根据“说明书”，在自己的显存里挖好坑，准备接数据。</li>
+<li><strong>【核心动作】广播（Broadcast）：</strong> 组长一声令下，把那条长长的数据链瞬间复制到所有组员的显存里。</li>
+<li><strong>【收尾工作】解包还原（Unpack）：</strong> 所有人把这条长数据链，按照“说明书”切开，还原成最初的字典格式。</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<p>下面我按照这个 List，结合代码给你一步步讲：</p>
+<h4>1. 【准备工作】同步“说明书”（元数据）</h4>
+<p><strong>对应函数：</strong> <code>_build_key_size_numel_dictionaries</code></p>
+<p>在网络传输中，接收方必须知道对方要发多大的东西过来。
+*   <strong>组长（Rank 0）</strong>：读取数据的形状（比如 <code>[4, 1024]</code>）。
+*   <strong>组员</strong>：此时是一脸懵逼的。</p>
+<p>代码逻辑：
+*   <strong>填表</strong>：代码里定义了一个 <code>sizes</code> 数组。组长把每个数据的维度（长、宽、高）填进去。
+*   <strong>发送表</strong>：<code>torch.distributed.broadcast(sizes_cuda, ...)</code>。组长把这张记录了尺寸的“表”发给所有人。
+*   <strong>计算</strong>：组员收到表后，算出：“哦，一共要发 1000 个数字过来，第一个数据是 2x5，第二个是...”</p>
+<blockquote>
+<p><strong>代码片段：</strong>
+```python</p>
+<h1>组长把尺寸填进 sizes 列表</h1>
+<p>if get_tensor_model_parallel_rank() == 0:
+    ...
+    sizes[i + offset] = s</p>
+<h1>广播这个尺寸表，让大家都知道数据有多大</h1>
+<p>torch.distributed.broadcast(sizes_cuda, ...)
+```</p>
+</blockquote>
+<h4>2. 【组长操作】数据打包（Flatten）</h4>
+<p><strong>对应函数：</strong> <code>broadcast_data</code> 中的 <code>if rank == 0</code> 部分</p>
+<p>网络传输最怕“碎”。发 100 个 1KB 的包，不如发 1 个 100KB 的包快。所以我们要把字典里的数据（Key-Value）全部“压扁”。</p>
+<p>代码逻辑：
+*   <strong>检查类型</strong>：<code>_check_data_types</code> 确保大家都是 <code>float32</code> 或者 <code>float16</code>，不能混着来。
+*   <strong>压扁</strong>：使用 <code>view(-1)</code> 把二维、三维矩阵拉成一条直线。
+*   <strong>拼接</strong>：使用 <code>torch.cat</code> 把所有拉直的数据拼在一起，变成一个超级长的 1D Tensor（<code>flatten_data</code>）。</p>
+<blockquote>
+<p><strong>代码片段：</strong>
+<code>python
+if get_tensor_model_parallel_rank() == 0:
+    # 把字典里所有 value 拉直，拼成一条长龙
+    flatten_data = torch.cat([data[key].contiguous().view(-1) for key in keys], dim=0).cuda()</code></p>
+</blockquote>
+<h4>3. 【组员操作】准备容器</h4>
+<p><strong>对应函数：</strong> <code>broadcast_data</code> 中的 <code>else</code> 部分</p>
+<p>组员现在手里有了第1步发来的“说明书”，知道总共要接收多少个数字（<code>total_numel</code>）。</p>
+<p>代码逻辑：
+*   组员申请一块显存，大小等于 <code>total_numel</code>，就像准备好一个空箱子。</p>
+<blockquote>
+<p><strong>代码片段：</strong>
+<code>python
+else:
+    # 组员创建一个空的 Tensor，准备接球
+    flatten_data = torch.empty(total_numel, device=..., dtype=datatype)</code></p>
+</blockquote>
+<h4>4. 【核心动作】广播（Broadcast）</h4>
+<p><strong>对应函数：</strong> <code>broadcast_data</code> 中的 <code>broadcast</code> 调用</p>
+<p>这是最关键的一步。利用 NCCL 通信库，把数据从 Rank 0 复制到 Group 内的所有人。</p>
+<p>代码逻辑：
+*   <code>src_rank</code> 是发送者（组长）。
+*   <code>group</code> 是通信组（张量并行的所有 GPU）。
+*   执行完这行代码后，所有组员那个空的 <code>flatten_data</code> 里瞬间填满了和组长一模一样的数据。</p>
+<blockquote>
+<p><strong>代码片段：</strong>
+<code>python
+torch.distributed.broadcast(
+    flatten_data,
+    get_tensor_model_parallel_src_rank(), # 发送者是谁
+    group=get_tensor_model_parallel_group() # 发给谁
+)</code></p>
+</blockquote>
+<h4>5. 【收尾工作】解包还原（Unpack）</h4>
+<p><strong>对应函数：</strong> <code>broadcast_data</code> 的最后部分</p>
+<p>现在大家手里都有一条一模一样的“长龙”数据，但程序后续需要的是字典（Dictionary），不是长龙。</p>
+<p>代码逻辑：
+*   <strong>切片</strong>：根据第1步算出来的 <code>key_numel</code>（每个数据有多少个元素），用 <code>narrow</code> 函数从长龙上切一段下来。
+*   <strong>整形</strong>：用 <code>view(size)</code> 把切下来的这一段，重新变回原来的形状（比如从一条线变回 <code>[4, 1024]</code> 的矩阵）。
+*   <strong>装箱</strong>：塞回 <code>output</code> 字典里。</p>
+<blockquote>
+<p><strong>代码片段：</strong>
+<code>python
+for key in keys:
+    size = key_size[key]   # 查表：原来形状是啥？
+    numel = key_numel[key] # 查表：这一段有多长？
+    # 切下来，变回原来的形状
+    output[key] = flatten_data.narrow(0, offset, numel).view(size)
+    offset += numel</code></p>
+</blockquote>
+<hr />
+<h3>总结</h3>
+<p>这个文件的核心逻辑就是：
+<strong>测量尺寸 -&gt; 广播尺寸 -&gt; 压扁数据 -&gt; 广播数据 -&gt; 还原数据</strong>。</p>
+<p>为什么要这么麻烦？
+因为在深度学习框架（PyTorch）的分布式通信中，<strong>接收方必须预先知道要接收的数据 Tensor 的形状</strong>才能分配显存。而这个脚本巧妙地先传“形状”，再传“内容”，从而实现了任意复杂字典数据的自动同步。</p>

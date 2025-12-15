@@ -1,0 +1,123 @@
+<h1>fla/ops/triton/rotary.py</h1>
+<p>这份代码是用 <strong>OpenAI Triton</strong> 编写的，目的是在 GPU 上极其高效地计算 <strong>RoPE (Rotary Positional Embeddings，旋转位置编码)</strong>。这是目前大模型（如 LLaMA, Mistral）中最常用的位置编码方式。</p>
+<p>简单来说，它的作用是：<strong>把输入向量两两分组，按照它们在序列中的位置进行旋转。</strong></p>
+<p>为了让你看懂，我把这个代码的执行逻辑拆解成一个 <strong>“任务清单 (Todo List)”</strong>。我们假装自己是 GPU 的一个线程（Thread），看看我们要按什么步骤完成这个任务。</p>
+<hr />
+<h3>任务清单：GPU 执行 RoPE 的 5 个步骤</h3>
+<h4>✅ Task 1: 搞清楚“我是谁” (定位与索引)</h4>
+<p><strong>目标</strong>：确定当前线程负责处理哪个 Batch、哪个 Head、以及序列中的哪一段数据。
+<strong>代码对应</strong>：<code>rotary_kernel</code> 函数的开头部分。</p>
+<ul>
+<li>
+<p><strong>逻辑解读</strong>：
+    GPU 是大规模并行的。Triton 启动了成千上万个“程序块”（Program）。</p>
+<ul>
+<li><code>pid_m</code>: 我负责序列长度方向的哪一块？</li>
+<li><code>pid_batch</code>: 我负责第几个样本？</li>
+<li><code>pid_head</code>: 我负责第几个注意力头（Head）？</li>
+</ul>
+</li>
+<li>
+<p><strong>难点（Variable Length）</strong>：
+    代码里有一个 <code>if not IS_VARLEN: ... else: ...</code>。</p>
+<ul>
+<li><strong>定长模式 (<code>not IS_VARLEN</code>)</strong>：普通的 Batch 数据，形状整整齐齐 <code>(Batch, Seq, Head, Dim)</code>。直接算内存地址。</li>
+<li><strong>变长模式 (<code>IS_VARLEN</code>)</strong>：为了省显存，把所有句子的 token 拼成了一长条（Packed Sequence）。这时需要查 <code>CU_SEQLENS</code> 表，找出当前句子在长条中的起始位置 <code>start_idx</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 找到数据的内存地址 (Pointer Arithmetic)</h4>
+<p><strong>目标</strong>：算出输入数据 <code>X</code> 和输出数据 <code>OUT</code> 在显存里的精确指针位置。
+<strong>代码对应</strong>：<code>X = X + ...</code> 和 <code>OUT = OUT + ...</code>。</p>
+<ul>
+<li><strong>逻辑解读</strong>：<ul>
+<li>利用 <strong>Stride (步长)</strong>：Triton 需要知道跳过多少个元素才能到达下一行。</li>
+<li><code>X</code> 指针移动到了当前 Batch、当前 Head 的起始位置。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 准备旋转参数 (加载 Cos 和 Sin)</h4>
+<p><strong>目标</strong>：根据当前处理的 Token 在句子中的位置，去查表读取对应的 $\cos$ 和 $\sin$ 值。
+<strong>代码对应</strong>：<code>rm_cs = ...</code> 以及 <code>tl.load(COS/SIN ...)</code>。</p>
+<ul>
+<li><strong>逻辑解读</strong>：<ul>
+<li><strong>位置偏移 (<code>SEQLEN_OFFSETS</code>)</strong>：如果是推理阶段（KV Cache），虽然只需要计算新生成的 1 个 token，但它的位置可能是第 100 个。所以需要加上这个偏移量，确保读到第 100 个位置的 $\cos/\sin$。</li>
+<li><strong>加载数据</strong>：从显存加载 $\cos$ 和 $\sin$ 到寄存器。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 核心数学计算 (执行旋转)</h4>
+<p><strong>目标</strong>：这是最关键的一步。根据不同的 RoPE 变体，对向量进行旋转。
+<strong>代码对应</strong>：<code>if not INTERLEAVED:</code> 和 <code>else:</code> 分支。</p>
+<p>这里有两种常见的 RoPE 内存排列方式，代码都支持：</p>
+<ul>
+<li>
+<p><strong>模式 A：普通模式 (LLaMA 默认, <code>not INTERLEAVED</code>)</strong></p>
+<ul>
+<li><strong>切分方式</strong>：把向量切成两半。比如向量是 <code>[x0, x1, x2, x3]</code>。它把 <code>[x0, x1]</code> 看作一半，<code>[x2, x3]</code> 看作一半。</li>
+<li><strong>配对</strong>：<code>x0</code> 和 <code>x2</code> 配对旋转，<code>x1</code> 和 <code>x3</code> 配对。</li>
+<li><strong>代码行为</strong>：<ol>
+<li>加载前半段 <code>x0</code>，加载后半段 <code>x1</code>。</li>
+<li>公式：
+    $$Out_0 = x_0 \cdot \cos - x_1 \cdot \sin$$
+    $$Out_1 = x_0 \cdot \sin + x_1 \cdot \cos$$
+    <em>(注：如果 <code>CONJUGATE</code> 为 True，代表反向旋转/求导，符号会变)</em></li>
+</ol>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>模式 B：交替模式 (HuggingFace 风格, <code>INTERLEAVED</code>)</strong></p>
+<ul>
+<li><strong>切分方式</strong>：相邻元素配对。<code>[x0, x1]</code> 是一对，<code>[x2, x3]</code> 是一对。</li>
+<li><strong>代码行为</strong>：<ol>
+<li>这部分比较 tricky。为了内存读取效率，它没有按 <code>0,1,2,3</code> 读，而是用了技巧加载 <code>X0</code> 和 <code>X1</code>。</li>
+<li><code>rk_swap</code>：用于交换索引，把 <code>(0, 1)</code> 变成 <code>(1, 0)</code>。</li>
+<li>最终也是做旋转计算。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 写回显存 (Store)</h4>
+<p><strong>目标</strong>：把算好的结果存回 <code>OUT</code> 指针指向的位置。
+<strong>代码对应</strong>：<code>tl.store(OUT, ...)</code>。</p>
+<ul>
+<li><strong>逻辑解读</strong>：<ul>
+<li><strong>Masking (掩码)</strong>：这是 GPU 编程的保护机制。因为 GPU 是按块（Block）操作的，如果序列长度是 5，但块大小是 8，多出来的 3 个线程不能乱写内存，必须被 <code>mask</code> 掉。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Python 包装层 (<code>apply_rotary</code>) 的 Todo List</h3>
+<p>除了上面的 Kernel，底下的 <code>apply_rotary</code> 函数是给 PyTorch 调用的接口。它的任务很简单：</p>
+<ol>
+<li><strong>检查参数</strong>：<ul>
+<li>确保 <code>cos</code> 和 <code>sin</code> 形状对得上。</li>
+<li>确保维度不超过 256（Triton kernel 里的 Block 限制）。</li>
+</ul>
+</li>
+<li><strong>处理内存连续性</strong>：<ul>
+<li><code>.contiguous()</code>：Triton 要求内存最好是连续的，否则计算步长会很麻烦。</li>
+</ul>
+</li>
+<li><strong>部分旋转 (Partial RoPE)</strong>：<ul>
+<li>有些模型只旋转向量的前半部分（比如 GPT-NeoX）。代码里有 <code>if rotary_dim &lt; headdim</code>，如果不需要旋转的部分，直接把原始数据 <code>copy_</code> 到输出。</li>
+</ul>
+</li>
+<li><strong>计算 Grid</strong>：<ul>
+<li>决定启动多少个 GPU 线程块。</li>
+</ul>
+</li>
+<li><strong>启动 Kernel</strong>：<ul>
+<li>把所有指针、步长（Stride）、常量传给 GPU 函数。</li>
+</ul>
+</li>
+</ol>
+<h3>总结：这段代码的“核心观点”</h3>
+<ol>
+<li><strong>性能优先</strong>：它没有用 PyTorch 的 <code>torch.cat</code> 或 <code>torch.stack</code> 来做旋转，而是直接写 <strong>Triton Kernel</strong>。这能极大地减少显存读写（IO），因为旋转操作是“计算密集型”较弱但“访存密集型”较强的操作，融合算子速度最快。</li>
+<li><strong>兼容性强</strong>：它同时支持了两种主流的 RoPE 格式（Interleaved 和 Non-Interleaved），以及支持变长序列（VarLen/FlashAttention 格式）和定长序列。</li>
+<li><strong>显存安全</strong>：大量使用了 Mask 和边界检查，防止 GPU 越界访问。</li>
+</ol>
+<p><strong>一句话概括</strong>：这是一个<strong>通用的、高性能的、底层的</strong> RoPE 算子实现，专门为了让大模型跑得更快。</p>

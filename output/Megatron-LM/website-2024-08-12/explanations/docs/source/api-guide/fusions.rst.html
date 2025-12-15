@@ -1,0 +1,83 @@
+<h1>docs/source/api-guide/fusions.rst</h1>
+<p>这份文档确实涉及比较底层的深度学习优化概念，如果你不是专门做模型加速的，看不懂很正常。</p>
+<p>简单来说，这份文件是一个<strong>工具箱说明书</strong>。这个工具箱里的工具只有一个目的：<strong>让模型跑得更快，更省显存。</strong></p>
+<p>为了让你理解，我制定了一个 <strong>“三步走”的学习清单 (To-Do List)</strong>，我们一步步来拆解。</p>
+<hr />
+<h3>📋 学习任务清单</h3>
+<h4>✅ Task 1: 理解核心概念 —— 什么是 "Fusion" (融合)？</h4>
+<p><strong>目标</strong>：明白为什么我们要把操作“融合”在一起。</p>
+<ul>
+<li><strong>背景</strong>：在深度学习里，GPU 最大的瓶颈通常不是“算得不够快”，而是“数据搬运太慢”（从显存读数据到计算核心）。</li>
+<li><strong>笨办法 (无融合)</strong>：<ol>
+<li>从显存读取数据 $X$。</li>
+<li>做加法 (Bias Add)。</li>
+<li>把结果写回显存。</li>
+<li>再次从显存读取刚才的结果。</li>
+<li>做激活函数 (GeLU)。</li>
+<li>把结果写回显存。</li>
+<li><em>问题：读写了4次显存，中间很多时间浪费在路上。</em></li>
+</ol>
+</li>
+<li><strong>聪明办法 (Fusion 融合)</strong>：<ol>
+<li>从显存读取数据 $X$。</li>
+<li><strong>一口气在计算核心里做完：加法 + 激活函数。</strong></li>
+<li>把最终结果写回显存。</li>
+<li><em>优势：只读写2次显存。这就是文档里说的 "improves compute efficiency by increasing the amount of work done each time a tensor is read from memory"（每次读取数据多干点活）。</em></li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 2: 理解实现手段 —— 它是怎么做到的？</h4>
+<p><strong>目标</strong>：看懂文档第一段提到的技术名词。</p>
+<p>文档提到了两种实现融合的方法：
+1.  <strong>PyTorch JIT (<code>torch.jit</code> / <code>torch.compile</code>)</strong>:
+    *   这是 PyTorch 自带的功能（即时编译）。它能自动分析你的代码，发现“哎，这两步可以合并”，然后自动生成一个高效的融合版本。
+2.  <strong>Custom Kernels (Apex, TransformerEngine)</strong>:
+    *   这是“硬写”的。NVIDIA 等公司用 C++ 或 CUDA 写好了极度优化的底层代码（Kernel），直接调用这些库，速度飞快。</p>
+<h4>✅ Task 3: 逐个击破 —— 这个工具箱里有哪些具体的工具？</h4>
+<p><strong>目标</strong>：理解文档中 <code>Submodules</code> 下面列出的具体功能。</p>
+<p>现在我们来看看这个包里具体提供了哪些“融合套餐”：</p>
+<ol>
+<li>
+<p><strong><code>fused_bias_dropout</code> (偏置加法 + 随机失活)</strong></p>
+<ul>
+<li><strong>做什么</strong>：把“加上偏置项 (Bias)”和“随机丢弃神经元 (Dropout)”这两个动作合二为一。</li>
+<li><strong>文档重点</strong>：提到训练 (Train) 和推理 (Inference) 模式不一样。因为 Dropout 只在训练时用，推理时不用，所以代码里会自动判断模式来选择不同的函数。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>fused_bias_gelu</code> (偏置加法 + GeLU激活)</strong></p>
+<ul>
+<li><strong>做什么</strong>：这是 Transformer 模型（如 BERT, GPT）里最常见的组合。把“加上偏置”和“GeLU激活函数”合体，极大提升大模型的速度。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>fused_layer_norm</code> (层归一化)</strong></p>
+<ul>
+<li><strong>做什么</strong>：LayerNorm 是大模型里必不可少的步骤，计算很繁琐（求均值、方差等）。</li>
+<li><strong>来源</strong>：文档说它是对 <strong>Apex</strong> 库的封装 (wrapper)。意思就是：“我不自己写，我直接调用 NVIDIA Apex 库里写好的那个超快的版本”。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>fused_softmax</code> (Softmax 概率计算)</strong></p>
+<ul>
+<li><strong>做什么</strong>：计算注意力机制 (Attention) 时必用的概率归一化。</li>
+<li><strong>来源</strong>：同样是封装了 Apex 库里的变体，为了快。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>fused_cross_entropy_loss</code> (交叉熵损失)</strong></p>
+<ul>
+<li><strong>做什么</strong>：计算模型预测结果和真实结果差距的。</li>
+<li><strong>亮点</strong>：它不仅融合了计算，还融合了 <strong>batches communication</strong>（多卡训练时的通信）。这意味着在计算损失时，它能更高效地处理多张显卡之间的数据同步。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>💡 总结</h3>
+<p><strong>这一页文档其实就在讲一件事：</strong></p>
+<blockquote>
+<p>“嘿，我们这个 <code>fusions</code> 包里提供了一堆<strong>加速插件</strong>。
+比如把‘加法+激活’合并，或者直接调用 NVIDIA 的加速库。
+用了这些插件，你的模型训练速度会变快，显存占用会变少。”</p>
+</blockquote>
+<p>现在回头再看那段英文，是不是清晰多了？</p>

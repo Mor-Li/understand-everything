@@ -1,0 +1,97 @@
+<h1>recipe/sppo/sppo_worker.py</h1>
+<p>这份代码确实涉及很多底层分布式训练的概念（比如 FSDP、Offload、Actor/Rollout/Ref 架构），直接看容易晕。</p>
+<p>你可以把这个脚本想象成一个<strong>刚打卡上班的“全能打工仔”（Worker）</strong>。他上班的第一件事（<code>init_model</code>）就是根据老板（Config 配置）给的“任务清单”，把自己的工位和工具准备好。</p>
+<p>为了让你看懂，我把这个 <code>init_model</code> 函数的逻辑拆解成一个 <strong>“打工仔的开工 To-Do List”</strong>。</p>
+<hr />
+<h3>📋 打工仔（SPPO Worker）的开工 To-Do List</h3>
+<p>这个 Worker 可能身兼数职，也可能只干一件事。他的核心任务是支持 <strong>SPPO（一种强化学习算法）</strong> 的训练。</p>
+<h4>✅ Task 1: 确认身份与拿图纸 (Configuration)</h4>
+<p><strong>“老板今天让我干啥？我是负责写作业（Actor），还是负责检查作业（Ref），还是负责做题（Rollout）？”</strong></p>
+<ul>
+<li><strong>代码对应:</strong> <code>override_model_config = ...</code> 以及各种 <code>if self._is_actor</code>, <code>if self._is_rollout</code> 的判断。</li>
+<li><strong>解释:</strong><ul>
+<li><strong>Actor (演员/学生):</strong> 需要被训练的模型。</li>
+<li><strong>Rollout (推理/做题):</strong> 负责根据当前的策略生成文本。</li>
+<li><strong>Ref (参考/老师):</strong> 原始模型，用来对比，防止训练后的模型偏离太远。</li>
+<li>这个 Worker 可能同时是 Actor 和 Rollout（省显存），也可能单独只是 Ref。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 组装核心大脑 (Build Model &amp; FSDP)</h4>
+<p><strong>“不管我是谁，我得先把那个巨大的 LLM 模型（大脑）搬进来。因为脑子太大，我要把它切碎了放在不同的显卡上（FSDP）。”</strong></p>
+<ul>
+<li><strong>代码对应:</strong>
+    <code>python
+    if self._is_actor or self._is_rollout:
+        # ...
+        self.actor_module_fsdp, self.actor_optimizer, ... = self._build_model_optimizer(...)</code></li>
+<li><strong>解释:</strong><ul>
+<li>如果我是 Actor 或 Rollout，我需要加载主模型。</li>
+<li><strong>FSDP (Fully Sharded Data Parallel):</strong> 这是一种把大模型切分到多个 GPU 上的技术，否则单卡放不下。</li>
+<li>如果是 Actor，我还需要准备“优化器”（<code>optim_config</code>），用来更新参数。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 内存大挪移 (Offload to CPU)</h4>
+<p><strong>“显存快爆了！先把暂时不用的东西搬到内存（CPU）里去，等要用的时候再拿回来。”</strong></p>
+<ul>
+<li><strong>代码对应:</strong>
+    <code>python
+    if self._is_offload_param:
+        offload_fsdp_model_to_cpu(...)
+    if self._is_offload_optimizer:
+        offload_fsdp_optimizer(...)</code></li>
+<li><strong>解释:</strong> 为了省钱（显存），把模型参数或优化器状态暂时存放在 CPU 内存中。</li>
+</ul>
+<h4>✅ Task 4: 穿上“训练员”制服 (Init Actor Class)</h4>
+<p><strong>“既然我是 Actor，我要加载专门用于 SPPO 训练的逻辑模块。”</strong></p>
+<ul>
+<li><strong>代码对应:</strong>
+    <code>python
+    if self._is_actor:
+        # ...
+        self.actor = DataParallelSPPOActor(..., actor_module=self.actor_module_fsdp, ...)</code></li>
+<li><strong>解释:</strong> 这里把刚才加载的 FSDP 模型包装进 <code>DataParallelSPPOActor</code> 类里，这个类包含了 SPPO 算法具体的数学计算逻辑（比如计算 Loss）。</li>
+</ul>
+<h4>✅ Task 5: 准备“做题”工具 (Init Rollout)</h4>
+<p><strong>“既然我还负责 Rollout，我要准备好快速生成文本的引擎。”</strong></p>
+<ul>
+<li><strong>代码对应:</strong>
+    <code>python
+    if self._is_rollout:
+        self.rollout, ... = self._build_rollout(...)</code></li>
+<li><strong>解释:</strong> Rollout 阶段通常需要高效的推理（Inference），这里可能会初始化像 vLLM 这样的加速库来生成数据。</li>
+</ul>
+<h4>✅ Task 6: 搬来“参考标准” (Init Reference Model)</h4>
+<p><strong>“既然我是 Ref，我要再搬一个模型进来，这个模型是‘冻结’的（不训练），专门用来做对比。”</strong></p>
+<ul>
+<li><strong>代码对应:</strong>
+    <code>python
+    if self._is_ref:
+        self.ref_module_fsdp = self._build_model_optimizer(..., role="ref")[0]
+        # ...
+        self.ref_policy = DataParallelSPPOActor(..., actor_module=self.ref_module_fsdp)</code></li>
+<li><strong>解释:</strong> Ref 模型通常和 Actor 一样大，但不需要优化器（因为不更新参数）。它用来计算 KL 散度（KL Divergence），确保新模型不要“忘本”。</li>
+</ul>
+<h4>✅ Task 7: 准备后勤保障 (Checkpoint &amp; Logging)</h4>
+<p><strong>“最后，准备好记账本（FLOPs Counter）和存档工具（Checkpoint Manager），万一训练挂了能读档重来。”</strong></p>
+<ul>
+<li><strong>代码对应:</strong>
+    <code>python
+    if self._is_actor:
+        self.flops_counter = FlopsCounter(...)
+        self.checkpoint_manager = FSDPCheckpointManager(...)</code></li>
+<li><strong>解释:</strong><ul>
+<li><strong>FlopsCounter:</strong> 计算训练用了多少算力。</li>
+<li><strong>CheckpointManager:</strong> 负责定期把训练好的模型保存到硬盘上。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这段代码就是一个<strong>“大管家”的初始化脚本</strong>。</p>
+<p>它不涉及具体的数学公式推导，而是负责<strong>工程实现</strong>：
+1.  <strong>加载模型</strong>（处理分布式切分 FSDP）。
+2.  <strong>分配角色</strong>（你是负责训练，还是负责推理，还是负责当裁判）。
+3.  <strong>资源管理</strong>（显存不够就往 CPU 搬）。</p>
+<p>看懂了这个，你就知道这个文件是整个 SPPO 训练流程中的<strong>基础设施搭建者</strong>。</p>

@@ -1,0 +1,81 @@
+<h1>docs/perf/perf_tuning.rst</h1>
+<p>这篇文章主要是在讲 <strong>“如何榨干你的显卡性能”</strong>，专门针对 <code>verl</code> 这个强化学习（RLHF）训练框架的。</p>
+<p>简单来说，训练大模型（尤其是 PPO 这种强化学习）主要分两步：
+1.  <strong>生成（Rollout）：</strong> 模型做题，生成一大堆回答。
+2.  <strong>训练（Update）：</strong> 根据回答的好坏，修改模型参数。</p>
+<p>这篇文章就是在教你如何调整参数，让这两个过程跑得更快，且不爆显存（OOM）。</p>
+<p>为了让你好理解，我把文中复杂的逻辑拆解成一个 <strong>“性能优化 To-Do List”</strong>，你可以按这个顺序一步步检查和调整：</p>
+<hr />
+<h3>🚀 阶段一：加速“做题”速度 (Rollout Generation)</h3>
+<p><em>这一步是让模型（Actor）快速生成数据。用的后端通常是 vLLM。</em></p>
+<p><strong>✅ 任务 1：把显存塞满 (vLLM Tuning)</strong>
+*   <strong>原理</strong>：vLLM 需要预占显存来存 KV Cache。占得越多，能同时处理的并发请求就越多。
+*   <strong>怎么做</strong>：
+    *   找到参数 <code>gpu_memory_utilization</code>。
+    *   <strong>建议值</strong>：<code>0.5</code> 到 <code>0.7</code> 之间。
+    *   <strong>注意</strong>：太高会导致 OOM（爆显存），太低会浪费显卡算力。注意 vLLM 版本不同（v0.6 vs v0.7），这个比例的计算方式略有不同，但核心逻辑是“给推理留够空间”。</p>
+<p><strong>✅ 任务 2：增加并发量</strong>
+*   <strong>原理</strong>：显卡就像一辆大巴车，一次拉的人（Token）越多越划算。
+*   <strong>怎么做</strong>：
+    *   如果日志显示 GPU Cache 利用率低，说明没吃饱。
+    *   调大 <code>max_num_batched_tokens</code>（建议大于 2048）或者 <code>max_num_seqs</code>。</p>
+<p><strong>✅ 任务 3：少用张量并行 (TP)，多用数据并行 (DP)</strong>
+*   <strong>原理</strong>：如果显卡够多，与其让多张卡合作算一个模型（TP），不如让每张卡独立算一个模型（DP/Replicas），后者吞吐量通常更高。
+*   <strong>怎么做</strong>：
+    *   减小 <code>tensor_parallel_size</code>。</p>
+<hr />
+<h3>📦 阶段二：数据打包 (去除 Padding)</h3>
+<p><em>这一步是为了避免显卡计算一堆无意义的“0”或填充符。</em></p>
+<p><strong>✅ 任务 4：开启“去填充”功能</strong>
+*   <strong>原理</strong>：通常一句话短、一句话长，为了对齐会补零（Padding）。这很浪费。开启这个功能后，会像俄罗斯方块一样把数据挤在一起。
+*   <strong>怎么做</strong>：
+    *   设置 <code>use_remove_padding=True</code>。
+    *   <strong>适用模型</strong>：Llama, Mistral, Gemma, Qwen 等主流模型目前都支持。</p>
+<hr />
+<h3>🏋️ 阶段三：加速“训练”速度 (Batch Size Tuning)</h3>
+<p><em>这一步是调整模型反向传播、更新参数时的效率。</em></p>
+<p>这里有两种策略，<strong>二选一</strong>：</p>
+<h4>策略 A：手动调小批次 (Static Batch Size)</h4>
+<p>如果你不开启动态批次，就需要手动微调 <code>micro_batch_size_per_gpu</code>。</p>
+<p><strong>✅ 任务 5：根据不同模型，设置不同的 Batch Size</strong>
+*   <strong>核心原则</strong>：训练参数（Actor/Critic）比较占显存，推理参数（Ref/Reward）不占显存。
+*   <strong>怎么做</strong>：
+    1.  <strong>开启省显存模式</strong>：把 Actor 和 Critic 的 <code>enable_gradient_checkpointing</code> 设为 <code>True</code>。
+    2.  <strong>Actor/Critic (训练用)</strong>：<code>ppo_micro_batch_size_per_gpu</code> 设小一点。
+    3.  <strong>Ref/Reward (只推理)</strong>：<code>log_prob_micro_batch_size_per_gpu</code> 可以设大一点（比如是上面的 2 倍）。
+    4.  <strong>Critic/Reward 模型</strong>：通常比 Actor 模型更能吃数据（因为词表层通常较小），可以设得比 Actor 大。</p>
+<h4>策略 B：使用动态批次 (Dynamic Batch Size) —— <strong>推荐</strong> 🔥</h4>
+<ul>
+<li><strong>原理</strong>：不按“几条数据”算，而是按“总共多少个字（Token）”算。这样更灵活，显存利用率最高。</li>
+</ul>
+<p><strong>✅ 任务 6：开启动态批次</strong>
+*   <strong>怎么做</strong>：
+    *   设置 <code>use_dynamic_bsz=True</code>。
+    *   <strong>不用管</strong> <code>micro_batch_size</code> 了。
+    *   <strong>改为调整</strong> <code>max_token_len_per_gpu</code>（每张卡最大吃多少个 Token）。</p>
+<p><strong>✅ 任务 7：调整动态批次的上限</strong>
+*   <strong>怎么做</strong>：
+    *   <code>actor.ppo_max_token_len_per_gpu</code>：至少要是 (提问长度 + 回答长度) 的 2 倍以上。作者建议设为 3 倍甚至更多，直到显存快爆为止。
+    *   <code>critic</code> 和 <code>reward</code> 的上限：可以设得非常大（比如 Actor 的 4 倍）。</p>
+<hr />
+<h3>🛠️ 阶段四：特殊场景优化</h3>
+<p><strong>✅ 任务 8：超长文本训练 (Long Context)</strong>
+*   <strong>场景</strong>：如果你要训练超过 32k 长度的文本。
+*   <strong>怎么做</strong>：
+    *   开启 Ulysses 序列并行：<code>ulysses_sequence_parallel_size &gt; 1</code>。
+    *   同时减小 Batch Size 防止爆显存。</p>
+<p><strong>✅ 任务 9：SFT 微调加速 (Liger Kernel)</strong>
+*   <strong>场景</strong>：做 SFT（有监督微调）时。
+*   <strong>怎么做</strong>：
+    *   安装 <code>pip3 install liger-kernel</code>。
+    *   配置里设置 <code>use_liger: True</code>。</p>
+<hr />
+<h3>📝 总结：新手调优路径</h3>
+<p>如果你完全不想看细节，请按这个<strong>傻瓜路径</strong>操作：</p>
+<ol>
+<li><strong>先开去填充</strong>：<code>use_remove_padding=True</code>。</li>
+<li><strong>再开动态批次</strong>：<code>use_dynamic_bsz=True</code>。</li>
+<li><strong>调大 vLLM 显存</strong>：<code>gpu_memory_utilization</code> 设个 0.6 左右。</li>
+<li><strong>试探上限</strong>：慢慢调大 <code>max_token_len_per_gpu</code>，直到程序报错说 OOM（显存不足），然后往回退一点点。</li>
+<li><strong>区别对待</strong>：记得 Critic（评论家模型）和 Reward（奖励模型）比 Actor（演员模型）能吃更多数据，参数给大点。</li>
+</ol>

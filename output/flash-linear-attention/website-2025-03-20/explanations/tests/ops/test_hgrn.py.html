@@ -1,0 +1,59 @@
+<h1>tests/ops/test_hgrn.py</h1>
+<p>这份代码其实是一个 <strong>单元测试（Unit Test）</strong> 文件。</p>
+<p>简单来说，它的作用是：<strong>“为了证明我们写的高速加速版代码（Fused/Chunk）算出来的结果，和最基础的慢速版代码（Naive）是一模一样的。”</strong></p>
+<p>如果不写这个测试，没人敢用那些加速过的复杂算子，因为怕算错了。</p>
+<p>下面我列一个 <strong>“阅读与理解任务清单 (To-Do List)”</strong>，带你一步步拆解这个文件在干嘛：</p>
+<hr />
+<h3>✅ Task 1：准备“尺子” (定义评测标准)</h3>
+<p><strong>代码位置：</strong> 开头的 <code>get_abs_err</code>, <code>get_err_ratio</code>, <code>assert_close</code> 函数。</p>
+<ul>
+<li><strong>这是啥：</strong> 因为计算机算浮点数（小数）会有微小的误差，所以不能直接用 <code>==</code> 判断两个结果是否相等。</li>
+<li><strong>观点：</strong> 我们需要一把“尺子”来衡量误差。<ul>
+<li>如果两个结果的差值（Diff）非常小（比如小于 0.005），我们就认为测试通过。</li>
+<li><code>assert_close</code> 就是裁判，如果误差太大，它就会报错，测试失败。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 2：测试“标准加速版” (Fused vs Naive)</h3>
+<p><strong>代码位置：</strong> <code>test_fused_recurrent</code> 函数。</p>
+<p>这是最核心的测试。
+*   <strong>步骤 1 (造数据)：</strong> 随机生成输入数据 <code>x</code> (输入), <code>g</code> (门控信号), <code>h0</code> (初始状态)。
+*   <strong>步骤 2 (跑基准)：</strong> 运行 <code>naive_recurrent_hgrn</code>。
+    *   <em>注：Naive 版通常是用纯 PyTorch 写的循环，跑得慢，但逻辑最简单，被视为“标准答案（Ground Truth）”。</em>
+    *   计算出结果 <code>ref</code> (参考值) 和梯度。
+*   <strong>步骤 3 (跑加速版)：</strong> 运行 <code>fused_recurrent_hgrn</code>。
+    *   <em>注：Fused 版通常是用 CUDA/Triton 写的底层加速代码，跑得快，但代码复杂容易写错。</em>
+    *   计算出结果 <code>tri</code> (待测值) 和梯度。
+*   <strong>步骤 4 (对比)：</strong> 使用 Task 1 的尺子，对比 <code>ref</code> 和 <code>tri</code>。
+    *   <strong>核心观点：</strong> 只要加速版算出来的<strong>输出值</strong>和<strong>梯度（反向传播）</strong>都和慢速版一样，那这个加速版就是可用的。</p>
+<hr />
+<h3>✅ Task 3：测试“变长序列” (Variable Length)</h3>
+<p><strong>代码位置：</strong> <code>test_fused_recurrent_varlen</code> 函数。</p>
+<ul>
+<li><strong>这是啥：</strong> 在实际训练大模型时，一个 Batch 里可能有好几句话，有的长有的短。为了效率，我们会把它们拼成一长条来算。</li>
+<li><strong>步骤 1 (切分数据)：</strong> 把一长串数据随机切分成 N 段，模拟 N 个不同长度的句子，记录切分点 <code>offsets</code>。</li>
+<li><strong>步骤 2 (跑基准)：</strong> 用 <code>for</code> 循环，一段一段地去跑 Naive 版代码，把结果拼起来。这是最笨但最稳的方法。</li>
+<li><strong>步骤 3 (跑加速版)：</strong> 直接把整条数据丢给 <code>fused_recurrent_hgrn</code>，并告诉它切分点 <code>cu_seqlens</code> 在哪。加速版算子应该能内部处理好这些切分。</li>
+<li><strong>核心观点：</strong> 验证加速算子在处理“拼盘数据”时，能不能正确地在切分点重置状态，不让上一句话的内容影响下一句话。</li>
+</ul>
+<hr />
+<h3>✅ Task 4：测试“分块算法” (Chunk vs Fused)</h3>
+<p><strong>代码位置：</strong> <code>test_chunk</code> 函数。</p>
+<ul>
+<li><strong>这是啥：</strong> HGRN 还有一种计算方式叫 Chunk（分块并行计算），通常用于训练阶段加速。</li>
+<li><strong>步骤 1 (确立新基准)：</strong> 这次它不再对比 Naive 版了，而是直接对比 <code>fused_recurrent_hgrn</code>。<ul>
+<li><em>为什么？</em> 因为 Task 2 已经证明了 Fused 版是对的，所以这里拿 Fused 版当标准答案，因为它比 Naive 版快，跑测试省时间。</li>
+</ul>
+</li>
+<li><strong>步骤 2 (跑分块版)：</strong> 运行 <code>chunk_hgrn</code>。</li>
+<li><strong>核心观点：</strong> 验证“分块（Chunk）”这种更高级的并行计算方式，算出来的结果和“循环（Recurrent）”方式是一致的。这保证了模型在训练（用 Chunk）和推理（用 Recurrent）时的表现一致。</li>
+</ul>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>这个文件的逻辑就是：
+1.  <strong>定义规则：</strong> 允许多少误差。
+2.  <strong>基础测试：</strong> 慢速版 vs 加速版（看对不对）。
+3.  <strong>进阶测试：</strong> 慢速版 vs 加速版（看处理长短不一的数据对不对）。
+4.  <strong>算法一致性测试：</strong> 加速循环版 vs 加速分块版（看两种不同的数学实现路径结果是否一致）。</p>
+<p>只要这三个测试函数都跑通（变绿），就说明这个 HGRN 算子写得没问题，可以放心用在模型里了。</p>

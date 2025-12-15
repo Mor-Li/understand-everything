@@ -1,0 +1,111 @@
+<h1>examples/data_preprocess/hellaswag.py</h1>
+<p>这份代码其实就是一个<strong>“数据加工流水线”</strong>。</p>
+<p>它的核心目标是：<strong>把原始的 HellaSwag 数据集（一种常识推理题），清洗并转换成大模型训练框架（这里是 <code>verl</code>）能够识别的标准格式，最后存下来。</strong></p>
+<p>为了让你看懂，我把它拆解成一个 <strong>6步走的 Todo List</strong>。我们跟着这个清单，一步步看代码是怎么完成任务的。</p>
+<hr />
+<h3>📋 任务清单 (Todo List)</h3>
+<ol>
+<li><strong>准备工作</strong>：设置好存储路径，从网上把原始数据拉下来。</li>
+<li><strong>打造清洁工具</strong>：定义一个“清洗函数”，专门处理脏文本。</li>
+<li><strong>制定加工标准</strong>：定义核心转换逻辑（怎么把原始题变成模型训练数据）。</li>
+<li><strong>剔除废料</strong>：把没有标准答案的数据扔掉。</li>
+<li><strong>批量生产</strong>：将加工标准应用到所有数据上。</li>
+<li><strong>入库存储</strong>：把处理好的数据存成文件，并备份到云端（HDFS）。</li>
+</ol>
+<hr />
+<h3>🧩 逐步讲解</h3>
+<h4>Task 1: 准备工作 (Setup &amp; Load)</h4>
+<p><strong>代码位置：</strong> <code>if __name__ == "__main__":</code> 开始的部分。</p>
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li>就像做饭先要买菜。代码首先定义了“菜”从哪里来（<code>data_source = "Rowan/hellaswag"</code>，这是 HuggingFace 上的一个数据集）。</li>
+<li>然后定义做好的菜放哪里（<code>local_dir</code> 和 <code>hdfs_dir</code>）。</li>
+<li><code>datasets.load_dataset</code> 这一行就是真正的“买菜”动作，把训练集(train)、验证集(val)、测试集(test)都下载到内存里。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 打造清洁工具 (The Cleaner)</h4>
+<p><strong>代码位置：</strong> <code>def preprocess(text):</code> 函数。</p>
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li>原始数据里有很多“杂质”。比如 HellaSwag 数据源自 WikiHow，里面经常有 <code>[title]</code> 这种标签，或者多余的空格。</li>
+<li>这个函数就是一个<strong>过滤器</strong>：<ul>
+<li><code>.strip()</code>：去掉首尾空格。</li>
+<li><code>.replace(" [title]", ". ")</code>：把标题标签换成句号。</li>
+<li><code>re.sub(...)</code>：用正则表达式去掉方括号里的奇怪内容。</li>
+</ul>
+</li>
+<li><strong>观点</strong>：<strong>垃圾进，垃圾出（Garbage In, Garbage Out）</strong>。如果不清洗文本，模型会学到奇怪的符号，影响推理能力。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 制定加工标准 (The Transformer)</h4>
+<p><strong>代码位置：</strong> <code>def make_map_fn(split):</code> 及其内部的 <code>process_fn</code>。</p>
+<ul>
+<li><strong>这是全篇最核心的部分</strong>。它定义了如何把一道“选择题”变成模型能看懂的“训练样本”。</li>
+<li><strong>原始数据长这样</strong>：<ul>
+<li><code>ctx_a</code>, <code>ctx_b</code>: 题目的上下文（比如：“一个人正在切洋葱...”）。</li>
+<li><code>endings</code>: 4个选项（比如：“...他开始哭”、“...洋葱变成了苹果”等）。</li>
+<li><code>label</code>: 正确答案的编号（比如 <code>0</code>）。</li>
+</ul>
+</li>
+<li><strong>代码把它变成了这样（字典格式）</strong>：<ul>
+<li><strong>Prompt (提示词)</strong>：把上下文拼起来，加上 activity label，变成用户的问题 (<code>query</code>)。</li>
+<li><strong>Reward Model (奖励模型信息)</strong>：<ul>
+<li><code>style</code>: "model"</li>
+<li><code>eval</code>: "multiple_choice" (告诉框架这是个做选择的任务)</li>
+<li><code>ground_truth</code>: 正确答案 <code>gold</code>。</li>
+<li><code>choices</code>: 4个选项的列表。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>观点</strong>：模型训练框架（Verl）通常需要统一的数据接口。这里把非结构化的文本，封装成了结构化的 JSON 对象，明确了<strong>“题目是什么”</strong>以及<strong>“怎么算做对”</strong>。</li>
+</ul>
+<h4>Task 4: 剔除废料 (Filter)</h4>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">train_dataset</span> <span class="o">=</span> <span class="n">train_dataset</span><span class="o">.</span><span class="n">filter</span><span class="p">(</span><span class="k">lambda</span> <span class="n">x</span><span class="p">:</span> <span class="nb">len</span><span class="p">(</span><span class="n">x</span><span class="p">[</span><span class="s2">&quot;label&quot;</span><span class="p">])</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">)</span>
+<span class="o">...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li>检查每一条数据，如果 <code>label</code>（答案）是空的，说明这道题没法用。</li>
+<li>直接用 <code>.filter</code> 把它丢弃。</li>
+</ul>
+</li>
+<li><strong>观点</strong>：确保数据质量，防止训练过程中程序报错或模型学坏。</li>
+</ul>
+<h4>Task 5: 批量生产 (Map)</h4>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">train_dataset</span> <span class="o">=</span> <span class="n">train_dataset</span><span class="o">.</span><span class="n">map</span><span class="p">(</span><span class="n">function</span><span class="o">=</span><span class="n">make_map_fn</span><span class="p">(</span><span class="s2">&quot;train&quot;</span><span class="p">),</span> <span class="n">with_indices</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="o">...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li>刚才 Task 3 只是制定了“规则”。</li>
+<li>这里用 <code>.map()</code> 函数，把这个规则<strong>应用到每一行数据上</strong>。</li>
+<li>这就好比流水线开动了，成千上万条原始数据经过这里，变成了统一格式的训练数据。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 6: 入库存储 (Save &amp; Upload)</h4>
+<p><strong>代码位置：</strong> 最后几行。</p>
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li><code>to_parquet(...)</code>：把处理好的数据保存为 <code>.parquet</code> 格式。<ul>
+<li><em>知识点</em>：Parquet 是一种非常高效的列式存储格式，比 CSV 读取快得多，是大数据训练的标准格式。</li>
+</ul>
+</li>
+<li><code>if hdfs_dir is not None:</code>：如果用户指定了云端路径（HDFS），就调用 <code>copy</code> 把本地生成的文件上传上去备份。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这段代码其实就在做一件事：</p>
+<p><strong>ETL (Extract, Transform, Load)</strong>
+1.  <strong>Extract</strong>: 下载 HellaSwag 数据。
+2.  <strong>Transform</strong>: 清洗文本，拼凑上下文，组装成包含 Prompt 和 Reward 信息的标准字典。
+3.  <strong>Load</strong>: 存成 Parquet 文件供后续 AI 训练使用。</p>

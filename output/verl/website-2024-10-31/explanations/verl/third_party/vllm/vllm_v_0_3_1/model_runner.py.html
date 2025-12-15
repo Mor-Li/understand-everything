@@ -1,0 +1,66 @@
+<h1>verl/third_party/vllm/vllm_v_0_3_1/model_runner.py</h1>
+<p>这份代码确实非常硬核，因为它处于 <strong>vLLM</strong>（一个高性能的大模型推理框架）的核心位置。这个文件 <code>model_runner.py</code> 的作用相当于 <strong>“后厨的总指挥”</strong>。</p>
+<p>它的上游是“服务员”（Scheduler，负责接收用户请求并排队），下游是“灶台”（GPU/Model，负责实际计算）。</p>
+<p>为了让你看懂，我把这个 <code>ModelRunner</code> 的工作拆解成一个 <strong>“任务清单 (To-Do List)”</strong>。想象你就是这个 Runner，你需要按顺序完成以下任务才能让模型吐出字来。</p>
+<hr />
+<h3>任务清单 (Task To-Do List)</h3>
+<h4>1. 任务一：入职与装修厨房 (初始化)</h4>
+<p><strong>对应代码：</strong> <code>__init__</code> 和 <code>load_model</code>
+*   <strong>目标</strong>：把环境搭好，把模型加载到显存里。
+*   <strong>动作</strong>：
+    *   读取各种配置（模型多大？用几张卡？）。
+    *   <strong>加载模型</strong> (<code>load_model</code>)：把 PyTorch 的模型权重搬到 GPU 上。
+    *   <strong>LoRA 准备</strong>：如果用户需要用 LoRA（一种微调技术），这里会初始化一个“LoRA 管理器”，用来管理不同用户的个性化外挂模型。</p>
+<h4>2. 任务二：试运行 (内存摸底)</h4>
+<p><strong>对应代码：</strong> <code>profile_run</code>
+*   <strong>目标</strong>：在正式接客前，先搞一次“压力测试”，看看模型到底吃多少显存。
+*   <strong>背景</strong>：大模型推理最怕显存不够（OOM）。vLLM 的核心技术是 PagedAttention，需要预先切分好显存块（KV Cache）。
+*   <strong>动作</strong>：
+    *   造一个 <strong>假的、最大负载的</strong> 请求列表（比如把 batch size 拉满，序列长度拉满）。
+    *   真的跑一次模型 (<code>self.execute_model</code>)。
+    *   测量显存水位，这样系统就知道还剩多少空间用来存 KV Cache 了。</p>
+<h4>3. 任务三：备菜 (数据预处理)</h4>
+<p><strong>对应代码：</strong> <code>prepare_input_tensors</code> 和 <code>_prepare_sample</code>
+*   <strong>目标</strong>：把用户发来的一堆杂乱的请求（比如 "你好"、"写首诗"），转换成 GPU 能看懂的整齐的 Tensor（张量）。
+*   <strong>难点</strong>：vLLM 支持 <strong>Continuous Batching</strong>（连续批处理），这意味着一个 Batch 里，有的请求刚开始（Prompt 阶段），有的请求已经生成了一半（Decode 阶段）。
+*   <strong>动作</strong>：
+    *   <strong>分类</strong>：判断当前是处理 Prompt（预填充）还是 Decode（生成）。
+    *   <strong><code>_prepare_sample</code> (重点)</strong>：这是文件中逻辑最复杂的部分。
+        *   它要计算每个请求在 Tensor 中的<strong>索引位置</strong>。
+        *   比如：Batch 里有 3 个请求，模型输出了 100 个 token 的概率，我们需要知道哪几个 token 对应的是请求 A 的结尾，哪几个是请求 B 的结尾，以便进行采样。
+    *   <strong>LoRA 映射</strong>：如果有 LoRA，还要标记“第 1 个请求用 LoRA A，第 2 个请求用 LoRA B”。</p>
+<h4>4. 任务四：正式炒菜 (模型执行)</h4>
+<p><strong>对应代码：</strong> <code>execute_model</code>
+*   <strong>目标</strong>：调用 GPU 进行数学运算，算出下一个 token 的概率。
+*   <strong>动作</strong>：
+    *   <strong>准备输入</strong>：调用上面的“备菜”函数。
+    *   <strong>激活 LoRA</strong>：如果当前 Batch 里有 LoRA 请求，把对应的 LoRA 模块激活。
+    *   <strong>CUDA Graph (加速黑科技)</strong>：代码里检查了 <code>input_metadata.use_cuda_graph</code>。如果是 Decode 阶段，通常会用 CUDA Graph 技术来减少 CPU 发射指令的开销（相当于把炒菜步骤录下来，一键自动炒）。
+    *   <strong>计算 (<code>model_executable</code>)</strong>：输入 Token + 位置编码 + KV Cache -&gt; <strong>神经网络</strong> -&gt; 隐状态 (Hidden States)。
+    *   <strong>采样 (<code>model.sample</code>)</strong>：根据隐状态算出概率，然后根据用户的要求（比如 top_k, temperature）选出下一个字。</p>
+<hr />
+<h3>总结：文中观点的逐步解析</h3>
+<p>如果你重新看代码，可以按这个逻辑流：</p>
+<ol>
+<li><strong>类定义</strong>：继承自 vLLM 原生的 Runner，为了适配 Bytedance 内部需求或 <code>verl</code> 强化学习框架做了一些修改。</li>
+<li><strong><code>_prepare_sample</code> 函数详解</strong>：<ul>
+<li>你会看到很多 <code>seq_group_metadata_list</code> 的循环。这是在遍历当前的请求。</li>
+<li><code>subquery_len</code>：指的是 Prompt 阶段可能太长，切成小块处理。</li>
+<li><code>selected_token_indices</code>：这是最关键的变量。模型输出是一个巨大的矩阵，我们只关心每个序列<strong>最后一个位置</strong>的输出（用来预测下一个字），这个变量就是记录这些“最后一个位置”在哪里。</li>
+</ul>
+</li>
+<li><strong><code>execute_model</code> 函数详解</strong>：<ul>
+<li>它是总入口。</li>
+<li>先 <code>prepare</code> (数据搬运到 GPU)。</li>
+<li>再 <code>run</code> (模型前向传播)。</li>
+<li>最后 <code>return output</code>。</li>
+</ul>
+</li>
+</ol>
+<h3>这段代码为什么难读？</h3>
+<p>因为它处理了很多 <strong>工程优化</strong> 的细节：
+*   <strong>异步拷贝 (<code>_async_h2d</code>)</strong>：为了快，CPU 准备数据的同时 GPU 可能在干活。
+*   <strong>LoRA 动态切换</strong>：不是加载一个模型就不动了，而是每个请求可能挂不同的 LoRA。
+*   <strong>CUDA Graph</strong>：为了极致性能，对计算图进行了录制和回放。</p>
+<p><strong>一句话概括：</strong>
+这个文件是 vLLM 的 <strong>“执行官”</strong>，它负责把抽象的“用户请求”翻译成具体的“GPU 显存操作和矩阵计算”，并把结果（生成的字）拿回来。</p>

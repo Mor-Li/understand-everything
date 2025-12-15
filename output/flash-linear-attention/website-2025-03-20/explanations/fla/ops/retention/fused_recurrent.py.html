@@ -1,0 +1,85 @@
+<h1>fla/ops/retention/fused_recurrent.py</h1>
+<p>这个代码片段确实非常“硬核”，因为它涉及到了<strong>大模型（LLM）架构</strong>、<strong>线性注意力机制（Linear Attention）</strong>以及<strong>底层算子优化</strong>。看不懂是很正常的。</p>
+<p>这段代码的核心目的是：<strong>实现 RetNet（Retentive Network）模型中的“循环（Recurrent）”模式推理。</strong></p>
+<p>为了让你听懂，我把理解这段代码的过程拆解成一个 <strong>Todo List（任务清单）</strong>，我们一步步来打钩。</p>
+<hr />
+<h3>📋 任务清单：理解 <code>fused_recurrent_retention</code></h3>
+<ol>
+<li><strong>Task 1：搞懂背景 —— 这到底是在算什么？</strong></li>
+<li><strong>Task 2：搞懂输入 —— Q, K, V 是什么？</strong></li>
+<li><strong>Task 3：搞懂核心魔法 —— 变量 <code>s</code> (衰减系数) 是怎么算的？</strong></li>
+<li><strong>Task 4：搞懂数据变形 —— 变量 <code>g</code> 是在做什么？</strong></li>
+<li><strong>Task 5：搞懂“偷懒”写法 —— 为什么要调用 <code>simple_gla</code>？</strong></li>
+</ol>
+<hr />
+<h3>🟢 Step 1: 搞懂背景</h3>
+<p><strong>RetNet</strong> 是微软提出的一个模型架构，旨在替代 Transformer。
+*   <strong>Transformer</strong> 的特点：效果好，但推理（生成文字）时显存占用大，速度慢。
+*   <strong>RNN (循环神经网络)</strong> 的特点：推理速度极快，内存占用小，但以前效果不好。
+*   <strong>RetNet</strong>：试图结合两者的优点。它在训练时像 Transformer（并行），在推理时像 RNN（串行/循环）。</p>
+<p><strong>结论：</strong> 这个文件的文件名 <code>fused_recurrent</code> 告诉我们，这段代码是专门用于 <strong>RNN 模式</strong>（即一步一步生成文本）或者 <strong>节省显存的训练模式</strong> 的算子。</p>
+<hr />
+<h3>🟢 Step 2: 搞懂输入 (Q, K, V)</h3>
+<p>函数签名里的 <code>q, k, v</code> 是深度学习中最经典的三个概念：
+*   <strong>Q (Query)</strong>: 当前我想查询的信息（比如当前的字）。
+*   <strong>K (Key)</strong>: 记忆库里的索引（以前的字的内容特征）。
+*   <strong>V (Value)</strong>: 记忆库里的具体内容。</p>
+<p>在 RetNet 的循环模式中，我们需要不断地把新的 K 和 V 融合进一个“状态（State）”里，然后用 Q 去查询这个状态。</p>
+<hr />
+<h3>🟢 Step 3: 搞懂核心魔法 (变量 <code>s</code>)</h3>
+<p>这是代码里最难懂的一行数学公式：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">s</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1</span> <span class="o">-</span> <span class="n">q</span><span class="o">.</span><span class="n">new_tensor</span><span class="p">(</span><span class="mf">2.</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float</span><span class="p">)</span><span class="o">.</span><span class="n">pow</span><span class="p">(</span><span class="o">-</span><span class="mf">5.</span> <span class="o">-</span> <span class="n">q</span><span class="o">.</span><span class="n">new_tensor</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">n_heads</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float</span><span class="p">)))</span><span class="o">.</span><span class="n">log</span><span class="p">()</span>
+</code></pre></div>
+
+<p><strong>人话解释：</strong>
+RetNet 和传统 Transformer 最大的区别在于，它引入了一个<strong>“遗忘机制”</strong>（Decay）。
+就像人的记忆一样，有些东西记得久，有些东西忘得快。RetNet 通过<strong>多头（Multi-head）</strong>注意力来实现这一点：
+*   第 1 个头：忘得很快（关注短期记忆）。
+*   第 2 个头：忘得稍微慢点。
+*   ...
+*   第 N 个头：忘得很慢（关注长期记忆）。</p>
+<p><strong>代码拆解：</strong>
+1.  <code>range(n_heads)</code>: 给每个头一个编号，从 0 到 N。
+2.  <code>2.pow(-5. - ...)</code>: 这是一个指数衰减公式。也就是 $2^{-(5 + i)}$。
+3.  <code>1 - ...</code>: 计算保留率（Gamma）。
+4.  <code>.log()</code>: <strong>取对数</strong>。</p>
+<p><strong>为什么要取对数？</strong>
+因为在这个库的底层实现中，计算衰减通常是用 $h_t = h_{t-1} \cdot e^g$ 这种形式。
+如果我们想要的衰减率是 $\gamma$，那么 $e^g = \gamma$，所以传入的参数 $g$ 必须是 $\ln(\gamma)$。这就是代码最后 <code>.log()</code> 的原因。</p>
+<hr />
+<h3>🟢 Step 4: 搞懂数据变形 (变量 <code>g</code>)</h3>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">head_first</span><span class="p">:</span>
+    <span class="n">g</span> <span class="o">=</span> <span class="n">s</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:,</span> <span class="kc">None</span><span class="p">]</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span><span class="n">q</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">q</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="n">q</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">])</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+</code></pre></div>
+
+<p><strong>人话解释：</strong>
+刚才算出来的 <code>s</code> 只是一个长度为 <code>n_heads</code> 的一维向量（每个头对应一个衰减值）。
+但是，输入的 Q/K/V 是三维的张量 <code>(Batch_Size, n_heads, Sequence_Length)</code>。</p>
+<p>为了能让它们进行矩阵运算，我们需要把 <code>s</code> <strong>广播（Expand）</strong> 成和 Q 一样的形状。
+*   这就好比：我要给全班同学发试卷，但我只有一张母版，所以我需要复印（Expand）成 50 份，发给每个人。</p>
+<p>这里的 <code>g</code> 代表 <strong>Gate（门控）</strong>，也就是告诉模型每一步要“遗忘”多少信息。</p>
+<hr />
+<h3>🟢 Step 5: 搞懂“偷懒”写法 (调用 <code>simple_gla</code>)</h3>
+<p>最后一行代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">return</span> <span class="n">fused_recurrent_simple_gla</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">g</span><span class="o">=</span><span class="n">g</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>人话解释：</strong>
+这个库的作者非常聪明，他发现 <strong>RetNet 其实是 GLA（Gated Linear Attention，门控线性注意力）的一个特例</strong>。</p>
+<ul>
+<li><strong>GLA</strong>: 是一种通用的架构，它的“遗忘门” <code>g</code> 是由神经网络根据输入内容动态计算出来的（即数据不同，遗忘速度不同）。</li>
+<li><strong>RetNet</strong>: 它的“遗忘门”是<strong>固定</strong>的（由 Step 3 的公式算出），与输入内容无关，只与头的编号有关。</li>
+</ul>
+<p><strong>结论：</strong>
+作者没有重写一遍 RetNet 的底层 CUDA 代码，而是直接算好了 RetNet 专属的固定的 <code>g</code>，然后扔给了通用的 <code>simple_gla</code> 函数去执行。这是一种代码复用（Wrapper）的写法。</p>
+<hr />
+<h3>📝 总结</h3>
+<p>这段代码在讲什么？</p>
+<ol>
+<li><strong>它是一个包装器（Wrapper）</strong>：它本身不干重活。</li>
+<li><strong>它定义了 RetNet 的规则</strong>：它根据 RetNet 的论文公式，计算出了特殊的、固定的衰减系数 <code>s</code>。</li>
+<li><strong>它转换了格式</strong>：把衰减系数转成了对数形式的 <code>g</code>。</li>
+<li><strong>它借用了工具</strong>：把算好的参数传给 <code>fused_recurrent_simple_gla</code>，利用现成的通用算子来完成计算。</li>
+</ol>
+<p><strong>一句话概括：</strong>
+这段代码通过构造一组特定的、固定的衰减参数，把通用的“简单门控线性注意力（Simple GLA）”算子，伪装成了“RetNet”算子来使用。</p>

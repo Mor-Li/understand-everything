@@ -1,0 +1,108 @@
+<h1>fla/ops/nsa/naive.py</h1>
+<p>这份代码实现了一个名为 <strong>NSA (Native Sparse Attention)</strong> 的注意力机制的“朴素”（Naive）版本。所谓的“朴素”版本，意味着它是用纯 Python 循环写的，主要用于验证逻辑正确性，而不是为了跑得快（跑得快的版本通常是用 CUDA 写的）。</p>
+<p>NSA 的核心思想是：<strong>我不看所有的历史 Token，我只看根据索引（Indices）选出来的几个“块”（Block）里的 Token。</strong></p>
+<p>为了让你看懂，我把阅读这份代码拆解成 <strong>5 个任务（Task List）</strong>，我们一步步来完成。</p>
+<hr />
+<h3>📝 任务清单 (Task Todo List)</h3>
+<ol>
+<li><strong>Task 1: 理解输入数据的角色 (尤其是 <code>indices</code>)</strong></li>
+<li><strong>Task 2: 理解 GQA 扩展 (让 K/V 数量对齐 Q)</strong></li>
+<li><strong>Task 3: 核心逻辑 —— 从“块索引”到“Token 索引”的转换</strong></li>
+<li><strong>Task 4: 数据抓取 (Gather) —— 只拿需要的数据</strong></li>
+<li><strong>Task 5: 计算注意力 (Attention) —— 也就是最终的算术题</strong></li>
+</ol>
+<hr />
+<h3>🔍 详细步骤讲解</h3>
+<h4>✅ Task 1: 理解输入数据的角色</h4>
+<p>首先看函数的参数，这是理解一切的基础。</p>
+<ul>
+<li><strong><code>q</code> (Query):</strong> 当前我想查的信息。</li>
+<li><strong><code>k</code>, <code>v</code> (Key, Value):</strong> 历史记忆库。</li>
+<li><strong><code>indices</code> (重点!):</strong> 这是 NSA 的灵魂。<ul>
+<li><strong>普通 Attention:</strong> 会看之前所有的 $K$ 和 $V$。</li>
+<li><strong>NSA:</strong> 并不是看所有，而是通过 <code>indices</code> 告诉你：“嘿，对于当前的 Query，你去查第 5 个块、第 8 个块和第 10 个块的数据。”</li>
+</ul>
+</li>
+<li><strong><code>block_size</code>:</strong> 告诉代码一个“块”里有多少个 Token（默认 64）。</li>
+</ul>
+<p><strong>代码对应:</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这里的 indices 形状是 [B, T, H, S]</span>
+<span class="c1"># S 是选了多少个块 (Selected blocks)</span>
+</code></pre></div>
+
+<h4>✅ Task 2: 理解 GQA 扩展 (让 K/V 数量对齐 Q)</h4>
+<p>现在很多模型使用 <strong>GQA (Grouped Query Attention)</strong>，意思是 Query 的头数（Heads）比 Key/Value 的头数多。比如 Q 有 32 个头，K/V 只有 4 个头。为了能计算，我们需要把 K/V 复制几遍，让它们的头数和 Q 一样多。</p>
+<p><strong>代码对应:</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 计算复制倍数 G</span>
+<span class="n">G</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">//</span> <span class="n">k</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> 
+
+<span class="c1"># repeat 函数把 k, v, indices 里的 Head 维度复制 G 倍</span>
+<span class="c1"># 比如从 4 个头变成 32 个头，方便后面一对一计算</span>
+<span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">indices</span> <span class="o">=</span> <span class="p">(</span><span class="n">repeat</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="s1">&#39;b t h d -&gt; b t (h g) d&#39;</span><span class="p">,</span> <span class="n">g</span><span class="o">=</span><span class="n">G</span><span class="p">)</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="p">(</span><span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">indices</span><span class="p">))</span>
+</code></pre></div>
+
+<p><strong>观点:</strong> 这一步只是为了数据形状对齐，属于预处理。</p>
+<h4>✅ Task 3: 核心逻辑 —— 从“块索引”到“Token 索引”</h4>
+<p>这是这份代码最难懂、也是最核心的地方。
+<code>indices</code> 存的是<strong>块的 ID</strong>（比如第 2 块），但计算 Attention 需要具体的<strong>Token ID</strong>（比如第 128 到 191 个词）。</p>
+<p>我们需要把“块 ID”翻译成“Token 位置”。</p>
+<p><strong>代码对应:</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># i_b 原本是块的编号 (Block ID)</span>
+<span class="c1"># BS 是 block_size (比如 64)</span>
+
+<span class="c1"># 这一步公式： Token_ID = Block_ID * 64 + (0...63)</span>
+<span class="c1"># unsqueeze(-1) 和 range(BS) 的配合，把每个块 ID 炸开成了 64 个具体的 Token 位置</span>
+<span class="n">i_b</span> <span class="o">=</span> <span class="n">i_b</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">BS</span> <span class="o">+</span> <span class="n">i_b</span><span class="o">.</span><span class="n">new_tensor</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">BS</span><span class="p">))</span>
+
+<span class="c1"># 变形后，i_b 里面装的就是所有我们需要去“看”的具体 Token 的下标了</span>
+</code></pre></div>
+
+<p><strong>观点:</strong> NSA 并不是随机稀疏，它是以 Block 为单位的稀疏。这一步就是在通过 Block ID 还原出具体的 Token 坐标。</p>
+<h4>✅ Task 4: 数据抓取 (Gather) —— 只拿需要的数据</h4>
+<p>因为是“朴素”实现，代码这里用了一个非常慢的 <code>for</code> 循环，一个 Token 一个 Token 地处理序列（<code>range(T)</code>）。</p>
+<p>在循环内部，对于每一个时刻的 Query (<code>q_i</code>)，我们需要去 K 和 V 里面把 Task 3 里算出来的那些 Token 抓出来。</p>
+<p><strong>代码对应:</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">for</span> <span class="n">i_q</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">T</span><span class="p">):</span> <span class="c1"># 遍历每一个时间步</span>
+    <span class="c1"># ...</span>
+    <span class="c1"># i_i 是当前这一步需要关注的 Token 下标</span>
+
+    <span class="c1"># gather: 从 k_b (所有的 Key) 中，根据 i_i (下标) 抓取出特定的 Key</span>
+    <span class="c1"># 结果 k_i 的长度不再是整个序列长度 T，而是 S * Block_Size (选中的那一点点数据)</span>
+    <span class="n">k_i</span><span class="p">,</span> <span class="n">v_i</span> <span class="o">=</span> <span class="nb">map</span><span class="p">(</span><span class="k">lambda</span> <span class="n">x</span><span class="p">:</span> <span class="n">x</span><span class="o">.</span><span class="n">gather</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="o">...</span><span class="p">),</span> <span class="p">(</span><span class="n">k_b</span><span class="p">,</span> <span class="n">v_b</span><span class="p">))</span>
+</code></pre></div>
+
+<p><strong>观点:</strong> 这就是<strong>Sparse (稀疏)</strong> 的体现。虽然显存里存了很长的 K 和 V，但我只把其中一小部分拿出来参与计算。</p>
+<h4>✅ Task 5: 计算注意力 (Attention)</h4>
+<p>数据都准备好了：
+*   <code>q_i</code>: 当前的一个 Query。
+*   <code>k_i</code>, <code>v_i</code>: 刚刚抓取出来的、一小撮相关的 Key 和 Value。</p>
+<p>现在就是标准的 Attention 公式：$\text{Softmax}(Q \cdot K^T) \cdot V$。</p>
+<p><strong>代码对应:</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 计算 Q 和 K 的相似度 (点积)</span>
+<span class="c1"># einsum(&#39;h d, n h d -&gt; n h&#39;) 意思是 Query(Head, Dim) * Key(Num_Selected, Head, Dim)</span>
+<span class="n">attn</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">einsum</span><span class="p">(</span><span class="s1">&#39;h d, n h d -&gt; n h&#39;</span><span class="p">,</span> <span class="n">q_i</span><span class="p">,</span> <span class="n">k_i</span><span class="p">)</span>
+
+<span class="c1"># 2. Masking (遮罩)</span>
+<span class="c1"># 必须确保我们不看“未来”的 Token (Causal Masking)</span>
+<span class="c1"># 如果选中的 Token 下标 (i_i) 大于当前时间 (i_q)，就填负无穷大</span>
+<span class="n">attn</span> <span class="o">=</span> <span class="n">attn</span><span class="o">.</span><span class="n">masked_fill</span><span class="p">(</span><span class="n">i_i</span> <span class="o">&gt;</span> <span class="n">i_q</span><span class="p">,</span> <span class="nb">float</span><span class="p">(</span><span class="s1">&#39;-inf&#39;</span><span class="p">))</span>
+
+<span class="c1"># 3. Softmax 归一化</span>
+<span class="n">attn</span> <span class="o">=</span> <span class="n">attn</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+
+<span class="c1"># 4. 乘以 V 得到输出</span>
+<span class="c1"># einsum(&#39;n h, n h v -&gt; h v&#39;) 加权求和</span>
+<span class="n">output</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">einsum</span><span class="p">(</span><span class="s1">&#39;n h, n h v -&gt; h v&#39;</span><span class="p">,</span> <span class="n">attn</span><span class="p">,</span> <span class="n">v_i</span><span class="p">)</span>
+</code></pre></div>
+
+<hr />
+<h3>💡 总结 (TL;DR)</h3>
+<p>这份代码其实就在干一件事：</p>
+<ol>
+<li><strong>输入:</strong> 给定一句话，和一张“藏宝图”（<code>indices</code>，告诉每个词该去关注哪些块）。</li>
+<li><strong>翻译:</strong> 把“藏宝图”里的块坐标，翻译成具体的每一个词的坐标。</li>
+<li><strong>提取:</strong> 拿着坐标去巨大的历史记录（K/V）里，只把相关的词抠出来。</li>
+<li><strong>计算:</strong> 只对这抠出来的一小部分词算 Attention，而不是对所有人算。</li>
+</ol>
+<p><strong>为什么要这么做？</strong>
+因为如果序列超级长（比如 100万 context），对所有人算 Attention 显存会爆炸且速度极慢。NSA 通过只算 <code>indices</code> 指定的那几个块，大大降低了计算量。这个 <code>naive.py</code> 只是为了演示这个逻辑，真正的加速在于 CUDA 版本如何高效地并行完成 Task 3 和 Task 4。</p>

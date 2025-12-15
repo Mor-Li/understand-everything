@@ -1,0 +1,77 @@
+<h1>fla/modules/layernorm.py</h1>
+<p>这份代码确实比较硬核，因为它不仅仅是写神经网络层，而是涉及到了<strong>底层GPU加速（Triton语言）</strong>和<strong>分布式训练</strong>。</p>
+<p>简单来说，这个文件的核心目的是：<strong>为了让大模型（如Llama, Mamba）跑得更快、更省显存，重新手写了“归一化层”（LayerNorm / RMSNorm）。</strong></p>
+<p>我为你列了一个<strong>学习任务清单 (To-Do List)</strong>，把这个文件拆解成 5 个步骤，带你一步步看懂它的核心观点。</p>
+<hr />
+<h3>📋 任务清单：一步步读懂 <code>layernorm.py</code></h3>
+<h4>✅ Task 1: 搞懂“它在算什么？” (基础概念)</h4>
+<p><strong>目标</strong>：理解代码里的数学逻辑，即 LayerNorm 和 RMSNorm 是干嘛的。</p>
+<ul>
+<li><strong>观点</strong>：<ul>
+<li>代码里有两个参考函数 <code>layer_norm_ref</code> 和 <code>rms_norm_ref</code>。它们是用来做“对齐”的，也就是标准答案。</li>
+<li><strong>LayerNorm</strong>: 把输入减去均值（Mean），除以标准差（Std），再乘以缩放参数（Weight）加偏置（Bias）。</li>
+<li><strong>RMSNorm</strong>: 省略了“减去均值”这一步，直接除以均方根。这是现在大模型（如 Llama）常用的，因为计算量更小，效果差不多。</li>
+<li><strong>Residual (残差连接)</strong>: 这里的代码不仅做归一化，还顺手把 <code>x + residual</code> (残差相加) 给做了。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 搞懂“为什么要重写？” (核心动机)</h4>
+<p><strong>目标</strong>：理解为什么不用 PyTorch 自带的 <code>nn.LayerNorm</code>。</p>
+<ul>
+<li><strong>观点</strong>：<ul>
+<li><strong>IO 瓶颈</strong>：在 GPU 上，计算通常很快，但把数据从显存搬进搬出很慢。</li>
+<li><strong>算子融合 (Kernel Fusion)</strong>：<ul>
+<li>普通做法：<code>读取数据 -&gt; 加残差 -&gt; 存数据</code> (第一步)，然后 <code>读取数据 -&gt; 算均值方差 -&gt; 归一化 -&gt; 存数据</code> (第二步)。这里存取了两次。</li>
+<li><strong>这份代码的做法</strong>：<code>读取数据 -&gt; 加残差 -&gt; 算均值方差 -&gt; 归一化 -&gt; 存数据</code>。<strong>全部在一个内核（Kernel）里一次性做完</strong>。</li>
+</ul>
+</li>
+<li>这就是代码里 <code>layer_norm_fwd_kernel</code> (前向传播) 和 <code>layer_norm_bwd_kernel</code> (反向传播) 存在的意义：<strong>极致的性能优化</strong>。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 拆解“核心引擎” (Triton Kernels)</h4>
+<p><strong>目标</strong>：理解 <code>@triton.jit</code> 装饰的那两个长函数在干嘛。</p>
+<ul>
+<li><strong><code>layer_norm_fwd_kernel</code> (前向传播核心)</strong>：<ol>
+<li><strong>加载数据</strong>：根据 <code>HAS_RESIDUAL</code> 决定要不要把残差数据也读进来。</li>
+<li><strong>即时计算</strong>：读进来的瞬间，直接执行 <code>x = x + residual</code>。</li>
+<li><strong>统计</strong>：计算这一行数据的均值 (Mean) 和方差 (Var)。如果是 RMSNorm，就不算 Mean。</li>
+<li><strong>归一化</strong>：执行 <code>(x - mean) / sqrt(var + eps)</code>。</li>
+<li><strong>输出</strong>：把结果写回显存。</li>
+</ol>
+</li>
+<li><strong><code>layer_norm_bwd_kernel</code> (反向传播核心)</strong>：<ul>
+<li>这是训练时用的，计算梯度。它利用了 Triton 的并行能力，手动计算微积分里的链式法则，为了省显存，它甚至支持 <strong>Recompute (重计算)</strong>，即不保存前向传播的结果，反向时再算一遍，用时间换空间。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 理解“封装与接口” (PyTorch Function)</h4>
+<p><strong>目标</strong>：看懂 <code>LayerNormFunction</code> 和 <code>LayerNormLinearFunction</code>。</p>
+<ul>
+<li><strong>观点</strong>：<ul>
+<li>Triton 写出来的内核是底层的，PyTorch 没法直接用。</li>
+<li><code>LayerNormFunction</code> 是一个适配器。它继承自 <code>torch.autograd.Function</code>。</li>
+<li><strong>Forward</strong>: 调用刚才写的 Triton 前向内核。</li>
+<li><strong>Backward</strong>: 调用 Triton 反向内核。</li>
+<li><strong>亮点 - <code>LayerNormLinear</code></strong>: 这是一个更高级的融合。它不仅融合了残差+归一化，还试图把紧接着的 <strong>Linear 层（全连接层）</strong> 的部分计算也考虑进来（虽然代码里主要是在 Backward 阶段利用了 Linear 的特性来优化内存）。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 搞懂“并行扩展” (Parallelism)</h4>
+<p><strong>目标</strong>：看懂最后的 <code>NormParallel</code> 类。</p>
+<ul>
+<li><strong>观点</strong>：<ul>
+<li>现在的模型太大（比如 70B 参数），单张显卡放不下。</li>
+<li><code>DeviceMesh</code> 和 <code>DTensor</code> 是 PyTorch 的分布式张量概念。</li>
+<li>这个类是为了支持 <strong>序列并行 (Sequence Parallelism)</strong>。简单说，就是把一句话切成好几段，分给不同的显卡算 Norm，最后再拼起来。这个类负责处理如何在多张卡之间切分（Shard）和复制（Replicate）参数。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这篇文章到底在讲啥？</h3>
+<p><strong>一句话总结</strong>：
+这是一个<strong>高性能、支持残差融合、支持 RMSNorm、支持分布式训练</strong>的归一化层实现，专门为大语言模型（LLM）的高效训练而设计。</p>
+<p><strong>你应该关注的重点</strong>：
+1.  <strong>Fusion (融合)</strong>：它把 <code>Residual Add</code> + <code>LayerNorm</code> + <code>Linear(部分)</code> 捏在一起算了，省了显存带宽。
+2.  <strong>Triton</strong>: 它用 Triton 语言重写了 CUDA 核心逻辑，比 PyTorch 原生实现更快（特别是在处理 hidden size &lt; 8k 的时候）。
+3.  <strong>Memory Efficient</strong>: 它非常在意显存的使用，甚至为了省显存愿意在反向传播时重算数据。</p>

@@ -1,0 +1,118 @@
+<h1>verl/models/mcore/loader.py</h1>
+<p>这份代码确实比较晦涩，因为它处理的是<strong>分布式大模型训练中最麻烦的部分之一：权重加载（Weight Loading）</strong>。</p>
+<p>简单来说，这个文件的任务是：<strong>把一个完整的模型权重文件（通常是 HuggingFace 格式），“切碎”并塞进已经被分布在多张显卡上的 Megatron 模型里。</strong></p>
+<p>因为 Megatron-LM 使用了<strong>模型并行（Tensor Parallelism, TP）</strong>和<strong>流水线并行（Pipeline Parallelism, PP）</strong>，模型不是完整存在一张卡上的，而是像拼图一样散落在不同显卡里。所以不能直接 <code>load_state_dict</code>，必须一边读权重，一边切分，一边分发。</p>
+<p>下面我为你列一个 <strong>“权重分发大队的工作清单（To-Do List）”</strong>，带你一步步看懂在这个代码里发生了什么。</p>
+<hr />
+<h3>📋 任务清单：从单机权重到分布式模型</h3>
+<h4>第一阶段：准备工作（谁负责什么？）</h4>
+<ol>
+<li><strong>[定位]</strong> 搞清楚当前显卡是谁（Rank几？），属于哪个并行组（TP组？PP组？）。</li>
+<li><strong>[制图]</strong> 制定一张“藏宝图”（<code>_megatron_calc_layer_map</code>）：计算全局第 N 层 Transformer Layer 到底存放在哪张显卡（Pipeline Rank）的哪个位置。</li>
+<li><strong>[拆包]</strong> 只有“总指挥”（通常是 Global Rank 0）负责读取完整的权重字典（<code>state_dict</code>），其他显卡等着接收数据，不要重复读硬盘。</li>
+</ol>
+<h4>第二阶段：核心循环（开始分发）</h4>
+<ol>
+<li><strong>[分发] Embedding 层</strong>：把词向量表切分或广播给对应的显卡。</li>
+<li><strong>[分发] Transformer 层（循环 N 次）</strong>：<ul>
+<li><strong>LayerNorm</strong>：直接广播（大家参数一样）。</li>
+<li><strong>QKV Attention</strong>：这是难点。要把 Q、K、V 的权重矩阵切开（TP切分），分给不同的显卡。</li>
+<li><strong>MLP (Gate/Up/Down Proj)</strong>：同样要把巨大的全连接层矩阵切开分发。</li>
+</ul>
+</li>
+<li><strong>[分发] Final LayerNorm</strong>：处理最后一层的归一化参数。</li>
+<li><strong>[分发] LM Head / Value Head</strong>：处理最后的输出层（生成词的概率或打分）。</li>
+</ol>
+<h4>第三阶段：收尾</h4>
+<ol>
+<li><strong>[同步]</strong> 确保所有显卡都拿到了属于自己的那部分数据。</li>
+<li><strong>[清理]</strong> 清空缓存，结束计时。</li>
+</ol>
+<hr />
+<h3>🔍 详细步骤解析（对应代码逻辑）</h3>
+<p>现在我们结合代码，逐步拆解上面的清单：</p>
+<h4>1. 制图：<code>_megatron_calc_layer_map</code></h4>
+<ul>
+<li><strong>代码位置</strong>：文件开头的函数。</li>
+<li><strong>在干嘛</strong>：如果你的模型有 32 层，分成了 4 个流水线阶段（PP=4）。那么：<ul>
+<li>GPU 0 负责第 0-7 层。</li>
+<li>GPU 1 负责第 8-15 层...以此类推。</li>
+</ul>
+</li>
+<li>这个函数就是生成这个映射关系：<code>全局第10层 -&gt; 属于 PP_Rank_1 的第 2 层</code>。</li>
+</ul>
+<h4>2. 定义分发工具：Helper Functions</h4>
+<p>在 <code>load_state_dict_to_megatron_gptmodel</code> 内部，定义了几个非常重要的内部函数（闭包），用来处理不同类型的张量：</p>
+<ul>
+<li>
+<p><strong><code>_broadcast_tensor</code></strong>：</p>
+<ul>
+<li><strong>场景</strong>：处理不需要切分的参数（比如 LayerNorm 的 gamma/beta，或者 Bias）。</li>
+<li><strong>动作</strong>：Rank 0 拿着数据，大喊一声（<code>dist.broadcast</code>），所有同一组的显卡都把数据抄下来。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>_broadcast_tp_shard_tensor</code></strong>：</p>
+<ul>
+<li><strong>场景</strong>：处理普通的线性层（Linear），需要按行或按列切分。</li>
+<li><strong>动作</strong>：Rank 0 先把大矩阵切成几块（<code>torch.chunk</code>），然后把第 1 块发给 TP Rank 0，第 2 块发给 TP Rank 1...</li>
+</ul>
+</li>
+<li>
+<p><strong><code>_broadcast_tp_shard_tensor_qkv</code></strong>（最复杂）：</p>
+<ul>
+<li><strong>场景</strong>：处理 Attention 的 Query, Key, Value 权重。</li>
+<li><strong>动作</strong>：因为 Q、K、V 通常在权重文件里是拼在一起的，或者是分头（Heads）存储的。这里需要精细地把它们拆开，保证每张卡拿到的 Attention Head 是完整的且正确的。代码里写了一大堆逻辑来处理 <code>num_query_groups</code> 和 <code>hidden_size</code> 的对齐问题。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>_broadcast_tp_shard_tensor_gate_up</code></strong>：</p>
+<ul>
+<li><strong>场景</strong>：处理 LLaMA/Mistral 架构中的 MLP 层（Gate proj 和 Up proj 通常是合并计算的）。</li>
+<li><strong>动作</strong>：把 Gate 和 Up 权重拼接后再切分，分发给各张卡。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 执行分发循环（主逻辑）</h4>
+<p>代码从 <code>if dp_rank == 0:</code> 开始进入正题：</p>
+<ul>
+<li>
+<p><strong>加载 Embeddings</strong>：
+    调用 <code>_broadcast_tp_shard_tensor_vocab</code>。因为词表很大（比如 32000 或 100000+），一张卡存不下，所以每张卡只存一部分词向量。</p>
+</li>
+<li>
+<p><strong>加载 Transformer Layers (For Loop)</strong>：
+    代码遍历 <code>range(config.num_hidden_layers)</code>。</p>
+<ul>
+<li>利用第一步做的“地图”，判断当前这层是不是归我管 (<code>if dst_pp_rank == pp_rank</code>)。</li>
+<li>如果归我管，就等着接收数据；如果不归我管，就跳过（但因为是广播机制，实际上是在通信组里配合占位）。</li>
+<li>依次加载：<ol>
+<li><code>input_layernorm</code></li>
+<li><code>self_attn</code> (Q, K, V, O) -&gt; <strong>用到 QKV 切分函数</strong></li>
+<li><code>post_attention_layernorm</code></li>
+<li><code>mlp</code> (Gate, Up, Down) -&gt; <strong>用到 Gate/Up 切分函数</strong></li>
+</ol>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>加载 LM Head (输出层)</strong>：</p>
+<ul>
+<li>如果是 <strong>Value Model</strong>（比如 PPO 里的 Critic 模型），输出通常是一个标量（维度为1），逻辑稍微不同，代码里有专门的 <code>if is_value_model:</code> 判断。</li>
+<li>如果是普通生成模型，则按 TP 切分加载。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 最后的同步</h4>
+<ul>
+<li><code>dist.barrier()</code>：大家停下来报数，确保没有人掉队。</li>
+<li><code>broadcast_params(wrapped_model)</code>：这步是为了处理 <strong>Data Parallel (DP)</strong>。<ul>
+<li>刚才的过程主要是在处理 TP 和 PP（把模型切碎）。</li>
+<li>如果还有 DP（比如有 8 张卡，4 张卡存一个模型副本，另外 4 张卡存一模一样的另一个副本），那么刚才只加载了第一个副本。</li>
+<li>这一步把加载好的权重，从第一个副本直接复制到所有其他的 DP 副本中。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这篇文章的观点（或者说核心逻辑）是：</p>
+<p><strong>不要让每张显卡都去读硬盘上的权重文件（太慢且显存会爆）。让 Rank 0 读入内存，然后像“切蛋糕”分给孩子们一样，根据每个人在模型并行组里的位置，精准地把属于它的那一片权重“投喂”过去。</strong></p>

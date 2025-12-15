@@ -1,0 +1,137 @@
+<h1>tests/utils/test_linear_cross_entropy_tp.py</h1>
+<p>这份代码是一个<strong>单元测试（Unit Test）</strong>文件。</p>
+<p>简单来说，它的目的是为了验证一个<strong>自定义的高性能算子（Kernel）</strong>是否写对了，并且测试它比普通的PyTorch写法快多少、省多少显存。</p>
+<p>这个算子的名字叫 <code>linear_cross_entropy</code>，它是专门为<strong>大模型训练中的“张量并行（Tensor Parallelism, TP）”</strong>场景设计的。</p>
+<p>为了让你听懂，我把背景知识先拆解一下，然后列一个 Task List，最后一步步带你看代码。</p>
+<hr />
+<h3>0. 背景知识（小白版）</h3>
+<ol>
+<li>
+<p><strong>Linear + Cross Entropy 是什么？</strong></p>
+<ul>
+<li>这是大语言模型（LLM）的“最后一层”。</li>
+<li><strong>Linear（线性层）</strong>：把模型的隐藏状态（Hidden States）映射到词表大小（比如 10万个词），算出每个词的打分（Logits）。</li>
+<li><strong>Cross Entropy（交叉熵）</strong>：计算这些打分和真实标签（Labels）之间的误差（Loss），用来更新模型。</li>
+<li>通常这两个步骤是分开算的，但为了快，我们常把它们合并在一起算（Fused）。</li>
+</ul>
+</li>
+<li>
+<p><strong>TP（张量并行）是什么？</strong></p>
+<ul>
+<li>LLM 的词表很大（比如 15万），Linear 层的权重矩阵非常大，单张显卡放不下或者算得慢。</li>
+<li><strong>TP</strong> 就是把这个大矩阵切成几块，分给不同的显卡（GPU）去算。每张卡只算一部分，最后大家把结果拼起来。</li>
+</ul>
+</li>
+<li>
+<p><strong>这个文件的目的：</strong></p>
+<ul>
+<li>开发者写了一个自定义的 CUDA 算子 <code>verl.utils.kernel.linear_cross_entropy</code>，号称能支持 TP，而且又快又省显存。</li>
+<li><strong>测试任务</strong>：必须证明这个新算子算出来的结果，和用原生 PyTorch 算出来的结果<strong>一模一样</strong>（数学上正确），且确实更快。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>1. 逻辑流程 Task List</h3>
+<p>要把这个测试跑通，代码内部其实执行了这样一个“任务清单”：</p>
+<ul>
+<li>
+<p><strong>Step 1: 环境准备 (Setup)</strong></p>
+<ul>
+<li>[ ] 启动多张显卡（模拟分布式环境）。</li>
+<li>[ ] 确定测试规模（Batch Size 是多少，词表多大）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 2: 制造数据 (Data Generation)</strong></p>
+<ul>
+<li>[ ] 随机生成一些假的输入数据（Hidden states, Weights, Labels）。</li>
+<li>[ ] 保证所有显卡拿到的输入数据在逻辑上是匹配的。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3: 建立“标准答案” (Baseline)</strong></p>
+<ul>
+<li>[ ] 用纯 PyTorch 的原生函数，手写一个带 TP 功能的逻辑（虽然慢，但逻辑肯定是即对的）。</li>
+<li>[ ] 算出 Forward（前向传播）的 Loss 和 Entropy。</li>
+<li>[ ] 算出 Backward（反向传播）的梯度（Gradients）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 4: 运行“待测对象” (Test Target)</strong></p>
+<ul>
+<li>[ ] 运行那个自定义的 <code>linear_cross_entropy</code> 算子。</li>
+<li>[ ] 同样算出 Forward 结果和 Backward 梯度。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 5: 核心对比 (Verify)</strong></p>
+<ul>
+<li>[ ] <strong>比对数值</strong>：检查 Step 3 和 Step 4 的结果是否几乎一样（误差极小）。</li>
+<li>[ ] <strong>比对性能</strong>：记录两者的时间（Latency）和显存占用（Memory），打印出来炫耀一下提升了多少。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>2. 逐步代码解读</h3>
+<p>现在我们对照上面的 List，来看看代码里具体是怎么写的。</p>
+<h4>1. 核心工具：制造“标准答案”的类</h4>
+<p>代码中定义了一个 <code>class TorchEntropyTP(torch.autograd.Function)</code>。
+*   <strong>作用</strong>：这是用慢速但稳健的 PyTorch 原生代码实现的参考版。
+*   <strong>Forward 函数</strong>：
+    *   <code>logits = torch.matmul(...)</code>: 先做矩阵乘法。
+    *   <code>dist.all_gather(...)</code>: <strong>关键点</strong>。因为是 TP 模式，每张卡只算了一部分 Logits，这里通过网络通信，把所有卡的结果收集起来，拼成完整的 <code>whole_logits</code>。
+    *   <code>cross_entropy(...)</code>: 在完整的 Logits 上算 Loss。
+*   <strong>Backward 函数</strong>：
+    *   手动推导了梯度的计算公式，用来模拟反向传播。</p>
+<h4>2. 测试主类：<code>TestLinearCrossEntropy_TensorParallel</code></h4>
+<p>这个类控制了整个测试流程。</p>
+<p><strong>Step 1: 环境准备</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="n">dist</span><span class="o">.</span><span class="n">init_process_group</span><span class="p">(</span><span class="n">backend</span><span class="o">=</span><span class="s2">&quot;nccl&quot;</span><span class="p">)</span> <span class="c1"># 初始化分布式环境</span>
+    <span class="c1"># ...</span>
+</code></pre></div>
+
+<p>这里它初始化了多卡通信，因为 TP 必须在多卡下跑。</p>
+<p><strong>Step 2: 制造数据</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">generate_hyper</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="c1"># 定义了5种不同的测试配置（不同的 BatchSize, 词表大小等）</span>
+    <span class="c1"># ...</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">generate_forward_inputs</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="c1"># 随机生成 hidden, weight, labels</span>
+    <span class="c1"># ...</span>
+</code></pre></div>
+
+<p><strong>Step 3 &amp; 4 &amp; 5: 验证正确性 (<code>verify_kernel_correctness</code>)</strong>
+这是最核心的函数。</p>
+<ul>
+<li><strong>同步数据</strong>：
+    <code>python
+    dist.broadcast(hidden, ...) # 保证所有显卡用的输入是一样的</code></li>
+<li><strong>跑标准答案 (Torch)</strong>：
+    <code>python
+    (torch_logprobs, torch_entropy) = run_torch_entropy_tp(...)</code>
+    这里调用了上面那个手写的 <code>TorchEntropyTP</code>。</li>
+<li><strong>跑新算子 (Kernel)</strong>：
+    <code>python
+    from verl.utils.kernel import linear_cross_entropy
+    (kernel_logprobs, kernel_entropy) = linear_cross_entropy(...)</code>
+    这里调用了我们要测试的那个 C++/CUDA 优化的算子。</li>
+<li><strong>比对结果 (Assert)</strong>：
+    <code>python
+    torch.testing.assert_close(torch_logprobs, kernel_logprobs, ...)</code>
+    如果这两个结果不一样，程序就会报错（测试失败）。</li>
+<li><strong>比对反向传播 (Backward)</strong>：
+    同样的逻辑，通过 <code>torch.autograd.grad</code> 算出梯度，然后对比 <code>torch_d_hidden</code> 和 <code>kernel_d_hidden</code> 是否一致。</li>
+</ul>
+<p><strong>Step 6: 检查显存 (<code>check_kernel_storage</code>)</strong>
+*   代码中分别运行了 <code>check_torch_storage</code> 和 <code>check_kernel_storage</code>。
+*   使用 <code>torch.cuda.max_memory_allocated()</code> 来统计运行过程中显存的峰值。
+*   通常自定义 Kernel 会因为减少了中间变量的存储（Re-computation 或者 Fusion），显存占用会比 PyTorch 原生写法低很多。</p>
+<h3>总结</h3>
+<p>这篇文章的观点（或者说这个测试文件的结论）是：</p>
+<ol>
+<li><strong>正确性</strong>：我们新写的 <code>linear_cross_entropy</code> 算子，在数学上和 PyTorch 原生的逻辑是等价的（通过了 <code>assert_close</code> 测试）。</li>
+<li><strong>性能</strong>：虽然代码里没有直接写结论，但运行这个脚本后，控制台会打印出 <code>Time</code> 和 <code>Memory</code> 的对比。通常预期是：新算子速度更快，显存占用更小。</li>
+</ol>
+<p><strong>一句话总结：这是一个质检员，用来确保那个为了大模型训练加速而写的“黑科技”算子，算得对，而且算得快。</strong></p>

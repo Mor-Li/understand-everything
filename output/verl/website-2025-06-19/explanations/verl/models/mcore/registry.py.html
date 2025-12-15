@@ -1,0 +1,82 @@
+<h1>verl/models/mcore/registry.py</h1>
+<p>这份代码其实是一个<strong>“大管家”</strong>或者说是<strong>“调度中心”</strong>。</p>
+<p>它的核心作用是：<strong>把 Hugging Face (HF) 格式的模型，转换并适配到 Megatron-Core (Mcore) 的高性能训练框架中去。</strong></p>
+<p>因为不同的模型（比如 Llama, Qwen, Mixtral）结构不同，处理方式也不同，所以需要一个统一的地方来管理这些差异。</p>
+<p>为了让你听懂，我把“加载并运行一个大模型”这个过程拆解成一个 <strong>Task List (任务清单)</strong>。这个文件里的代码，就是为了完成这个清单上的每一项任务而存在的。</p>
+<hr />
+<h3>📝 任务清单：如何把一个 HF 模型搬进 Mcore 运行？</h3>
+<p>假设你现在手里有一个 Hugging Face 的模型（比如 Llama-3），你想用 Megatron-Core 来训练它。你需要按顺序做下面这 5 件事：</p>
+<h4>✅ Task 1: 身份查验 (Check In)</h4>
+<p><strong>“你是谁？我们支持你吗？”</strong></p>
+<ul>
+<li><strong>问题</strong>：系统得知道你传入的 <code>LlamaForCausalLM</code> 到底是个什么东西，系统里有没有对应的处理方案。</li>
+<li><strong>代码对应</strong>：<ul>
+<li><code>SupportedModel</code> (枚举类)：这是“白名单”，列出了所有支持的 VIP 客户（Llama, Qwen, Deepseek 等）。</li>
+<li><code>get_supported_model</code> (函数)：这是“门卫”。你给它一个字符串名字，它告诉你这是否在白名单里。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 翻译说明书 (Translate Config)</h4>
+<p><strong>“把 HF 的参数配置，翻译成 Mcore 能看懂的格式。”</strong></p>
+<ul>
+<li><strong>问题</strong>：Hugging Face 的配置文件（<code>config.json</code>）和 Megatron-Core 需要的配置格式是不一样的。比如 HF 叫 <code>num_attention_heads</code>，Mcore 可能需要特定的对象结构。</li>
+<li><strong>代码对应</strong>：<ul>
+<li><code>MODEL_CONFIG_CONVERTER_REGISTRY</code> (字典)：这是一个查找表。<ul>
+<li>如果你是 Llama -&gt; 用 <code>hf_to_mcore_config_dense</code> 翻译。</li>
+<li>如果你是 Mixtral -&gt; 用 <code>hf_to_mcore_config_mixtral</code> 翻译。</li>
+</ul>
+</li>
+<li><code>hf_to_mcore_config</code> (函数)：执行翻译动作的工人。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 搭建骨架 (Build Architecture)</h4>
+<p><strong>“根据图纸，把模型的层（Layer）搭起来。”</strong></p>
+<ul>
+<li><strong>问题</strong>：Llama 是稠密模型（Dense），Mixtral 是混合专家模型（MoE）。它们的网络结构代码是不一样的。我们需要实例化正确的 PyTorch 模型类。</li>
+<li><strong>代码对应</strong>：<ul>
+<li><code>MODEL_INITIALIZER_REGISTRY</code> (字典)：这是施工队分配表。<ul>
+<li>Llama -&gt; 派 <code>DenseModel</code> 团队去搭建。</li>
+<li>Qwen2_MoE -&gt; 派 <code>Qwen2MoEModel</code> 团队去搭建。</li>
+</ul>
+</li>
+<li><code>init_mcore_model</code> (函数)：这是包工头，负责调用上面的团队，把模型真正 <code>new</code> 出来。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 规定思考方式 (Define Forward Pass)</h4>
+<p><strong>“数据进来了，该怎么走？”</strong></p>
+<ul>
+<li><strong>问题</strong>：模型搭建好了，数据输入进去后，是先做 Attention 还是先做 MLP？多模态模型（如 Qwen2-VL）的处理流程和纯文本模型不一样。</li>
+<li><strong>代码对应</strong>：<ul>
+<li><code>MODEL_FORWARD_REGISTRY</code> (字典)：这是操作手册库。<ul>
+<li>普通 LLM -&gt; 用 <code>gptmodel_forward</code>（通用流程）。</li>
+<li>视觉模型 -&gt; 用 <code>gptmodel_forward_qwen2_5_vl</code>（特殊流程）。</li>
+</ul>
+</li>
+<li><code>get_mcore_forward_fn</code> (函数)：取出对应的操作手册给你。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 搬运物资 (Convert Weights)</h4>
+<p><strong>“把训练好的参数存下来，或者把 HF 的参数读进来。”</strong></p>
+<ul>
+<li><strong>问题</strong>：Megatron-Core 训练完保存的权重切分方式（Tensor Parallel）和 Hugging Face 的不一样。需要一个转换器来互相转换。</li>
+<li><strong>代码对应</strong>：<ul>
+<li><code>MODEL_WEIGHT_CONVERTER_REGISTRY</code> (字典)：搬运工名单。</li>
+<li><code>get_mcore_weight_converter</code> (函数)：找到对应的搬运工。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结一下</h3>
+<p>这个 <code>registry.py</code> 文件本身<strong>不写具体的算法</strong>（不写 Attention 怎么算，不写 Layer 怎么初始化），它只是一个<strong>中介</strong>。</p>
+<p>它通过 4 个大的字典（Registry），把 <strong>“模型名字”</strong> 和 <strong>“处理该模型的具体工具”</strong> 绑定在一起：</p>
+<ol>
+<li><strong>Config 转换器</strong> (HF -&gt; Mcore)</li>
+<li><strong>模型初始化器</strong> (怎么建模型)</li>
+<li><strong>Forward 函数</strong> (怎么跑模型)</li>
+<li><strong>权重转换器</strong> (怎么存取参数)</li>
+</ol>
+<p><strong>为什么要这么写？</strong>
+为了<strong>解耦</strong>。如果明天你想支持一个新的模型（比如 <code>GPT-5</code>），你只需要写好它的 Config、Model、Forward 代码，然后在这个文件里注册一下（加一行代码），整个系统就能支持 <code>GPT-5</code> 了，而不需要改动核心训练代码。</p>

@@ -1,0 +1,99 @@
+<h1>tests/unit_tests/dist_checkpointing/test_fully_parallel.py</h1>
+<p>这份代码是 <strong>Megatron-LM</strong>（NVIDIA 开发的大模型训练框架）中的一个<strong>单元测试文件</strong>。</p>
+<p>它的核心目的是测试一种<strong>“完全并行（Fully Parallel）”的模型保存与加载策略</strong>。</p>
+<p>简单来说，在大模型训练中，模型参数非常大，分布在很多张 GPU 上。如果让每张 GPU 都去保存自己的那部分数据，或者让 Rank 0（主节点）一个人保存所有数据，效率都很低或者会内存溢出。这个策略的目的是：<strong>智能地分配任务，让不同的 GPU 负责保存/加载不同的数据块，从而达到负载均衡，并节省内存。</strong></p>
+<p>为了让你听懂，我把阅读这份代码的过程拆解成一个 <strong>Task Todo List</strong>，我们一步一步来完成。</p>
+<hr />
+<h3>Task List: 逐步解析 <code>test_fully_parallel.py</code></h3>
+<h4>✅ Task 1: 理解基础概念（什么是 Mock 和 ShardedTensor？）</h4>
+<p>在看逻辑之前，先看代码里用到的基础工具。</p>
+<ol>
+<li><strong><code>ShardedTensor</code></strong>:<ul>
+<li>这是 Megatron 中用来表示“切片张量”的类。比如一个大矩阵被切成了 8 份放在 8 张 GPU 上，每一份就是一个 <code>ShardedTensor</code>。</li>
+<li>代码中的 <code>get_sharded_state_dict</code> 方法就是为了造一堆<strong>假数据</strong>（模拟模型参数），用来测试。</li>
+</ul>
+</li>
+<li><strong><code>MockSaveStrategy</code> / <code>MockLoadStrategy</code></strong>:<ul>
+<li><strong>Mock</strong> 意为“模拟”。这两个类继承了真实的保存/加载策略，但<strong>没有真正把文件写到硬盘上</strong>。</li>
+<li>它们的作用是：记录一下“<strong>我是 Rank X，我被分配了保存哪些 Tensor 的任务</strong>”。</li>
+<li>这样测试的时候，只需要检查“谁领到了什么任务”，而不用真的去读写磁盘。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 2: 理解测试数据的分布 (<code>get_sharded_state_dict</code>)</h4>
+<p>这是整个测试的地基。我们需要搞清楚在这个测试里，数据长什么样。
+代码模拟了 8 张卡（World Size 8, 假设 TP=2, DP=4 这样的结构），创建了以下几种典型的数据：</p>
+<ul>
+<li><strong><code>sd_keyB</code></strong>: 这是一个完全切分的数据。<strong>每一张 GPU 上都有独特的一部分</strong>（<code>coverage=1</code>）。<ul>
+<li><em>潜台词：</em> 这个必须大家都参与保存，因为每个人的数据都不一样。</li>
+</ul>
+</li>
+<li><strong><code>sd_key_TP_repl1</code> / <code>repl2</code></strong>: 这是张量并行（TP）的数据。<ul>
+<li><em>潜台词：</em> 同一个 TP 组内数据不同，但不同的 DP 组之间数据是重复的。这意味着有冗余，不需要所有人都保存。</li>
+</ul>
+</li>
+<li><strong><code>sd_keyD</code> / <code>C</code> / <code>E</code></strong>: 这是完全复制的数据（比如 LayerNorm 的参数，通常所有卡上都一样，或者只在 DP 组间复制）。<ul>
+<li><em>潜台词：</em> 这些数据冗余度最高，只需要挑几个人保存就行了，其他人不用干活。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 核心逻辑 —— 谁来存？ (<code>test_save_distribution</code>)</h4>
+<p>这是代码中最难懂也是最核心的部分。
+<strong>测试目标</strong>：验证系统是否按“最优策略”分配了保存任务。</p>
+<p>这个“最优策略”的算法逻辑写在注释里了：
+1.  <strong>Lowest coverage (覆盖率最低优先)</strong>: 如果一个数据大家都不一样（比如 <code>keyB</code>），那没得选，必须存。优先级最高。
+2.  <strong>Largest tensor (大张量优先)</strong>: 同样是冗余数据，先把大的分配出去，防止某一张卡最后处理太多大文件累死。
+3.  <strong>Shard id (ID 排序)</strong>: 兜底规则，按名字排。</p>
+<p><strong>代码行为解读：</strong>
+*   <code>if not parallelization_along_dp</code>: 如果不在 DP 组内并行（即全局并行），代码断言（Assert）：
+    *   <code>keyB</code>: <code>range(Utils.world_size)</code> -&gt; <strong>所有人</strong>都要存（因为每个人手里的 <code>keyB</code> 都不一样）。
+    *   <code>keyD</code>: <code>[4]</code> -&gt; Rank 4 负责存 <code>keyD</code>（因为 <code>keyD</code> 最大，Rank 4 被选中干苦力）。
+    *   <code>keyC</code>: <code>[5]</code> -&gt; Rank 5 负责存 <code>keyC</code>。
+    *   <code>key_TP_repl1</code>: <code>[0, 1]</code> -&gt; 这两个 Rank 负责存 TP 切片。
+*   <strong>结论</strong>：这个测试就是为了确认：<strong>系统是不是真的按照“谁闲着谁干活、数据越大越先分”的原则把任务分下去了。</strong></p>
+<h4>✅ Task 4: 核心逻辑 —— 谁来取？ (<code>test_load_distribution</code>)</h4>
+<p>保存是为了加载。加载的逻辑和保存类似，但方向相反。
+*   <code>test_load_distribution</code> 测试的是：当我想读取 checkpoint 时，是不是也能智能分配读取任务，然后通过网络把数据分发给需要的人。
+*   逻辑与保存几乎一致，确保加载任务也是负载均衡的。</p>
+<h4>✅ Task 5: 内存防爆测试 (<code>test_memory_usage</code>)</h4>
+<p>大模型加载最怕什么？<strong>OOM (Out Of Memory)</strong>。
+如果加载策略写得烂，可能会先把整个大模型读到一张卡的内存里，然后再分发，这会导致显存瞬间爆炸。</p>
+<p><strong>代码行为解读：</strong>
+1.  定义了一个 <code>ParallelLoadWithMemUsage</code> 类，它在每次分配张量时记录 <code>torch.cuda.memory_allocated()</code>（当前显存占用）。
+2.  创建了一堆 4MB 大小的张量。
+3.  执行加载操作 <code>load_strategy.load(...)</code>。
+4.  <strong>关键断言</strong>：
+    <code>python
+    assert max(mem_alloc) - mem_alloc_start &lt; 4.01 * megabytes</code>
+    这句话的意思是：<strong>在加载过程中，显存的峰值增量，不能超过“一个张量”的大小（约 4MB）。</strong>
+5.  <strong>结论</strong>：这证明了该策略是<strong>流式（Streaming）</strong>处理的或者是<strong>原地（In-place）</strong>处理的，处理完一个释放一个，而不是把所有东西都堆在内存里。</p>
+<hr />
+<h3>总结：文中观点的通俗解释</h3>
+<p>这就好比 <strong>8 个人（8个 GPU）</strong> 要一起搬家（保存/加载模型）：</p>
+<ol>
+<li>
+<p><strong>分类整理（Get Sharded State Dict）</strong>：</p>
+<ul>
+<li>有些家具是每个人私有的（比如牙刷 <code>keyB</code>），每个人必须自己搬。</li>
+<li>有些家具是大家共用的，而且一模一样买了 8 份（比如客厅同款椅子 <code>keyD</code>）。</li>
+</ul>
+</li>
+<li>
+<p><strong>分配任务（Save/Load Distribution）</strong>：</p>
+<ul>
+<li>为了不累死某一个人，队长（算法）决定：</li>
+<li>那 8 把一模一样的椅子，虽然每人房里都有，但我们只需要搬 <strong>1 把</strong> 到新家，到了新家再照着买或者复制就行。</li>
+<li>于是队长指派：Rank 4，你力气大，你负责搬椅子（<code>keyD</code>）；Rank 5，你搬桌子（<code>keyC</code>）。</li>
+<li>其他人：你们不用搬椅子和桌子了，你们只负责搬自己的牙刷（<code>keyB</code>）。</li>
+<li><strong>代码里的 <code>test_save_distribution</code> 就是在检查这个分配名单对不对。</strong></li>
+</ul>
+</li>
+<li>
+<p><strong>检查体力（Memory Usage）</strong>：</p>
+<ul>
+<li>搬家过程中，不能让任何一个人手里的东西超过他能拿的极限。</li>
+<li>测试确保：每个人每次只拿一样东西，搬完了再拿下一个，绝对不能一次性抱起 10 个箱子（防止 OOM）。</li>
+</ul>
+</li>
+</ol>
+<p>这份代码就是为了保证这套“聪明搬家法”逻辑正确且不费力。</p>

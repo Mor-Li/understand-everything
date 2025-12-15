@@ -1,0 +1,53 @@
+<h1>tests/functional_tests/jet_recipes/local-generator.py</h1>
+<p>这份代码乍一看确实有点绕，因为它用了不少“元编程”的技巧（比如 <code>eval</code> 和 <code>re</code> 正则表达式），而且涉及到了任务调度（Slurm/Sbatch）。</p>
+<p>简单来说，这是一个 <strong>“脚本批量生成器”</strong>。</p>
+<p>它的核心作用是：<strong>读取一个配置文件（YAML），根据里面的参数组合，自动生成一大堆可以在服务器上运行的 Shell 脚本。</strong></p>
+<p>为了让你听得懂，我把这个代码执行的过程拆解成一个 <strong>5步走的 Task List（任务清单）</strong>，我们假装自己是这个程序，一步步看它在干嘛：</p>
+<hr />
+<h3>📝 Task 1: 进货 —— 读取原材料 (YAML)</h3>
+<p><strong>对应代码：</strong> <code>main</code> 函数开头部分
+<strong>在干什么：</strong>
+程序首先打开你指定的 YAML 文件（<code>src_yaml</code>）。这个文件就像是一个“菜谱”，里面定义了两样东西：
+1.  <strong><code>spec</code> (基础模板)</strong>：不管是做什么菜，都需要的基础步骤（比如“由 Python 运行...”）。
+2.  <strong><code>products</code> (变量组合)</strong>：这是重点。比如你想测试 3 种模型大小，2 种学习率。</p>
+<h3>🔄 Task 2: 排列组合 —— 生成所有可能的测试方案</h3>
+<p><strong>对应代码：</strong> <code>itertools.product(*prod.values())</code>
+<strong>在干什么：</strong>
+这是整个脚本最核心的逻辑。
+假设你的 YAML 里写了：
+*   模型: [A, B]
+*   GPU数量: [1, 8]</p>
+<p>程序会做一个“笛卡尔积”（Cartesian Product），自动生成 $2 \times 2 = 4$ 种组合：
+1.  (模型A, 1卡)
+2.  (模型A, 8卡)
+3.  (模型B, 1卡)
+4.  (模型B, 8卡)</p>
+<p><strong>目的：</strong> 这样你就不用手写 4 个脚本了，它帮你自动遍历所有情况。</p>
+<h3>✍️ Task 3: 填空题 —— 替换模板中的变量</h3>
+<p><strong>对应代码：</strong> <code>eval_name</code> 和 <code>save_script</code> 中的 <code>re.findall</code>, <code>re.sub</code>, <code>eval</code>
+<strong>在干什么：</strong>
+现在程序手里拿到了一组具体的参数（比如：模型A，1卡）。它手里还有一个“填空题”模板（即 YAML 里的 <code>script</code> 字段）。</p>
+<p>模板长这样（举例）：
+<code>python train.py --model {model_name} --gpus {gpu_count}</code></p>
+<p>程序会利用 Python 的 <code>eval</code> 功能，把 <code>{model_name}</code> 替换成 <code>A</code>，把 <code>{gpu_count}</code> 替换成 <code>1</code>。
+<strong>结果变成：</strong>
+<code>python train.py --model A --gpus 1</code></p>
+<p>同时，它还会根据参数给这个脚本起个名字（<code>eval_name</code> 函数），比如叫 <code>test_modelA_gpu1.sh</code>。</p>
+<h3>📦 Task 4: 包装 —— 决定脚本格式 (Bash vs Sbatch)</h3>
+<p><strong>对应代码：</strong> <code>save_script</code> 中的 <code>if format == 'sbatch': ...</code>
+<strong>在干什么：</strong>
+程序会看你运行命令时加的 <code>--format</code> 参数。
+*   <strong>如果是 <code>bash</code></strong>：它直接把你刚才生成的命令写入文件。
+*   <strong>如果是 <code>sbatch</code></strong>：这是为了在超算集群（Slurm）上跑任务用的。它会把你的命令“包装”一下，塞进那个 <code>SBATCH_TEMPLATE</code> 里。
+    *   这个模板里包含了 <code>srun</code> 命令，还会自动挂载 NVIDIA 的 Docker 镜像路径 (<code>nvcr.io/...</code>)。</p>
+<h3>💾 Task 5: 出货 —— 保存文件</h3>
+<p><strong>对应代码：</strong> <code>with open(...) as f: f.write(...)</code>
+<strong>在干什么：</strong>
+最后一步很简单，把处理好的内容写入到 <code>--save_dir</code> 指定的目录里（默认为 <code>./scripts</code>）。
+最终你会得到一堆 <code>.sh</code> 文件，每一个文件对应 Task 2 中生成的一种测试组合。</p>
+<hr />
+<h3>总结：它到底解决了什么问题？</h3>
+<p><strong>没有这个脚本时：</strong>
+你想测 Megatron-LM 在不同参数下的表现，你需要手动复制粘贴 10 个 <code>.sh</code> 文件，然后一个个进去改参数（改学习率、改模型层数、改数据路径...），非常容易出错且累人。</p>
+<p><strong>有了这个脚本后：</strong>
+你只需要写 <strong>1 个</strong> YAML 配置文件，列出你想测的所有参数列表。运行这个 Python 脚本，它瞬间帮你生成那 10 个（甚至 100 个）对应的 <code>.sh</code> 启动脚本，并且帮你把文件名都起好了。</p>

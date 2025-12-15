@@ -1,0 +1,60 @@
+<h1>megatron/legacy/model/t5_model.py</h1>
+<p>这份代码确实比较硬核，因为它不仅仅是一个 T5 模型，它是 <strong>NVIDIA Megatron-LM</strong> 框架下的 T5 模型。这意味着它里面塞满了为了让模型在<strong>多张显卡上并行训练</strong>（Model Parallelism）而设计的逻辑。</p>
+<p>为了让你读懂它，我们把“构建并运行这个 T5 模型”想象成一个<strong>项目任务清单 (Todo List)</strong>。我们按照逻辑顺序，一步步把这个文件拆解开。</p>
+<hr />
+<h3>🛠️ 任务清单：构建 Megatron T5 模型</h3>
+<h4>✅ Task 1: 准备数据处理工具 (Helper Functions)</h4>
+<p>在模型真正开始计算之前，我们需要先把输入的数据整理好。
+*   <strong>代码位置</strong>: <code>t5_extended_attention_mask</code> 和 <code>t5_position_ids</code> 函数。
+*   <strong>原理解析</strong>:
+    *   <strong>Attention Mask (注意力掩码)</strong>: T5 是 Transformer 架构，需要 Mask 来告诉模型“哪些词是填充的(padding)不要看”或者“后面的词不要偷看”。<code>t5_extended_attention_mask</code> 就是把输入的 mask 变成模型需要的 4 维形状 <code>[b, 1, s, s]</code>。
+    *   <strong>Position IDs (位置编码)</strong>: 模型不认识文字的先后顺序，<code>t5_position_ids</code> 给每个词生成一个序号（0, 1, 2...），告诉模型谁在前谁在后。</p>
+<h4>✅ Task 2: 制造“输出层” (The LM Head)</h4>
+<p>模型计算完后，得到的是一堆抽象的数字（Hidden States），我们需要把它变成字典里每个词的概率。
+*   <strong>代码位置</strong>: <code>class T5LMHead(MegatronModule)</code>
+*   <strong>原理解析</strong>:
+    *   这是一个线性层（Linear Layer），通常叫 LM Head。
+    *   <strong>难点 (Megatron 特色)</strong>: 注意看 <code>self.bias.model_parallel = True</code>。这意味着这个层的参数（Bias）是被<strong>切分</strong>存储在不同显卡上的。如果词表有 50000 个词，用了 2 张卡，每张卡可能只负责计算 25000 个词的概率。这就是<strong>张量并行 (Tensor Parallelism)</strong>。</p>
+<h4>✅ Task 3: 组装模型主体 (T5Model Init)</h4>
+<p>这是核心部分，我们要把 T5 的 Encoder（编码器）和 Decoder（解码器）搭起来。
+*   <strong>代码位置</strong>: <code>class T5Model</code> -&gt; <code>__init__</code>
+*   <strong>原理解析</strong>:
+    *   <strong>流水线并行 (Pipeline Parallelism)</strong>: 你会看到 <code>pre_process</code> (预处理) 和 <code>post_process</code> (后处理) 这两个开关。
+        *   如果你的模型巨大，需要跨 4 张卡部署（卡1-&gt;卡2-&gt;卡3-&gt;卡4）。
+        *   <strong>卡1</strong> 会开启 <code>pre_process=True</code>（负责把词变成向量），关闭 <code>post_process</code>。
+        *   <strong>卡4</strong> 会关闭 <code>pre_process</code>，开启 <code>post_process=True</code>（负责算 Loss）。
+        *   中间的卡全关。这就是为什么代码里到处都在判断这两个布尔值。
+    *   <strong>获取骨架</strong>: <code>get_language_model(...)</code> 这一行代码调用了底层的 Transformer 模块，生成了 T5 的核心骨架。
+    *   <strong>挂载输出层</strong>: 如果当前显卡负责最后一步 (<code>if self.post_process and self.add_decoder</code>)，就实例化 Task 2 中定义的 <code>T5LMHead</code>。</p>
+<h4>✅ Task 4: 定义数据流向 (Forward Pass)</h4>
+<p>模型建好了，现在要定义数据怎么流过这个模型。
+*   <strong>代码位置</strong>: <code>def forward(...)</code>
+*   <strong>步骤分解</strong>:
+    1.  <strong>整理输入</strong>: 调用 Task 1 的工具，处理 Mask 和 Position IDs。
+    2.  <strong>跑骨架</strong>: <code>self.language_model(...)</code>。这一步把输入扔进 Transformer 层，得到 <code>lm_output</code>（通常是 Decoder 的输出）。
+    3.  <strong>判断身份</strong>:
+        *   <strong>情况 A (我是中间层)</strong>: 直接返回输出给下一张卡。
+        *   <strong>情况 B (我是最后一张卡)</strong>: 进入 <code>if self.post_process...</code> 代码块。
+    4.  <strong>计算 Logits</strong>: <code>self.lm_head(...)</code> 把 Transformer 的输出变成词的预测分数。
+    5.  <strong>计算 Loss (损失)</strong>:
+        *   如果有 <code>lm_labels</code>（真实标签），就计算交叉熵损失 (<code>tensor_parallel.vocab_parallel_cross_entropy</code>)。
+        *   这里又用到了并行计算 Loss 的技巧，不用把所有数据汇聚到一张卡上算，而是大家分摊计算。
+    6.  <strong>形状调整</strong>: 注意代码里有很多 <code>transpose(0,1)</code>，这是因为 Megatron 内部喜欢用 <code>[序列长度, batch, hidden]</code> 的形状，而外部通常用 <code>[batch, 序列长度, hidden]</code>，所以要转置一下。</p>
+<h4>✅ Task 5: 存档与读档 (Save/Load Checkpoint)</h4>
+<p>因为模型被切碎在不同显卡上，普通的 PyTorch 保存/加载方法行不通。
+*   <strong>代码位置</strong>: <code>state_dict_for_save_checkpoint</code> 和 <code>load_state_dict</code>
+*   <strong>原理解析</strong>:
+    *   这两个函数是为了手动管理保存的内容。
+    *   它会检查：我有 <code>language_model</code> 吗？我有 <code>lm_head</code> 吗？我有 <code>word_embeddings</code> 吗？
+    *   只有当前显卡拥有的部分，才会被写入字典保存下来。</p>
+<hr />
+<h3>总结：这篇文章到底讲了啥？</h3>
+<p>简单来说，这个文件就是<strong>把标准的 T5 模型拆解并改装，让它能跑在 Megatron-LM 分布式训练框架上</strong>。</p>
+<p><strong>核心观点/逻辑链：</strong>
+1.  <strong>T5 结构</strong>: 标准的 Encoder-Decoder 架构。
+2.  <strong>并行化改造</strong>:
+    *   <strong>切分参数</strong>: LM Head 的 Bias 是切分的。
+    *   <strong>切分流程</strong>: 通过 <code>pre_process</code> 和 <code>post_process</code> 支持把模型像香肠一样切几段放在不同 GPU 上（流水线并行）。
+    *   <strong>切分计算</strong>: Loss 的计算也是分布式的。
+3.  <strong>胶水代码</strong>: 处理 Mask、位置编码、以及输入输出形状的转置，确保数据能正确喂给底层的 Transformer 模块。</p>
+<p>现在你看代码里的 <code>if self.post_process</code> 或者 <code>parallel_output</code> 应该就能明白，这些都是为了<strong>多卡协作</strong>而存在的红绿灯。</p>

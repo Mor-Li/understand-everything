@@ -1,0 +1,60 @@
+<h1>tests/functional_tests/test_scripts/bert/pretrain_bert_distributed_test.sh</h1>
+<p>这份脚本确实看起来很复杂，因为它不仅仅是“跑一个模型”，而是一个<strong>自动化测试脚本</strong>。它的目的是在多张显卡上训练一个 BERT 模型，并验证训练过程是否符合预期（比如检查是否能从断点恢复，或者损失函数 Loss 是否达标）。</p>
+<p>为了让你容易理解，我们可以把这个脚本想象成一个<strong>“训练大队长”</strong>。他手里拿着一张清单（Todo List），按顺序执行一系列任务。</p>
+<p>下面就是这位“大队长”的 <strong>Task Todo List</strong>，我们一步步来看：</p>
+<hr />
+<h3>📋 Task 1: 接收并整理“上级指令” (参数解析)</h3>
+<p><strong>对应代码：</strong> 开头的 <code>for ARGUMENT in "$@"</code> 部分。
+*   <strong>动作：</strong> 脚本启动时，外部会传进来很多参数（比如 <code>MBS=4</code>, <code>NUM_NODES=2</code>）。
+*   <strong>目的：</strong> 大队长先把这些参数读进来，记在小本本上（环境变量），比如“每批次处理多少数据”、“用几个节点”。</p>
+<h3>📋 Task 2: 检查装备与默认设置 (环境初始化)</h3>
+<p><strong>对应代码：</strong> <code>if [[ -z $MBS ]]; then ...</code> 等判断语句。
+*   <strong>动作：</strong> 如果上级没给具体指令，大队长就用默认值。
+    *   如果没说 Micro Batch Size (MBS)，就默认设为 4。
+    *   如果没说词表文件在哪，就去默认路径找。
+    *   设定每个节点用 8 张显卡 (<code>GPUS_PER_NODE=8</code>)。</p>
+<h3>📋 Task 3: 确定“作战风格” (确定性与精度)</h3>
+<p><strong>对应代码：</strong> <code>ALLOW_NONDETERMINISTIC</code> 和 <code>USE_CORE</code> 部分。
+*   <strong>动作：</strong>
+    *   <strong>确定性模式：</strong> 如果要求结果必须可复现（每次跑结果完全一样），大队长会关闭一些为了速度但可能导致微小随机误差的算法 (<code>NCCL_ALGO=^NVLS</code>)。
+    *   <strong>新旧核心切换：</strong> 检查是否使用 <code>Megatron Core</code>（新架构）。如果是，就用 <code>bf16</code> 精度；如果用旧架构（Legacy），就用 <code>fp16</code> 精度。</p>
+<h3>📋 Task 4: 制定特殊任务：断点续练测试 (Checkpoint Resume)</h3>
+<p><strong>对应代码：</strong> <code>if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then ...</code>
+*   <strong>动作：</strong> 这是一个特殊的测试分支。如果开启了这个开关，大队长会想：“这次不是为了跑完，而是为了测试<strong>存盘和读盘</strong>功能是否正常。”
+*   <strong>调整：</strong> 他会强制把训练步数设为 100 步，并且频繁保存存档（每 50 步存一次）。</p>
+<h3>📋 Task 5: 撰写核心作战计划 (拼装 torchrun 命令)</h3>
+<p><strong>对应代码：</strong> <code>torch_run_cmd="torchrun ..."</code> 这一大段最长的代码。
+*   <strong>动作：</strong> 这是脚本的灵魂。大队长开始写那一长串的启动命令。
+*   <strong>关键参数解读：</strong>
+    *   <strong>模型规格：</strong> 24层 (<code>--num-layers</code>), 隐藏层1024 (<code>--hidden-size</code>) -&gt; 这是一个标准的 BERT Large 规模模型。
+    *   <strong>并行策略：</strong> 怎么切分模型？看 <code>$TP_SIZE</code> (张量并行) 和 <code>$PP_SIZE</code> (流水线并行)。
+    *   <strong>数据路径：</strong> 也就是 <code>$DATA_PATH</code> 和 <code>$VOCAB_FILE</code>。
+    *   <strong>监控：</strong> 把日志写到 TensorBoard 里，方便后续检查。</p>
+<h3>📋 Task 6: 微调 FP16 设置 (如果需要)</h3>
+<p><strong>对应代码：</strong> <code>if [[ "${TRAINING_DTYPE}" == "fp16" ]]; then ...</code>
+*   <strong>动作：</strong> 如果前面决定用 FP16 精度，为了防止数值溢出或为了兼容性，需要额外加一些环境变量参数（比如 <code>NVTE_APPLY_QK_LAYER_SCALING</code>）。</p>
+<h3>📋 Task 7: 正式执行任务 (Run!)</h3>
+<p><strong>对应代码：</strong> <code>eval $command</code> 以及之前的逻辑。
+*   <strong>动作：</strong>
+    *   <strong>普通模式：</strong> 直接运行上面拼好的命令。
+    *   <strong>断点续练模式（复杂）：</strong>
+        1.  先跑一次（跑满100步）。
+        2.  <strong>搞破坏：</strong> 删掉第 100 步的存档，把记录文件改写成“最新是第 50 步”。
+        3.  <strong>再跑一次：</strong> 强迫模型从第 50 步加载，看看能不能顺利接着练。
+*   <strong>执行：</strong> <code>eval $command</code> 这行代码才是真正按下“启动按钮”的时刻。</p>
+<h3>📋 Task 8: 收集战果 (数据提取)</h3>
+<p><strong>对应代码：</strong> <code>python3 .../get_test_results_from_tensorboard_logs.py ...</code>
+*   <strong>动作：</strong> 训练跑完了，大队长派出一个 Python 小助手去读取 TensorBoard 的日志文件，把关键指标（比如 Loss 值、吞吐量）提取出来存成 <code>results.json</code>。</p>
+<h3>📋 Task 9: 质量验收 (Pytest 验证)</h3>
+<p><strong>对应代码：</strong> 最后一段 <code>if [[ $SKIP_PYTEST != 1 ]]; then ...</code>
+*   <strong>动作：</strong> 最后一步质检。
+    *   如果是<strong>普通训练</strong>：对比这次跑出来的结果和“标准答案（Golden Values）”是否一致。如果 Loss 偏差太大，测试失败。
+    *   如果是<strong>断点续练</strong>：对比“第一次跑的后半程”和“恢复存档后跑的后半程”曲线是否完全重合。如果重合，说明断点续练功能完美。</p>
+<hr />
+<h3>总结</h3>
+<p>这个脚本其实就是<strong>为了自动化测试 Megatron-LM 框架下的 BERT 模型训练功能</strong>。</p>
+<p>它做了三件事：
+1.  <strong>配置环境</strong>（单机还是多机，FP16还是BF16）。
+2.  <strong>运行训练</strong>（正常跑，或者故意测试“暂停-恢复”）。
+3.  <strong>验证结果</strong>（用 Python 脚本自动检查 Loss 对不对）。</p>
+<p>你看不懂是因为它把很多“为了测试而写的逻辑”（比如那个断点续练的删除操作）和“真正训练的参数”混在一起了。希望这个 List 能帮你理清思路！</p>

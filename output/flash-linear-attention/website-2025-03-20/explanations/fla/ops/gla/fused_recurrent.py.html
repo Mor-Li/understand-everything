@@ -1,0 +1,89 @@
+<h1>fla/ops/gla/fused_recurrent.py</h1>
+<p>这段代码确实容易让人一头雾水，因为它涉及了<strong>线性注意力机制（Linear Attention）</strong>、<strong>RNN（循环神经网络）</strong>以及<strong>底层CUDA加速</strong>的接口封装。</p>
+<p>简单来说，这段代码是一个<strong>高性能的算子接口</strong>，用于执行 Gated Linear Attention (GLA) 的计算。</p>
+<p>为了帮你理解，我制定了一个<strong>“五步学习 To-Do List”</strong>。我们将从概念入手，最后看代码逻辑。</p>
+<hr />
+<h3>✅ Task 1: 理解核心背景 —— 什么是 "Gated Linear Attention (GLA)"?</h3>
+<p>在看代码前，先建立一个直观印象：
+*   <strong>传统的 Transformer (Attention):</strong> 计算量很大，因为每个 token 都要看之前所有的 token。
+*   <strong>RNN:</strong> 计算量小，因为它只维护一个“记忆状态”（Hidden State），读一个词，更新一下记忆，输出一个结果。
+*   <strong>GLA (本文的主角):</strong> 它试图结合两者的优点。它表面上是 Attention，但数学上可以写成 RNN 的形式。</p>
+<p><strong>这段代码在做什么？</strong>
+它在执行 GLA 的 <strong>RNN 模式</strong>（Recurrent Mode）。也就是像 RNN 一样，一步一步地读取输入，更新内部记忆状态，并产生输出。之所以叫 <code>fused</code>（融合），是因为它为了跑得快，把很多数学运算融合到底层（C++/CUDA）里一次性算完了，而不是用 Python 写循环。</p>
+<hr />
+<h3>✅ Task 2: 拆解输入食材 —— 参数都在干什么？</h3>
+<p>我们来看看函数 <code>fused_recurrent_gla</code> 需要哪些原材料（Args）：</p>
+<ol>
+<li><strong><code>q, k, v</code></strong>: 这是 Attention 机制的老三样（Query, Key, Value）。<ul>
+<li>你可以把它们想象成：<code>q</code>是当前的问题，<code>k</code>和<code>v</code>是过去的知识。</li>
+</ul>
+</li>
+<li><strong><code>gk, gv</code> (重点)</strong>: 这是 GLA 特有的 <strong>"Gates" (门控)</strong>。<ul>
+<li><strong>G</strong> 代表 Gate。</li>
+<li>在 RNN 里，我们需要决定“遗忘”多少过去的记忆。<code>gk</code> 和 <code>gv</code> 就是用来控制这个“遗忘率”的。它们决定了旧的 <code>k</code> 和 <code>v</code> 在记忆里保留多久。</li>
+</ul>
+</li>
+<li><strong><code>initial_state</code></strong>: 初始状态。<ul>
+<li>既然是 RNN 模式，就像接力跑，可能上一段文本处理完留下了一个“记忆”，现在接着用。如果没有，就是从零开始。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 3: 理解输出产品 —— Returns 是什么？</h3>
+<p>函数返回两个东西：
+1.  <strong><code>o</code> (Output)</strong>: 模型的输出结果。这是下一层网络需要的输入。
+2.  <strong><code>final_state</code></strong>: 最终状态。
+    *   把这段文本读完了，脑子里的“记忆”变成了什么样？把它存下来，处理下一段文本时可以用作 <code>initial_state</code>。</p>
+<hr />
+<h3>✅ Task 4: 逐行代码逻辑解析 —— 这个函数具体干了啥？</h3>
+<p>现在我们看代码内容。你会发现这个函数其实是一个<strong>“二道贩子” (Wrapper)</strong>，它自己不干重活，主要是整理数据，然后包给更底层的函数去做。</p>
+<p><strong>步骤分解：</strong></p>
+<ol>
+<li>
+<p><strong>检查变长序列 (<code>if cu_seqlens is not None:</code>)</strong>:</p>
+<ul>
+<li>有些时候，一个 batch 里的句子长度不一样（比如一句长，一句短）。</li>
+<li>代码在这里做检查：如果是变长模式，Batch Size 必须展平为 1，且不支持 <code>head_first</code> 模式。这是为了配合 FlashAttention 的数据格式。</li>
+</ul>
+</li>
+<li>
+<p><strong>自动设置缩放 (<code>if scale is None:</code>)</strong>:</p>
+<ul>
+<li>Attention 通常需要除以 $\sqrt{d_k}$ 来防止数值过大。</li>
+<li>代码：<code>scale = k.shape[-1] ** -0.5</code>。如果你没传 <code>scale</code>，它就自动帮你算好。</li>
+</ul>
+</li>
+<li>
+<p><strong>调用核心算子 (<code>fused_recurrent(...)</code>)</strong>:</p>
+<ul>
+<li><strong>这是最关键的一步！</strong></li>
+<li>它调用了 <code>from fla.ops.common.fused_recurrent import fused_recurrent</code>。</li>
+<li>注意看参数传递：它把 <code>gk</code> 和 <code>gv</code> 传进去了。</li>
+<li><strong>注意：</strong> 原通用的 <code>fused_recurrent</code> 接受一个通用的 <code>g</code> (decay)，但在 GLA 算法里，Key 和 Value 有各自独立的门控，所以这里专门传了 <code>gk</code> 和 <code>gv</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>返回结果</strong>:</p>
+<ul>
+<li>把算好的 <code>o</code> 和 <code>final_state</code> 丢回去。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 5: 总结与图解</h3>
+<p>为了彻底弄懂，你可以把这个函数想象成一个<strong>“记忆加工厂”</strong>的经理。</p>
+<ul>
+<li><strong>输入流 (Q, K, V)</strong>: 原材料源源不断送进来。</li>
+<li><strong>控制阀门 (GK, GV)</strong>: 经理手里的遥控器，决定哪些原材料存进仓库，哪些扔掉（遗忘）。</li>
+<li><strong>仓库 (State)</strong>: 存储当前积累的信息矩阵（形状是 $[H, K, V]$）。</li>
+<li><strong>工作流程</strong>:<ol>
+<li>经理检查订单（检查 <code>cu_seqlens</code> 格式对不对）。</li>
+<li>经理设定机器参数（计算 <code>scale</code>）。</li>
+<li>经理按下启动按钮（调用 <code>fused_recurrent</code> 底层算子）。</li>
+<li>机器一边读取 Q/K/V，一边根据 GK/GV 更新仓库，同时生产出产品 O。</li>
+<li>最后交货（返回 O）并盘点仓库（返回 final_state）。</li>
+</ol>
+</li>
+</ul>
+<h3>为什么这段代码“看不懂”？</h3>
+<p>因为它<strong>隐藏了数学公式</strong>。它没有写出 $h_t = g_t \odot h_{t-1} + k_t^T v_t$ 这样的公式，而是直接调用了编译好的 CUDA 算子。你只需要知道它的功能是：<strong>用 RNN 的方式高效计算带门控的线性注意力</strong> 即可。</p>

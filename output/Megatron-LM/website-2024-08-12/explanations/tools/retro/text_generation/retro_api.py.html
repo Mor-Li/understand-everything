@@ -1,0 +1,108 @@
+<h1>tools/retro/text_generation/retro_api.py</h1>
+<p>这个文件 <code>retro_api.py</code> 的核心作用是充当 <strong>“人类指令”</strong> 和 <strong>“庞大的 Retro AI 模型”</strong> 之间的 <strong>翻译官和调度员</strong>。</p>
+<p>Retro 是一种增强型的大模型，它不仅靠自己“背”下来的知识（参数），还能去“查资料”（检索邻居/Retrieval）。</p>
+<p>为了让你看懂，我把整个代码执行过程想象成一个 <strong>“任务清单 (Todo List)”</strong>。当你想让 AI 写东西时，这个文件就在后台默默执行以下 5 个主要步骤：</p>
+<hr />
+<h3>📝 任务清单 (Task Todo List)</h3>
+<ol>
+<li><strong>【同步信息】全员对齐：</strong> 确保所有的显卡（GPU）都知道我们要干什么。</li>
+<li><strong>【翻译输入】文本转数字：</strong> 把人类写的提示词（Prompt）转换成机器能懂的数字（Token），并整理整齐。</li>
+<li><strong>【准备外挂】整理检索资料：</strong> 处理 Retro 模型特有的“外挂资料库”（检索到的邻居信息）。</li>
+<li><strong>【执行生成】大脑运转：</strong> 启动模型核心，开始一个字一个字地往后写。</li>
+<li><strong>【翻译输出】数字转文本：</strong> 把模型生成的数字变回人类能看懂的文字，并清理格式。</li>
+</ol>
+<hr />
+<h3>🔍 逐步详细讲解</h3>
+<p>下面我结合代码片段，一步步给你讲这五个 Task 是怎么完成的。</p>
+<h4>Task 1: 【同步信息】全员对齐 (Synchronization)</h4>
+<p>在大型模型推理中，通常使用多张显卡（Rank 0, Rank 1...）。用户通常只把指令发给主卡（Rank 0），但所有卡都需要协同工作。</p>
+<ul>
+<li><strong>代码位置：</strong> <code>retro_generate</code> 函数开头。</li>
+<li><strong>发生了什么：</strong><ul>
+<li>主卡（Rank 0）拿到了参数（比如要生成多少字、温度系数是多少）。</li>
+<li>它通过 <code>broadcast</code>（广播）把这些参数发送给其他所有显卡。</li>
+<li><strong>目的：</strong> 防止 Rank 0 想生成 100 个字，而 Rank 1 以为只生成 50 个字，导致精神分裂（报错）。</li>
+</ul>
+</li>
+</ul>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 代码片段示意</span>
+<span class="n">values</span> <span class="o">=</span> <span class="p">[</span><span class="n">tokens_to_generate</span><span class="p">,</span> <span class="n">temperature</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="c1"># 把参数打包</span>
+<span class="n">values_float_tensor</span> <span class="o">=</span> <span class="n">broadcast_float_list</span><span class="p">(</span><span class="mi">10</span><span class="p">,</span> <span class="n">float_list</span><span class="o">=</span><span class="n">values</span><span class="p">)</span> <span class="c1"># 广播给所有显卡</span>
+</code></pre></div>
+
+<h4>Task 2: 【翻译输入】文本转数字 (Tokenization &amp; Batching)</h4>
+<p>模型看不懂中文或英文，只看得懂数字 ID。而且模型要求输入的长度必须整齐划一（矩阵）。</p>
+<ul>
+<li><strong>代码位置：</strong> <code>tokenize_prompts</code> 和 <code>_tokenize_prompts_and_batch</code> 函数。</li>
+<li><strong>发生了什么：</strong><ol>
+<li><strong>分词 (Tokenize)：</strong> 调用 <code>tokenizer</code> 把 "你好" 变成 <code>[123, 456]</code>。</li>
+<li><strong>补齐 (Padding)：</strong> 如果你一次发了两个句子，一句长一句短，代码会用空白符（EOD）把短的那句补长，让它们长度一致，变成一个整齐的方块（Tensor）。</li>
+<li><strong>再次广播：</strong> 处理好的数字矩阵，再次从 Rank 0 广播给所有显卡。</li>
+</ol>
+</li>
+</ul>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 代码片段示意</span>
+<span class="c1"># 把提示词变成数字列表</span>
+<span class="n">prompts_tokens</span> <span class="o">=</span> <span class="p">[</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">tokenize</span><span class="p">(</span><span class="n">prompt</span><span class="p">)</span> <span class="k">for</span> <span class="n">prompt</span> <span class="ow">in</span> <span class="n">prompts</span><span class="p">]</span>
+<span class="c1"># 计算最大长度，不足的补 EOD</span>
+<span class="n">prompt_tokens</span><span class="o">.</span><span class="n">extend</span><span class="p">([</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">eod</span><span class="p">]</span> <span class="o">*</span> <span class="n">padding_size</span><span class="p">)</span>
+<span class="c1"># 转换成 PyTorch 的 Tensor (张量)</span>
+<span class="n">prompts_tokens_tensor</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">LongTensor</span><span class="p">(</span><span class="n">prompts_tokens</span><span class="p">)</span>
+</code></pre></div>
+
+<h4>Task 3: 【准备外挂】整理检索资料 (Retro Specifics)</h4>
+<p>这是 <strong>Retro</strong> 模型特有的步骤。Retro 的特点是生成时会参考外部检索到的“邻居”（Neighbours）。</p>
+<ul>
+<li><strong>代码位置：</strong> <code>retro_generate</code> 函数中间部分。</li>
+<li><strong>发生了什么：</strong><ul>
+<li>代码接收一个 <code>neighbours_array</code>（检索到的相关文档数据）。</li>
+<li>它计算需要多少个“块”（Chunk），因为 Retro 是分块处理信息的。</li>
+<li>它把这些检索资料 <code>reshape</code>（变形）并 <code>repeat</code>（复制），整理成模型刚好能吃进去的形状 <code>(l, k, r)</code>。</li>
+</ul>
+</li>
+</ul>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 代码片段示意</span>
+<span class="c1"># 调整检索数据的形状，使其适配模型的输入层</span>
+<span class="n">neighbours_array</span> <span class="o">=</span> <span class="n">neighbours_array</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">repeat</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<h4>Task 4: 【执行生成】大脑运转 (Generation)</h4>
+<p>万事俱备，开始真正调用模型的神经网络进行计算。</p>
+<ul>
+<li><strong>代码位置：</strong> <code>retro_generate</code> 结尾调用的 <code>retro_generate_tokens_probs_and_return_on_first_stage</code>。</li>
+<li><strong>发生了什么：</strong><ul>
+<li>这是最核心的一步。它把刚才准备好的 <strong>提示词数字</strong> 和 <strong>检索资料</strong> 一起喂给模型。</li>
+<li>模型开始根据概率，一个接一个地“猜”下一个字是什么。</li>
+<li><strong>注意：</strong> 如果 <code>tokens_to_generate</code> 是 0，它就不生成，只是给你的输入打个分（Score）。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 5: 【翻译输出】数字转文本 (Post-processing)</h4>
+<p>模型吐出来了一堆新的数字列表，人类还是看不懂，需要转回去。</p>
+<ul>
+<li><strong>代码位置：</strong> <code>retro_generate_and_post_process</code> 函数。</li>
+<li><strong>发生了什么：</strong><ul>
+<li><strong>只在主卡处理：</strong> <code>if mpu.is_pipeline_first_stage():</code> 只有第一阶段的显卡负责最后的整理，避免重复劳动。</li>
+<li><strong>解码 (Detokenize)：</strong> 把生成的数字 <code>[123, 456, ...]</code> 变回文字字符串。</li>
+<li><strong>清理：</strong> 去掉补齐用的空白符，把输入和生成的内容拼接或者分段返回。</li>
+<li><strong>返回结果：</strong> 最终把人类可读的文本列表交还给用户。</li>
+</ul>
+</li>
+</ul>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 代码片段示意</span>
+<span class="c1"># 把生成的 token 变回文本</span>
+<span class="n">tokens</span><span class="p">,</span> <span class="n">prompts_plus_generations</span><span class="p">,</span> <span class="o">...</span> <span class="o">=</span> <span class="n">detokenize_generations</span><span class="p">(</span><span class="n">tokens</span><span class="p">,</span> <span class="n">lengths</span><span class="p">,</span> <span class="kc">True</span><span class="p">)</span>
+<span class="k">return</span> <span class="n">prompts_plus_generations</span> <span class="c1"># 返回最终结果</span>
+</code></pre></div>
+
+<hr />
+<h3>💡 总结</h3>
+<p>你可以把 <code>retro_api.py</code> 看作是一个 <strong>流水线经理</strong>：</p>
+<ol>
+<li><strong>接单</strong>（接收参数）。</li>
+<li><strong>开会</strong>（多显卡同步）。</li>
+<li><strong>备料</strong>（把文字切成 Token，把检索资料切好）。</li>
+<li><strong>加工</strong>（扔进模型跑计算）。</li>
+<li><strong>包装</strong>（把结果翻译回文字，打包送出）。</li>
+</ol>
+<p>所有的复杂逻辑（比如广播、Padding、Reshape）都是为了让那个挑剔的数学模型能顺利运行而不报错。</p>

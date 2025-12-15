@@ -1,0 +1,70 @@
+<h1>verl/models/README.md</h1>
+<p>这份文档其实是一份<strong>开发指南</strong>。它的核心目的是：<strong>教开发者如何把一个 HuggingFace 的模型（比如 Llama, Qwen）移植到 <code>verl</code> 这个高性能训练框架中。</strong></p>
+<p>简单来说，HuggingFace 的原版代码虽然好用，但不够快，也不容易在几百张显卡上并行训练。<code>verl</code> 想要像改装赛车一样，把原版模型“拆解”、“改装”，让它支持更高效的<strong>并行计算</strong>和<strong>数据输入方式</strong>。</p>
+<p>为了让你听懂，我把这个过程拆解成一个 <strong>“赛车改装 Todo List”</strong>，分五个阶段一步步讲：</p>
+<hr />
+<h3>第一阶段：准备原材料 (搬运)</h3>
+<p><strong>任务目标：</strong> 别从零写代码，先把现成的轮子拿过来。</p>
+<ul>
+<li><strong>Todo 1:</strong> 去 HuggingFace 的代码库里，找到你想要移植的模型文件（比如 <code>modeling_llama.py</code>）。</li>
+<li><strong>Todo 2:</strong> 把这个文件复制粘贴到 <code>verl</code> 的文件夹 (<code>verl/models/hf</code>) 下。<ul>
+<li><strong>解释：</strong> 我们需要原版模型的数学逻辑（比如它是怎么做加法乘法的），所以先复制过来作为底稿。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>第二阶段：做“手术” (改装核心引擎)</h3>
+<p><strong>任务目标：</strong> 原版代码里有很多为了“聊天”设计的功能（推理），但我们要的是“训练”和“极速”，所以要删减和修改。</p>
+<ul>
+<li><strong>Todo 3 (删除累赘):</strong> 删掉所有和 <code>kv cache</code> 相关的代码。<ul>
+<li><strong>解释：</strong> <code>kv cache</code> 是为了聊天时生成下一个字不卡顿用的。但在大规模训练或并行处理时，这个东西很碍事，我们需要纯粹的计算逻辑，所以删掉。</li>
+</ul>
+</li>
+<li><strong>Todo 4 (更换燃料接口):</strong> 修改模型的输入格式，改成 <strong>Packed Inputs（打包输入）</strong>。<ul>
+<li><strong>具体操作：</strong> 输入不再是一堆带有很多 <code>0</code> (padding) 的矩阵，而是变成紧凑的一长串数字。</li>
+<li><strong>你需要改用这三个参数：</strong><ol>
+<li><code>input_ids</code>: 所有数据拼成的一维长条。</li>
+<li><code>cu_seqlens</code>: 告诉模型，在这个长条里，第几个字到第几个字是第一句话，第几个是第二句话。</li>
+<li><code>max_seqlen</code>: 最长的那句话有多长。</li>
+</ol>
+</li>
+<li><strong>解释：</strong> 原版 HuggingFace 为了把长短不一的句子凑成一个方块矩阵，填了很多无效的 <code>0</code>。<code>verl</code> 嫌这浪费显存和算力，所以要把句子“首尾相连”拼起来算，这叫 Packed Inputs。这就要求必须使用 <strong>Flash Attention</strong>（一种极速的注意力算法）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>第三阶段：质量检测 (测试)</h3>
+<p><strong>任务目标：</strong> 刚才手术做太大了，得确认没把模型改坏。</p>
+<ul>
+<li><strong>Todo 5:</strong> 写一个测试脚本。</li>
+<li><strong>Todo 6:</strong> 让“改装后的模型”和“原版 HuggingFace 模型”跑同样的数据，对比输出结果。<ul>
+<li><strong>解释：</strong> 如果两者的输出数值一模一样（或者误差极小），说明你的改装是成功的，逻辑没变，只是变快了。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>第四阶段：加装涡轮增压 (并行化改造)</h3>
+<p><strong>任务目标：</strong> 单张显卡跑不动大模型，我们要让模型学会把任务分给多张显卡。</p>
+<ul>
+<li><strong>Todo 7 (张量并行 - Tensor Parallel):</strong> 按照 PyTorch 的官方文档，给模型添加“切分”功能。<ul>
+<li><strong>解释：</strong> 比如一个巨大的矩阵乘法，单卡算太慢。我们要把矩阵切成几块，分给 GPU1, GPU2, GPU3 同时算，最后再拼起来。这需要手动写代码告诉程序怎么切（Resharding）。</li>
+</ul>
+</li>
+<li><strong>Todo 8 (数据并行 - Data Parallel):</strong> 使用 FSDP2 (Fully Sharded Data Parallel) 接口。<ul>
+<li><strong>解释：</strong> 当你有几百张卡时，大家一起算不同的数据。FSDP 帮你把巨大的模型参数切碎了存在不同显卡里，省显存。这一步主要调用 PyTorch 现成的 API。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>第五阶段：未来科技 (流水线并行)</h3>
+<p><strong>任务目标：</strong> 如果模型大到连切分矩阵都放不下，就要把模型像香肠一样切成几段。</p>
+<ul>
+<li><strong>Todo 9 (流水线并行 - Pipeline Parallel):</strong> <em>（注：文档说这部分目前还在实验阶段）</em><ul>
+<li><strong>解释：</strong> 比如模型有 32 层，把前 16 层放在 GPU1，后 16 层放在 GPU2。数据像流水线一样流过。文档提示这需要 PyTorch 2.4+ 的新功能。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这篇文档就是在说：
+<strong>“别直接用 HuggingFace 的原生代码，太慢且不支持大集群。请你把代码复制过来，删掉推理用的缓存，改成紧凑的输入格式，然后手动加上多显卡切分计算的钩子（Hooks）。”</strong></p>

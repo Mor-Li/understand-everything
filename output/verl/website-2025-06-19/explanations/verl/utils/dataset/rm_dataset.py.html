@@ -1,0 +1,75 @@
+<h1>verl/utils/dataset/rm_dataset.py</h1>
+<p>这份代码确实涉及很多深度学习数据处理的细节。为了让你更容易理解，我们可以把这个 <code>RMDataset</code> 类想象成一个<strong>“流水线工厂”</strong>。</p>
+<p>这个工厂的目标是：<strong>为训练一个“奖励模型（Reward Model）”准备数据。</strong>
+<em>奖励模型的作用是判断：对于同一个问题，哪个回答更好，哪个回答更差。</em></p>
+<p>我们可以把这份代码的工作拆解成一张 <strong>TODO List（任务清单）</strong>，程序运行的时候就是在一步步打钩完成这些任务：</p>
+<hr />
+<h3>✅ Task 1：项目启动与配置 (初始化 <code>__init__</code>)</h3>
+<p>在工厂开工前，必须先定好规矩。
+*   <strong>代码位置</strong>：<code>__init__</code> 函数。
+*   <strong>要做的事</strong>：
+    1.  <strong>确定原材料清单</strong>：<code>parquet_files</code> 告诉程序数据文件在哪里（通常是类似 Excel 的表格文件）。
+    2.  <strong>雇佣翻译官</strong>：<code>tokenizer</code> 是分词器，它的作用是把人类的文字（"你好"）翻译成机器能懂的数字（[101, 233, ...]）。
+    3.  <strong>确定暗号</strong>：告诉程序，表格里哪一列是“问题”(<code>prompt</code>)，哪一列是“好回答”(<code>chosen</code>)，哪一列是“坏回答”(<code>rejected</code>)。
+    4.  <strong>设定规格</strong>：<code>max_length=1024</code>，规定每条数据最长不能超过 1024 个单位，太长要切掉，太短要补齐。</p>
+<h3>✅ Task 2：进货 (下载数据 <code>_download</code>)</h3>
+<p>原材料可能在云端（比如 S3 或 HDFS），需要先搬到本地仓库。
+*   <strong>代码位置</strong>：<code>_download</code> 和 <code>download_files_distributed</code> 函数。
+*   <strong>要做的事</strong>：
+    1.  <strong>防止拥挤</strong>：如果是多张显卡（分布式）一起训练，不能大家同时去下载，会把网挤爆。代码里写了逻辑：只有<strong>一号员工（Rank 0）</strong>去下载，其他员工原地等待（<code>barrier</code>）。
+    2.  <strong>搬运</strong>：把远程的文件复制到本地缓存目录 (<code>cache_dir</code>)。</p>
+<h3>✅ Task 3：拆箱验货 (读取文件 <code>_read_files_and_tokenize</code>)</h3>
+<p>货到了，要把箱子打开，把数据拿出来放到内存里备用。
+*   <strong>代码位置</strong>：<code>_read_files_and_tokenize</code> 函数。
+*   <strong>要做的事</strong>：
+    1.  <strong>读取表格</strong>：用 <code>pandas</code> 打开 parquet 文件。
+    2.  <strong>分类存放</strong>：把数据拆成三个大列表：
+        *   📜 <code>prompts</code>：所有的问题。
+        *   👍 <code>chosen_responses</code>：所有的优秀回答。
+        *   👎 <code>rejected_responses</code>：所有的糟糕回答。
+    *   <em>注：虽然函数名叫 tokenize，但实际上这一步它只读了文本，还没开始转数字。</em></p>
+<h3>✅ Task 4：按需加工 (获取单条数据 <code>__getitem__</code>)</h3>
+<p>这是流水线最核心的部分。当训练开始时，模型会喊：“给我一条数据！”工厂就得现场加工出一条。
+*   <strong>代码位置</strong>：<code>__getitem__</code> 函数。
+*   <strong>要做的事</strong>：
+    1.  <strong>抽取一组</strong>：根据编号 <code>item</code>，拿出一个问题、一个好回答、一个坏回答。
+    2.  <strong>翻译（Tokenization）</strong>：让翻译官（Tokenizer）把这三段文字变成数字 ID。
+    3.  <strong>加结束符</strong>：在回答的末尾加上一个“结束信号”（EOS token），告诉模型这句话讲完了。
+    4.  <strong>拼接（核心逻辑）</strong>：奖励模型需要看“问题+回答”。所以这里做了两次拼接：
+        *   <strong>正样本</strong> = 问题 ID + 好回答 ID
+        *   <strong>负样本</strong> = 问题 ID + 坏回答 ID</p>
+<h3>✅ Task 5：统一尺寸 (填充 <code>_pad_to_length</code>)</h3>
+<p>机器模型有强迫症，它要求进来的数据长度必须整整齐齐。
+*   <strong>代码位置</strong>：<code>_pad_to_length</code> 函数。
+*   <strong>要做的事</strong>：
+    1.  <strong>检查长度</strong>：看看刚才拼好的数据有多长。
+    2.  <strong>太短了？</strong>：补 0（Padding），直到补满 1024 位。
+    3.  <strong>太长了？</strong>：无情切断（Truncate），只保留前 1024 位。
+    4.  <strong>Mask</strong>：同时生成一个 <code>attention_mask</code>，告诉模型哪些是真数据（1），哪些是刚才补的 0（0）。</p>
+<h3>✅ Task 6：打包出厂 (Return 结果)</h3>
+<ul>
+<li><strong>代码位置</strong>：<code>__getitem__</code> 的最后部分。</li>
+<li><strong>要做的事</strong>：<ol>
+<li><strong>堆叠</strong>：把处理好的“正样本”和“负样本”叠在一起（<code>torch.stack</code>）。</li>
+<li><strong>发货</strong>：返回一个字典，包含 <code>input_ids</code>（数字内容）和 <code>attention_mask</code>（有效位标记）。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结一下</h3>
+<p>这个脚本其实就干了一件事：
+<strong>把 Excel 表格里的文本对（好回答 vs 坏回答），转换成 PyTorch 训练能直接吃的 Tensor（张量）格式。</strong></p>
+<p>它输出的数据结构大概长这样（对于每一条数据）：</p>
+<div class="codehilite"><pre><span></span><code><span class="p">{</span>
+    <span class="s2">&quot;input_ids&quot;</span><span class="p">:</span> <span class="p">[</span>
+        <span class="p">[</span><span class="n">问题</span> <span class="o">+</span> <span class="n">好回答</span> <span class="o">+</span> <span class="mf">0000.</span><span class="o">..</span><span class="p">],</span>  <span class="c1"># 正样本</span>
+        <span class="p">[</span><span class="n">问题</span> <span class="o">+</span> <span class="n">坏回答</span> <span class="o">+</span> <span class="mf">0000.</span><span class="o">..</span><span class="p">]</span>   <span class="c1"># 负样本</span>
+    <span class="p">],</span>
+    <span class="s2">&quot;attention_mask&quot;</span><span class="p">:</span> <span class="p">[</span>
+        <span class="p">[</span><span class="mi">1111111111111</span> <span class="o">+</span> <span class="mf">0000.</span><span class="o">..</span><span class="p">],</span>
+        <span class="p">[</span><span class="mi">1111111111111</span> <span class="o">+</span> <span class="mf">0000.</span><span class="o">..</span><span class="p">]</span>
+    <span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>模型拿到这个数据，就能学习去给“好回答”打高分，给“坏回答”打低分了。</p>

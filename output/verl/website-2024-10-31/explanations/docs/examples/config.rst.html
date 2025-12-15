@@ -1,0 +1,106 @@
+<h1>docs/examples/config.rst</h1>
+<p>这份文档看起来确实很吓人，因为它涉及了 <strong>LLM（大模型）+ PPO（强化学习）+ 分布式训练（FSDP/vLLM）</strong> 三个非常硬核的技术栈。</p>
+<p>为了让你看懂，我们不要把它当成代码配置，而是把它想象成 <strong>“训练一个学生（AI）参加考试”</strong> 的项目计划书。</p>
+<p>我们可以把这个配置文件拆解成 <strong>5个待办任务（To-Do List）</strong>。</p>
+<hr />
+<h3>任务清单概览</h3>
+<ol>
+<li><strong>准备教材 (Data)</strong>：学生读什么书？做多长的题？</li>
+<li><strong>组建团队 (Actor/Rollout/Ref)</strong>：谁负责学？谁负责监考？谁负责快速答题？</li>
+<li><strong>设定评分标准 (Reward/Critic)</strong>：谁来打分？怎么打分？</li>
+<li><strong>制定学习方法 (Algorithm)</strong>：具体的数学学习策略是什么？</li>
+<li><strong>后勤管理 (Trainer)</strong>：学多久？多久存一次档？</li>
+</ol>
+<hr />
+<h3>详细步骤拆解</h3>
+<h4>✅ Task 1: 准备教材 (Data)</h4>
+<p>这一部分定义了数据从哪里来，以及数据的“形状”。</p>
+<ul>
+<li><strong>核心配置解读</strong>：<ul>
+<li><code>train_files</code>: <strong>教材路径</strong>。告诉程序去哪里读取训练数据（parquet格式）。</li>
+<li><code>max_prompt_length</code>: <strong>题目最大长度</strong>。如果题目太长，会被截断或报错。</li>
+<li><code>max_response_length</code>: <strong>答案最大长度</strong>。限制学生回答时最多能写多少字。</li>
+<li><code>train_batch_size</code>: <strong>单次学习量</strong>。一次给模型看多少道题。</li>
+<li><code>return_raw_input_ids</code>: <strong>格式兼容性检查</strong>。如果你的“评分老师”（Reward Model）和“学生”（Policy）用的语言（Tokenizer）不一样，这个要设为 True。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 组建团队 (Actor/Rollout/Reference Policy)</h4>
+<p>这是最复杂的部分。在 PPO 训练中，同一个模型其实分饰了三个角色，或者需要三个模型配合。</p>
+<ul>
+<li>
+<p><strong>角色 1：Actor (学生)</strong></p>
+<ul>
+<li>这是真正需要被训练、参数会更新的模型。</li>
+<li><code>strategy: fsdp</code>: <strong>省显存策略</strong>。使用 FSDP 技术把模型切碎放在不同显卡上，防止显存爆炸。</li>
+<li><code>optim</code>: <strong>学习率设置</strong>。比如 <code>lr: 1e-6</code>，决定了学得快还是慢。</li>
+<li><code>ppo_epochs</code>: <strong>复习次数</strong>。同一批数据，学生要反复学几遍。</li>
+</ul>
+</li>
+<li>
+<p><strong>角色 2：Reference Model (Ref - 参照系/监考老师)</strong></p>
+<ul>
+<li>这是一个<strong>冻结</strong>的模型，参数不更新。</li>
+<li><strong>作用</strong>：防止学生学“飘”了。我们会计算 Actor 和 Ref 的差异（KL Divergence），如果学生写的答案和原始模型差别太大，会被惩罚。</li>
+<li><code>fsdp_config</code>: 同样使用 FSDP 策略来加载它。</li>
+</ul>
+</li>
+<li>
+<p><strong>角色 3：Rollout (答题机器)</strong></p>
+<ul>
+<li><strong>作用</strong>：PPO 需要模型先生成一堆答案，然后拿去评分。生成的动作是很慢的。</li>
+<li><code>name: vllm</code>: <strong>加速器</strong>。这里指定使用 <code>vLLM</code> 这个库来加速推理生成。</li>
+<li><code>hybrid_engine: True</code>: <strong>混合引擎</strong>。意思是：训练时用 PyTorch/FSDP（为了求导），生成答案时切换到 vLLM（为了速度）。这是这个配置文件的核心亮点。</li>
+<li><code>temperature</code>, <code>top_p</code>: <strong>创造力设置</strong>。控制生成答案时的随机性。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 设定评分标准 (Reward Model &amp; Critic)</h4>
+<p>学生回答了问题，需要有人打分，学生才能进步。</p>
+<ul>
+<li>
+<p><strong>Reward Model (RM - 外部评分员)</strong></p>
+<ul>
+<li><code>enable</code>: 是否启用。如果是做数学题（有标准答案），可能不需要 RM，设为 False。如果是做聊天机器人（RLHF），需要一个模型来判断回答好不好，设为 True。</li>
+<li><code>model.path</code>: 评分模型的路径。</li>
+</ul>
+</li>
+<li>
+<p><strong>Critic Model (价值评估员)</strong></p>
+<ul>
+<li>这是 PPO 算法内部的一个组件。它负责<strong>预测</strong>学生当前状态能得多少分。</li>
+<li>配置通常和 Actor 类似（在文档中简写了，说大部分参数同 Actor）。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 制定学习方法 (Algorithm)</h4>
+<p>这里是 PPO 算法的数学超参数，决定了“奖惩机制”的细节。</p>
+<ul>
+<li><strong>核心配置解读</strong>：<ul>
+<li><code>kl_ctrl</code>: <strong>防跑偏系数</strong>。控制 KL 散度的权重。如果设得大，模型就不敢乱改答案；设得小，模型可能会产生很狂野的回答。</li>
+<li><code>gamma</code>, <code>lam</code>: <strong>远见系数</strong>。决定模型是看重眼前的奖励，还是看重长远的未来奖励。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 后勤管理 (Trainer)</h4>
+<p>控制整个训练流程的进度条。</p>
+<ul>
+<li><strong>核心配置解读</strong>：<ul>
+<li><code>total_epochs</code>: <strong>总学期数</strong>。整个训练要跑多少轮。</li>
+<li><code>nnodes</code>, <code>n_gpus_per_node</code>: <strong>硬件资源</strong>。你用了几台机器，每台几张卡。</li>
+<li><code>save_freq</code>: <strong>存档频率</strong>。跑多少步保存一次模型权重。</li>
+<li><code>logger</code>: <strong>监控</strong>。比如 <code>wandb</code>，用来画图看 Loss 曲线。</li>
+<li><code>critic_warmup</code>: <strong>热身</strong>。在正式训练 Actor 之前，先单独训练一下 Critic，让它打分准一点。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：在这个 Config 里你最需要改什么？</h3>
+<p>如果你只是想跑通代码，通常只需要关注以下几项：</p>
+<ol>
+<li><strong>路径类</strong>：把 <code>~/data/...</code> 和 <code>~/models/...</code> 改成你自己的文件路径。</li>
+<li><strong>显存类</strong>：如果显存爆了（OOM），把 <code>train_batch_size</code>、<code>ppo_micro_batch_size</code> 调小。</li>
+<li><strong>资源类</strong>：<code>n_gpus_per_node</code> 改成你实际的卡数。</li>
+<li><strong>时长类</strong>：<code>total_epochs</code> 决定训练多久。</li>
+</ol>
+<p>其他的参数（比如 <code>kl_coef</code>, <code>gamma</code> 等）通常是算法工程师调好的默认值，初学者可以先不动。</p>

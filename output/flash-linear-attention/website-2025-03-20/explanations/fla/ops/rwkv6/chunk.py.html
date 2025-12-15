@@ -1,0 +1,104 @@
+<h1>fla/ops/rwkv6/chunk.py</h1>
+<p>这份代码确实非常硬核，它属于<strong>高性能算子开发</strong>（High-Performance Operator Development），混合了 PyTorch 和 Triton（一种用于编写 GPU 内核的语言）。</p>
+<p>要看懂这份代码，不能一行行读，得先懂它的<strong>设计逻辑</strong>。这份代码实现的是 <strong>RWKV-6 模型</strong> 的 <strong>Chunk（分块）模式</strong> 的前向（Forward）和后向（Backward）传播。</p>
+<p>为了让你听懂，我把阅读这份代码的任务拆解成一个 <strong>To-Do List</strong>，我们一步步来划钩。</p>
+<hr />
+<h3>任务清单：理解 RWKV-6 Chunk 算子</h3>
+<h4>✅ Task 1: 理解核心背景 (Concept)</h4>
+<p><strong>目标</strong>：明白为什么要有“Chunk”这个概念。
+*   <strong>RWKV 是什么？</strong> 它是一种线性 Attention。你可以把它看作 RNN（省显存，串行计算）和 Transformer（并行计算，费显存）的结合体。
+*   <strong>为什么要 Chunk（分块）？</strong>
+    *   纯 RNN 模式：一个 token 接一个 token 算，太慢了，GPU 利用率低。
+    *   纯 Transformer 模式：一次算所有 token 的两两关系，显存爆炸。
+    *   <strong>Chunk 模式（本代码的核心）</strong>：折中方案。把长序列（比如长度 2048）切成小块（比如每块 64 长度）。
+        *   <strong>块内（Intra）</strong>：像 Transformer 一样并行计算（用矩阵乘法）。
+        *   <strong>块间（Inter）</strong>：像 RNN 一样传递隐藏状态 $h$。</p>
+<h4>✅ Task 2: 理解前向传播流程 (The Forward Pass)</h4>
+<p>代码入口是 <code>chunk_rwkv6_fwd</code> 函数。它的逻辑分三步走：</p>
+<p><strong>Step 2.1: 预处理 - 计算衰减 (Cumsum)</strong>
+*   <strong>概念</strong>：RWKV 有一个核心机制是 Time Decay（时间衰减）$g$。为了快速计算，我们需要先算出 $g$ 的前缀和（Cumulative Sum）。这就像我们要算 $a \times b \times c$，为了方便并行，我们先算出 $\log a, \log a+\log b, \dots$。
+*   <strong>对应代码</strong>：<code>chunk_rwkv6_fwd_cumsum</code>
+*   <strong>Triton 内核</strong>：<code>chunk_rwkv6_fwd_cumsum_kernel</code>。它负责在 GPU 上快速算出累加值 <code>gi</code> (inclusive) 和 <code>ge</code> (exclusive)。</p>
+<p><strong>Step 2.2: 块间循环 - 传递状态 (Inter-Chunk)</strong>
+*   <strong>概念</strong>：算出每个块（Chunk）结束时，留给下一个块的“记忆”（Hidden State, $h$）。这部分类似 RNN。
+*   <strong>对应代码</strong>：<code>chunk_fwd_h</code> (注意：这个函数是从 <code>fla.ops.common.chunk_h</code> 导入的，不在本文件里实现，但逻辑上属于这一步)。</p>
+<p><strong>Step 2.3: 块内计算 - 局部注意力 (Intra-Chunk) [本文件的核心]</strong>
+*   <strong>概念</strong>：这是本文件最复杂的部分。在每个 64 长度的小块内部，计算 $Q$ 和 $K$ 的交互，并加上衰减 $g$ 和特殊的 bonus $u$。这生成了一个局部的 Attention 矩阵 $A$。
+*   <strong>对应代码</strong>：<code>chunk_rwkv6_fwd_intra</code>
+*   <strong>Triton 内核</strong>：
+    *   <code>chunk_rwkv6_fwd_A_kernel_intra_sub_inter</code>: 计算块内不同子块之间的交互。
+    *   <code>chunk_rwkv6_fwd_A_kernel_intra_sub_intra</code>: 计算极小范围内的交互。
+    *   <strong>解释</strong>：你会看到很多 <code>chunk_rwkv6_fwd_A_...</code> 的内核，它们就是在拼命优化这个“块内矩阵乘法”的速度。</p>
+<p><strong>Step 2.4: 合并输出</strong>
+*   <strong>概念</strong>：最终输出 $O = \text{块间贡献} + \text{块内贡献}$。
+*   <strong>对应代码</strong>：<code>chunk_gla_fwd_o_gk</code> (也是导入的)。</p>
+<h4>✅ Task 3: 理解后向传播 (The Backward Pass)</h4>
+<p><strong>目标</strong>：训练模型需要算梯度。
+*   <strong>概念</strong>：就是把 Forward 的过程反过来算一遍，求 $dQ, dK, dV, dG$。
+*   <strong>对应代码</strong>：<code>chunk_rwkv6_bwd</code>
+*   <strong>Triton 内核</strong>：
+    *   <code>chunk_rwkv6_bwd_kernel_dh</code>: 算隐藏状态的梯度。
+    *   <code>chunk_rwkv6_bwd_kernel_intra</code>: 算块内的梯度（最难的部分）。
+    *   <code>chunk_rwkv6_bwd_kernel_inter</code>: 算块间的梯度。</p>
+<hr />
+<h3>逐层代码导读 (Mapping Code to Logic)</h3>
+<p>现在你再回头看代码，应该能对上号了：</p>
+<ol>
+<li>
+<p><strong>文件头部 Imports</strong>:</p>
+<ul>
+<li>引入了 <code>chunk_fwd_h</code> 和 <code>chunk_gla_...</code>，说明这个文件主要负责 <strong>RWKV6 特有的逻辑</strong>（主要是 $g$ 的处理和 $u$ 的处理），通用的部分复用了 GLA（Gated Linear Attention）的代码。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>chunk_rwkv6_fwd_cumsum_kernel</code> (Triton Kernel)</strong>:</p>
+<ul>
+<li><strong>功能</strong>：计算 $g$ 的积分（累加）。</li>
+<li><strong>特征</strong>：看到 <code>tl.load</code> 读取数据，然后简单的 <code>tl.dot</code> 或者累加，最后 <code>tl.store</code>。这是为后续计算做准备。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>chunk_rwkv6_fwd_A_kernel_...</code> (一堆内核)</strong>:</p>
+<ul>
+<li><strong>功能</strong>：计算块内的 $A$ 矩阵。</li>
+<li><strong>核心数学</strong>：$A = Q \times K^T \times \text{Decay}$。</li>
+<li><strong>代码细节</strong>：<ul>
+<li><code>b_q * tl.exp(b_gq - b_gn[None, :])</code>: 这里就是在算 $Q$ 乘以衰减项。</li>
+<li><code>tl.dot(b_qg, b_kg)</code>: 这里就是 $Q \times K^T$。</li>
+<li><strong>Bonus $u$</strong>: 代码里会有 <code>b_u</code>，这是 RWKV 特有的，当前时刻的 $K$ 对 $Q$ 有一个特殊的加成。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong><code>chunk_rwkv6_fwd</code> (Python 函数)</strong>:</p>
+<ul>
+<li>这是总指挥。</li>
+<li>它按顺序调用：<code>cumsum</code> -&gt; <code>chunk_fwd_h</code> (算 RNN 状态) -&gt; <code>chunk_rwkv6_fwd_intra</code> (算局部 Attention) -&gt; <code>chunk_gla_fwd_o_gk</code> (算最终输出)。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>ChunkRWKV6Function</code> (PyTorch Autograd)</strong>:</p>
+<ul>
+<li>这是给 PyTorch 用的包装器。</li>
+<li><code>forward</code>: 记录上下文，调用上面的 fwd 函数。</li>
+<li><code>backward</code>: 接收梯度 <code>do</code>，调用 <code>chunk_rwkv6_bwd</code> 算出所有参数的梯度。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>chunk_rwkv6</code> (API)</strong>:</p>
+<ul>
+<li>这是给用户（也就是你）调用的接口。它处理输入的形状（B, T, H, K），处理变长序列（<code>cu_seqlens</code>），然后调用 Function。</li>
+</ul>
+</li>
+</ol>
+<h3>总结：这代码在干嘛？</h3>
+<p>简单来说，<strong>这个文件就是为了在 GPU 上极速地跑 RWKV-6 模型</strong>。</p>
+<ul>
+<li>如果用纯 PyTorch 写 <code>for</code> 循环，速度会慢得像蜗牛。</li>
+<li>作者把 RWKV-6 的公式拆解成了“块间”和“块内”两部分。</li>
+<li>然后用 <strong>Triton</strong>（一种类 C 的 GPU 编程语言）手写了最耗时的矩阵运算部分（Kernel）。</li>
+<li><strong>你看不懂是正常的</strong>，因为这包含了大量的 GPU 显存管理、指针偏移计算和并行计算逻辑。</li>
+</ul>
+<p><strong>建议阅读策略</strong>：
+不要纠结于 <code>tl.make_block_ptr</code> 里面的指针偏移量（那些 <code>i_t * BT + i_i * BC</code>），只需要关注 <code>chunk_rwkv6_fwd</code> 这个 Python 函数的流程，知道数据是怎么流动的即可。</p>

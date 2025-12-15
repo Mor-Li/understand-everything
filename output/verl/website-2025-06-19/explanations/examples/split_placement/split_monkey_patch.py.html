@@ -1,0 +1,187 @@
+<h1>examples/split_placement/split_monkey_patch.py</h1>
+<p>这段代码实现了一个<strong>强化学习（RL）训练循环的核心逻辑</strong>，具体来说是 <strong>PPO (Proximal Policy Optimization)</strong> 算法的一个变体。</p>
+<p>简单来说，这段代码就像是一个<strong>“总指挥”</strong>（Driver），它指挥一群<strong>“工人”</strong>（Worker Groups，代码中的 <code>wg</code>）去完成大语言模型的训练任务。</p>
+<p>为了让你更容易理解，我把它拆解成一个 <strong>Task List (任务清单)</strong>，然后按照这个清单一步步给你讲。</p>
+<hr />
+<h3>📋 Task List：PPO 训练流程清单</h3>
+<p>想象你在训练一个学生（Actor模型）写作文，流程如下：</p>
+<ol>
+<li><strong>准备工作</strong>：设置好记录本（Logger），加载之前的进度（Checkpoint）。</li>
+<li><strong>考前摸底</strong>（可选）：在训练开始前先测一次，看看水平如何。</li>
+<li><strong>开始循环（每一轮 Epoch/Step）</strong>：<ul>
+<li><strong>Task 1: 让学生写作文 (Rollout/Generation)</strong><ul>
+<li>给学生题目（Prompt），让学生生成答案。</li>
+</ul>
+</li>
+<li><strong>Task 2: 整理考卷 (Data Preparation)</strong><ul>
+<li>给每份考卷贴标签（UUID），整理格式，确保分发给阅卷老师时是均匀的。</li>
+</ul>
+</li>
+<li><strong>Task 3: 分析考卷 (Compute Stats)</strong><ul>
+<li><em>回顾</em>：计算学生当时写出这个词的概率是多少？</li>
+<li><em>对比</em>：计算“标准答案”（Reference Policy）写出这个词的概率是多少？（为了防止学生乱写，不能偏离原意太远）。</li>
+<li><em>预估</em>：估分老师（Critic）预估这篇作文能得多少分？</li>
+</ul>
+</li>
+<li><strong>Task 4: 打分与计算优势 (Compute Rewards &amp; Advantage)</strong><ul>
+<li>打分老师（Reward Model）给出最终分数。</li>
+<li>计算“优势”（Advantage）：这篇作文比“平均水平”好了多少？</li>
+</ul>
+</li>
+<li><strong>Task 5: 学习与修正 (Update Models)</strong><ul>
+<li><strong>更新估分老师（Critic）</strong>：让你下次估分更准。</li>
+<li><strong>更新学生（Actor）</strong>：根据分数和优势，调整写作策略（好的多写，坏的少写）。</li>
+</ul>
+</li>
+<li><strong>Task 6: 阶段性检查 (Validation &amp; Save)</strong><ul>
+<li>每隔一段时间，拿新题测一下，存个档。</li>
+</ul>
+</li>
+<li><strong>Task 7: 记录日志 (Logging)</strong><ul>
+<li>把这一轮的分数、耗时记下来。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🧐 逐步解析：代码到底在干啥？</h3>
+<p>现在我们对照上面的 Task List，来看看代码的具体实现。</p>
+<h4>1. 准备工作 &amp; 考前摸底</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 初始化日志记录器</span>
+<span class="n">logger</span> <span class="o">=</span> <span class="n">Tracking</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="c1"># 加载之前的模型权重</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">_load_checkpoint</span><span class="p">()</span>
+
+<span class="c1"># 如果配置了验证，先跑一次验证看看初始水平</span>
+<span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">val_reward_fn</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="o">...</span><span class="p">:</span>
+    <span class="n">val_metrics</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_validate</span><span class="p">()</span>
+    <span class="n">logger</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：磨刀不误砍柴工。在开始大规模训练前，必须确保环境正常，且知道模型的初始能力基线。</li>
+</ul>
+<h4>2. 核心循环开始</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">for</span> <span class="n">epoch</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">trainer</span><span class="o">.</span><span class="n">total_epochs</span><span class="p">):</span>
+    <span class="k">for</span> <span class="n">batch_dict</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">train_dataloader</span><span class="p">:</span>
+        <span class="c1"># ... 取出一个 batch 的数据（通常是 Prompt）</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：训练是分批次进行的，在这个大循环里，我们不断重复“生成-打分-更新”的过程。</li>
+</ul>
+<h4>3. Task 1: 让学生写作文 (Rollout)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">with</span> <span class="n">_timer</span><span class="p">(</span><span class="s2">&quot;gen&quot;</span><span class="p">,</span> <span class="n">timing_raw</span><span class="p">):</span>
+    <span class="c1"># actor_rollout_wg 是负责推理的工人组</span>
+    <span class="c1"># 根据 Prompt 生成回复 (Response)</span>
+    <span class="n">gen_batch_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">actor_rollout_wg</span><span class="o">.</span><span class="n">generate_sequences</span><span class="p">(</span><span class="n">gen_batch</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：这是 RL 中最耗时的一步。模型处于“推理模式”，根据当前的策略生成数据。这些数据将成为后续学习的“经验”。</li>
+</ul>
+<h4>4. Task 2: 整理考卷 (Data Preparation)</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 给每条数据打上唯一ID，方便追踪</span>
+<span class="n">batch</span><span class="o">.</span><span class="n">non_tensor_batch</span><span class="p">[</span><span class="s2">&quot;uid&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="o">...</span>
+<span class="c1"># 如果配置了重复采样（比如一个问题生成 n 个回答），这里进行数据复制</span>
+<span class="n">batch</span> <span class="o">=</span> <span class="n">batch</span><span class="o">.</span><span class="n">repeat</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="n">batch</span> <span class="o">=</span> <span class="n">batch</span><span class="o">.</span><span class="n">union</span><span class="p">(</span><span class="n">gen_batch_output</span><span class="p">)</span>
+
+<span class="c1"># 负载均衡：确保多卡训练时，每张卡处理的数据量差不多</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">_balance_batch</span><span class="p">(</span><span class="n">batch</span><span class="p">,</span> <span class="n">metrics</span><span class="o">=</span><span class="n">metrics</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：分布式训练中，数据对齐和负载均衡非常重要，否则会导致某些显卡空闲，浪费算力。</li>
+</ul>
+<h4>5. Task 3: 分析考卷 (Compute Stats)</h4>
+<p>这一步是计算 PPO 算法需要的各种概率值。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 计算旧策略的 Log Probability (当前模型生成这些词的概率)</span>
+<span class="n">old_log_prob</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">actor_rollout_wg</span><span class="o">.</span><span class="n">compute_log_prob</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
+
+<span class="c1"># 2. 计算参考策略的 Log Probability (原始模型生成这些词的概率)</span>
+<span class="c1"># 作用：用于计算 KL 散度，防止模型训练坏了（忘记了该怎么说话）</span>
+<span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_reference_policy</span><span class="p">:</span>
+    <span class="n">ref_log_prob</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">ref_policy_wg</span><span class="o">.</span><span class="n">compute_ref_log_prob</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
+
+<span class="c1"># 3. 计算 Critic 的价值预估 (Values)</span>
+<span class="c1"># 作用：Critic 预测当前状态未来能得多少分，作为 Baseline</span>
+<span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_critic</span><span class="p">:</span>
+    <span class="n">values</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">critic_wg</span><span class="o">.</span><span class="n">compute_values</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：PPO 需要知道“我刚才生成这个词有多自信”（Old Log Prob）以及“老师觉得这个大概能得几分”（Value），才能决定怎么改。</li>
+</ul>
+<h4>6. Task 4: 打分与计算优势 (Rewards &amp; Advantage)</h4>
+<p>这是 RL 的灵魂，告诉模型什么是好的。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 奖励模型 (Reward Model) 打分</span>
+<span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_rm</span><span class="p">:</span>
+    <span class="n">reward_tensor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">rm_wg</span><span class="o">.</span><span class="n">compute_rm_score</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
+
+<span class="c1"># 2. 结合规则打分 (比如格式对不对)</span>
+<span class="n">reward_tensor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">reward_fn</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
+
+<span class="c1"># 3. 计算 KL 惩罚 (KL Penalty)</span>
+<span class="c1"># 如果模型生成的和参考模型差别太大，扣分！</span>
+<span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">algorithm</span><span class="o">.</span><span class="n">use_kl_in_reward</span><span class="p">:</span>
+    <span class="n">batch</span><span class="p">,</span> <span class="n">kl_metrics</span> <span class="o">=</span> <span class="n">apply_kl_penalty</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+<span class="c1"># 4. 计算优势 (Advantage)</span>
+<span class="c1"># 使用 GAE (Generalized Advantage Estimation) 算法</span>
+<span class="c1"># 核心思想：实际得分 - Critic 预估得分 = 优势 (Advantage)</span>
+<span class="n">batch</span> <span class="o">=</span> <span class="n">compute_advantage</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：单纯的高分不够，我们需要知道这个动作比“预期”好了多少（Advantage）。如果 Critic 预期你会考 90 分，你考了 95，优势就是 +5；如果预期 60，你考了 90，优势就是 +30（说明这个动作更好）。</li>
+</ul>
+<h4>7. Task 5: 学习与修正 (Update Models)</h4>
+<p>终于开始更新模型参数了。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 更新 Critic 模型 (让它下次估分更准)</span>
+<span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_critic</span><span class="p">:</span>
+    <span class="n">critic_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">critic_wg</span><span class="o">.</span><span class="n">update_critic</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
+
+<span class="c1"># 2. 更新 Actor 模型 (让它根据优势调整策略)</span>
+<span class="c1"># 通常会有个 warmup，刚开始 Critic 不准的时候先不更新 Actor</span>
+<span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">trainer</span><span class="o">.</span><span class="n">critic_warmup</span> <span class="o">&lt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">global_steps</span><span class="p">:</span>
+    <span class="n">actor_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">actor_rollout_wg</span><span class="o">.</span><span class="n">update_actor</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
+
+<span class="c1"># 等待更新完成并收集指标</span>
+<span class="n">critic_output</span> <span class="o">=</span> <span class="n">critic_output</span><span class="o">.</span><span class="n">get</span><span class="p">()</span>
+<span class="n">actor_output</span> <span class="o">=</span> <span class="n">actor_output</span><span class="o">.</span><span class="n">get</span><span class="p">()</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：这是一个<strong>异步与同步结合</strong>的过程。<code>update_actor</code> 发送指令给 GPU 工人，<code>output.get()</code> 等待结果返回。</li>
+</ul>
+<h4>8. Task 6 &amp; 7: 检查与收尾</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 验证集测试</span>
+<span class="k">if</span> <span class="o">...</span> <span class="n">test_freq</span> <span class="o">...</span><span class="p">:</span>
+    <span class="n">val_metrics</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_validate</span><span class="p">()</span>
+
+<span class="c1"># 保存模型</span>
+<span class="k">if</span> <span class="o">...</span> <span class="n">save_freq</span> <span class="o">...</span><span class="p">:</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">_save_checkpoint</span><span class="p">()</span>
+
+<span class="c1"># 记录日志</span>
+<span class="n">metrics</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="n">logger</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">data</span><span class="o">=</span><span class="n">metrics</span><span class="p">,</span> <span class="n">step</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">global_steps</span><span class="p">)</span>
+</code></pre></div>
+
+<h3>总结</h3>
+<p>这段代码就是一个标准的 <strong>PPO 训练流水线</strong>。</p>
+<ul>
+<li><strong>输入</strong>：一堆 Prompt。</li>
+<li><strong>过程</strong>：<ol>
+<li>Actor 生成回答。</li>
+<li>Ref Policy 和 Critic 辅助计算概率和价值。</li>
+<li>Reward Model 给回答打分。</li>
+<li>计算出哪些回答是“超常发挥”（高 Advantage）。</li>
+<li>修改 Actor 参数，让它以后多做“超常发挥”的动作。</li>
+</ol>
+</li>
+<li><strong>输出</strong>：一个更会写 Prompt 回答的模型。</li>
+</ul>
+<p>之所以叫 <code>split_monkey_patch</code>，可能是因为这个文件是为了演示某种<strong>拆分部署</strong>（Split Placement，比如 Actor 在一组 GPU，Critic 在另一组 GPU）而对原有代码进行的“魔改”或简化版实现。</p>

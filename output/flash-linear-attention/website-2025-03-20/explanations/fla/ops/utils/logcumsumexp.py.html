@@ -1,0 +1,131 @@
+<h1>fla/ops/utils/logcumsumexp.py</h1>
+<p>这段代码是用 <strong>OpenAI Triton</strong> 编写的一个 GPU Kernel（核心计算函数）。Triton 的写法和普通的 Python 很不一样，它更像是在指挥 GPU 的一个个微小的核心（Thread）协同工作。</p>
+<p>完全看不懂是很正常的，因为这不仅涉及编程，还涉及<strong>数值计算的稳定性（Log-Sum-Exp Trick）</strong>和<strong>并行计算的逻辑</strong>。</p>
+<p>为了让你听懂，我们把这个过程拆解成一个 <strong>Project Todo List</strong>，我们一项一项来划勾。</p>
+<hr />
+<h3>任务清单 (Todo List)</h3>
+<ol>
+<li><strong>【数学原理】搞懂我们在算什么 (LogCumSumExp)</strong></li>
+<li><strong>【准备工作】搞懂变量和并行策略 (Setup)</strong></li>
+<li><strong>【核心魔法】搞懂“下三角矩阵”的作用 (The Mask)</strong></li>
+<li><strong>【循环逻辑】分块处理长序列 (Loop &amp; Block)</strong></li>
+<li><strong>【数值稳定】最难懂的部分：如何防止溢出 (The Max Trick)</strong></li>
+<li><strong>【收尾工作】写回结果 (Store)</strong></li>
+</ol>
+<hr />
+<h3>Task 1: 【数学原理】搞懂我们在算什么</h3>
+<p>首先，这个函数的名字叫 <code>logcumsumexp</code>。拆开看就是：
+1.  <strong>Exp</strong>: 先做指数运算 $e^x$
+2.  <strong>CumSum</strong>: 做累加 (Cumulative Sum)
+3.  <strong>Log</strong>: 最后取对数 $\log$</p>
+<p><strong>数学公式是这样的：</strong>
+对于输入序列 $s = [s_0, s_1, s_2, ...]$，我们要计算输出 $z$：
+$$z_t = \log( \sum_{i=0}^{t} e^{s_i} )$$</p>
+<p><strong>为什么要这么麻烦？</strong>
+在深度学习（比如 Attention 机制或 Mamba/RWKV 等 RNN 变体）中，我们处理概率时通常是在 Log 空间（对数空间）。直接算 $e^{s_i}$ 很容易导致数字太大溢出（Inf）或者太小变成0。所以我们需要一种技巧在计算过程中一直保持数值稳定，这就是代码里各种 <code>max</code>, <code>sub</code>, <code>exp</code> 换来换去的原因。</p>
+<hr />
+<h3>Task 2: 【准备工作】搞懂变量和并行策略</h3>
+<p>Triton 是并行计算。假设我们有一堆数据（Batch Size），GPU 会启动很多个程序实例（Program）同时处理。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这里的 s 是输入数据，z 是输出位置，T 是时间长度，S 是状态维度，BT 是块大小</span>
+<span class="n">i_bh</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>  <span class="c1"># 当前这个程序处理第几个 Batch</span>
+</code></pre></div>
+
+<ul>
+<li><strong>并行逻辑</strong>：每个 Program 处理一个样本（Batch）。</li>
+<li><strong>分块逻辑</strong>：如果在时间轴 $T$ 上数据太长，GPU 显存放不下，我们需要把它切成小块，每块长度为 <code>BT</code>（比如 16, 32, 64）。</li>
+</ul>
+<hr />
+<h3>Task 3: 【核心魔法】搞懂“下三角矩阵”的作用</h3>
+<p>代码里这一行非常关键：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">o_i</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">BT</span><span class="p">)</span>
+<span class="c1"># 生成一个 BT x BT 的矩阵，只有左下角是 1，右上角是 0</span>
+<span class="n">m_s</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">o_i</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">&gt;=</span> <span class="n">o_i</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:],</span> <span class="mf">1.</span><span class="p">,</span> <span class="mf">0.</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>这是干嘛的？</strong>
+这是并行计算前缀和（CumSum）的经典技巧。
+如果你有一个向量 $v$，乘以这个下三角矩阵 $M$，结果就是 $v$ 的累加和。
+比如：
+$$
+\begin{bmatrix} 1 &amp; 0 \ 1 &amp; 1 \end{bmatrix} \times \begin{bmatrix} a \ b \end{bmatrix} = \begin{bmatrix} a \ a+b \end{bmatrix}
+$$
+<strong>结论</strong>：<code>m_s</code> 是用来在当前这一小块数据内部快速计算累加和的工具。</p>
+<hr />
+<h3>Task 4 &amp; 5: 【循环逻辑】与【数值稳定】(最难的部分)</h3>
+<p>现在我们开始遍历时间轴 $T$，每次处理 <code>BT</code> 这么长的数据。</p>
+<p>我们需要维护两个<strong>跨块（Block）传递的状态</strong>，就像接力跑一样：
+*   <code>b_mp</code>: <strong>M</strong>ax <strong>P</strong>revious (之前的最大值，用于防溢出)
+*   <code>b_zp</code>: <strong>Z</strong> (Sum) <strong>P</strong>revious (之前的累加和，已经做过防溢出处理)</p>
+<p><strong>代码逐行解析：</strong></p>
+<ol>
+<li>
+<p><strong>加载数据</strong>：
+    <code>python
+    # 从内存加载当前这一块的数据 s
+    b_s = tl.load(p_s, ...).to(tl.float32)</code></p>
+</li>
+<li>
+<p><strong>找当前最大值 (为了数值稳定)</strong>：
+    <code>python
+    # 找出当前这一块里的最大值
+    b_mc = tl.max(b_s, 0)
+    # 如果不是第一块，要看看之前的最大值(b_mp)是不是更大，取最大的那个
+    if i_t &gt; 0:
+        b_mc = tl.maximum(b_mp, b_mc)</code>
+    <em>解释</em>：Log-Sum-Exp 技巧的核心是：$\log(e^a + e^b) = m + \log(e^{a-m} + e^{b-m})$，其中 $m$ 是最大值。这里就是在找这个 $m$。</p>
+</li>
+<li>
+<p><strong>对齐历史数据 (Rescaling)</strong>：
+    <code>python
+    # 把“之前的累加和”根据“新的最大值”进行缩放
+    b_zp = b_zp * tl.exp(b_mp - b_mc)</code>
+    <em>解释</em>：因为 <code>b_zp</code> 之前是基于旧的 <code>b_mp</code> 缩放的，现在有了新的全局最大值 <code>b_mc</code>，必须把差值补上，否则加在一起单位不对。</p>
+</li>
+<li>
+<p><strong>计算当前块</strong>：
+    <code>python
+    # 当前数据减去最大值，然后取指数
+    b_s = tl.exp(b_s - b_mc)</code></p>
+</li>
+<li>
+<p><strong>核心计算 (矩阵乘法做累加)</strong>：
+    <code>python
+    # 1. dot(m_s, b_s): 用刚才那个下三角矩阵，算出当前块内部的累加和
+    # 2. + b_zp: 加上前面所有块遗留下来的累加和
+    b_z = tl.dot(m_s, b_s, allow_tf32=False) + b_zp</code></p>
+</li>
+<li>
+<p><strong>更新状态给下一轮循环</strong>：
+    <code>python
+    # 更新“之前的累加和”，也就是当前算出来的最后一个值
+    b_zc = tl.max(b_z, 0) # 这里实际上是在取这一块最后的累积值（虽然写法是max，但在cumsum逻辑下其实是取末尾状态的一种变体或特定维度的处理，具体看维度S）
+    b_mp = b_mc # 更新最大值
+    b_zp = b_zc # 更新累加和</code></p>
+</li>
+</ol>
+<hr />
+<h3>Task 6: 【收尾工作】写回结果</h3>
+<p>现在 <code>b_z</code> 里面存的是 $e^{s-m}$ 的累加和。我们要把它变回 Log 空间。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 取对数 log(Sum)</span>
+<span class="c1"># 2. 加上之前减去的最大值 m (b_mc)</span>
+<span class="c1"># 3. 1e-20 是为了防止 log(0) 报错</span>
+<span class="n">b_z</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">b_z</span> <span class="o">!=</span> <span class="mi">0</span><span class="p">,</span> <span class="n">b_z</span><span class="p">,</span> <span class="mf">1e-20</span><span class="p">))</span> <span class="o">+</span> <span class="n">b_mc</span>
+
+<span class="c1"># 存回显存</span>
+<span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">p_z</span><span class="p">,</span> <span class="n">b_z</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<hr />
+<h3>总结：这段代码到底干了啥？</h3>
+<p><strong>一句话总结：</strong>
+它在 GPU 上高效、并行地计算了一个长序列的“指数-累加-对数”，并且使用了<strong>分块计算</strong>（Block Loop）和<strong>Log-Sum-Exp技巧</strong>来保证计算过程中数字不会溢出。</p>
+<p><strong>你的脑内模拟流程：</strong>
+1.  <strong>切块</strong>：把长长的序列切成小段。
+2.  <strong>准备</strong>：生成一个“累加器矩阵”（全1下三角）。
+3.  <strong>循环</strong>：
+    *   拿到一小段数据。
+    *   找到最大值（为了不溢出）。
+    *   把上一段剩下的余额（<code>b_zp</code>）按比例折算一下。
+    *   用“累加器矩阵”算出这一小段的内部累加，再加上余额。
+    *   保存余额和最大值给下一段用。
+4.  <strong>还原</strong>：把算好的结果取 Log，加回最大值，存盘。</p>

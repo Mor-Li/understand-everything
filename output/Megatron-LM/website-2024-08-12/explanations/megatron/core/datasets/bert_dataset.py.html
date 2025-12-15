@@ -1,0 +1,132 @@
+<h1>megatron/core/datasets/bert_dataset.py</h1>
+<p>这份代码确实比较晦涩，因为它涉及到了 <strong>BERT模型预训练（Pre-training）</strong> 中最核心的数据处理逻辑。</p>
+<p>简单来说，这个文件的作用是：<strong>把硬盘里的生文本（Raw Text），加工成 BERT 模型能“吃”进去的张量（Tensors）。</strong></p>
+<p>为了让你听懂，我们把这个过程想象成一个 <strong>“出题老师”</strong>（Dataset类），正在给 <strong>“学生”</strong>（BERT模型）准备考卷。BERT 的考试主要考两门课：
+1.  <strong>完形填空（MLM）</strong>：把句子里的字挖掉，让模型填。
+2.  <strong>判断下句（NSP）</strong>：给两句话，问模型这俩是不是原本就挨着的。</p>
+<p>下面我列一个 <strong>Task Todo List</strong>，带你一步步看完这个“出题”的全过程：</p>
+<hr />
+<h3>Task 1: 准备考试大纲 (Configuration)</h3>
+<p><strong>代码对应：</strong> <code>BERTMaskedWordPieceDatasetConfig</code> 类</p>
+<ul>
+<li><strong>Todo:</strong> 确定我们要不要考“判断下句（NSP）”这门课。</li>
+<li><strong>解释:</strong><ul>
+<li>代码里有一个 <code>classification_head: bool</code>。</li>
+<li>如果它是 <code>True</code>，说明我们要准备 NSP 任务的数据（也就是模型最后要输出一个分类结果：是/不是下一句）。</li>
+<li>如果它是 <code>False</code>，可能只考完形填空。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 2: 从书架上拿原始素材 (Initialization)</h3>
+<p><strong>代码对应：</strong> <code>__init__</code> 方法</p>
+<ul>
+<li><strong>Todo:</strong> 建立索引，知道第几页书对应哪个样本。</li>
+<li><strong>解释:</strong><ul>
+<li><code>self.token_lookup</code>: 把词表加载进来，方便后面随机查词。</li>
+<li><code>self.sample_index</code>: 计算好每个样本的起止位置。注意这里特意留出了空间（<code>sequence_length - 3</code>），这是为了给特殊的标记符（如 <code>[CLS]</code>, <code>[SEP]</code>）留座位的。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 3: 开始出题 - 拿去生面团 (Get Item Start)</h3>
+<p><strong>代码对应：</strong> <code>__getitem__</code> 方法的前几行</p>
+<ul>
+<li><strong>Todo:</strong> 根据索引 <code>idx</code>，从巨大的数据集里把一段原始文字取出来。</li>
+<li><strong>解释:</strong><ul>
+<li><code>sample = [self.dataset[i] ...]</code>：这就是取出来的原始词（Token IDs）。</li>
+<li><code>numpy.random.RandomState</code>: 设置随机种子。为了保证实验可复现，随机性是跟索引绑定的。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 4: 准备“判断下句”的考题 (Split A &amp; B)</h3>
+<p><strong>代码对应：</strong> <code>__getitem__</code> 中 <code>if self.config.classification_head:</code> 下面的逻辑</p>
+<ul>
+<li><strong>Todo:</strong> 把取出来的一长段话切成两半（句子A 和 句子B），并决定要不要搞点“假数据”来骗模型。</li>
+<li><strong>解释:</strong><ul>
+<li><strong>切分 (Pivot):</strong> 随机找个位置把文本切开。</li>
+<li><strong>造假 (is_next_random):</strong> 掷硬币（50%概率）。<ul>
+<li><strong>正面:</strong> 保持原样，B确实是A的下一句（Label = IsNext）。</li>
+<li><strong>反面:</strong> 把 A 和 B 的顺序颠倒，或者随机拼凑，让 B 根本不是 A 的下一句（Label = NotNext）。</li>
+</ul>
+</li>
+<li>这就是为了训练 BERT 理解句子间的逻辑关系。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 5: 裁剪长短 (Truncation)</h3>
+<p><strong>代码对应：</strong> <code>while length_A + length_B &gt; target_sequence_length:</code> 循环</p>
+<ul>
+<li><strong>Todo:</strong> 也就是如果 A + B 太长了，超过了卷面限制（比如512个字），就得剪裁。</li>
+<li><strong>解释:</strong><ul>
+<li>看 A 长还是 B 长，谁长剪谁。</li>
+<li>随机决定是剪掉开头的字，还是剪掉结尾的字，直到长度塞得进模型为止。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 6: 加上“特殊包装” (Formatting)</h3>
+<p><strong>代码对应：</strong> <code># Merge the subsegments...</code> 部分</p>
+<ul>
+<li><strong>Todo:</strong> 按照 BERT 的标准格式把 A 和 B 拼起来。</li>
+<li><strong>解释:</strong> BERT 的标准输入格式是：<code>[CLS] 句子A [SEP] 句子B [SEP]</code>。<ul>
+<li><code>tokens</code>: 这里手动插入了 <code>cls</code> 和 <code>sep</code> token。</li>
+<li><code>assignments</code>: 这是 <strong>Segment ID</strong>（句子身份卡）。<ul>
+<li>句子A的部分全是 <code>0</code>。</li>
+<li>句子B的部分全是 <code>1</code>。</li>
+<li>模型靠这个区分哪部分是前句，哪部分是后句。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 7: 挖空出题 - 完形填空 (Masking)</h3>
+<p><strong>代码对应：</strong> <code>self._create_masked_lm_predictions</code> 调用 和 <code>_get_token_mask</code> 方法</p>
+<ul>
+<li><strong>Todo:</strong> 在拼好的句子里，随机挑 15% 的字，把它“盖住”或“改掉”，让模型去猜原词。</li>
+<li><strong>逻辑细节 (<code>_get_token_mask</code>):</strong><ul>
+<li><strong>80% 的情况:</strong> 替换成 <code>[MASK]</code> 特殊字符（比如：今天天气好 -&gt; 今天天气[MASK]）。</li>
+<li><strong>10% 的情况:</strong> 替换成一个瞎选的随机词（比如：今天天气好 -&gt; 今天天气<strong>苹果</strong>）。这是为了强迫模型看上下文，不要只依赖 <code>[MASK]</code> 标记。</li>
+<li><strong>10% 的情况:</strong> 保持不变（比如：今天天气好 -&gt; 今天天气好）。这是为了让模型在微调时也能适应真实文本。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 8: 补齐卷面 (Padding)</h3>
+<p><strong>代码对应：</strong> <code># Pad the sequences...</code> 部分</p>
+<ul>
+<li><strong>Todo:</strong> 如果句子不够长（没填满512个格子），后面全部补 <code>0</code>（Padding）。</li>
+<li><strong>解释:</strong><ul>
+<li><code>numpy.pad(...)</code>: 给 <code>tokens</code>, <code>assignments</code>, <code>labels</code> 全部补齐长度。</li>
+<li>这样做是为了让不同长度的句子能打包成一个 Batch 给 GPU 批量处理。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 9: 生成标准答案 (Labels &amp; Output)</h3>
+<p><strong>代码对应：</strong> 最后返回的 <code>dict</code></p>
+<ul>
+<li><strong>Todo:</strong> 整理好所有数据，打包返回。</li>
+<li><strong>解释:</strong><ul>
+<li><code>text</code>: 挖了空的题目（输入给模型）。</li>
+<li><code>labels</code>: 完形填空的正确答案（被挖掉的那些词的原词）。注意：没被挖掉的地方通常填 <code>-1</code>，表示不算分。</li>
+<li><code>types</code>: 刚才生成的 000111 句子身份卡。</li>
+<li><code>is_random</code>: 刚才 Task 4 里的“判断下句”的正确答案（0或1）。</li>
+<li><code>loss_mask</code>: 告诉模型计算 Loss 的时候，Padding 的部分不要算进去。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件就是一条流水线：
+1.  <strong>拿肉</strong>（Raw Text）
+2.  <strong>切块</strong>（Split A/B）
+3.  <strong>甚至可能换成假肉</strong>（NSP Random Swap）
+4.  <strong>修剪</strong>（Truncate）
+5.  <strong>摆盘</strong>（Add CLS/SEP）
+6.  <strong>撒调料/挖洞</strong>（Masking 80/10/10）
+7.  <strong>打包</strong>（Padding &amp; Return）</p>
+<p>最终产出就是 BERT 训练时的一个 Step 所需要的数据。</p>

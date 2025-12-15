@@ -1,0 +1,95 @@
+<h1>tests/functional_tests/python_test_utils/test_fp8_ci_pipeline.py</h1>
+<p>这份代码其实是一个<strong>“自动化阅卷老师”</strong>。</p>
+<p>它的场景是：开发人员修改了代码（特别是涉及到 FP8，即 8位浮点数精度的模型训练部分），跑了一次模型训练。
+它的任务是：<strong>拿着这次训练的成绩单（Actual），去跟历史上最好的一次标准答案（Expected）做对比，看看这次改动有没有把模型搞坏。</strong></p>
+<p>为了让你彻底看懂，我把它拆解成一个 <strong>6步走的 Task List</strong>，我们一步步来完成这个“阅卷”过程。</p>
+<hr />
+<h3>Task 1：准备考场与试卷（环境与配置）</h3>
+<p><strong>代码对应：</strong> 开头的 <code>import</code> 和 全局变量 <code>LOGS_DIR</code>, <code>EXPECTED_METRICS_FILE</code> 以及 <code>class TestFP8CIPipeline</code> 的属性。</p>
+<ul>
+<li><strong>要做什么：</strong><ol>
+<li>确定这次考试的考生在哪里（<code>LOGS_DIR</code>：当前训练产生的日志路径）。</li>
+<li>确定标准答案在哪里（<code>EXPECTED_METRICS_FILE</code>：以前存好的、认为正确的指标文件）。</li>
+<li>设定及格线（Class 里的属性）：<ul>
+<li><code>margin_loss = 0.2</code>：允许的分数误差范围。</li>
+<li><code>auc_threshold = 0.01</code>：允许的面积误差（后面会讲）。</li>
+<li><code>correlation_threshold = 0.999</code>：曲线走势必须非常相似。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h3>Task 2：拿出标准答案（读取基准数据）</h3>
+<p><strong>代码对应：</strong> <code>_setup(self)</code> 方法。</p>
+<ul>
+<li><strong>要做什么：</strong><ol>
+<li>打开那个“标准答案”文件（JSON格式）。</li>
+<li>把它加载到内存里 (<code>self.expected</code>)。</li>
+<li>如果找不到标准答案，直接报错，没法阅卷了。</li>
+</ol>
+</li>
+</ul>
+<h3>Task 3：拿出考生的答卷（读取实际数据）</h3>
+<p><strong>代码对应：</strong> <code>_get_actual(self, loss_type)</code> 方法。</p>
+<ul>
+<li><strong>要做什么：</strong><ol>
+<li>去日志目录里读取 TensorBoard 的日志。</li>
+<li>提取出我们关心的曲线数据（比如 <code>lm loss</code>，即语言模型的损失值）。</li>
+<li><strong>注意：</strong> 这里还会根据标准答案里的 <code>start_step</code>（开始步数）、<code>end_step</code>（结束步数）和 <code>step_interval</code>（采样间隔）对考生的数据进行<strong>切片</strong>，保证大家比较的是同一个时间段的数据。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<p><strong>接下来是核心的“阅卷”环节，用了三种不同的数学方法来对比两条曲线（实际 vs 预期）：</strong></p>
+<h3>Task 4：对比方法 A —— 逐点找茬（Margin Test）</h3>
+<p><strong>代码对应：</strong> <code>_margin_test_helper</code> 和 <code>test_lm_loss_margin</code>。</p>
+<ul>
+<li><strong>逻辑：</strong><ul>
+<li>把考生的曲线和标准答案的曲线叠在一起。</li>
+<li><strong>动作：</strong> 检查每一个时间点，两者的差值是不是都在允许的 <code>margin_loss</code> (0.2) 范围内。</li>
+<li><strong>严格程度：</strong> 只要有一个点偏差太大，或者整体偏差超过阈值，测试就挂掉。</li>
+<li><strong>代码细节：</strong> <code>np.allclose</code> 是 numpy 用来判断两个数组是否“足够接近”的函数。</li>
+<li><em>注：代码中 <code>test_lm_loss_margin</code> 被标记了 <code>@pytest.mark.xfail</code>，意思是作者知道这个测试目前可能会挂（太严格了），挂了也不算整个任务失败。</em></li>
+</ul>
+</li>
+</ul>
+<h3>Task 5：对比方法 B —— 算总分（AUC Test）</h3>
+<p><strong>代码对应：</strong> <code>_auc_test_helper</code> 和 <code>test_lm_loss_auc</code>。</p>
+<ul>
+<li><strong>逻辑：</strong><ul>
+<li>有时候单点波动大一点没关系，关键是整体表现。</li>
+<li><strong>动作：</strong> 计算“曲线下的面积”（AUC - Area Under Curve）。你可以理解为计算整个训练过程中的<strong>累积损失量</strong>。</li>
+<li><strong>判定：</strong> 如果考生的总面积和标准答案的总面积，差距在 <code>1%</code> (<code>auc_threshold</code>) 以内，就算通过。</li>
+<li><strong>数学工具：</strong> <code>trapezoid</code> (梯形法则) 用来算积分面积。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 6：对比方法 C —— 看趋势（Correlation Test）</h3>
+<p><strong>代码对应：</strong> <code>_correlation_test_helper</code> 和 <code>test_lm_loss_correlation</code>。</p>
+<ul>
+<li><strong>逻辑：</strong><ul>
+<li>数值略有不同没关系，但如果标准答案是下降的，你却是上升的，那就不对。</li>
+<li><strong>动作：</strong> 计算两条曲线的<strong>皮尔逊相关系数</strong> (Pearson correlation)。</li>
+<li><strong>判定：</strong> 相关系数要大于 <code>0.999</code>。这意味着两条曲线的形状、起伏必须高度一致。</li>
+<li><em>注：这个也被标记了 <code>xfail</code>，说明目前 FP8 训练的波动可能导致形状偶尔对不上。</em></li>
+</ul>
+</li>
+</ul>
+<h3>Task 7：体育测试（速度检查）</h3>
+<p><strong>代码对应：</strong> <code>iteration_timing_node</code> 方法。</p>
+<ul>
+<li><strong>要做什么：</strong><ul>
+<li>除了看损失函数（Loss），还要看训练速度（Time）。</li>
+<li><strong>动作：</strong> 读取 <code>iteration-time</code>（每一步训练花的时间）。</li>
+<li><strong>计算：</strong> 取后 2/3 的数据算平均值（去掉刚开始训练时的不稳定阶段）。</li>
+<li><strong>判定：</strong> 现在的速度必须和预期的速度差不多（误差在 <code>margin_time</code> 范围内）。如果变慢太多，说明代码改动导致了性能退化。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结一下</h3>
+<p>这个脚本就是为了回答以下三个问题：
+1.  <strong>准不准？</strong> (Task 4, 5, 6: Loss 曲线是否和预期一致？)
+2.  <strong>快不快？</strong> (Task 7: 训练速度是否达标？)
+3.  <strong>能不能用？</strong> (Task 1, 2, 3: 整个流程是否跑通？)</p>
+<p>如果所有没被标记 <code>xfail</code> 的测试都通过了，说明这次代码修改是安全的，没有引入严重的 Bug。</p>

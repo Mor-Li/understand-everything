@@ -1,0 +1,92 @@
+<h1>verl/utils/tracking.py</h1>
+<p>这份代码其实就是一个<strong>“管家”</strong>或<strong>“万能遥控器”</strong>。</p>
+<p>在做 AI 训练时，我们通常需要把训练过程中的各种数据（比如准确率、损失值、生成的文本）记录下来，画成图表。市面上有很多工具干这个事（比如 WandB, TensorBoard, MLflow 等）。</p>
+<p>这个文件的作用是：<strong>把所有这些工具统一封装起来。你只需要告诉这个“管家”你要记什么，它会自动帮你分发到你开启的那些工具里去，不用你针对每个工具单独写代码。</strong></p>
+<p>为了让你看懂，我把这个文件要做的事情拆解成一个 <strong>Task Todo List（任务清单）</strong>，按照代码运行的逻辑一步步讲：</p>
+<hr />
+<h3>Task 1: 招聘与入职 (初始化 <code>__init__</code>)</h3>
+<p><strong>目标</strong>：确定你要用哪些工具记录实验，并帮它们登录、建立档案。</p>
+<ol>
+<li><strong>检查名单</strong>：<ul>
+<li>代码看 <code>__init__</code> 函数。它接收一个 <code>default_backend</code> 列表（比如 <code>['wandb', 'tensorboard']</code>）。</li>
+<li>它会检查这些名字是不是它支持的（<code>supported_backend</code> 列表里有的）。</li>
+</ul>
+</li>
+<li><strong>逐个激活</strong>：<ul>
+<li><strong>如果有 WandB</strong>：登录账号，初始化项目 (<code>wandb.init</code>)，把配置参数传上去。</li>
+<li><strong>如果有 MLflow</strong>：设置追踪地址，创建实验 (<code>mlflow.set_experiment</code>)，记录参数。代码里还专门写了一些辅助函数（如 <code>_compute_mlflow_params_from_objects</code>）来把复杂的参数格式化成 MLflow 能看懂的样子。</li>
+<li><strong>如果有 SwanLab/ClearML/Volcengine</strong>：也是类似的，登录 API，创建项目。</li>
+<li><strong>如果有 TensorBoard</strong>：创建一个文件夹用来存日志 (<code>_TensorboardAdapter</code>)。</li>
+<li><strong>如果有 Console</strong>：就是直接在终端屏幕上打印出来。</li>
+</ul>
+</li>
+<li><strong>保存联络方式</strong>：<ul>
+<li>把所有初始化好的工具实例（Logger）都存到一个叫 <code>self.logger</code> 的字典里，方便后面随时调用。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>Task 2: 日常记账 (记录数据 <code>log</code>)</h3>
+<p><strong>目标</strong>：训练过程中，每跑一步（Step），就把产生的数据（Data）记录下来。</p>
+<ol>
+<li><strong>接收指令</strong>：<ul>
+<li>外部代码调用 <code>Tracking.log(data, step)</code>。比如：<code>data={'loss': 0.5, 'accuracy': 0.9}</code>。</li>
+</ul>
+</li>
+<li><strong>群发消息</strong>：<ul>
+<li>代码会遍历 <code>self.logger</code> 里所有的工具。</li>
+<li>不管你是 WandB 还是 TensorBoard，统统调用它们的 <code>.log()</code> 方法，把数据传过去。</li>
+<li>这样你只用写一行 <code>log</code> 代码，所有后台都能收到数据。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>Task 3: 翻译官 (适配器 Adapter)</h3>
+<p><strong>目标</strong>：因为不同的工具记录数据的方法不一样，需要专门的“翻译”类来处理。</p>
+<ul>
+<li><strong><code>ClearMLLogger</code> 类</strong>：<ul>
+<li>专门伺候 ClearML 的。它会判断数据是数字（scalar）还是表格（DataFrame），然后调用 ClearML 特有的 <code>report_scalar</code> 或 <code>report_table</code>。</li>
+</ul>
+</li>
+<li><strong><code>_TensorboardAdapter</code> 类</strong>：<ul>
+<li>专门伺候 TensorBoard 的。它主要负责把数据写成本地文件 (<code>writer.add_scalar</code>)。</li>
+</ul>
+</li>
+<li><strong><code>_MlflowLoggingAdapter</code> 类</strong>：<ul>
+<li>专门伺候 MLflow 的。它负责处理特殊字符（比如把 <code>@</code> 换成 <code>_at_</code>），然后发给 MLflow。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 4: 成果展示 (记录生成样本 <code>ValidationGenerationsLogger</code>)</h3>
+<p><strong>目标</strong>：AI 模型训练时会生成一些文本（比如问答）。我们需要直观地看到模型生成了什么，不仅仅是冷冰冰的数字。</p>
+<ol>
+<li><strong>接收样本</strong>：<ul>
+<li>这是一个专门的类 <code>ValidationGenerationsLogger</code>。它接收 <code>samples</code>（包含输入、模型输出、打分）。</li>
+</ul>
+</li>
+<li><strong>按格式排版</strong>：<ul>
+<li><strong>对 WandB</strong>：它会把这些文本做成一个漂亮的<strong>表格 (Table)</strong>，有 Input, Output, Score 列，方便网页上查看。</li>
+<li><strong>对 SwanLab/TensorBoard</strong>：表格不好显示，它就把这些内容拼成一长串<strong>文本 (Text)</strong>，用 Markdown 格式排版好，记录下来。</li>
+<li><strong>对 MLflow</strong>：它把数据存成一个 <strong>JSON 文件 (Artifact)</strong> 上传上去。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>Task 5: 下班打卡 (清理 <code>__del__</code>)</h3>
+<p><strong>目标</strong>：实验结束，保存数据，关闭连接。</p>
+<ol>
+<li><strong>善后工作</strong>：<ul>
+<li>当 <code>Tracking</code> 对象被销毁时（或者脚本结束时）。</li>
+<li>它会通知 WandB (<code>finish</code>)、TensorBoard (<code>close</code>) 等工具：“实验结束了，把剩下的数据传完，保存文件，断开连接。”</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结</h3>
+<p>这篇代码的核心思想就是 <strong>"封装"</strong>。</p>
+<ul>
+<li><strong>输入</strong>：你只需要给它项目名、实验名、要记录的数据。</li>
+<li><strong>黑盒</strong>：它内部处理了不同平台（WandB, TensorBoard, MLflow等）繁琐的 API 差异、登录逻辑、数据格式转换。</li>
+<li><strong>输出</strong>：你的实验数据被整整齐齐地记录在了你指定的各个平台上。</li>
+</ul>

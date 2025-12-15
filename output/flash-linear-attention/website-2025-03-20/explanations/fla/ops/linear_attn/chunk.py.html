@@ -1,0 +1,84 @@
+<h1>fla/ops/linear_attn/chunk.py</h1>
+<p>这段代码看起来非常短，因为它其实是一个<strong>“壳”</strong>（Wrapper）。它把复杂的计算逻辑封装到了底层的 <code>chunk_simple_gla</code> 函数里了。</p>
+<p>为了让你彻底搞懂这段代码在干什么，以及它背后的逻辑，我给你列了一个 <strong>Task List（学习任务清单）</strong>。我们像闯关一样，一步一步来拆解它。</p>
+<hr />
+<h3>🟢 Task 1: 搞清楚“我们在做什么菜？”（核心概念）</h3>
+<p><strong>目标：</strong> 理解这段代码解决的大背景问题——<strong>线性注意力机制 (Linear Attention)</strong>。</p>
+<ul>
+<li><strong>传统注意力（Standard Attention/Softmax）：</strong> 就像你看一本书，每读一个字都要回头把前面所有的字都看一遍。书越厚（序列 $T$ 越长），你看得越慢，计算量是平方级爆炸 ($T^2$)。</li>
+<li><strong>线性注意力（Linear Attention）：</strong> 这是这段代码的主角。它的思路是：我看书时，把前面的内容总结成一个“记忆”（State），每读一个字，我只更新这个记忆，然后继续往下读。计算量是线性的 ($T$)，非常快，省显存。</li>
+<li><strong>Chunk（分块）：</strong> 纯线性的计算虽然推理快，但训练时不好并行。<strong>Chunk</strong> 的意思是：把长文章切成一小段一小段（Chunks）。段内并行计算（像Transformer），段间串行传递记忆（像RNN）。这是为了<strong>加速训练</strong>。</li>
+</ul>
+<p><strong>代码对应：</strong>
+文件名叫 <code>chunk.py</code>，函数名叫 <code>chunk_linear_attn</code>，意思就是<strong>“用分块加速算法来实现线性注意力”</strong>。</p>
+<hr />
+<h3>🟢 Task 2: 准备食材（理解输入参数）</h3>
+<p><strong>目标：</strong> 看懂 <code>def chunk_linear_attn(...)</code> 里的参数都是啥。</p>
+<ul>
+<li><strong><code>q, k, v</code></strong>: 這是 Attention 的老三样。<ul>
+<li><code>q</code> (Query): 你现在的查询（比如“这句话讲啥？”）。</li>
+<li><code>k</code> (Key): 索引（比如书里的关键词）。</li>
+<li><code>v</code> (Value): 实际内容（比如书里的正文）。</li>
+<li><strong>形状</strong>：<code>[B, H, T, K]</code>。B是Batch大小，H是多头注意力的头数，T是序列长度（字数），K/V是特征维度。</li>
+</ul>
+</li>
+<li><strong><code>scale</code></strong>: 缩放因子。为了防止数字太大导致计算溢出或梯度消失，通常会除以 $\sqrt{K}$。</li>
+<li><strong><code>initial_state</code></strong>: 初始记忆。如果你是接着上一章读的，你需要传入上一章的“读后感”。</li>
+<li><strong><code>head_first</code></strong>: 数据排布格式。是 <code>[Batch, Head, Time, ...]</code> 还是 <code>[Batch, Time, Head, ...]</code>。代码里默认是 Head 在前。</li>
+</ul>
+<hr />
+<h3>🟢 Task 3: 核心烹饪手法（理解偷懒的艺术）</h3>
+<p><strong>目标：</strong> 理解代码中最关键的一行：调用 <code>chunk_simple_gla</code>。</p>
+<p>代码原文：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">o</span><span class="p">,</span> <span class="n">final_state</span> <span class="o">=</span> <span class="n">chunk_simple_gla</span><span class="p">(</span>
+    <span class="n">q</span><span class="o">=</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="o">=</span><span class="n">v</span><span class="p">,</span>
+    <span class="n">scale</span><span class="o">=</span><span class="n">scale</span><span class="p">,</span>
+    <span class="n">g</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>  <span class="c1"># &lt;--- 重点在这里！！！</span>
+    <span class="o">...</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解析：</strong>
+1.  <strong>GLA 是什么？</strong> GLA (Gated Linear Attention) 是线性注意力的一个升级版，它加了一个<strong>门控（Gate, <code>g</code>）</strong>，用来控制遗忘（比如：太久以前的内容我就忘掉）。
+2.  <strong>为什么要调它？</strong> 线性注意力其实就是 GLA 的一个<strong>特例</strong>。
+    *   GLA：有遗忘机制。
+    *   Linear Attention：没有遗忘机制（或者说遗忘率为0，所有历史记得一样清楚）。
+3.  <strong>偷懒的技巧：</strong> 作者不想重写一遍线性注意力的底层CUDA算子，直接复用了 GLA 的算子，但是把门控 <code>g</code> 设为了 <code>None</code>。
+    *   <strong>这意味着：</strong> 这是一个“不带遗忘门”的线性注意力计算。</p>
+<hr />
+<h3>🟢 Task 4: 摆盘（归一化 Normalize）</h3>
+<p><strong>目标：</strong> 理解 <code>if normalize:</code> 这一块在干什么。</p>
+<p>代码原文：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">normalize</span><span class="p">:</span>
+    <span class="n">o</span> <span class="o">=</span> <span class="n">normalize_output</span><span class="p">(</span><span class="n">q</span> <span class="o">*</span> <span class="n">scale</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">o</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解析：</strong>
+在标准的 Softmax Attention 里，Softmax 公式自带了一个分母（所有分数的和），保证输出概率和为 1。
+在线性注意力里，我们是用 $Q \times (K^T \times V)$ 算的，这里面<strong>没有除以分母</strong>。
+如果不处理，输出的数值会随着序列长度 $T$ 越来越大（读得越多，累加的值越大），最后这就爆了。</p>
+<ul>
+<li><strong><code>normalize_output</code></strong>：这就是在补做那个“除法”。它计算 $Q \times K^T$ 的累加和作为分母，把输出 <code>o</code> 重新拉回到正常的数值范围。</li>
+</ul>
+<hr />
+<h3>🟢 Task 5: 打包带走（返回值）</h3>
+<p><strong>目标：</strong> 理解 <code>return o, final_state</code>。</p>
+<ul>
+<li><strong><code>o</code> (Output)</strong>: 当前这段文字处理完后的结果，形状和输入一样。你可以把它理解为“读完这段话生成的理解”。</li>
+<li><strong><code>final_state</code></strong>: 最后的记忆状态。<ul>
+<li>如果你还要接着读下一段话，你就把这个 <code>final_state</code> 当作下一次调用的 <code>initial_state</code> 传进去。</li>
+<li>这就是线性注意力能处理无限长文本的关键（类似于 RNN 的 hidden state）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底讲了啥？</h3>
+<p>如果用一句话说：
+<strong>这段代码是一个“适配器”，它利用现有的、带门控功能的底层算子（<code>chunk_simple_gla</code>），通过关闭门控（<code>g=None</code>）并加上数学上的归一化修正，实现了标准的、高效的分块线性注意力（Linear Attention）。</strong></p>
+<h4>你的执行 List：</h4>
+<ol>
+<li><strong>不用</strong> 去纠结 <code>chunk_simple_gla</code> 内部怎么实现的（那是复杂的 CUDA/Triton 代码）。</li>
+<li><strong>只需要知道</strong>：这函数把 $O(T^2)$ 的复杂度降到了 $O(T)$。</li>
+<li><strong>记住</strong>：它把线性注意力看作是“没有遗忘”的 Gated Linear Attention。</li>
+<li><strong>注意</strong>：<code>normalize</code> 很重要，是为了防止数值爆炸。</li>
+</ol>

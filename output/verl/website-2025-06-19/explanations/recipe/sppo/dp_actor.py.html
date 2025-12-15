@@ -1,0 +1,125 @@
+<h1>recipe/sppo/dp_actor.py</h1>
+<p>这份代码实现的是 <strong>SPPO (Self-Play Preference Optimization)</strong> 算法中的 <strong>Actor（策略模型）</strong> 更新逻辑。</p>
+<p>简单来说，这段代码的任务就是：<strong>拿着数据（提示词、模型生成的回答、奖励分数），去调整模型参数，让模型生成的回答的概率变化趋势，尽可能逼近奖励分数所指示的方向。</strong></p>
+<p>为了让你听懂，我把这段代码拆解成一个 <strong>“训练大模型的 Todo List”</strong>，我们按照这个清单一步步看它是怎么工作的。</p>
+<hr />
+<h3>核心任务清单 (Todo List)</h3>
+<h4>✅ Task 1: 定义“我们要优化的目标是什么？” (核心数学公式)</h4>
+<p><strong>对应代码函数：</strong> <code>compute_sppo_loss</code></p>
+<p>这是整个文件的灵魂。SPPO 和传统的 PPO 不一样，它把强化学习问题转化为了一个<strong>回归问题</strong>。</p>
+<ul>
+<li><strong>步骤 1.1：计算“观点变化量” (<code>log_ratios</code>)</strong><ul>
+<li>代码：<code>log_ratios = log_prob_sum - old_log_prob_sum</code></li>
+<li><strong>解释：</strong> 模型现在的参数（<code>log_prob</code>）对这个回答的信心，减去模型之前的参数（<code>old_log_prob</code>）对这个回答的信心。这代表模型更新后，对这个回答的偏好增加了多少。</li>
+</ul>
+</li>
+<li><strong>步骤 1.2：计算“目标变化量” (<code>scaled_rewards</code>)</strong><ul>
+<li>代码：<code>scaled_rewards = eta * (rewards)</code></li>
+<li><strong>解释：</strong> 这个回答实际得了多少分（Reward）。这就好比老师给的标准答案：如果分高，模型就应该大幅增加对这个回答的信心。</li>
+</ul>
+</li>
+<li><strong>步骤 1.3：计算“差距”并尝试缩小它 (Loss)</strong><ul>
+<li>代码：<code>loss_vec = (log_ratios - scaled_rewards) ** 2</code></li>
+<li><strong>解释：</strong> 这是一个 <strong>均方误差 (MSE)</strong>。</li>
+<li><strong>核心观点：</strong> SPPO 认为，<strong>模型对某个回答的信心增量（Log Ratio），应该等于它获得的奖励（Reward）</strong>。如果奖励很高，模型就该大大增加生成这句话的概率；如果奖励很低（甚至是负的），模型就该保持不变甚至降低概率。代码就是在最小化这两者之间的差距。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 2: 准备训练流水线 (Actor 类初始化)</h4>
+<p><strong>对应代码类：</strong> <code>DataParallelSPPOActor</code> -&gt; <code>update_policy</code> 方法开头</p>
+<ul>
+<li><strong>步骤 2.1：开启训练模式</strong><ul>
+<li>代码：<code>self.actor_module.train()</code></li>
+<li><strong>解释：</strong> 告诉 PyTorch，我们要开始更新参数了。</li>
+</ul>
+</li>
+<li><strong>步骤 2.2：整理数据包</strong><ul>
+<li>代码：<code>batch = data.select(...)</code></li>
+<li><strong>解释：</strong> 从一大堆数据里挑出我们需要的东西：<ul>
+<li><code>input_ids</code>: 问题是什么。</li>
+<li><code>responses</code>: 模型回答了什么。</li>
+<li><code>old_log_probs</code>: 之前模型生成这句话的概率是多少（用于 Task 1.1）。</li>
+<li><code>seq_level_rewards</code>: 这个回答得了几分（用于 Task 1.2）。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 3: 切分数据 (Batching)</h4>
+<p><strong>对应代码：</strong> <code>dataloader = ...</code> 和 <code>micro_batches = ...</code></p>
+<ul>
+<li><strong>步骤 3.1：大块切小块 (Mini-batch)</strong><ul>
+<li><strong>解释：</strong> 显存有限，不能一次性把所有数据塞进去，要分成若干个 Mini-batch。</li>
+</ul>
+</li>
+<li><strong>步骤 3.2：小块切微块 (Micro-batch)</strong><ul>
+<li><strong>解释：</strong> 为了支持更长的序列或更大的模型，把 Mini-batch 再切得更碎，一点点喂给 GPU 吃（这叫梯度累积）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 4: 开始循环训练 (Training Loop)</h4>
+<p><strong>对应代码：</strong> <code>for epoch in ...</code>, <code>for batch_idx ...</code>, <code>for data in micro_batches ...</code></p>
+<p>这是一个三层循环：
+1.  <strong>Epoch 循环：</strong> 同样的数据学几遍？
+2.  <strong>Mini-batch 循环：</strong> 遍历数据块。
+3.  <strong>Micro-batch 循环：</strong> 实际执行计算的最小单元。</p>
+<hr />
+<h4>✅ Task 5: 模型前向计算 (Forward Pass)</h4>
+<p><strong>对应代码：</strong> <code>self._forward_micro_batch(...)</code></p>
+<ul>
+<li><strong>步骤 5.1：现在的模型怎么看？</strong><ul>
+<li><strong>解释：</strong> 把数据喂给<strong>当前</strong>的模型，算出<strong>当前</strong>的 <code>log_prob</code>（生成概率）。</li>
+<li><strong>注意：</strong> 这里需要拿到最新的概率，才能去和 <code>old_log_prob</code> 比较，计算 Task 1 中的 <code>log_ratios</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 6: 计算总损失 (Calculate Total Loss)</h4>
+<p><strong>对应代码：</strong> <code>pg_loss, ... = compute_sppo_loss(...)</code> 及后续几行</p>
+<p>这是把各种 Loss 加在一起的过程：</p>
+<ul>
+<li><strong>步骤 6.1：计算 SPPO 核心损失</strong><ul>
+<li>调用 Task 1 中的逻辑，强制让模型的概率变化去拟合奖励分数。</li>
+</ul>
+</li>
+<li><strong>步骤 6.2：(可选) 加上熵惩罚 (Entropy)</strong><ul>
+<li>代码：<code>policy_loss = pg_loss - entropy_loss * entropy_coeff</code></li>
+<li><strong>解释：</strong> 防止模型这就变得太“独断专行”，保持一定的随机性（探索性）。</li>
+</ul>
+</li>
+<li><strong>步骤 6.3：(可选) 加上 KL 散度惩罚 (KL Loss)</strong><ul>
+<li>代码：<code>kld = kl_penalty(...)</code></li>
+<li><strong>解释：</strong> 防止模型为了拿高分，改得面目全非，变得不像“人话”或者偏离原始模型太远。让它不要“忘本”。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 7: 反向传播与更新 (Backward &amp; Step)</h4>
+<p><strong>对应代码：</strong> <code>loss.backward()</code> 和 <code>self._optimizer_step()</code></p>
+<ul>
+<li><strong>步骤 7.1：计算梯度</strong><ul>
+<li><strong>解释：</strong> 根据刚才算出的总 Loss，反推每个参数应该怎么调。</li>
+</ul>
+</li>
+<li><strong>步骤 7.2：更新参数</strong><ul>
+<li><strong>解释：</strong> 实际修改神经网络的权重。</li>
+</ul>
+</li>
+<li><strong>步骤 7.3：记录日志</strong><ul>
+<li>代码：<code>metrics["actor/loss"] = ...</code></li>
+<li><strong>解释：</strong> 记下这次考了多少分，方便画图看训练曲线。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这代码讲了个什么观点？</h3>
+<p>这段代码的核心观点是 <strong>SPPO (Self-Play Preference Optimization)</strong> 的实现逻辑：</p>
+<ol>
+<li><strong>它不像传统 PPO</strong> 那样需要复杂的 Advantage（优势函数）计算和 Clipping（截断）。</li>
+<li><strong>它的核心假设很简单</strong>：如果一个回答奖励高，模型更新后生成它的概率增量（Log Ratio）就应该大。</li>
+<li><strong>它的实现方式</strong>：直接用 <strong>均方误差 (MSE)</strong> 强迫 <code>概率增量</code> 等于 <code>缩放后的奖励</code>。</li>
+</ol>
+<p>你看懂这个 List，就看懂了这个文件的逻辑。</p>

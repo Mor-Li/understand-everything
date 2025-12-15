@@ -1,0 +1,97 @@
+<h1>megatron/core/fusions/fused_bias_swiglu.py</h1>
+<p>这份代码确实属于深度学习框架中比较底层的部分（Megatron-Core），涉及到了<strong>自定义算子</strong>、<strong>显存优化</strong>和<strong>手动梯度计算</strong>。看不懂是很正常的，因为它不是在写模型结构，而是在写“如何让这个数学运算跑得更快、更省显存”。</p>
+<p>为了帮你消化这份代码，我制定了一个 <strong>6步走的 Task List</strong>。我们按顺序一步步来拆解。</p>
+<hr />
+<h3>📝 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1: 搞懂核心数学公式 (什么是 SwiGLU？)</strong></li>
+<li><strong>Task 2: 理解为什么要 "Fusion" (JIT 是干嘛的？)</strong></li>
+<li><strong>Task 3: 拆解前向传播 (Forward 代码分析)</strong></li>
+<li><strong>Task 4: 面对最难的部分——反向传播 (Backward 代码分析)</strong></li>
+<li><strong>Task 5: 理解显存黑科技 (FP8 Input Store)</strong></li>
+<li><strong>Task 6: 统筹全局 (Wrapper 函数)</strong></li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 1: 搞懂核心数学公式 (什么是 SwiGLU？)</h4>
+<p>首先，抛开代码，SwiGLU 是目前大模型（如 LLaMA）中最常用的<strong>激活函数</strong>。
+它的逻辑很简单：把输入切成两半，一半做 SiLU 激活，另一半保持原样，然后两半乘起来。</p>
+<ul>
+<li><strong>公式：</strong> <code>SwiGLU(x) = SiLU(x1) * x2</code></li>
+<li><strong>代码对应：</strong>
+    <code>python
+    def swiglu(y):
+        y_1, y_2 = torch.chunk(y, 2, -1)  # 把输入 y 在最后一个维度切成两半
+        return F.silu(y_1) * y_2          # 第一半做激活，乘上第二半</code></li>
+</ul>
+<h4>Task 2: 理解为什么要 "Fusion" (JIT 是干嘛的？)</h4>
+<p>你会在代码里看到很多 <code>@jit_fuser</code> 装饰器。
+<strong>背景：</strong> 在 GPU 上，读取内存（显存）比计算要慢得多。
+<strong>问题：</strong> 如果按普通方式写：<code>加偏置</code> -&gt; <code>存回显存</code> -&gt; <code>切分</code> -&gt; <code>存回</code> -&gt; <code>SiLU</code> -&gt; <code>存回</code>... 这样频繁读写显存非常慢。
+<strong>解决：</strong> <strong>Kernel Fusion (算子融合)</strong>。<code>@jit_fuser</code> 告诉 PyTorch：“把这几个操作合并成一个大的操作，一次性读入数据，算完所有步骤，再写回显存”。</p>
+<p>这就像原本你要跑三趟超市买三个苹果，Fusion 之后是你拿个大袋子一趟把三个苹果都买回来。</p>
+<h4>Task 3: 拆解前向传播 (Forward 代码分析)</h4>
+<p>代码中定义了两个 JIT 函数用于前向计算：</p>
+<ol>
+<li><strong><code>swiglu(y)</code></strong>: 纯粹的 SwiGLU 计算（如 Task 1 所述）。</li>
+<li><strong><code>bias_swiglu(y, bias)</code></strong>:
+    <code>python
+    @jit_fuser
+    def bias_swiglu(y, bias):
+        y = y + bias      # 1. 先加上偏置 (Bias)
+        return swiglu(y)  # 2. 再做 SwiGLU</code>
+    <strong>目的：</strong> 把“加偏置”和“激活函数”融合在一起做，速度更快。</li>
+</ol>
+<h4>Task 4: 面对最难的部分——反向传播 (Backward 代码分析)</h4>
+<p>这是代码里最让人头大的部分（<code>swiglu_back</code> 和 <code>bias_swiglu_back</code>）。
+<strong>为什么需要它？</strong>
+通常 PyTorch 会自动算梯度（Autograd）。但是，为了追求极致性能和显存控制，Megatron 选择<strong>手写梯度的数学公式</strong>。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>swiglu_back(g, y)</code></li>
+<li><strong>逻辑：</strong> 这里面那一长串 <code>g * torch.sigmoid(y_1) * ...</code> 其实就是 SwiGLU 函数对输入求导的数学公式（链式法则）。</li>
+<li><strong>观点：</strong> 你不需要手动推导这个公式，只需要知道<strong>这是为了手动告诉 GPU 如何计算梯度</strong>，而不是依赖 PyTorch 自动生成的图，这样通常更快且更省内存。</li>
+</ul>
+<h4>Task 5: 理解显存黑科技 (FP8 Input Store)</h4>
+<p>现在的模型太大了，显存不够用。代码里藏了一个优化技巧：<strong>FP8</strong>。</p>
+<p>请看 <code>BiasSwiGLUFunction</code> 类中的 <code>forward</code> 方法：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">input_for_backward</span> <span class="o">=</span> <span class="nb">input</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float8_e4m3fn</span><span class="p">)</span> <span class="k">if</span> <span class="n">fp8_input_store</span> <span class="k">else</span> <span class="nb">input</span>
+<span class="n">ctx</span><span class="o">.</span><span class="n">save_for_backward</span><span class="p">(</span><span class="n">input_for_backward</span><span class="p">,</span> <span class="n">bias</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>问题：</strong> 为了算梯度（反向传播），前向传播时的输入数据（<code>input</code>）必须保存在显存里，直到反向传播结束。这非常占显存。</li>
+<li><strong>解决：</strong> 如果开启 <code>fp8_input_store</code>，代码会把原本 16位（BF16/FP16）的数据强行压缩成 <strong>8位（FP8）</strong> 存起来。</li>
+<li><strong>效果：</strong> 显存占用直接砍半（甚至更多），虽然精度损失一点点，但在大模型训练中通常是可以接受的。</li>
+<li><strong>还原：</strong> 在 <code>backward</code> 函数里，它会把 FP8 再转回原来的类型来算梯度。</li>
+</ul>
+<h4>Task 6: 统筹全局 (Wrapper 函数)</h4>
+<p>最后看文件底部的 <code>bias_swiglu_impl</code> 函数。它是给外部调用的总接口。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">bias_swiglu_impl</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">bias</span><span class="p">,</span> <span class="n">fp8_input_store</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+    <span class="c1"># 1. 检查形状，确保是 2D 或 3D 张量</span>
+    <span class="n">ori_shape</span> <span class="o">=</span> <span class="nb">input</span><span class="o">.</span><span class="n">shape</span>
+
+    <span class="c1"># 2. 展平数据：为了方便计算，把数据变成 [Batch*Seq, Hidden] 的形状</span>
+    <span class="nb">input</span> <span class="o">=</span> <span class="nb">input</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">ori_shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>
+
+    <span class="c1"># 3. 选择调用哪种 Function (带Bias 或 不带Bias)</span>
+    <span class="k">if</span> <span class="n">bias</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">output</span> <span class="o">=</span> <span class="n">BiasSwiGLUFunction</span><span class="o">.</span><span class="n">apply</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">bias</span><span class="p">,</span> <span class="n">fp8_input_store</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">output</span> <span class="o">=</span> <span class="n">SwiGLUFunction</span><span class="o">.</span><span class="n">apply</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">fp8_input_store</span><span class="p">)</span>
+
+    <span class="c1"># 4. 恢复形状：把数据变回原来的 [Batch, Seq, Hidden]</span>
+    <span class="k">return</span> <span class="n">output</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">ori_shape</span><span class="p">)</span> <span class="o">==</span> <span class="mi">2</span> <span class="k">else</span> <span class="n">output</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<hr />
+<h3>💡 总结：这个文件到底在讲什么？</h3>
+<p>如果你的同事问你：“这个文件是干嘛的？” 你可以这样回答：</p>
+<blockquote>
+<p>"这是一个<strong>高性能的 SwiGLU 激活函数实现</strong>。</p>
+<ol>
+<li>它用了 <strong>JIT Fusion</strong> 技术，把加 Bias 和 SwiGLU 计算融合在一起，减少 GPU 显存读写。</li>
+<li>它<strong>手写了反向传播</strong>逻辑，没有完全依赖 PyTorch 自动微分，为了更细粒度的控制。</li>
+<li>它支持 <strong>FP8 存储优化</strong>，在前向传播时把需要保存的 Tensor 压缩成 8-bit，大大节省了大模型训练时的显存开销。"</li>
+</ol>
+</blockquote>
+<p>现在是不是清晰一些了？</p>

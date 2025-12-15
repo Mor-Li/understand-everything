@@ -1,0 +1,113 @@
+<h1>megatron/core/dist_checkpointing/strategies/common.py</h1>
+<p>这段代码确实比较抽象，因为它是 <strong>Megatron-LM</strong>（一个用于训练超大模型的框架）中关于 <strong>分布式检查点（Distributed Checkpointing）</strong> 的底层实现逻辑。</p>
+<p>简单来说，它的作用是：<strong>定义了如何用最基础的 PyTorch 方式（<code>torch.save</code> 和 <code>torch.load</code>）来保存和读取那些分散在不同显卡上的模型数据。</strong></p>
+<p>为了帮你读懂，我制定了一个 <strong>“学习任务清单 (Todo List)”</strong>。我们按照这个清单，从宏观概念到具体代码，一步步拆解。</p>
+<hr />
+<h3>📋 学习任务清单 (Todo List)</h3>
+<h4>✅ Task 1: 理解背景 —— 我们在解决什么问题？</h4>
+<p><strong>核心概念：</strong> 在多卡训练（分布式训练）中，保存模型（Checkpointing）比单卡复杂得多。
+*   <strong>问题：</strong> 模型太大，被切分（Sharded）到了不同的 GPU 上。
+*   <strong>目标：</strong> 我们需要把这些切碎的数据保存下来，或者把保存好的数据加载回去。
+*   <strong>这个文件的角色：</strong> 它是“通用策略（Common Strategy）”，也就是最朴素的保存方式——直接把数据存成 <code>.pt</code> 文件。</p>
+<h4>✅ Task 2: 区分两种数据 —— "Common" vs "Sharded"</h4>
+<p>代码里反复出现这两个词，必须先分清：
+1.  <strong>Common State (通用状态):</strong>
+    *   <strong>是什么：</strong> 所有显卡上都一样的数据。比如：当前的训练步数（step）、学习率参数、配置参数。
+    *   <strong>怎么存：</strong> 只需要保存一份（通常由主进程保存），大家都能读。
+    *   <strong>文件名：</strong> 代码里定义了 <code>COMMON_STATE_FNAME = 'common.pt'</code>。
+2.  <strong>Sharded Objects (分片对象):</strong>
+    *   <strong>是什么：</strong> 被切分的数据。比如：超大模型的参数矩阵、优化器的状态。GPU 1 只有第一半，GPU 2 只有第二半。
+    *   <strong>怎么存：</strong> 每块显卡（或每个分片）需要保存自己负责的那一部分。</p>
+<hr />
+<h4>✅ Task 3: 读懂“保存”逻辑 (<code>TorchCommonSaveStrategy</code>)</h4>
+<p><strong>目标：</strong> 看懂 <code>TorchCommonSaveStrategy</code> 类。</p>
+<ul>
+<li>
+<p><strong>Step 3.1: 保存通用状态 (<code>save_common</code>)</strong>
+    <code>python
+    def save_common(self, common_state_dict: StateDict, checkpoint_dir: Path):
+        if torch.distributed.get_rank() == 0:  # 重点：只有 Rank 0 (主进程) 动手
+            torch.save(common_state_dict, checkpoint_dir / COMMON_STATE_FNAME)</code></p>
+<ul>
+<li><strong>解读：</strong> 既然大家数据都一样，没必要每个人都存一遍。只有老大（Rank 0）把数据写进 <code>common.pt</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.2: 保存分片数据 (<code>save_sharded_objects</code>)</strong>
+    <code>python
+    def save_sharded_objects(self, sharded_objects_state_dict: ShardedStateDict, checkpoint_dir: Path):
+        for sh_obj in nested_values(sharded_objects_state_dict): # 遍历所有分片对象
+            if is_main_replica(sh_obj.replica_id): # 重点：去重
+                # ... 生成保存路径，然后 torch.save ...</code></p>
+<ul>
+<li><strong>解读：</strong><ul>
+<li>这里有一个 <code>is_main_replica</code> 的判断。因为在某些并行策略下，GPU 1 和 GPU 2 可能持有相同的数据副本（Replication）。</li>
+<li>为了节省空间，如果有多个人持有同一份数据，只让“主副本”去保存。</li>
+<li>保存的文件名通常是 <code>unique_key.pt</code>。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 4: 读懂“加载”逻辑 (<code>TorchCommonLoadStrategy</code>)</h4>
+<p><strong>目标：</strong> 看懂 <code>TorchCommonLoadStrategy</code> 类。</p>
+<ul>
+<li>
+<p><strong>Step 4.1: 加载通用状态 (<code>load_common</code>)</strong></p>
+<ul>
+<li><strong>逻辑：</strong> 很简单，找到 <code>common.pt</code>，用 <code>torch.load</code> 读进内存。如果文件不存在就报错。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 4.2: 加载分片数据 (<code>load_sharded_objects</code>)</strong></p>
+<ul>
+<li><strong>逻辑：</strong> 这是一个<strong>替换</strong>的过程。输入是一个包含“占位符”的字典，函数要把真正的 Tensor 数据填进去。</li>
+<li><strong>核心代码段：</strong>
+    <code>python
+    def load_sharded_object(sh_obj: ShardedObject):
+        # 1. 拼凑出文件名 unique_key.pt
+        load_path = checkpoint_dir / f'{sh_obj.unique_key}.pt'
+        try:
+            # 2. 尝试加载
+            loaded_obj = torch.load(load_path)
+        except FileNotFoundError as e:
+            # ... 后面一大堆是处理旧版本兼容性的 (Backward compatible) ...
+        return loaded_obj</code></li>
+<li><strong>解读：</strong> 代码主要是根据 <code>unique_key</code> 找到对应的 <code>.pt</code> 文件，加载数据并返回。<code>try...except</code> 块里那一长串代码是为了兼容旧版本的保存路径格式（以前可能不叫这个名，或者路径层级不同），如果找不到新格式的文件，就去试旧格式。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 5: 理解元数据扫描 (进阶)</h4>
+<p><strong>目标：</strong> 看懂 <code>load_sharded_metadata</code>。</p>
+<ul>
+<li><strong>场景：</strong> 有时候我们不想真的把几百 GB 的模型加载进内存，我们只想知道“磁盘上有哪些分片？它们的形状（Shape）是多少？”</li>
+<li><strong>逻辑：</strong><ol>
+<li>遍历文件夹 (<code>checkpoint_dir.iterdir()</code>)。</li>
+<li>寻找 <code>shard_*.pt</code> 这种文件。</li>
+<li>根据文件名推断出这是一个什么样的分片对象（构建 <code>ShardedObject</code>）。</li>
+<li><strong>解读：</strong> 这通常用于预检查或者转换 checkpoint 格式时使用。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 6: 注册策略 (收尾)</h4>
+<p><strong>目标：</strong> 看懂最后两行。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">default_strategies</span><span class="p">[</span><span class="n">StrategyAction</span><span class="o">.</span><span class="n">LOAD_COMMON</span><span class="o">.</span><span class="n">value</span><span class="p">][(</span><span class="s1">&#39;torch&#39;</span><span class="p">,</span> <span class="mi">1</span><span class="p">)]</span> <span class="o">=</span> <span class="n">TorchCommonLoadStrategy</span><span class="p">()</span>
+<span class="n">default_strategies</span><span class="p">[</span><span class="n">StrategyAction</span><span class="o">.</span><span class="n">SAVE_COMMON</span><span class="o">.</span><span class="n">value</span><span class="p">][(</span><span class="s1">&#39;torch&#39;</span><span class="p">,</span> <span class="mi">1</span><span class="p">)]</span> <span class="o">=</span> <span class="n">TorchCommonSaveStrategy</span><span class="p">(</span><span class="s1">&#39;torch&#39;</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong><ul>
+<li>这是把上面定义的两个类“挂载”到系统的全局配置里。</li>
+<li>它的意思是：如果用户配置说我要用 <strong><code>torch</code></strong> 格式、版本 <strong><code>1</code></strong> 来进行 <strong><code>LOAD</code></strong> 或 <strong><code>SAVE</code></strong> 操作，那就请调用这个文件里写的 <code>TorchCommonLoadStrategy</code> 或 <code>TorchCommonSaveStrategy</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结 (Takeaway)</h3>
+<p>这个文件其实就是一个<strong>翻译官</strong>：
+1.  <strong>对于保存：</strong> 它告诉 Megatron 框架，“别管那些复杂的分布式逻辑了，把数据给我，我用最标准的 <code>torch.save</code> 帮你存成文件，通用数据存一个文件，分片数据各存各的文件。”
+2.  <strong>对于加载：</strong> 它告诉框架，“把你要读取的 Key 给我，我去硬盘上找对应的 <code>.pt</code> 文件，用 <code>torch.load</code> 读出来给你。”</p>
+<p>现在回头再看代码，是不是清晰了一些？重点关注 <code>save</code> 和 <code>load</code> 那几个核心函数即可。</p>

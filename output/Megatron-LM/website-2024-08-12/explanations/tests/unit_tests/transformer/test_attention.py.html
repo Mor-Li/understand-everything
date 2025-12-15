@@ -1,0 +1,117 @@
+<h1>tests/unit_tests/transformer/test_attention.py</h1>
+<p>这是一份非常典型的<strong>单元测试（Unit Test）</strong>代码。</p>
+<p>为了让你听懂，我们可以把这个文件想象成是一张<strong>“质检清单”</strong>。</p>
+<p>设想你是一个负责制造汽车引擎核心部件（这里是 GPT 模型中的 <code>SelfAttention</code> 自注意力机制）的工程师。每次你修改了设计图纸，你都需要跑一遍这张清单，确保你的修改没有把引擎搞坏。</p>
+<p>我为你制定了一个<strong>5步的学习任务 List</strong>，我们一步一步来拆解这张“质检清单”：</p>
+<h3>📝 学习任务 List</h3>
+<ol>
+<li><strong>任务一：搞清楚我们在测什么？（环境搭建）</strong></li>
+<li><strong>任务二：点名查验（基础构造测试）</strong></li>
+<li><strong>任务三：试运行（GPU 前向传播测试）</strong></li>
+<li><strong>任务四：测试“加速模式”（RoPE 旋转位置编码测试）</strong></li>
+<li><strong>任务五：测试“省油模式”（重计算/Checkpointing 测试）</strong></li>
+</ol>
+<hr />
+<h3>详细讲解</h3>
+<h4>任务一：搞清楚我们在测什么？（环境搭建）</h4>
+<p>在测试开始前，必须先搭好台子。这对应代码中的 <code>setup_method</code>。</p>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>python
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1,1) # 1. 模拟分布式环境
+        self.transformer_config = TransformerConfig(...) # 2. 定义配置
+        self.parallel_attention = SelfAttention(...) # 3. 制造出那个核心部件</code></li>
+<li><strong>通俗解释：</strong><ol>
+<li><strong>模拟环境</strong>：Megatron 是用来在大集群上训练大模型的。但在测试里，我们假装初始化了一个并行的环境（虽然这里设为1，即单卡模拟）。</li>
+<li><strong>定义规格</strong>：我们不能拿真 GPT-4 的规格来测，那太大了。这里定义了一个<strong>“迷你版”模型</strong>：只有2层，隐藏层大小只有12（通常是几千），4个注意力头。这是一个“玩具级”的配置，专门用来跑通逻辑的。</li>
+<li><strong>制造部件</strong>：根据上面的规格，实例化了一个 <code>SelfAttention</code> 对象。这就是我们要“质检”的目标。</li>
+</ol>
+</li>
+</ul>
+<h4>任务二：点名查验（基础构造测试）</h4>
+<p>部件造出来了，先看看它长得对不对。这对应 <code>test_constructor</code>。</p>
+<ul>
+<li><strong>代码片段：</strong>
+    ```python
+    def test_constructor(self):
+        assert isinstance(self.parallel_attention, SelfAttention) # 1. 确认身份
+        assert self.parallel_attention.layer_number == 1 # 2. 确认层号<div class="codehilite"><pre><span></span><code>num_weights = sum([p.numel() for p in self.parallel_attention.parameters()])
+assert num_weights == 648 # 3. 数零件
+</code></pre></div>
+
+<p><code>``
+*   **通俗解释：**
+1.  **验明正身**：你确定造出来的是“自注意力模块”，而不是别的东西吗？
+2.  **查层号**：确认它是第1层的模块。
+3.  **数零件（核心）**：</code>num_weights == 648`。这是在数这个模块里有多少个可训练的参数。
+    *   <em>为什么要数？</em> 如果你改了代码，导致少了一个偏置项（Bias）或者多了一个矩阵，参数量就会变。这里强制要求参数总量必须是 648，少一个螺丝都不行。</p>
+</li>
+</ul>
+<h4>任务三：试运行（GPU 前向传播测试）</h4>
+<p>静态检查过了，现在要通电试运行。这对应 <code>test_gpu_forward</code>。</p>
+<ul>
+<li><strong>代码片段：</strong>
+    ```python
+    def test_gpu_forward(self):
+        # ... 设置数据 ...
+        hidden_states = torch.ones(...) # 1. 伪造输入数据
+        output, bias = self.parallel_attention(hidden_states, attention_mask) # 2. 塞进机器里跑<div class="codehilite"><pre><span></span><code><span class="gh">#</span> 3. 检查出口出来的东西对不对
+assert output.shape[0] == sequence_length
+assert output.shape[1] == micro_batch_size
+assert output.shape[2] == config.hidden_size
+</code></pre></div>
+
+<p><code>``
+*   **通俗解释：**
+1.  **伪造数据**：造了一些全也是 1 的假数据（Tensor），放到 GPU 上。
+2.  **运行**：调用</code>self.parallel_attention(...)<code>，这就是所谓的“前向传播”（Forward）。
+3.  **检查输出形状**：我们不关心算出来的具体数字是多少（因为输入是瞎填的），我们只关心**输出的形状（Shape）**对不对。
+    *   如果进去是</code>[32, 2, 12]` 的矩阵，出来的也必须符合预期的维度。如果维度错了，说明矩阵乘法写错了。</p>
+</li>
+</ul>
+<h4>任务四：测试“加速模式”（RoPE 旋转位置编码测试）</h4>
+<p>现在的模型通常会用一种叫 RoPE 的技术来处理位置信息。这是个高级功能，得单独测。这对应 <code>test_fused_rope_gpu_forward</code>。</p>
+<ul>
+<li><strong>代码片段：</strong>
+    ```python
+    def test_fused_rope_gpu_forward(self):
+        self.parallel_attention.config.apply_rope_fusion = True # 1. 打开开关
+        # ... 准备带位置信息的数据 ...
+        output, bias = self.parallel_attention(..., rotary_pos_emb=rotary_pos_emb) # 2. 带参数运行<div class="codehilite"><pre><span></span><code># 3. 再次检查形状
+assert output.shape...
+</code></pre></div>
+
+<p><code>``
+*   **通俗解释：**
+1.  **打开开关**：把配置里的</code>apply_rope_fusion<code>（应用融合的旋转位置编码）设为 True。
+2.  **带参数运行**：这次输入多了一个</code>rotary_pos_emb`（位置编码数据）。
+3.  <strong>目的</strong>：确保开启了这个特定的优化功能后，程序依然能跑通，且输出形状正确。</p>
+</li>
+</ul>
+<h4>任务五：测试“省油模式”（重计算/Checkpointing 测试）</h4>
+<p>大模型训练很占显存，有一种技术叫“激活重计算”（Checkpointing），是用时间换空间。这个功能如果坏了，显存会爆炸。这对应 <code>test_checkpointed_gpu_forward</code>。</p>
+<ul>
+<li><strong>代码片段：</strong>
+    ```python
+    def test_checkpointed_gpu_forward(self):
+        transformer_config.recompute_granularity='selective' # 1. 开启省显存模式
+        # ...
+        output, bias = checkpointed_parallel_attention(...) # 2. 运行<div class="codehilite"><pre><span></span><code>assert config.recompute_granularity == &#39;selective&#39; # 3. 确认模式开启
+<span class="gh">#</span> ... 检查形状
+</code></pre></div>
+
+<p><code>``
+*   **通俗解释：**
+1.  **开启模式**：设置</code>recompute_granularity='selective'`。这意味着告诉模型：“有些中间结果不用存，下次用到再算一遍，省点内存”。
+2.  <strong>目的</strong>：验证在这个特殊的内存优化配置下，模型依然能正常工作，不会报错。</p>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件其实就是为了回答这四个问题：
+1.  <strong>能不能造出来？</strong> (Constructor)
+2.  <strong>最基本的功能能不能跑通？</strong> (Basic Forward)
+3.  <strong>加了位置编码优化能不能跑通？</strong> (RoPE Forward)
+4.  <strong>开了省内存模式能不能跑通？</strong> (Checkpointed Forward)</p>
+<p>如果这四个测试都 Pass（通过），开发者就可以放心地说：“这个 Attention 模块没问题，可以拿去组装大模型了！”</p>

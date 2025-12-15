@@ -1,0 +1,100 @@
+<h1>verl/utils/megatron/pipeline_parallel.py</h1>
+<p>这段代码确实比较晦涩，因为它属于<strong>大模型分布式训练（Megatron-LM）</strong>的底层基础设施代码。如果不了解“流水线并行（Pipeline Parallelism）”和“序列并行（Sequence Parallelism）”，确实很难看懂。</p>
+<p>我们可以把这段代码的任务想象成<strong>“为一条超级庞大的工厂流水线准备原材料”</strong>。</p>
+<p>为了让你读懂，我制定了一个 <strong>“三步走的学习 To-Do List”</strong>。我们一步一步来拆解。</p>
+<hr />
+<h3>📋 任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 0: 理解背景</strong> —— 为什么要写这个文件？（工厂的调度问题）</li>
+<li><strong>Task 1: 拆解 <code>compute_transformers_input_shapes</code></strong> —— 也就是“计算包裹大小”。</li>
+<li><strong>Task 2: 拆解 <code>make_batch_generator</code></strong> —— 也就是“把包裹放到传送带上”。</li>
+</ol>
+<hr />
+<h3>✅ Task 0: 理解背景 (Context)</h3>
+<p><strong>场景：</strong> 你在训练一个巨大的模型（比如 GPT-4 规模），一个 GPU 放不下，甚至几十个 GPU 拼在一起才勉强放下。
+<strong>解决方案：</strong> 我们把模型切成好几段，放在不同的 GPU 上。
+*   GPU 1 负责第 1-10 层。
+*   GPU 2 负责第 11-20 层。
+*   ...
+这就是 <strong>流水线并行 (Pipeline Parallelism, PP)</strong>。</p>
+<p><strong>问题来了：</strong>
+当 GPU 1 算完数据，要把结果传给 GPU 2 时，GPU 2 需要提前知道：“<strong>你会扔给我一个多大的数据块？</strong>”
+如果 GPU 2 不知道形状，它就没法预先分配显存，或者通信会出错。</p>
+<p><strong>这个文件的核心目的：</strong> 就是为了解决数据在流水线上传输时的<strong>形状计算</strong>和<strong>数据投喂</strong>问题。</p>
+<hr />
+<h3>✅ Task 1: 拆解 <code>compute_transformers_input_shapes</code></h3>
+<p><strong>目标：告诉流水线上的每一个 GPU，它即将收到的数据长什么样。</strong></p>
+<p>这个函数是在做“预计算”。让我们看看它里面的 Todo：</p>
+<h4>Step 1.1: 去除“气泡” (Unpad)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">input_ids_rmpad</span> <span class="o">=</span> <span class="n">unpad_input</span><span class="p">(</span><span class="n">input_ids</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">),</span> <span class="n">attention_mask</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
+</code></pre></div>
+
+<ul>
+<li><strong>现象：</strong> 通常我们将一堆句子打包成一个 Batch 时，因为句子长短不一，短句子后面会补很多 0 (Padding) 来对齐长句子。</li>
+<li><strong>动作：</strong> 这里用了 <code>flash_attn</code> 的 <code>unpad_input</code>。它的作用是<strong>把那些没用的 0 全部扔掉</strong>，把所有句子的有效单词（token）首尾相连，压扁成这一长条。</li>
+<li><strong>目的：</strong> 省显存、省计算量。Megatron 和 FlashAttention 喜欢处理这种紧凑的数据。</li>
+</ul>
+<h4>Step 1.2: 像切蛋糕一样切分数据 (Sequence Parallel)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">meta_info</span><span class="p">[</span><span class="s2">&quot;sequence_parallel&quot;</span><span class="p">]:</span>
+    <span class="n">input_ids_rmpad</span> <span class="o">=</span> <span class="n">pad_to_sequence_parallel</span><span class="p">(</span><span class="n">input_ids_rmpad</span><span class="p">)</span>
+    <span class="c1"># ... shape[0] // mpu.get_tensor_model_parallel_world_size() ...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>背景：</strong> 如果开启了 <strong>序列并行 (Sequence Parallel)</strong>，意味着不仅模型被切分了，连这一长条数据也要被切分到多个 GPU 上同时计算。</li>
+<li><strong>动作：</strong><ol>
+<li><code>pad_to_sequence_parallel</code>: 先把数据补齐一点点，确保总长度能被 GPU 数量整除。</li>
+<li><code>// mpu.get_tensor_model_parallel_world_size()</code>: <strong>除以 GPU 的数量</strong>。</li>
+</ol>
+</li>
+<li><strong>比喻：</strong> 假设有一条 100 米长的面条，你有 4 个厨师（GPU）。每个人只能处理 25 米。所以这里计算出的形状是 <strong>25</strong>，而不是 100。</li>
+</ul>
+<h4>Step 1.3: 汇报尺寸</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">input_shapes</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">Size</span><span class="p">([</span><span class="o">...</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">meta_info</span><span class="p">[</span><span class="s2">&quot;hidden_size&quot;</span><span class="p">]]))</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作：</strong> 最后计算出的形状是 <code>[处理后的长度, 1, 隐藏层维度]</code>。</li>
+<li><strong>结果：</strong> 这个函数返回一个列表，告诉系统：“嘿，这一批数据，每个 GPU 应该准备好接收这么大的一块张量。”</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 拆解 <code>make_batch_generator</code></h3>
+<p><strong>目标：把数据做成迭代器，喂给 Megatron 的引擎。</strong></p>
+<p>Megatron 的流水线有一种高级玩法叫 <strong>虚拟流水线 (Virtual Pipeline, VPP)</strong>。</p>
+<ul>
+<li><strong>普通流水线：</strong> GPU 1 算完一整块，给 GPU 2。</li>
+<li><strong>虚拟流水线 (VPP)：</strong> 为了减少等待时间，把 GPU 1 负责的层再切碎，数据也切碎。GPU 1 算一小会儿，就传给 GPU 2，然后 GPU 1 再回头算下一小块。这就形成了“交错 (Interleaved)”执行。</li>
+</ul>
+<p>这个函数就是为了适配这种玩法：</p>
+<h4>Step 2.1: 处理 VPP 模式</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">vpp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+    <span class="n">batch_generator</span> <span class="o">=</span> <span class="p">[</span><span class="n">batches</span><span class="p">]</span> <span class="o">*</span> <span class="n">vpp_size</span>
+    <span class="n">batch_generator</span> <span class="o">=</span> <span class="p">[</span><span class="nb">iter</span><span class="p">(</span><span class="n">b</span><span class="p">)</span> <span class="k">for</span> <span class="n">b</span> <span class="ow">in</span> <span class="n">batch_generator</span><span class="p">]</span>
+</code></pre></div>
+
+<ul>
+<li><strong>情况：</strong> 如果开启了 VPP（<code>vpp_size &gt; 1</code>），Megatron 的调度器会以为它在面对多个“虚拟”的阶段。</li>
+<li><strong>动作：</strong> <code>[batches] * vpp_size</code>。这行代码复制了多个数据列表的引用。</li>
+<li><strong>结果：</strong> 它返回了一个<strong>迭代器列表</strong>。<ul>
+<li>比如 VPP=2，它就返回 <code>[迭代器A, 迭代器B]</code>。</li>
+<li>Megatron 调度器在第 1 个虚拟阶段会找 <code>迭代器A</code> 要数据，在第 2 个虚拟阶段会找 <code>迭代器B</code> 要数据。虽然它们指向的是同一份数据源，但在代码接口上需要分开提供。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 2.2: 处理普通模式</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">else</span><span class="p">:</span>
+    <span class="n">batch_generator</span> <span class="o">=</span> <span class="nb">iter</span><span class="p">(</span><span class="n">batches</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>情况：</strong> 没有 VPP，最普通的流水线。</li>
+<li><strong>动作：</strong> 直接把数据列表变成一个迭代器返回。简单粗暴。</li>
+</ul>
+<hr />
+<h3>📝 总结 (Summary)</h3>
+<p>如果用一句话概括这个文件：
+<strong>这是连接 <code>verl</code> 数据加载器和 <code>Megatron</code> 训练引擎的“适配器”。</strong></p>
+<ol>
+<li><strong><code>compute_transformers_input_shapes</code></strong>: 负责<strong>量尺寸</strong>。因为用了 FlashAttention 去除 Padding，又用了序列并行切分数据，张量形状变得很复杂，必须提前算好告诉 Megatron，方便它在 GPU 间通信。</li>
+<li><strong><code>make_batch_generator</code></strong>: 负责<strong>发货</strong>。根据是否使用了高级的虚拟流水线技术（VPP），把数据包装成 Megatron 能够识别的迭代器格式。</li>
+</ol>

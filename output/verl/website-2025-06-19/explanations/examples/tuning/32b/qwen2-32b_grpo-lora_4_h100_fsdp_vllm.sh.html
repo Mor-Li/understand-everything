@@ -1,0 +1,98 @@
+<h1>examples/tuning/32b/qwen2-32b_grpo-lora_4_h100_fsdp_vllm.sh</h1>
+<p>这个脚本确实看起来密密麻麻的参数很吓人。其实，你可以把它想象成<strong>给大厨（计算机）的一张详细的“做菜清单”（训练模型配置单）</strong>。</p>
+<p>这个脚本的目标是：<strong>使用 GRPO 算法，通过 LoRA 微调的方式，让 Qwen2.5-32B 这个大模型学会做 GSM8K（小学数学题）。</strong></p>
+<p>为了让你看懂，我把这个脚本拆解成一个 <strong>7步走的 Task List（任务清单）</strong>，每一项任务对应脚本里的一块内容。</p>
+<hr />
+<h3>📋 Task 1: 准备工作台 (环境设置)</h3>
+<p>在开始做菜前，先把灶台（GPU）清理好，把记录本（WandB）准备好。</p>
+<ul>
+<li><strong>代码对应：</strong> 脚本最开头几行。</li>
+<li><strong>解读：</strong><ul>
+<li><code>export CUDA_VISIBLE_DEVICES...</code>: 告诉电脑，“我要用这8块显卡（0-7）”。</li>
+<li><code>export WANDB_...</code>: 设置云端监控记录的名字。训练大模型很贵，必须实时监控（WandB 是一个看训练曲线的工具），这里设置了项目名叫 <code>gsm8k-grpo...</code>。</li>
+<li><code>export VLLM_ATTENTION_BACKEND=XFORMERS</code>: 这是一个补丁。vLLM 是用来加速模型生成的引擎，这里指定用 <code>XFORMERS</code> 后端，主要是为了防止低版本软件出 Bug。</li>
+</ul>
+</li>
+</ul>
+<h3>📋 Task 2: 算算有多少米下锅 (批次大小计算)</h3>
+<p>这是最让新手头晕的数学题，但其实就是为了决定<strong>一次喂给模型多少道题</strong>。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>nproc_per_gpu=45</code> 到 <code>mini_batch_size=...</code> 这一段。</li>
+<li><strong>解读：</strong><ul>
+<li><code>nproc_per_gpu=45</code>: 这是一个调参的过程。你看那行注释 <code># 32√ → 64× → 48×...</code>，这是工程师的<strong>血泪史</strong>。意思是试了64崩了（显存炸了），试了48也崩了，最后发现 <strong>45</strong> 是能跑满显存且不炸的极限数字。</li>
+<li><code>total_procs</code>: 算出总共并行处理多少数据（单卡45个 × 1台机器 × 每台4张卡 = 180）。</li>
+<li><strong>观点：</strong> 这里体现了<strong>压榨硬件性能</strong>的观点，尽量把显存塞满以提高效率。</li>
+</ul>
+</li>
+</ul>
+<h3>📋 Task 3: 指定“教材”和“学生” (数据与模型路径)</h3>
+<p>告诉程序，我们要训练哪个模型，用什么数据训练。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>data.train_files</code> 和 <code>actor_rollout_ref.model.path</code> 等。</li>
+<li><strong>解读：</strong><ul>
+<li><strong>教材 (Data)</strong>: <code>gsm8k/train.parquet</code>。GSM8K 是经典的小学数学应用题数据集。</li>
+<li><strong>学生 (Model)</strong>: <code>Qwen/Qwen2.5-32B-Instruct</code>。使用的是阿里千问的320亿参数模型。</li>
+<li><strong>算法</strong>: <code>algorithm.adv_estimator=grpo</code>。这是核心！用的是 <strong>GRPO</strong> 算法（一种比 PPO 更省显存的强化学习算法，DeepSeek-R1 也就是用的这种思路）。</li>
+</ul>
+</li>
+</ul>
+<h3>📋 Task 4: 设定“省钱省力”的训练模式 (LoRA &amp; FSDP)</h3>
+<p>32B的模型非常大，4张 H100 显卡直接训练可能显存不够，所以要用技巧。</p>
+<ul>
+<li><strong>代码对应：</strong> 带有 <code>lora</code> 和 <code>fsdp</code> 字样的参数。</li>
+<li><strong>解读：</strong><ul>
+<li><strong>LoRA (低秩适应)</strong>: <code>lora_rank=32</code>。<ul>
+<li><em>观点</em>：不要重新训练大脑的所有神经元（全量微调），那样太贵太慢。我们在大脑旁贴一张“便利贴”（LoRA），只训练这张便利贴。</li>
+</ul>
+</li>
+<li><strong>FSDP (全分片数据并行)</strong>: <code>fsdp_config.param_offload=True</code>。<ul>
+<li><em>观点</em>：显存还是不够怎么办？把模型切碎（Sharding），一部分放在显存里计算，不用的部分暂时扔到内存（CPU RAM）里去（Offload）。这是一种<strong>用速度换空间</strong>的策略。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h3>📋 Task 5: 设定“模拟考”方式 (Rollout / vLLM)</h3>
+<p>强化学习需要模型先“做题”（生成答案），然后给分。生成答案的过程叫 Rollout。</p>
+<ul>
+<li><strong>代码对应：</strong> 带有 <code>actor_rollout_ref.rollout</code> 的参数。</li>
+<li><strong>解读：</strong><ul>
+<li><code>rollout.name=vllm</code>: 使用 vLLM 这个超快引擎来做题。</li>
+<li><code>gpu_memory_utilization=0.3</code>: <em>重点</em>。告诉 vLLM，“你只能用 30% 的显存来做题，剩下的 70% 我要留着用来训练（更新参数）”。如果这个比例太高，训练就会报 OOM（显存溢出）。</li>
+<li><code>rollout.n=5</code>: 每道题，让模型生成 5 个不同的答案，然后从中学习最好的。</li>
+</ul>
+</li>
+</ul>
+<h3>📋 Task 6: 设定“奖惩机制” (PPO/GRPO 参数)</h3>
+<p>模型做完题了，怎么告诉它好坏？</p>
+<ul>
+<li><strong>代码对应：</strong> <code>actor.ppo_...</code> 和 <code>kl_loss</code> 相关参数。</li>
+<li><strong>解读：</strong><ul>
+<li><code>kl_loss_coef=0.001</code>: <strong>防跑偏机制</strong>。KL 散度是用来衡量“新模型”和“旧模型”差别的。<ul>
+<li><em>观点</em>：我们希望模型变聪明，但<strong>不希望它变得面目全非</strong>（比如开始胡言乱语）。这个参数就是拉住它的绳子，别让它为了拿高分而作弊或崩溃。</li>
+</ul>
+</li>
+<li><code>max_prompt_length</code> / <code>max_response_length</code>: 限制题目和答案的长度，太长了显存装不下，直接截断（<code>truncation='error'</code> 表示如果太长直接报错，严格模式）。</li>
+</ul>
+</li>
+</ul>
+<h3>📋 Task 7: 启动并监控 (Trainer 设置)</h3>
+<p>最后一步，按下启动键，并规定多久存一次档。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>trainer....</code> 部分。</li>
+<li><strong>解读：</strong><ul>
+<li><code>trainer.n_gpus_per_node=4</code>: 确认用4张卡。</li>
+<li><code>save_freq=20</code>: 每跑 20 步存一次档（防止断电白跑）。</li>
+<li><code>tee ${WANDB_PROJECT}.log</code>: 把屏幕上滚动的字同时也写到一个日志文件里，方便以后查错。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个脚本在讲什么故事？</h3>
+<p>这个脚本讲述了这样一个故事：</p>
+<blockquote>
+<p>“我们要用 <strong>4张 H100 显卡</strong>，通过 <strong>GRPO 强化学习算法</strong>，给 <strong>Qwen-32B</strong> 模型上数学课（GSM8K）。</p>
+<p>为了防止显卡撑爆，我们采用了 <strong>LoRA（只练一小部分参数）</strong> 和 <strong>FSDP（模型切片+卸载到内存）</strong> 的省钱策略。</p>
+<p>同时，我们小心翼翼地计算了批次大小（45），并限制了 vLLM 的显存占用（30%），确保训练和生成能在一个显卡里和谐共存。</p>
+<p>最终目标是让模型数学变好，同时不要学坏（KL Loss 控制）。”</p>
+</blockquote>

@@ -1,0 +1,143 @@
+<h1>fla/ops/rwkv4/fused_recurrent.py</h1>
+<p>这份代码确实比较硬核，它是一个深度学习模型 <strong>RWKV-4</strong> 的底层加速代码。</p>
+<p>简单来说，这段代码是用 <strong>Triton</strong>（一种专门用于编写高性能 GPU 内核的语言）编写的，目的是为了让 RWKV 模型在推理或训练时，像传统 RNN（循环神经网络）一样<strong>逐个时间步（Token）</strong>地快速计算，同时保持极高的数值稳定性。</p>
+<p>为了让你看懂，我把你（或者说 GPU 显卡）想象成一个流水线工人，我给你列一个 <strong>Task List（任务清单）</strong>，告诉你每一步在干什么。</p>
+<hr />
+<h3>核心背景：RWKV 是啥？</h3>
+<p>RWKV 是一种像 Transformer 一样强，但像 RNN 一样推理省显存的模型。
+它的核心公式是：$Output = \frac{Numerator}{Denominator}$。
+因为涉及到大量的指数运算（$e^x$），数字容易变得超级大（溢出）或超级小（归零），所以代码里有一半的逻辑都在处理<strong>“数值稳定性”</strong>（防止报错）。</p>
+<hr />
+<h3>任务清单 (Task List)</h3>
+<p>我们将代码拆解为三个阶段：<strong>准备工作</strong>、<strong>前向传播（推理/计算结果）</strong>、<strong>反向传播（训练/计算梯度）</strong>。</p>
+<h4>Phase 1: 准备与理解输入 (Python 层)</h4>
+<p>在 <code>FusedRecurrentRWKV4Function</code> 类中。</p>
+<ol>
+<li>
+<p><strong>Task 1: 拿到原材料</strong></p>
+<ul>
+<li><code>w</code>: 遗忘因子（决定模型记性能保留多久）。代码里做了 <code>w = -torch.exp(w)</code>，把它变成了负指数，意味着信息会随时间衰减。</li>
+<li><code>u</code>: 当前输入的权重（Bonus，给当前这一刻的信息加权）。</li>
+<li><code>k</code> (Key): 输入的键（特征）。</li>
+<li><code>v</code> (Value): 输入的值（内容）。</li>
+<li><code>state</code>: 之前的记忆（上一刻留下的烂摊子）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 2: 数据类型转换</strong></p>
+<ul>
+<li>为了计算精度，把半精度（float16）强制转为单精度（float32）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 3: 呼叫 GPU 工人</strong></p>
+<ul>
+<li>启动 <code>fused_recurrent_rwkv4_forward</code>，把数据扔进显卡。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>Phase 2: 前向传播 (Triton Kernel 层)</h4>
+<p>这是代码中最难懂的 <code>fused_recurrent_rwkv4_forward_kernel</code> 部分。想象你是一个 GPU 核心，你负责处理<strong>一批数据（Batch）中的某几个通道（Channel）</strong>。</p>
+<ol>
+<li>
+<p><strong>Task 1: 找工位 (Indexing)</strong></p>
+<ul>
+<li><code>b_idx</code>, <code>c_idx</code>: 确认我现在负责第几个句子（Batch）的第几组特征（Channel）。</li>
+<li><strong>定位指针</strong>: 计算出 <code>k</code>, <code>v</code>, <code>w</code>, <code>u</code> 在显存里的具体地址。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 2: 读取初始记忆 (Load State)</strong></p>
+<ul>
+<li>RWKV 的记忆不像 LSTM 那么简单，它由三部分组成：<ul>
+<li><code>alpha</code>: 分子的累加和。</li>
+<li><code>beta</code>: 分母的累加和。</li>
+<li><code>eps</code>: <strong>核心技巧！</strong> 一个用于缩放的系数（为了防止 $e^{big_number}$ 爆炸，我们记录目前遇到的最大指数值）。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 3: 加载参数 (Load Params)</strong></p>
+<ul>
+<li>把 <code>w</code> (衰减率) 和 <code>u</code> (当前权重) 读进寄存器。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 4: 开启时间循环 (The Time Loop)</strong></p>
+<ul>
+<li>
+<p>这是 RNN 的核心，<code>for t in range(tsz):</code>，也就是从第 1 个字读到第 T 个字。</p>
+</li>
+<li>
+<p><strong>Step 4.1: 读取当前时刻输入</strong></p>
+<ul>
+<li>读取当前的 $K_t$ 和 $V_t$。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 4.2: 计算输出 (WKV)</strong></p>
+<ul>
+<li><em>目的</em>：结合“过去的记忆”和“现在的输入”算出结果。</li>
+<li><em>数学魔法</em>：<code>ukt = u + kt</code> (当前输入的强度)。</li>
+<li><em>防爆炸处理</em>：<code>tau = max(ukt, eps)</code>。找出“当前强度”和“过去记忆强度”谁更大。</li>
+<li><em>计算输出</em>：利用 <code>tau</code> 把数值归一化，算出当前的 <code>wkv</code>（Output）。</li>
+<li><em>保存</em>：把 <code>wkv</code> 存回显存。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 4.3: 更新记忆 (Update State)</strong></p>
+<ul>
+<li><em>目的</em>：为下一个时间步做准备。现在的“当前”马上就要变成“过去”了。</li>
+<li><em>衰减</em>：旧的记忆要乘以 <code>w</code> (衰减)。</li>
+<li><em>融合</em>：<code>eps = max(w + eps, kt)</code>。更新最大指数记录。</li>
+<li><em>更新 Alpha/Beta</em>：把当前的 $K_t$ 和 $V_t$ 融合进 <code>alpha</code> 和 <code>beta</code> 中。</li>
+<li><em>保存</em>：把更新后的 <code>alpha</code>, <code>beta</code>, <code>eps</code> 存入 <code>state_out</code>，留给下一个 Block 或者输出。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>Phase 3: 反向传播 (Backward Kernel 层)</h4>
+<p>这是 <code>fused_recurrent_rwkv4_backward_kernel</code>。如果你只是用模型（推理），不需要看这里。如果你要训练模型，这里是在算梯度。</p>
+<ol>
+<li>
+<p><strong>Task 1: 时间倒流</strong></p>
+<ul>
+<li>前向是从 $t=0$ 到 $t=T$。</li>
+<li>反向传播必须从 $t=T$ 到 $t=0$ (<code>tc = tsz - t - 1</code>)。因为未来的梯度会影响过去。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 2: 算账 (Gradient Calculation)</strong></p>
+<ul>
+<li>拿到输出的梯度 <code>gwkv</code>。</li>
+<li>根据链式法则（Chain Rule），一步步推导：<ul>
+<li>输出变了，那 <code>u</code> 应该怎么变？(<code>gu</code>)</li>
+<li><code>k</code> 和 <code>v</code> 应该怎么变？(<code>gk</code>, <code>gv</code>)</li>
+<li>之前的记忆 <code>state</code> 应该怎么变？</li>
+<li>衰减系数 <code>w</code> 应该怎么变？(<code>gw</code>)</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 3: 累加与保存</strong></p>
+<ul>
+<li>把算出来的梯度存回显存，供 PyTorch 更新模型参数。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结：这段代码到底在干嘛？</h3>
+<p>如果不用这段代码，用普通的 PyTorch 写循环：
+1.  <strong>慢</strong>：Python 的 <code>for</code> 循环在 GPU 上执行效率极低。
+2.  <strong>显存爆炸</strong>：需要保存中间每一步的所有计算图。</p>
+<p><strong>这段代码做的事情：</strong>
+它“<strong>融合 (Fused)</strong>”了整个时间循环。它告诉 GPU：“别管 Python 怎么慢，你直接在显卡内部开启一个超高速循环，把这 1000 个时间步一口气算完，中间不需要跟 Python 汇报，只把最后的结果给我。”</p>
+<p><strong>核心难点清单：</strong>
+1.  <strong>并行化策略</strong>：Batch 和 Channel 维度是并行的，Time 维度是串行的（Recurrent）。
+2.  <strong>数值稳定性 (Numerical Stability)</strong>：代码里到处都是 <code>max</code>, <code>exp(x - max)</code>, <code>eps</code>，这都是为了保证 $e^{100}$ 这种计算不会变成 <code>inf</code>（无穷大）。
+3.  <strong>State 管理</strong>：必须精确维护 <code>alpha</code>, <code>beta</code>, <code>eps</code> 这三个状态变量，才能保证数学上的等价性。</p>

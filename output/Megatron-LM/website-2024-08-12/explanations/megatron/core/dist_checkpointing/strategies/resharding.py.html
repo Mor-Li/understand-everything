@@ -1,0 +1,94 @@
+<h1>megatron/core/dist_checkpointing/strategies/resharding.py</h1>
+<p>这个文件 <code>resharding.py</code> 的核心目的是解决 <strong>Megatron-Core 在保存和加载模型权重时的一个痛点：</strong></p>
+<p><strong>痛点：</strong> 当张量（Tensor）被切分（Sharded，例如张量并行 TP）后，又被展平（Flattened，变成一维数组）时，如果要在不同数量的 GPU 之间加载（比如用 4 张卡训练存的权重，想在 8 张卡上跑），数据的存取模式会变得非常乱，效率极低且难以计算位置。</p>
+<p><strong>解决方案（核心观点）：</strong> 不要直接存那个展平的一维长条。而是把这个张量“虚拟”成一种特殊的形状——<strong>“网格+数据块”</strong> 的形式。这样在保存和加载时，就能更容易地计算出哪一块数据属于哪张卡，从而支持高效的 <strong>Resharding（重切分/改变并行度）</strong>。</p>
+<hr />
+<p>为了让你看懂，我把这个文件的逻辑拆解成一个 <strong>Task Todo List</strong>，这是代码执行的逻辑流：</p>
+<h3>Task List: 高效重切分流程</h3>
+<ol>
+<li><strong>【识别】(Identification):</strong> 找出哪些张量是既被切分了，又是多维展平成一维的（这种最难搞）。</li>
+<li><strong>【重构形状】(Reformulation):</strong> 既然展平了不好找位置，那就通过数学计算，算出它在全局视角下应该长什么样（把一维还原回多维网格）。</li>
+<li><strong>【偷天换日】(Factory Replacement):</strong> 在保存/加载前，把原本的张量对象替换成一个“工厂对象”（Factory）。这个工厂里不存数据，只存“怎么拼装数据”的说明书。</li>
+<li><strong>【计算重叠】(Overlap Calculation):</strong> (核心难点) 当加载权重时，计算“Checkpoint 里存的切片”和“当前模型需要的切片”在多维空间上哪里重叠了。</li>
+<li><strong>【拼装数据】(Merge):</strong> 把 Checkpoint 里读出来的重叠部分数据，挖出来，填进当前模型的张量里，最后再展平回去。</li>
+</ol>
+<hr />
+<h3>逐步代码讲解</h3>
+<p>下面我按照上面的 List，结合代码给你讲讲它是怎么一步步实现的。</p>
+<h4>第一步：【识别】找出麻烦的张量</h4>
+<p>代码位置：<code>is_nd_flattened_tensor</code> 函数</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">is_nd_flattened_tensor</span><span class="p">(</span><span class="n">sh_ten</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="c1"># 逻辑很简单：</span>
+    <span class="c1"># 1. 是 ShardedTensor（被切分的张量）</span>
+    <span class="c1"># 2. flattened_range 不为空（说明被展平了）</span>
+    <span class="c1"># 3. global_shape &gt; 1 （原本是多维的，比如 [1024, 4096]）</span>
+    <span class="k">return</span> <span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>观点：</strong> 只有这种“原本多维但被迫展平”的张量才需要这套复杂的处理逻辑，普通的张量直接存取就行。</p>
+<h4>第二步：【重构形状】计算“虚拟网格”</h4>
+<p>代码位置：<code>nd_flattened_tensor_reformulated_global_shape</code> 和 docstring</p>
+<p><strong>观点：</strong>
+假设原本全局张量是 <code>[X, Y, Z]</code>，每张卡上分到的是 <code>[x, y, z]</code>。
+但在内存里，每张卡实际存的是一个展平的 <code>[x*y*z]</code>。
+为了方便切分，代码把它想象（Reformulate）成一个新的形状：
+*   <strong>全局形状变成：</strong> <code>[X//x, Y//y, Z//z, x*y*z]</code>
+*   <strong>局部形状变成：</strong> <code>[1, 1, 1, x*y*z]</code></p>
+<p>这就像把一个大蛋糕切成很多小方块。前三个维度 <code>X//x</code> 等代表<strong>“这是第几行第几列的方块”</strong>，最后一个维度 <code>x*y*z</code> 代表<strong>“这个方块里的具体数据”</strong>。
+这样做的好处是，前三个维度变成了坐标轴，非常容易计算“哪张卡拥有哪几个方块”。</p>
+<h4>第三步：【偷天换日】应用工厂模式</h4>
+<p>代码位置：<code>apply_nd_flattened_tensors_reformulation</code></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">apply_nd_flattened_tensors_reformulation</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="c1"># 遍历所有张量</span>
+    <span class="c1"># 如果是“麻烦张量”，就调用 reformulate_single_nd_flattened_tensor</span>
+    <span class="c1"># 把原本的 ShardedTensor 替换成 ShardedTensorFactory</span>
+    <span class="n">dict_list_map_inplace</span><span class="p">(</span><span class="n">maybe_reformulate_nd_flattened_tensor</span><span class="p">,</span> <span class="n">sharded_state_dict</span><span class="p">)</span>
+    <span class="c1"># ...</span>
+</code></pre></div>
+
+<p><strong>观点：</strong> 这一步是预处理。我们不直接操作数据，而是生成一个“操作计划”。<code>ShardedTensorFactory</code> 就是这个计划，它包含两个关键函数：<code>build_fn</code>（怎么存/怎么构建视图）和 <code>merge_fn</code>（怎么读/怎么合并）。</p>
+<h4>第四步：【计算重叠】核心逻辑</h4>
+<p>代码位置：<code>reformulate_single_nd_flattened_tensor</code> 内部</p>
+<p>这是文件最难懂的地方。假设你保存时用了 2 张卡（TP=2），加载时用了 4 张卡（TP=4）。
+你需要计算：<strong>Checkpoint 里的块（旧块）和当前模型需要的块（新块），在空间上是怎么对应的？</strong></p>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># ...</span>
+    <span class="c1"># 计算当前需要的切片（app shard）和 Checkpoint 里的切片（ckpt fragm）的比例关系</span>
+    <span class="k">for</span> <span class="n">dim</span><span class="p">,</span> <span class="p">(</span><span class="n">app_chunk_dim_offset</span><span class="p">,</span> <span class="n">ckpt_fragm</span><span class="p">,</span> <span class="n">app_fragm</span><span class="p">)</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+        <span class="c1"># 算出当前卡需要的数据，跨越了 Checkpoint 里的哪几个块</span>
+        <span class="n">first_overlap_dim_offset</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">ckpt_fragm</span> <span class="o">/</span> <span class="n">app_fragm</span> <span class="o">*</span> <span class="n">app_chunk_dim_offset</span><span class="p">)</span>
+        <span class="n">next_overlap_dim_offset</span> <span class="o">=</span> <span class="n">math</span><span class="o">.</span><span class="n">ceil</span><span class="p">(</span><span class="n">ckpt_fragm</span> <span class="o">/</span> <span class="n">app_fragm</span> <span class="o">*</span> <span class="p">(</span><span class="n">app_chunk_dim_offset</span> <span class="o">+</span> <span class="mi">1</span><span class="p">))</span>
+        <span class="c1"># 记录下所有重叠的坐标</span>
+        <span class="n">overlap_dim_offsets</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">first_overlap_dim_offset</span><span class="p">,</span> <span class="n">next_overlap_dim_offset</span><span class="p">))</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+这就好比铺地砖。
+旧方案是铺大块地砖（TP小），新方案是铺小块地砖（TP大）。
+这里在计算：我现在的这块小地砖，覆盖了原来大地砖的哪一部分？可能跨越了两块旧地砖的接缝。代码通过这些计算，精确找到了所有相关的旧数据块坐标。</p>
+<h4>第五步：【拼装数据】合并与拷贝</h4>
+<p>代码位置：<code>reformulate_single_nd_flattened_tensor</code> 内部的 <code>sh_ten_merge_fn</code></p>
+<div class="codehilite"><pre><span></span><code>    <span class="nd">@torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">()</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">sh_ten_merge_fn</span><span class="p">(</span><span class="n">sub_state_dict</span><span class="p">):</span>
+        <span class="c1"># 1. 创建一个空的本地张量（未展平的形状）</span>
+        <span class="n">app_non_flat_ten</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="n">sh_ten</span><span class="o">.</span><span class="n">local_shape</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+        <span class="c1"># 2. 遍历加载进来的每一个 Checkpoint 块</span>
+        <span class="k">for</span> <span class="p">(</span><span class="n">ckpt_global_offset</span><span class="p">,</span> <span class="n">ckpt_local_shape</span><span class="p">),</span> <span class="n">ckpt_ten</span> <span class="ow">in</span> <span class="n">sub_state_dict</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="c1"># 3. 计算精细的切片位置（narrow）</span>
+            <span class="c1"># _shards_get_overlap_region_wrt_saved_tensor 会告诉我们：</span>
+            <span class="c1"># &quot;把 ckpt_ten 的第 A 到 B 行，复制到 app_non_flat_ten 的第 C 到 D 行&quot;</span>
+            <span class="k">for</span> <span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="ow">in</span> <span class="n">_shards_get_overlap_region_wrt_saved_tensor</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+                <span class="n">src_ten</span> <span class="o">=</span> <span class="n">src_ten</span><span class="o">.</span><span class="n">narrow</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+                <span class="n">dest_ten</span> <span class="o">=</span> <span class="n">dest_ten</span><span class="o">.</span><span class="n">narrow</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+            <span class="c1"># 4. 执行复制</span>
+            <span class="n">dest_ten</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">src_ten</span><span class="p">)</span>
+
+        <span class="c1"># 5. 最后，把拼好的多维张量展平，返回回去</span>
+        <span class="k">return</span> <span class="n">app_non_flat_ten</span><span class="o">.</span><span class="n">flatten</span><span class="p">()[</span><span class="n">sh_ten</span><span class="o">.</span><span class="n">flattened_range</span><span class="p">]</span>
+</code></pre></div>
+
+<h3>总结</h3>
+<p>这篇文章（代码）其实就在干一件事：</p>
+<p><strong>把“展平的一维数组”在逻辑上还原回“多维网格”，通过计算网格坐标的重叠关系，来精确地搬运数据，从而实现高效的、支持并行度改变的模型加载。</strong></p>
+<p>如果你不这么做，直接在一维数组上算偏移量，当维度很高或者切分很复杂时，数学上会极其复杂且内存访问不连续（IO性能差）。</p>

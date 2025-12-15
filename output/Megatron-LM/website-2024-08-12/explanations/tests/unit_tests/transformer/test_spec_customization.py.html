@@ -1,0 +1,55 @@
+<h1>tests/unit_tests/transformer/test_spec_customization.py</h1>
+<p>这份代码确实涉及了很多底层架构设计的概念，如果直接看代码细节很容易晕。</p>
+<p>简单来说，这个文件是 <strong>NVIDIA Megatron-Core</strong> 库的一个<strong>单元测试</strong>文件。它测试的核心功能是：<strong>“如何像搭积木一样，通过配置单（Spec）来灵活地组装 Transformer 模型，而不是把代码写死。”</strong></p>
+<p>为了让你看懂，我为你列了一个 <strong>“学习任务清单 (To-Do List)”</strong>。请按照这个顺序，一步步理解代码想要传达的观点。</p>
+<hr />
+<h3>✅ Task 1: 理解核心背景 —— 为什么要“定制化 (Customization)”？</h3>
+<p><strong>观点：</strong> 在训练大模型时，我们经常需要替换模型的某一部分。例如，把普通的 <code>Linear</code> 层换成 NVIDIA 优化的 <code>TEColumnParallelLinear</code> 层。
+<strong>代码对应：</strong> 这一步不需要看具体的函数，而是看 <code>setup_method</code> 里定义的变量。
+*   <strong>动作：</strong> 观察 <code>self.attention_spec</code>。
+*   <strong>解释：</strong> 以前我们写代码可能直接写 <code>new SelfAttention()</code>。但在这里，它定义了一个 <code>ModuleSpec</code>（模块说明书）。
+    *   它说：“我要一个 <code>SelfAttention</code> 模块。”
+    *   它的子模块（submodules）要是：<code>TEDotProductAttention</code>（英伟达优化的注意力）而不是普通的。
+*   <strong>结论：</strong> 这个文件的第一个观点是：<strong>将“模型结构”与“具体实现类”解耦。</strong></p>
+<h3>✅ Task 2: 基础测试 —— 验证“说明书”能否变成“实物”</h3>
+<p><strong>观点：</strong> 既然我们只写了“说明书”（Spec），系统必须有能力根据说明书找到代码，并把它造出来。
+<strong>代码对应：</strong> <code>test_import_module</code> 和 <code>test_build_module</code>。
+*   <strong>动作 1：</strong> 看 <code>test_import_module</code>。
+    *   它测试 <code>import_module</code> 函数。给定一个字符串路径 <code>'megatron...SelfAttention'</code>，它能顺藤摸瓜找到这个 Python 类吗？
+    *   <strong>结果：</strong> <code>assert id(cls) == id(SelfAttention)</code>，证明找到了。
+*   <strong>动作 2：</strong> 看 <code>test_build_module</code>。
+    *   它测试 <code>build_module</code> 函数。给定一个 <code>ModuleSpec</code>（说明书），它能 <code>new</code> 一个对象出来吗？
+    *   它尝试造了一个 <code>SelfAttention</code> 层，又造了一个 <code>LayerNorm</code> 层。
+*   <strong>结论：</strong> 系统的“工厂”功能正常，<strong>可以通过配置动态生成代码对象</strong>。</p>
+<h3>✅ Task 3: 兼容性测试 —— 验证特殊硬件特性 (Sliding Window Attention)</h3>
+<p><strong>观点：</strong> 定制化的好处是可以使用特殊硬件加速库（Transformer Engine, TE）。有些功能（比如滑动窗口注意力 SWA）只有 TE 支持，普通 PyTorch 版本不支持。
+<strong>代码对应：</strong> <code>test_sliding_window_attention</code>。
+*   <strong>动作：</strong>
+    1.  代码先尝试用普通的 <code>DotProductAttention</code> 开启 <code>window_size</code>。
+        *   <strong>结果：</strong> 报错 (<code>threw = True</code>)。说明普通版不支持。
+    2.  代码再尝试用定制的 <code>TEDotProductAttention</code> (TE版) 开启 <code>window_size</code>。
+        *   <strong>结果：</strong> 成功，并且参数正确。
+*   <strong>结论：</strong> 通过 Spec 切换到底层实现（TE版），<strong>可以让模型获得普通版没有的高级特性</strong>。</p>
+<h3>✅ Task 4: 一致性测试 —— 验证“批量生产”与“单独定制”是否一样</h3>
+<p><strong>观点：</strong> 构建一个巨大的 Transformer Block（由很多层组成），我有两种写法：
+1.  <strong>省事法：</strong> 给一个模板，告诉程序“把这个层重复 N 次”。
+2.  <strong>精细法：</strong> 给一个列表，明确列出第 1 层用啥，第 2 层用啥……第 N 层用啥。
+这两种写法造出来的模型，跑出来的结果必须一模一样。</p>
+<p><strong>代码对应：</strong> <code>test_transformer_block_custom</code>。
+*   <strong>动作：</strong>
+    1.  <code>layer_spec1</code> (省事法)：只传了一个 <code>ModuleSpec</code> 给 <code>TransformerBlock</code>。
+    2.  <code>layer_spec2</code> (精细法)：传了一个列表 <code>[ModuleSpec] * num_layers</code> 给 <code>TransformerBlock</code>。
+    3.  分别实例化两个模型，固定随机种子，输入相同的数据 (<code>hidden_states</code>)。
+    4.  对比输出 <code>out1</code> 和 <code>out2</code>。
+*   <strong>结果：</strong> <code>assert torch.all(torch.eq(out1, out2))</code>，两者完全相等。
+*   <strong>结论：</strong> 系统的灵活性很高，<strong>既支持统一配置，也支持（潜在的）逐层微调，且数学计算是稳定的。</strong></p>
+<hr />
+<h3>总结：这个文件到底讲了啥？</h3>
+<p>如果你把这个文件看作一个产品的质检报告，它在说：</p>
+<ol>
+<li><strong>灵活性合格：</strong> 我们可以通过配置文件（Spec）随意替换模型的零件（比如把普通零件换成 NVIDIA 高级零件）。</li>
+<li><strong>工厂合格：</strong> 给定配置文件，程序能准确地找到代码并组装成模型。</li>
+<li><strong>功能合格：</strong> 换上高级零件后，确实能用上高级功能（如滑动窗口注意力）。</li>
+<li><strong>稳定性合格：</strong> 无论是“批量复制”还是“逐个指定”，造出来的模型是一致的。</li>
+</ol>
+<p>这个测试是为了保证 Megatron-Core 能够灵活地支持各种不同的大模型架构（GPT, Llama, etc.），而不需要每次都重写底层代码。</p>

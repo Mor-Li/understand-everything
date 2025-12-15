@@ -1,0 +1,81 @@
+<h1>docs/source/api-guide/distributed.rst</h1>
+<p>这段文档确实写得很“硬核”，因为它描述的是深度学习中<strong>分布式训练（Distributed Training）</strong>最底层的通信机制。</p>
+<p>简单来说，这段代码是为了解决一个问题：<strong>当你有好几张显卡（Rank）一起训练同一个模型时，大家算出来的“修改意见”（梯度/Gradients）是不一样的，怎么把大家的意见统一起来，然后再去更新模型？</strong></p>
+<p>我们可以把这个过程想象成一个<strong>“多人协作拼图”</strong>的项目。为了让你读懂，我制定了一个<strong>3步走的“学习任务清单（To-Do List）”</strong>，我们一步步来拆解：</p>
+<hr />
+<h3>📋 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1: 理解总目标</strong> —— 搞懂 <code>distributed package</code> 是干嘛的。</li>
+<li><strong>Task 2: 搞懂主力工具</strong> —— 学习 <code>distributed_data_parallel</code> (DDP) 是怎么“一边干活一边对账”的。</li>
+<li><strong>Task 3: 搞懂收尾工作</strong> —— 学习 <code>finalize_model_grads</code> 是怎么处理“特殊情况”的。</li>
+</ol>
+<hr />
+<h3>💡 详细讲解</h3>
+<h4>✅ Task 1: 理解总目标 (Package Overview)</h4>
+<p><strong>文档原文：</strong></p>
+<blockquote>
+<p>"This package contains various utilities to finalize model weight gradients on each rank before the optimizer step."</p>
+</blockquote>
+<p><strong>人话解释：</strong>
+想象你和另外 7 个人（一共 8 个 Rank/显卡）在抄同一个作业（训练模型）。
+*   你们每个人只看了一部分课本（数据并行），所以每个人算出来的答案（梯度）都不一样。
+*   在老师批改（Optimizer step / 优化器更新参数）之前，你们必须<strong>互相对一下答案</strong>，算出一个平均值，保证大家最后交上去的作业是一模一样的。
+*   <strong>这个包的作用</strong>：就是帮你们“对答案”和“统一意见”的工具箱。</p>
+<hr />
+<h4>✅ Task 2: 搞懂主力工具 (DDP Wrapper)</h4>
+<p><strong>文档原文：</strong></p>
+<blockquote>
+<p><code>distributed.distributed_data_parallel</code>
+...Stores gradients in a contiguous buffer... supports the option of overlapping communication... by breaking up full model's gradients into smaller buckets...</p>
+</blockquote>
+<p><strong>人话解释：</strong>
+这是这个包里最重要的工具，叫 <strong>DDP 包装器</strong>。它有两个核心黑科技：</p>
+<ol>
+<li>
+<p><strong>连续内存（Contiguous Buffer）</strong>：</p>
+<ul>
+<li><em>比喻</em>：模型里有几亿个参数，如果不整理，就像满屋子散落的拼图碎片，传输很慢。这个工具把所有碎片<strong>打包成一个整箱子</strong>，一次性传输，效率更高。</li>
+</ul>
+</li>
+<li>
+<p><strong>通信与计算重叠（Overlapping Communication with Computation）</strong>：</p>
+<ul>
+<li><em>痛点</em>：通常是“算完所有题” -&gt; “大家停下来对答案” -&gt; “继续算下一章”。这意味着对答案时，大脑（GPU计算核心）是闲着的。</li>
+<li><em>解决（Buckets）</em>：它把作业分成很多<strong>小桶（Buckets）</strong>。</li>
+<li><em>场景</em>：当你算完第1桶题目的梯度时，立刻把这桶数据发出去跟别人对答案（通信），同时你的大脑不闲着，马上开始算第2桶题目。</li>
+<li><em>结果</em>：<strong>一边算，一边传</strong>，不浪费时间。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 3: 搞懂收尾工作 (Finalize Gradients)</h4>
+<p><strong>文档原文：</strong></p>
+<blockquote>
+<p><code>distributed.finalize_model_grads</code>
+Finalize model gradients... across all used parallelism modes... (e.g., 'tied' layers... or gradients for experts in a MoE...)</p>
+</blockquote>
+<p><strong>人话解释：</strong>
+除了上面说的“大家一起算平均值”（数据并行），现在的超大模型还有很多复杂的切分方式，这个函数就是用来做<strong>最后的大一统</strong>，处理各种特殊情况：</p>
+<ol>
+<li>
+<p><strong>流水线并行（Pipeline Parallelism）中的“绑定层”</strong>：</p>
+<ul>
+<li>有些模型的第1层和最后1层是共用参数的（Tied Layers）。如果第1层在显卡A，最后1层在显卡B，这俩显卡必须交换信息，把这两层的梯度同步一下。</li>
+</ul>
+</li>
+<li>
+<p><strong>混合专家模型（MoE / Expert Parallelism）</strong>：</p>
+<ul>
+<li>MoE 模型里有很多“专家”（Experts），不同的专家可能住在不同的显卡上。</li>
+<li>这个函数负责把分散在各地的“专家”的梯度收集起来，确保每个专家都得到了正确的更新。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>📝 总结 (Summary)</h3>
+<p>如果把这个文件看作一个<strong>“团队协作守则”</strong>：</p>
+<ol>
+<li><strong><code>distributed</code> (整体)</strong>：这是我们的协作总纲，目标是让大家在更新模型前，把意见（梯度）统一。</li>
+<li><strong><code>distributed_data_parallel</code> (DDP)</strong>：这是<strong>主力搬运工</strong>。它把零散的数据打包（Buffer），并且学会了“左右互搏术”，一边计算一边传输数据（Overlapping）。</li>
+<li><strong><code>finalize_model_grads</code> (收尾)</strong>：这是<strong>总协调员</strong>。不管你是哪种复杂的工种（流水线、MoE专家），在最后时刻，它都会确保所有人的数据都同步到位了，可以放心地让优化器（Optimizer）去修改模型了。</li>
+</ol>

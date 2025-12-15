@@ -1,0 +1,124 @@
+<h1>tasks/zeroshot_gpt/evaluate.py</h1>
+<p>这份代码是 <strong>NVIDIA Megatron-LM</strong> 项目的一部分，专门用于<strong>Zero-shot（零样本）评估</strong>。</p>
+<p>简单来说，它的作用是：<strong>拿一个训练好的 GPT 模型，不进行任何额外的训练（Fine-tuning），直接让它去做一些特定的任务（比如填空、续写），看看它现在的水平通过率（Accuracy）或者困惑度（Perplexity/Loss）是多少。</strong></p>
+<p>为了让你看懂，我把这个脚本想象成一个<strong>“监考老师”</strong>，列了一个它的 <strong>“监考任务清单 (To-Do List)”</strong>。我们一步一步对照代码来看：</p>
+<hr />
+<h3>📋 监考老师的任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>确定考试科目</strong> (初始化与配置)</li>
+<li><strong>请出考生</strong> (构建与加载模型)</li>
+<li><strong>分发试卷</strong> (准备数据)</li>
+<li><strong>开始监考：逐题作答</strong> (循环评估)<ul>
+<li><em>4.1 整理题目</em> (处理 Batch)</li>
+<li><em>4.2 考生思考</em> (模型前向传播)</li>
+<li><em>4.3 现场打分</em> (计算 Loss 或 Accuracy)</li>
+</ul>
+</li>
+<li><strong>汇总成绩</strong> (多显卡数据合并)</li>
+<li><strong>公布成绩单</strong> (计算最终指标并打印)</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>1. 确定考试科目 (初始化与配置)</h4>
+<p><strong>代码位置：</strong> <code>main()</code> 函数开头
+<strong>逻辑：</strong>
+首先，程序得知道今天要测什么。
+*   如果是 <code>LAMBADA</code> 任务（一种预测句子最后一个词的任务），我们关心的是<strong>准确率 (Accuracy)</strong>，即模型猜没猜对那个词。
+*   如果是 <code>WIKITEXT103</code> 任务（阅读理解/语言模型能力），我们关心的是<strong>损失值 (Loss)</strong>，即模型读这段话顺不顺畅。</p>
+<blockquote>
+<p><strong>代码对应：</strong>
+<code>python
+if args.task == 'LAMBADA':
+    eval_metric = 'accuracy'
+elif args.task == 'WIKITEXT103':
+    eval_metric = 'loss'</code></p>
+</blockquote>
+<h4>2. 请出考生 (构建与加载模型)</h4>
+<p><strong>代码位置：</strong> <code>main()</code> 中的 <code>get_model</code> 和 <code>load_checkpoint</code>，以及 <code>get_model_provider</code> 函数
+<strong>逻辑：</strong>
+这里需要把那个巨大的 GPT 模型加载到显存里。
+*   <code>get_model_provider</code> 是一个包装器，它决定了模型的输出方式。
+*   <strong>关键点</strong>：如果测 Loss，因为计算量大，通常保持并行输出 (<code>parallel_output=True</code>)；如果测准确率，我们需要完整的预测结果来比对，所以关闭并行输出。</p>
+<blockquote>
+<p><strong>代码对应：</strong>
+<code>python
+model = get_model(get_model_provider(eval_metric), wrap_with_ddp=False)
+load_checkpoint(model, None, None) # 载入训练好的参数</code></p>
+</blockquote>
+<h4>3. 分发试卷 (准备数据)</h4>
+<p><strong>代码位置：</strong> <code>main()</code> 中的 <code>build_dataset</code> 和 <code>build_data_loader</code>
+<strong>逻辑：</strong>
+把测试文本（如维基百科文章）转换成模型能看懂的数字（Token），并打包成一叠叠的试卷（Batch）。</p>
+<h4>4. 开始监考：逐题作答 (循环评估)</h4>
+<p><strong>代码位置：</strong> <code>evaluate()</code> 函数
+<strong>逻辑：</strong>
+这是一个大循环，模型拿着试卷（Data Loader），一题一题（Batch by Batch）地做。</p>
+<blockquote>
+<p><strong>代码对应：</strong>
+<code>python
+for iteration, batch in enumerate(data_loader):
+    output = forward_step(...) # 做题</code></p>
+</blockquote>
+<p>在此步骤内部，发生了三个微小的动作：</p>
+<ul>
+<li>
+<p><strong>4.1 整理题目 (处理 Batch)</strong></p>
+<ul>
+<li><strong>代码位置：</strong> <code>process_batch()</code></li>
+<li><strong>逻辑：</strong> GPT 是预测下一个词。所以，如果输入是 <code>[A, B, C]</code>，那么标签（答案）就是 <code>[B, C, D]</code>。这里会把输入数据错一位，生成 <code>tokens</code>（输入）和 <code>labels</code>（答案）。同时生成 <code>mask</code>，防止模型“偷看”后面的答案。</li>
+</ul>
+</li>
+<li>
+<p><strong>4.2 考生思考 (模型前向传播)</strong></p>
+<ul>
+<li><strong>代码位置：</strong> <code>forward_step()</code></li>
+<li><strong>逻辑：</strong><ul>
+<li><code>recv_forward</code> 和 <code>send_forward</code>：因为大模型通常切分在多张显卡上（流水线并行），这里负责在显卡之间传递数据。</li>
+<li><code>model(tokens, ...)</code>：这是真正的大脑运算过程，输入 token，输出预测结果（Logits）。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>4.3 现场打分 (计算 Loss 或 Accuracy)</strong></p>
+<ul>
+<li><strong>代码位置：</strong> <code>forward_step()</code> 的后半部分</li>
+<li><strong>逻辑：</strong> 只有流水线的最后一张显卡（Last Stage）负责打分。<ul>
+<li><strong>如果是 Loss：</strong> 计算交叉熵（Cross Entropy），看模型预测的概率分布和真实答案差多远。</li>
+<li><strong>如果是 Accuracy：</strong> 看模型预测概率最大的那个词 (<code>argmax</code>) 是不是就是真实答案。如果是，得 1 分，否则 0 分。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<p><strong>代码对应：</strong>
+<code>python
+if eval_metric == 'accuracy':
+    outputs = torch.argmax(output, -1)
+    correct = (outputs == labels).float()
+    # ... 统计正确的数量</code></p>
+</blockquote>
+<h4>5. 汇总成绩 (多显卡数据合并)</h4>
+<p><strong>代码位置：</strong> <code>evaluate()</code> 中的 <code>torch.distributed.all_reduce</code>
+<strong>逻辑：</strong>
+因为是多卡并行（Data Parallel），每张卡只测了一部分数据。这里要把所有卡算出来的总分（Total Loss 或 Total Correct Count）加在一起。</p>
+<h4>6. 公布成绩单 (计算最终指标并打印)</h4>
+<p><strong>代码位置：</strong> <code>evaluate_and_print_results()</code>
+<strong>逻辑：</strong>
+拿到总分后，除以总题数，算出最终指标。
+*   <strong>Loss 模式：</strong> 算出平均 Loss，然后转换成 <strong>PPL (Perplexity，困惑度)</strong>。PPL 越低，说明模型觉得这句话越通顺，能力越强。这里还做了一个 <code>token_ratio</code> 的修正（针对分词器的差异）。
+*   <strong>Accuracy 模式：</strong> 直接计算 <code>正确数 / 总数</code>，得到百分比。</p>
+<blockquote>
+<p><strong>代码对应：</strong>
+<code>python
+if eval_metric == 'loss':
+    ppl = math.exp(min(20, val_loss)) # 计算困惑度
+    print('ppl: {:.4E}'.format(ppl))
+elif eval_metric == 'accuracy':
+    acc = output / num_examples       # 计算准确率
+    print('avg accuracy: {:.4E}'.format(acc))</code></p>
+</blockquote>
+<hr />
+<h3>总结</h3>
+<p>这个脚本就是一个<strong>自动化的阅卷机</strong>。它不教模型新知识（不训练），只是把模型叫过来，丢给它一堆填空题（WikiText 或 LAMBADA），利用多张显卡协作，最后告诉你这个模型到底有多聪明（PPL 低）或者答题有多准（Accuracy 高）。</p>

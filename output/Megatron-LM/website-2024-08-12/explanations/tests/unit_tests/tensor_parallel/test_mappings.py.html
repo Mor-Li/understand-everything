@@ -1,0 +1,137 @@
+<h1>tests/unit_tests/tensor_parallel/test_mappings.py</h1>
+<p>这份代码确实非常抽象，因为它测试的是<strong>分布式深度学习中的底层通信逻辑</strong>。要看懂它，你需要想象有多个显卡（GPU）同时在跑这段代码，且它们之间在互相传球（数据）。</p>
+<p>这份文件的核心观点是：<strong>验证 Megatron-Core 框架中，张量并行（Tensor Parallelism, TP）和序列并行（Sequence Parallelism, SP）的通信算子，在“前向传播”和“反向传播”时的数学正确性。</strong></p>
+<p>为了让你听懂，我们把阅读任务分解成一个 Todo List。</p>
+<hr />
+<h3>📋 阅读任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1: 搞懂“排兵布阵” (环境初始化)</strong><ul>
+<li>理解 <code>Utils.initialize_model_parallel(4, 2)</code> 到底在干什么。</li>
+</ul>
+</li>
+<li><strong>Task 2: 理解“复制”与“归约” (Copy &amp; Reduce)</strong><ul>
+<li>分析 <code>test_CopyToModelParallelRegion</code> 和 <code>test_ReduceFromModelParallelRegion</code>。</li>
+<li>搞懂为什么结果是 6 和 22。</li>
+</ul>
+</li>
+<li><strong>Task 3: 理解“切分”与“收集” (Scatter &amp; Gather)</strong><ul>
+<li>分析 <code>test_Scatter...</code> 和 <code>test_Gather...</code>。</li>
+<li>搞懂数据是怎么被切开分给不同显卡的。</li>
+</ul>
+</li>
+<li><strong>Task 4: 理解“序列并行” (Sequence Parallel)</strong><ul>
+<li>分析带 <code>Sequence</code> 字眼的测试。</li>
+<li>搞懂它和普通张量并行的切法有什么不同。</li>
+</ul>
+</li>
+<li><strong>Task 5: 理解“前向”与“反向”的对偶性 (重点)</strong><ul>
+<li>为什么代码里总是在测 <code>.backward()</code>？</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>💡 逐步讲解</h3>
+<h4>Task 1: 搞懂“排兵布阵”</h4>
+<p>代码第一行测试都会调用 <code>Utils.initialize_model_parallel(4, 2)</code>。
+这是全篇的数学基础：
+*   <strong>World Size (总显卡数)</strong> = 4 * 2 = <strong>8 张卡</strong>。
+*   <strong>TP (张量并行度)</strong> = 4。这意味着每 4 张卡组成一个小组，在这个小组内切分模型。
+*   <strong>PP (流水线并行度)</strong> = 2。
+*   <strong>Rank (当前显卡编号)</strong> = 0 到 7。</p>
+<p><strong>关键分组：</strong>
+*   <strong>TP Group 1:</strong> Rank [0, 1, 2, 3] 是一组。
+*   <strong>TP Group 2:</strong> Rank [4, 5, 6, 7] 是一组。
+*   所有的通信（Copy, Reduce, Scatter）都只发生在组内。</p>
+<h4>Task 2: 理解“复制”与“归约” (Copy &amp; Reduce)</h4>
+<p>这里涉及两个最基础的算子。</p>
+<p><strong>1. <code>test_CopyToModelParallelRegion</code> (复制到并行区域)</strong>
+*   <strong>场景：</strong> 比如虽然用了 4 张卡并行，但有个输入（比如 Dropout 的 mask）是单卡生成的，需要让 4 张卡都拿到一模一样的这份数据。
+*   <strong>前向传播 (Forward):</strong> 简单的复制（Identity）。输入是什么，输出就是什么。
+    *   代码：<code>mappings.copy_to_tensor_model_parallel_region(input_data)</code>
+*   <strong>反向传播 (Backward):</strong> 重点来了！如果 4 张卡在前向时拿到了同一份数据，那么在反向传播算梯度时，需要把 4 张卡的梯度<strong>加起来 (All-Reduce)</strong> 才能得到总梯度。
+*   <strong>代码解读：</strong>
+    *   <code>input_data = ... * Utils.rank</code>: 假设 Rank 0 的数据是 0，Rank 1 是 1... Rank 3 是 3。
+    *   <code>output_data = ...backward(...)</code>: 模拟反向传播。
+    *   <strong>结果验证：</strong>
+        *   对于 Group 1 (0,1,2,3)：梯度之和 = 0+1+2+3 = <strong>6</strong>。
+        *   对于 Group 2 (4,5,6,7)：梯度之和 = 4+5+6+7 = <strong>22</strong>。
+    *   这就是代码里 <code>result * 6</code> 和 <code>result * 22</code> 的由来。</p>
+<p><strong>2. <code>test_ReduceFromModelParallelRegion</code> (从并行区域归约)</strong>
+*   <strong>场景：</strong> 4 张卡各自算了一部分结果，现在要加起来得到最终结果（比如最后算 Loss 的时候）。
+*   <strong>前向传播:</strong> 所有卡的数据相加 (All-Reduce)。
+    *   代码验证了 <code>reduce_from...</code> 的结果等于 rank 之和 (6 或 22)。
+*   <strong>反向传播:</strong> 如果前向是“加法”，反向传播时，梯度会原封不动地<strong>复制</strong>给每一张卡。
+    *   代码验证了 <code>backward</code> 的结果等于 <code>input_data</code>（即没变）。</p>
+<h4>Task 3: 理解“切分”与“收集” (Scatter &amp; Gather)</h4>
+<p>这是张量并行（TP）的核心。假设有一个大矩阵 <code>(8行, 4列)</code>。</p>
+<p><strong>1. <code>test_ScatterToModelParallelRegion</code> (切分)</strong>
+*   <strong>动作：</strong> 把大矩阵切开，分给 TP 组里的 4 张卡。
+*   <strong>怎么切？</strong> 默认切<strong>最后一个维度</strong>（列）。
+*   <strong>代码解读：</strong>
+    *   输入 <code>(8, 4)</code>。TP=4。
+    *   Rank 0 拿第 0 列，Rank 1 拿第 1 列...
+    *   验证：<code>output_data</code> 等于 <code>input_data</code> 的第 <code>req_dim</code> 列。
+*   <strong>反向传播：</strong> 前向是“切分”，反向就是“拼凑（Gather）”。代码验证了反向操作能把分散的数据拼回成 <code>0, 1, 2, 3</code> 的序列。</p>
+<p><strong>2. <code>test_GatherFromModelParallelRegion</code> (收集)</strong>
+*   <strong>动作：</strong> 4 张卡手里各有一小条数据，把它们拼成一个大矩阵。
+*   <strong>代码解读：</strong>
+    *   前向传播：拼凑。Rank 0 的数据放在第 0 列，Rank 1 在第 1 列...
+    *   反向传播：前向是“拼凑”，反向就是“切分”。
+    *   代码验证了 <code>backward</code> 出来的结果，正是当前 Rank 对应的那一列数据。</p>
+<h4>Task 4: 理解“序列并行” (Sequence Parallel)</h4>
+<p>这是 Megatron-Core 的进阶特性。TP 通常切的是 Hidden Size（列），而 SP 切的是 Sequence Length（行，即句子长度）。</p>
+<p><strong>1. <code>test_ScatterToSequenceParallelRegion</code></strong>
+*   <strong>区别：</strong> 注意代码里的 <code>req_dim</code> 计算方式变了。
+*   <strong>动作：</strong> 沿着<strong>第 0 维（行）</strong>切分。
+*   <strong>代码解读：</strong>
+    *   输入 <code>(8, 4)</code>。
+    *   Rank 0 拿第 [0, 1] 行。
+    *   Rank 1 拿第 [2, 3] 行。
+    *   ...
+    *   验证：<code>output_data</code> 等于 <code>input_data</code> 的切片 <code>[req_dim : req_dim+2]</code>。</p>
+<p><strong>2. <code>test_ReduceScatterToSequenceParallelRegion</code></strong>
+*   这是一个组合动作：先做 Reduce（求和），再做 Scatter（切分）。
+*   <strong>场景：</strong> 在 Transformer 的 MLP 层或 Attention 层输出后，通常需要先对 TP 的结果求和，然后为了省显存，不保留完整的全量结果，而是直接切分给各张卡保存。
+*   <strong>代码解读：</strong>
+    *   输入：大家都有一个 <code>(4)</code> 大小的向量。
+    *   前向：先加起来 (All-Reduce)，然后切成 4 份，每人拿一份。
+    *   验证：<code>expected_output</code> 既包含了求和的逻辑，也包含了切分的逻辑。</p>
+<h4>Task 5: 总结——前向与反向的“对偶性”</h4>
+<p>看懂这个文件，你只需要记住一个核心逻辑表，所有测试都在验证这个表：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">算子名称 (Function)</th>
+<th style="text-align: left;">前向传播 (Forward)</th>
+<th style="text-align: left;">反向传播 (Backward)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><strong>Copy</strong></td>
+<td style="text-align: left;">复制 (Identity)</td>
+<td style="text-align: left;">求和 (All-Reduce)</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Reduce</strong></td>
+<td style="text-align: left;">求和 (All-Reduce)</td>
+<td style="text-align: left;">复制 (Identity)</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Scatter</strong> (TP/SP)</td>
+<td style="text-align: left;">切分 (Split)</td>
+<td style="text-align: left;">拼凑 (All-Gather)</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>Gather</strong> (TP/SP)</td>
+<td style="text-align: left;">拼凑 (All-Gather)</td>
+<td style="text-align: left;">切分 (Split)</td>
+</tr>
+</tbody>
+</table>
+<p><strong>文中的观点总结：</strong>
+这篇代码不是在讲“观点”，而是在通过单元测试<strong>保证数学逻辑的严密性</strong>。它在说：
+1.  “当我把一个张量切分给 4 张卡时，我必须保证每张卡拿到的那部分是对的。”
+2.  “当我在反向传播算梯度时，如果前向是切分，反向必须自动把梯度拼回来，数值不能错。”
+3.  “如果是 Sequence Parallel，我要切的是行；如果是 Tensor Parallel，我要切的是列。”</p>
+<p>希望这个 List 能帮你把这些枯燥的代码对应到具体的物理动作上！</p>

@@ -1,0 +1,130 @@
+<h1>fla/module/multiscale_retention.py</h1>
+<p>这段代码确实看着比较“劝退”，因为它不是用于教学的基础代码，而是一个<strong>高度优化、面向高性能计算</strong>的工业级实现（使用了 Triton 加速核）。</p>
+<p>它实现的是 <strong>RetNet (Retentive Network)</strong> 的核心层。简单来说，RetNet 试图结合 Transformer（并行训练快）和 RNN（推理速度快、显存占用低）的优点。</p>
+<p>为了让你看懂，我为你制定了一个 <strong>5步学习 Task List</strong>。我们不纠结复杂的数学公式，而是从“数据怎么流动的”这个角度一步步拆解。</p>
+<hr />
+<h3>📋 学习 Task List (你的 Todo 清单)</h3>
+<ol>
+<li><strong>Task 1: 搞懂“我是谁” (背景定位)</strong><ul>
+<li>弄清楚这个模块在整个大模型里扮演什么角色。</li>
+</ul>
+</li>
+<li><strong>Task 2: 盘点“零件库” (<code>__init__</code> 函数)</strong><ul>
+<li>看看初始化时准备了哪些层（Q, K, V, Gate）。</li>
+</ul>
+</li>
+<li><strong>Task 3: 数据“预处理” (<code>forward</code> 前半部分)</strong><ul>
+<li>看输入数据 $x$ 是怎么被变形和编码的（RoPE）。</li>
+</ul>
+</li>
+<li><strong>Task 4: 核心“黑魔法” (Retention 计算)</strong><ul>
+<li>理解那三个神秘的 <code>fused_...</code> 函数是干嘛的。</li>
+</ul>
+</li>
+<li><strong>Task 5: 最后的“精装修” (<code>forward</code> 后半部分)</strong><ul>
+<li>看输出是怎么经过归一化和门控机制（Gating）处理的。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>💡 逐步讲解 (按 List 执行)</h3>
+<h4>✅ Task 1: 搞懂“我是谁”</h4>
+<ul>
+<li><strong>文件名</strong>: <code>multiscale_retention.py</code></li>
+<li><strong>身份</strong>: 这是 RetNet 的核心组件，叫 <strong>Multi-Scale Retention (MSR)</strong>。你可以把它看作是 Transformer 中 <strong>Multi-Head Attention (MHA)</strong> 的替代品。</li>
+<li><strong>目的</strong>: 它的作用和 Attention 一样，是为了让模型理解上下文，但是它计算起来更省显存，推理更快。</li>
+</ul>
+<h4>✅ Task 2: 盘点“零件库” (<code>__init__</code>)</h4>
+<p>我们看 <code>__init__</code> 函数，看看它准备了哪些“积木”：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 维度定义</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">q_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="n">embed_dim</span><span class="p">,</span> <span class="n">embed_dim</span><span class="p">,</span> <span class="n">bias</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>      <span class="c1"># Query</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">k_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="n">embed_dim</span><span class="p">,</span> <span class="n">embed_dim</span><span class="p">,</span> <span class="n">bias</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>      <span class="c1"># Key</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">v_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="n">embed_dim</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">value_dim</span><span class="p">,</span> <span class="n">bias</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span> <span class="c1"># Value</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">g_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="n">embed_dim</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">value_dim</span><span class="p">,</span> <span class="n">bias</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span> <span class="c1"># Gate (这是RetNet特有的)</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">out_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">value_dim</span><span class="p">,</span> <span class="n">embed_dim</span><span class="p">,</span> <span class="n">bias</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span> <span class="c1"># 输出层</span>
+
+<span class="c1"># 2. 归一化层</span>
+<span class="c1"># 这里用的是 GroupNorm 的一种变体，对每个 Head 独立做 RMSNorm</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">group_norm</span> <span class="o">=</span> <span class="n">RMSNorm</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">head_v_dim</span><span class="p">,</span> <span class="n">eps</span><span class="o">=</span><span class="n">layernorm_eps</span><span class="p">)</span>
+
+<span class="c1"># 3. 位置编码</span>
+<span class="c1"># 这是一个旋转位置编码 (RoPE)，让模型知道词的顺序</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">rotary</span> <span class="o">=</span> <span class="n">RotaryEmbedding</span><span class="p">(</span><span class="n">dim</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">head_qk_dim</span><span class="p">,</span> <span class="n">interleaved</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>关键点：</strong>
+*   它有 <strong>Q, K, V</strong>，这和 Transformer 一样。
+*   它多了一个 <strong>G (Gate)</strong>，这是为了控制信息流动的强弱。
+*   注意 <code>value_dim</code> 通常比 <code>embed_dim</code> 大（<code>expansion_ratio=2</code>），这意味着中间层的“容量”是输入的两倍。</p>
+<h4>✅ Task 3: 数据“预处理” (<code>forward</code> 前半部分)</h4>
+<p>现在数据 <code>x</code> 进来了，形状通常是 <code>(Batch, Length, Dim)</code>。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 投影并变形 (Q 和 K)</span>
+<span class="c1"># 把 x 变成 Query 和 Key，然后拆分成多个 Head</span>
+<span class="n">q1</span> <span class="o">=</span> <span class="n">rearrange</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">q_proj</span><span class="p">(</span><span class="n">x</span><span class="p">),</span> <span class="s1">&#39;... (h d) -&gt; ... h d&#39;</span><span class="p">,</span> <span class="n">h</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">num_heads</span><span class="p">)</span>
+<span class="n">k1</span> <span class="o">=</span> <span class="n">rearrange</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">k_proj</span><span class="p">(</span><span class="n">x</span><span class="p">),</span> <span class="s1">&#39;... (h d) -&gt; ... h d&#39;</span><span class="p">,</span> <span class="n">h</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">num_heads</span><span class="p">)</span>
+
+<span class="c1"># 2. 注入位置信息 (RoPE)</span>
+<span class="c1"># 只有 Q 和 K 需要位置信息，V 不需要</span>
+<span class="n">q</span><span class="p">,</span> <span class="n">k</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">rotary</span><span class="p">(</span><span class="n">q1</span><span class="p">,</span> <span class="n">k1</span><span class="p">)</span>
+
+<span class="c1"># 3. 维度转置</span>
+<span class="c1"># 为了配合后面的计算核，把维度调整一下</span>
+<span class="n">q</span><span class="p">,</span> <span class="n">k</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">),</span> <span class="n">k</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+
+<span class="c1"># 4. 投影 V (Value)</span>
+<span class="c1"># V 承载的是内容信息</span>
+<span class="n">v</span> <span class="o">=</span> <span class="n">rearrange</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">v_proj</span><span class="p">(</span><span class="n">x</span><span class="p">),</span> <span class="s1">&#39;b n (h d) -&gt; b h n d&#39;</span><span class="p">,</span> <span class="n">h</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">num_heads</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+</code></pre></div>
+
+<p><strong>这一步发生了什么？</strong>
+就像炒菜前的切菜。把输入切成了 Q、K、V 三份。给 Q 和 K 撒上了“位置粉末”（RoPE），这样模型就知道哪个词在前，哪个词在后。</p>
+<h4>✅ Task 4: 核心“黑魔法” (Retention 计算)</h4>
+<p>这是代码最难懂的地方，因为它调用了外部的高性能算子（Triton kernel）。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">form</span> <span class="o">==</span> <span class="s1">&#39;fused_chunk&#39;</span><span class="p">:</span>
+    <span class="n">o</span> <span class="o">=</span> <span class="n">fused_chunk_retention</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">)</span>
+<span class="k">elif</span> <span class="n">form</span> <span class="o">==</span> <span class="s1">&#39;parallel&#39;</span><span class="p">:</span>
+    <span class="n">o</span> <span class="o">=</span> <span class="n">parallel_retention</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">)</span>
+<span class="k">elif</span> <span class="n">form</span> <span class="o">==</span> <span class="s1">&#39;fused_recurrent&#39;</span><span class="p">:</span>
+    <span class="n">o</span> <span class="o">=</span> <span class="n">fused_recurrent_retention</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>这一步在干嘛？</strong>
+这三行代码做的是<strong>同一件事</strong>（数学结果基本一致），但是<strong>计算方式</strong>不同：</p>
+<ol>
+<li><strong>Parallel (并行模式)</strong>: 像 Transformer 一样一次性算出所有词的关系。<strong>训练时用</strong>，速度极快。</li>
+<li><strong>Recurrent (循环模式)</strong>: 像 RNN 一样，读一个词，吐一个词。<strong>推理（生成文本）时用</strong>，显存占用极小，速度快。</li>
+<li><strong>Chunk (分块模式)</strong>: 混合体。把长序列切成小块，块内并行，块间循环。这是为了处理超长文本而设计的优化。</li>
+</ol>
+<p>这里的 <code>o</code> 就是 Q、K、V 经过复杂的加权混合后的结果（类似于 Attention 的 output，但这里叫 Retention）。</p>
+<h4>✅ Task 5: 最后的“精装修” (<code>forward</code> 后半部分)</h4>
+<p>算出来的结果 <code>o</code> 还不能直接输出，需要最后处理一下。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 归一化 (GroupNorm)</span>
+<span class="c1"># 把形状变回去，然后过一个 RMSNorm</span>
+<span class="n">o</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">group_norm</span><span class="p">(</span><span class="n">rearrange</span><span class="p">(</span><span class="n">o</span><span class="p">,</span> <span class="s1">&#39;b h n d -&gt; b n h d&#39;</span><span class="p">))</span>
+
+<span class="c1"># 2. 门控机制 (Gating)</span>
+<span class="c1"># 这一步是 RetNet 的精髓之一。</span>
+<span class="c1"># self.g_proj(x) 计算出一个“门”。</span>
+<span class="c1"># 这里的 * 是逐元素相乘。意思是：根据输入 x 的内容，决定保留多少 Retention 的结果 o。</span>
+<span class="n">gated_o</span> <span class="o">=</span> <span class="n">rearrange</span><span class="p">(</span><span class="n">o</span><span class="p">,</span> <span class="s1">&#39;b n h d -&gt; b n (h d)&#39;</span><span class="p">)</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">g_proj</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+
+<span class="c1"># 3. 最终输出投影</span>
+<span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">out_proj</span><span class="p">(</span><span class="n">gated_o</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>这一步发生了什么？</strong>
+1.  <strong>洗澡</strong>: <code>group_norm</code> 把数据洗干净，防止数值过大或过小。
+2.  <strong>安检</strong>: <code>g_proj</code> 像是一个安检门，它决定哪些信息可以通过，哪些被过滤掉（Swish 激活函数通常用于这种门控）。
+3.  <strong>打包</strong>: <code>out_proj</code> 把数据变回原来的维度，准备传给下一层。</p>
+<hr />
+<h3>📝 总结 (Summary)</h3>
+<p>如果把这个类比作一个<strong>信息处理工厂</strong>：</p>
+<ol>
+<li><strong>原料进厂</strong>: 输入 <code>x</code>。</li>
+<li><strong>分拣车间</strong>: 拆分成 Q（查询单）、K（索引）、V（内容）。</li>
+<li><strong>打标签</strong>: 给 Q 和 K 打上时间戳（RoPE），防止顺序搞乱。</li>
+<li><strong>核心加工 (Retention)</strong>: 根据 Q 和 K 的匹配程度，从 V 中提取信息。这个过程有三种模式（并行、循环、分块），取决于你是想快速训练还是快速生成。</li>
+<li><strong>质检与过滤</strong>: 结果通过 GroupNorm 规范化，然后被 Gate（门控）过滤一遍，只保留有用的信息。</li>
+<li><strong>出厂</strong>: 重新打包，输出。</li>
+</ol>
+<p>这段代码之所以看起来难，是因为它把最复杂的数学计算（Retention 公式）封装在 <code>fla.ops.triton</code> 里面了，留下的全是数据维度的变换 (<code>rearrange</code>)。你只需要理解它是在做 <strong>Input -&gt; [Q,K,V,G] -&gt; Retention -&gt; Norm -&gt; Gate -&gt; Output</strong> 这个流程即可。</p>

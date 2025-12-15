@@ -1,0 +1,103 @@
+<h1>docs/amd_tutorial/amd_build_dockerfile_page.rst</h1>
+<p>这份文档的核心目的是指导用户<strong>如何在 AMD GPU（特别是 MI300 系列）上运行 <code>verl</code> 这个强化学习训练框架</strong>。</p>
+<p>由于 AMD 的软件环境（ROCm）和 NVIDIA（CUDA）不同，不能直接用通用的安装方式，必须通过构建特定的 Docker 镜像并设置特定的环境变量来解决兼容性问题。</p>
+<p>为了让你更容易理解，我将文档内容拆解为一个<strong>“任务清单 (To-Do List)”</strong>，你只需要按顺序执行这些步骤即可。</p>
+<hr />
+<h3>任务清单：在 AMD GPU 上运行 Verl</h3>
+<h4>第一步：准备 Docker 环境 (Build Docker)</h4>
+<p><strong>目标</strong>：构建一个包含 AMD ROCm 驱动、PyTorch 和 vLLM/SGLang 的运行环境。
+<strong>原因</strong>：AMD 的深度学习环境依赖比较复杂，直接在物理机安装容易出错，官方推荐用 Docker。</p>
+<ol>
+<li><strong>复制 Dockerfile 内容</strong>：<ul>
+<li>文档中 <code>docker/Dockerfile.rocm</code> 下面的代码块，保存为文件 <code>Dockerfile.rocm</code>。</li>
+<li><em>注意点</em>：这个镜像基于 <code>lmsysorg/sglang</code>，因为它支持 vLLM 和 FSDP（完全分片数据并行）。</li>
+</ul>
+</li>
+<li><strong>构建镜像</strong>：<ul>
+<li>在终端运行命令：<code>docker build -f docker/Dockerfile.rocm -t verl-rocm .</code></li>
+<li>这会生成一个名为 <code>verl-rocm</code> 的 Docker 镜像。</li>
+</ul>
+</li>
+</ol>
+<h4>第二步：启动 Docker 容器 (Run Container)</h4>
+<p><strong>目标</strong>：进入刚才构建好的环境，并确保容器能访问 AMD 的 GPU 硬件。</p>
+<ol>
+<li><strong>运行启动命令</strong>：<ul>
+<li>使用文档 <code>Run the container</code> 部分的命令。</li>
+<li><em>关键参数解释</em>：<ul>
+<li><code>--device /dev/dri</code> 和 <code>--device /dev/kfd</code>：这是让 Docker 能看到 AMD GPU 的关键。</li>
+<li><code>--shm-size 128G</code>：防止内存溢出。</li>
+<li><code>-v $HOME:$HOME</code>：把你的家目录挂载进去，方便读取数据。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<h4>第三步：设置关键环境变量 (Configuration)</h4>
+<p><strong>目标</strong>：解决 <code>Ray</code> 框架在 AMD 环境下的兼容性 Bug。这是文档中最强调的一点。</p>
+<ol>
+<li><strong>检查 Ray 版本</strong>：<ul>
+<li>通常现在的版本都大于 2.45.0。</li>
+</ul>
+</li>
+<li><strong>设置变量</strong>：<ul>
+<li>在运行训练脚本前，必须执行：
+    <code>export RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1</code></li>
+<li><em>解释</em>：如果不加这个，Ray 可能无法正确识别或调度 AMD GPU，导致报错。</li>
+</ul>
+</li>
+</ol>
+<h4>第四步：运行训练任务 (单机模式)</h4>
+<p><strong>目标</strong>：在一台机器上跑通 PPO 或 GRPO 算法。</p>
+<ol>
+<li><strong>准备数据和模型</strong>：<ul>
+<li>下载模型（如 Qwen2.5-0.5B）。</li>
+<li>预处理数据（运行 <code>examples/data_preprocess/gsm8k.py</code>）。</li>
+</ul>
+</li>
+<li><strong>选择推理引擎</strong>：<ul>
+<li>文档默认使用 <code>vLLM</code> (<code>ENGINE=vllm</code>)。</li>
+</ul>
+</li>
+<li><strong>运行训练脚本</strong>：<ul>
+<li><strong>PPO 示例</strong>：参考文档 <code>PPO</code> 章节的代码块。</li>
+<li><strong>GRPO 示例</strong>：参考文档 <code>GRPO</code> 章节的代码块。</li>
+<li><em>核心动作</em>：直接复制对应的 <code>python3 -m verl.trainer.main_ppo ...</code> 命令运行即可。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>进阶任务：多节点集群训练 (Slurm)</h3>
+<p><em>(如果你只有一台机器，可以忽略此部分)</em></p>
+<p><strong>目标</strong>：在高性能计算集群（使用 Slurm 调度系统）上，利用多台机器进行大规模训练。</p>
+<p><strong>文档提供了一个全自动脚本 (<code>slurm_script.sh</code>)，它的逻辑流程如下：</strong></p>
+<ol>
+<li><strong>环境清理与准备</strong>：<ul>
+<li>脚本会自动加载 Docker 镜像，清理旧容器。</li>
+<li>设置大量的网络环境变量（如 <code>NCCL_...</code>），这是为了让多台机器的 GPU 通信顺畅。</li>
+</ul>
+</li>
+<li><strong>启动 Ray 集群</strong>：<ul>
+<li><strong>Head Node (主节点)</strong>：脚本会自动在第一台机器上启动 Ray Head。</li>
+<li><strong>Worker Nodes (工作节点)</strong>：脚本会在其他机器上启动 Ray Worker，并连接到主节点。</li>
+</ul>
+</li>
+<li><strong>数据与模型准备</strong>：<ul>
+<li>在 Docker 容器内自动下载数据和模型。</li>
+</ul>
+</li>
+<li><strong>开始训练</strong>：<ul>
+<li>最后，脚本会在主节点上触发 <code>verl.trainer.main_ppo</code> 命令，开始分布式训练。</li>
+</ul>
+</li>
+</ol>
+<p><strong>你的 Todo</strong>：
+1.  将 <code>slurm_script.sh</code> 内容复制并保存。
+2.  根据你的集群情况修改头部参数（如 <code>#SBATCH --nodes=2</code>）。
+3.  运行 <code>sbatch slurm_script.sh</code> 提交任务。</p>
+<hr />
+<h3>总结 (TL;DR)</h3>
+<p>这篇文章其实就讲了三件事：
+1.  <strong>装环境</strong>：用 <code>Dockerfile.rocm</code> 建个 Docker。
+2.  <strong>打补丁</strong>：运行前记得 <code>export RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1</code>。
+3.  <strong>跑代码</strong>：提供了单机和多机（Slurm）的运行脚本模板，直接抄作业改改参数就能跑。</p>

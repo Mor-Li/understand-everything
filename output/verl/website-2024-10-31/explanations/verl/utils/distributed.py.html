@@ -1,0 +1,61 @@
+<h1>verl/utils/distributed.py</h1>
+<p>没问题。这段代码虽然短，但它涉及了<strong>分布式训练（Distributed Training）</strong>最核心的初始化步骤。如果不了解背景，确实像天书。</p>
+<p>我们可以把这段代码想象成：<strong>你在组织一个巨大的交响乐团（多张显卡/GPU）来共同演奏一首曲子（训练一个大模型）。</strong></p>
+<p>为了让这个乐团能协同工作，你需要完成以下几个 <strong>Task（任务）</strong>。我会按照代码执行的逻辑，一步步拆解给你看。</p>
+<hr />
+<h3>📋 任务清单 (Task List)</h3>
+<h4>✅ Task 1: 建立通讯频道 (建立群聊)</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">torch.distributed</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">datetime</span><span class="w"> </span><span class="kn">import</span> <span class="n">timedelta</span>
+<span class="n">torch</span><span class="o">.</span><span class="n">distributed</span><span class="o">.</span><span class="n">init_process_group</span><span class="p">(</span><span class="s1">&#39;nccl&#39;</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="n">timedelta</span><span class="p">(</span><span class="n">seconds</span><span class="o">=</span><span class="n">timeout_second</span><span class="p">))</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+*   <strong>背景</strong>：当你有多张显卡（比如 8 张）一起训练时，它们需要互相“说话”（同步数据、交换梯度）。
+*   <strong>操作</strong>：<code>init_process_group</code> 就是在建立这个“群聊”。
+*   <strong>细节</strong>：
+    *   <code>'nccl'</code>：这是 NVIDIA 专门为显卡通信设计的“语言”（后端）。在 GPU 训练中，这是标准配置，速度最快。
+    *   <code>timeout</code>：如果群里有人掉线或者卡住了，等待多久算超时（这里默认设了 10 小时，也就是 36000 秒）。</p>
+<h4>✅ Task 2: 确认身份信息 (我是谁？)</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">local_rank</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s2">&quot;LOCAL_RANK&quot;</span><span class="p">])</span>
+<span class="n">rank</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s2">&quot;RANK&quot;</span><span class="p">])</span>
+<span class="n">world_size</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s2">&quot;WORLD_SIZE&quot;</span><span class="p">])</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+*   <strong>背景</strong>：群建好了，每个进程（Process）需要知道自己的身份。这些信息通常是由启动命令（如 <code>torchrun</code>）自动写在环境变量里的，代码只需要去读取。
+*   <strong>核心概念（非常重要）</strong>：
+    *   <strong><code>WORLD_SIZE</code> (总人数)</strong>：这次训练总共有多少张显卡参与？（比如一共 16 张）。
+    *   <strong><code>RANK</code> (全局编号)</strong>：我在整个乐团里排第几？（从 0 到 15）。Rank 0 通常是“指挥家”，负责保存模型、打印日志。
+    *   <strong><code>LOCAL_RANK</code> (本地编号)</strong>：我在<strong>当前这台机器</strong>上排第几？
+        *   <em>例子</em>：假设你有 2 台机器，每台机器有 8 张卡。
+        *   第 2 台机器上的第 1 张卡：它的 <code>RANK</code> 可能是 8，但它的 <code>LOCAL_RANK</code> 是 0。</p>
+<h4>✅ Task 3: 绑定物理设备 (入座)</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">distributed</span><span class="o">.</span><span class="n">is_initialized</span><span class="p">():</span>
+    <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">set_device</span><span class="p">(</span><span class="n">local_rank</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+*   <strong>背景</strong>：现在程序知道自己是“这台机器上的第 0 号进程”了（<code>local_rank</code> = 0），但它默认可能还是会去抢第 0 号显卡。如果所有进程都去抢第 0 号卡，程序就崩了。
+*   <strong>操作</strong>：<code>torch.cuda.set_device(local_rank)</code> 这句话就是命令当前进程：“你，去绑定物理上的第 <code>local_rank</code> 号显卡，别碰其他的。”
+*   <strong>结果</strong>：一人一卡，互不干扰。</p>
+<h4>✅ Task 4: 汇报结果 (返回数据)</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">return</span> <span class="n">local_rank</span><span class="p">,</span> <span class="n">rank</span><span class="p">,</span> <span class="n">world_size</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+*   <strong>操作</strong>：初始化工作做完了，函数把刚才获取到的三个关键身份信息（本地排名、全局排名、总人数）打包返回给主程序。
+*   <strong>用途</strong>：主程序后续需要用这些信息来决定谁负责打印 Log，谁负责切分数据等。</p>
+<hr />
+<h3>总结</h3>
+<p>这段代码 <code>initialize_global_process_group</code> 的作用就是：</p>
+<ol>
+<li><strong>拉群</strong>：让所有显卡连上线 (<code>init_process_group</code>)。</li>
+<li><strong>查户口</strong>：看一眼环境变量，搞清楚自己是哪台机器上的哪张卡 (<code>os.environ</code>)。</li>
+<li><strong>占座</strong>：把自己绑定到对应的显卡硬件上 (<code>set_device</code>)。</li>
+</ol>
+<p>现在再回看代码，是不是清晰多了？</p>

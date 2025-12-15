@@ -1,0 +1,116 @@
+<h1>tools/checkpoint/loader_megatron.py</h1>
+<p>这份代码确实比较硬核，因为它涉及到了<strong>深度学习框架的底层</strong>（Megatron-LM）和<strong>分布式训练</strong>（模型并行）的逻辑。</p>
+<p>简单来说，这个脚本是一个 <strong>“搬运工”</strong>。它的任务是：<strong>把一个被打散在多个文件里的 Megatron 格式模型（通常是因为使用了多卡训练，模型被切分了），加载进内存，拼凑完整，然后通过一个队列（Queue）传给另一个程序（通常是转换脚本，比如转成 HuggingFace 格式）。</strong></p>
+<p>为了让你看懂，我把它想象成一个<strong>流水线工人的任务清单 (Todo List)</strong>。我们按照代码执行的顺序，一步步来看这个工人做了什么。</p>
+<hr />
+<h3>📋 任务清单：Megatron 模型加载工</h3>
+<ol>
+<li><strong>【准备工具】</strong>：找到并导入 Megatron 的源代码库。</li>
+<li><strong>【伪造现场】</strong>：伪造命令行参数，骗过 Megatron 的初始化检查。</li>
+<li><strong>【读取图纸】</strong>：从 Checkpoint 文件中读取模型的配置（几层？多大？）。</li>
+<li><strong>【搭建骨架】</strong>：根据配置，在内存里把模型的“空壳”搭建出来。</li>
+<li><strong>【填充血肉】</strong>：把硬盘上的权重文件加载到“空壳”里。</li>
+<li><strong>【发送情报】</strong>：把模型的元数据（Metadata）发给接收方。</li>
+<li><strong>【拆解与打包】</strong>：按层（Layer）遍历，把切碎的权重拼好，打包发走。</li>
+</ol>
+<hr />
+<h3>🧩 详细步骤拆解</h3>
+<h4>1. 【准备工具】环境配置</h4>
+<p><strong>代码位置</strong>：<code>_load_checkpoint</code> 函数开头 (第 30-50 行)</p>
+<ul>
+<li><strong>原来的问题</strong>：Megatron 是一个复杂的库，如果不引用它的路径，代码跑不起来。</li>
+<li><strong>工人的操作</strong>：<ul>
+<li>查看 <code>args.megatron_path</code>，把 Megatron 的文件夹加入到系统路径 (<code>sys.path</code>)。</li>
+<li>尝试导入 <code>megatron.training</code> 等模块。如果找不到，直接报错下班（<code>exit(1)</code>）。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 【伪造现场】Mock 参数</h4>
+<p><strong>代码位置</strong>：第 53-67 行 (<code>sys.argv = [...]</code>)</p>
+<ul>
+<li><strong>原来的问题</strong>：Megatron 的代码写得很死，初始化时必须读取命令行参数（比如 <code>--micro-batch-size</code> 等）。但我们现在只是在<strong>加载</strong>模型，不是在<strong>训练</strong>，没有这些参数会报错。</li>
+<li><strong>工人的操作</strong>：<ul>
+<li>强行修改 <code>sys.argv</code>，填入一堆假参数（比如 <code>--micro-batch-size 1</code>，<code>--no-initialization</code>）。</li>
+<li><strong>目的</strong>：为了让 Megatron 以为自己在正常运行，从而乖乖地帮我们解析配置。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 【读取图纸】加载配置</h4>
+<p><strong>代码位置</strong>：第 70-110 行</p>
+<ul>
+<li><strong>工人的操作</strong>：<ul>
+<li>调用 <code>load_args_from_checkpoint</code>。</li>
+<li>它会打开你指定的文件夹，读取 <code>arguments</code> 文件。</li>
+<li><strong>核对清单</strong>：检查关键参数是否存在（比如 <code>num_layers</code>（层数）, <code>hidden_size</code>（隐藏层大小）, <code>tensor_model_parallel_size</code>（模型被切了几刀））。如果缺了关键参数，直接报警退出。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 【搭建骨架】与 5. 【填充血肉】</h4>
+<p><strong>代码位置</strong>：第 127-169 行 (<code>def get_models(...)</code>)</p>
+<p>这是最复杂的一步。
+*   <strong>背景知识</strong>：Megatron 训练大模型时，会把一个大模型切成好几块（Tensor Parallel, TP）放在不同的 GPU 上。
+*   <strong>工人的操作</strong>：
+    *   因为加载脚本通常是在单机上运行，它需要<strong>模拟</strong>多卡环境。
+    *   它写了一个循环 <code>for rank in range(count)</code>，假装自己是第 0 号 GPU，然后假装是第 1 号 GPU...
+    *   <code>model_provider</code>：根据配置创建模型对象（此时是随机初始化的空壳）。
+    *   <code>load_checkpoint</code>：从硬盘读取对应的权重文件，填入这个空壳。
+    *   <strong>结果</strong>：现在内存里有了一个列表 <code>models</code>，里面存着切分好的模型碎片。</p>
+<h4>6. 【发送情报】发送元数据</h4>
+<p><strong>代码位置</strong>：第 189-231 行</p>
+<ul>
+<li><strong>工人的操作</strong>：<ul>
+<li>创建一个对象 <code>md</code> (metadata)。</li>
+<li>记录下模型的关键信息：层数、词表大小、是否使用 SwiGLU、Layernorm 是否有 Bias 等等。</li>
+<li><code>queue.put(md)</code>：通过队列把这份“说明书”发给主程序，告诉它：“我们要转换的模型长这样，请做好准备。”</li>
+</ul>
+</li>
+</ul>
+<h4>7. 【拆解与打包】核心循环 (The Loop)</h4>
+<p><strong>代码位置</strong>：第 237 行直到结束</p>
+<p>这是脚本干活最累的地方。它要把分散的权重<strong>拼</strong>回来。</p>
+<ul>
+<li>
+<p><strong>任务 A：处理 Embedding (词向量)</strong></p>
+<ul>
+<li>代码：第 246-253 行。</li>
+<li>动作：因为词表通常被切分在不同卡上，这里用 <code>torch.cat(..., dim=0)</code> 把它们按行拼起来，变成一个完整的词向量矩阵，然后发走。</li>
+</ul>
+</li>
+<li>
+<p><strong>任务 B：处理 Transformer 层 (核心层)</strong></p>
+<ul>
+<li>代码：第 256-328 行。这是一个大循环 <code>for layer_num in ...</code>。</li>
+<li><strong>对于每一层</strong>：<ol>
+<li><strong>取不切分的参数</strong>：比如 LayerNorm 的 <code>weight</code> 和 <code>bias</code>，所有卡上都一样，直接取第 0 个模型的即可。</li>
+<li><strong>取被切分的参数 (TP)</strong>：比如 <code>qkv_weight</code> (注意力机制的权重) 和 <code>dense_weight</code> (全连接层权重)。</li>
+<li><strong>拼接 (Merge)</strong>：<ul>
+<li>有些权重是按行切的，有些是按列切的。</li>
+<li>代码里用 <code>torch.cat(list, dim=0)</code> 或 <code>dim=1</code> 把 <code>models[0]</code>, <code>models[1]</code>... 里的权重拼成一个完整的大矩阵。</li>
+</ul>
+</li>
+<li><strong>特殊处理 SwiGLU</strong>：如果是 LLaMA 类模型用了 SwiGLU，切分逻辑更复杂，代码里有专门的 <code>if md.swiglu:</code> 逻辑来处理拼接。</li>
+</ol>
+</li>
+<li><strong>打包发送</strong>：拼好这一层的所有参数后，用 <code>queue_put</code> 发送，标签叫 <code>"transformer layer X"</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>任务 C：收尾 (Final Norm &amp; Output)</strong></p>
+<ul>
+<li>代码：第 331 行之后。</li>
+<li>动作：处理最后的归一化层 (<code>Final Norm</code>) 和输出层 (<code>Output Layer</code>)，同样如果有切分就拼起来，然后发送。</li>
+</ul>
+</li>
+<li>
+<p><strong>任务 D：下班</strong></p>
+<ul>
+<li>代码：最后一行 <code>queue.put("done")</code>。</li>
+<li>动作：告诉主程序：“所有零件都拆解、拼装、发送完毕，我下班了。”</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结</h3>
+<p>这个文件的核心逻辑就是：
+<strong>模拟分布式环境 -&gt; 加载切片模型 -&gt; 按层遍历 -&gt; 将切片的权重 Tensor 拼接 (Concat) 成完整 Tensor -&gt; 传输出去。</strong></p>
+<p>如果不做这一步，你拿到的只是一个个无法独立使用的模型碎片文件。</p>

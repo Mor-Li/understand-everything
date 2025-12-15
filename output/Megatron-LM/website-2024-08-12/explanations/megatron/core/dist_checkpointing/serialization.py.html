@@ -1,0 +1,131 @@
+<h1>megatron/core/dist_checkpointing/serialization.py</h1>
+<p>这份代码文件 <code>serialization.py</code> 是 <strong>Megatron-Core</strong> 中处理 <strong>分布式模型保存与加载（Checkpointing）</strong> 的核心入口文件。</p>
+<p>简单来说，它的作用就是把 PyTorch 原生的 <code>torch.save</code> 和 <code>torch.load</code> 变成了 <strong>“分布式版”</strong>，专门用来处理那些大到无法放进单个 GPU 的超大模型。</p>
+<p>为了让你看懂，我列了一个 <strong>学习任务清单 (To-Do List)</strong>，我们一步步来拆解这个文件。</p>
+<hr />
+<h3>📋 任务清单：一步步读懂分布式存档</h3>
+<h4>✅ Task 1: 理解核心背景 (Why?)</h4>
+<p><strong>目标</strong>：明白为什么要写这个文件，而不是直接用 <code>torch.save</code>。</p>
+<ul>
+<li><strong>普通情况</strong>：你有一个小模型，直接 <code>torch.save(model.state_dict(), "model.pt")</code>，生成一个文件。</li>
+<li><strong>Megatron 的情况</strong>：模型有几千亿参数，被切分（Sharded）到了几百个 GPU 上。<ul>
+<li>如果只存一个文件：内存会爆，写文件会慢死。</li>
+<li><strong>解决办法</strong>：每个 GPU 只存自己那一部分数据，同时还需要存一些公共的配置信息。</li>
+</ul>
+</li>
+<li><strong>这个文件的角色</strong>：它是总指挥。它告诉各个 GPU：“准备好你们的数据，按照某种策略（Strategy），把数据存进文件夹里。”</li>
+</ul>
+<h4>✅ Task 2: 掌握核心词汇 (Vocabulary)</h4>
+<p><strong>目标</strong>：看懂代码里的变量名都在指代什么。</p>
+<ol>
+<li><strong><code>ShardedStateDict</code> (切分状态字典)</strong>:<ul>
+<li>普通的 <code>state_dict</code> 里面全是真实的 Tensor 数据。</li>
+<li>这里的 <code>ShardedStateDict</code> 里面存的是 <strong>“数据的描述”</strong>（比如：这个 Tensor 叫什么，它是怎么被切分的，属于哪个 GPU）。</li>
+</ul>
+</li>
+<li><strong><code>ShardedTensor</code> / <code>ShardedObject</code></strong>:<ul>
+<li>被切分的数据对象。</li>
+</ul>
+</li>
+<li><strong><code>Common</code> vs <code>Sharded</code></strong>:<ul>
+<li><strong>Common (公共数据)</strong>：所有 GPU 都一样的小数据（比如迭代步数、学习率参数）。通常由 Rank 0 (主进程) 负责存。</li>
+<li><strong>Sharded (切分数据)</strong>：巨大的模型权重，每个 GPU 都不一样。</li>
+</ul>
+</li>
+<li><strong><code>Strategy</code> (策略)</strong>:<ul>
+<li>保存的方法。比如是存成 PyTorch 格式，还是存成 Zarr 格式？是同步存还是异步存？</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 3: 解析 <code>save</code> 函数 (怎么存？)</h4>
+<p><strong>目标</strong>：看懂 <code>def save(...)</code> 函数的流程。</p>
+<p>想象这是一次 <strong>“集体搬家”</strong> 活动：</p>
+<ol>
+<li><strong>检查环境</strong>：<ul>
+<li>代码：<code>if torch.distributed.get_rank() == 0: ...</code></li>
+<li>解释：主进程检查目标文件夹是否存在，是不是空的。</li>
+</ul>
+</li>
+<li><strong>分类整理</strong>：<ul>
+<li>代码：<code>extract_nonpersistent</code>, <code>extract_sharded_base</code></li>
+<li>解释：把东西分成三类：<ul>
+<li><strong>不保存的</strong> (Non-persistent)：扔掉。</li>
+<li><strong>公共的</strong> (Common)：交给主进程打包。</li>
+<li><strong>切分的</strong> (Sharded)：这是大件家具，需要拆开。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>保存公共部分</strong>：<ul>
+<li>代码：<code>common_strategy.save_common(...)</code></li>
+<li>解释：主进程把小件行李存成一个 <code>common.pt</code>。</li>
+</ul>
+</li>
+<li><strong>保存切分部分</strong>：<ul>
+<li>代码：<code>sharded_strategy.save(...)</code></li>
+<li>解释：所有 GPU 同时开工，把自己显存里的那块模型权重写到硬盘上。</li>
+</ul>
+</li>
+<li><strong>写元数据 (Metadata)</strong>：<ul>
+<li>代码：<code>save_config(...)</code></li>
+<li>解释：最后写一个说明书（<code>metadata.json</code>），记录这次搬家用了什么格式，方便以后读取。</li>
+</ul>
+</li>
+<li><strong>异步保存 (Async)</strong> (可选)：<ul>
+<li>代码：<code>async_sharded_save</code></li>
+<li>解释：如果开启，GPU 把数据丢给 CPU 或后台线程去写硬盘，自己立刻回去继续训练，不耽误时间。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 4: 解析 <code>load</code> 函数 (怎么读？)</h4>
+<p><strong>目标</strong>：看懂 <code>def load(...)</code> 函数的流程。</p>
+<p>加载比保存更难，因为你需要把硬盘上的碎片拼回显存里，还得对齐形状。</p>
+<ol>
+<li><strong>读取公共部分</strong>：<ul>
+<li>代码：<code>common_strategy.load_common(...)</code></li>
+<li>解释：先读那个 <code>common.pt</code>，获取基础信息。</li>
+</ul>
+</li>
+<li><strong>准备“模具”</strong>：<ul>
+<li>代码：<code>sharded_state_dict</code> (参数)</li>
+<li>解释：<code>load</code> 函数要求你传入当前的 <code>model.state_dict()</code>。为什么？因为加载器需要知道现在的模型长什么样，才能把硬盘上的数据填进对应的坑位里。</li>
+</ul>
+</li>
+<li><strong>验证 (Validation)</strong>：<ul>
+<li>代码：<code>validate_integrity_and_strict_load(...)</code></li>
+<li>解释：检查硬盘里的数据和现在的模型能不能对上？有没有少 key？形状对不对？</li>
+</ul>
+</li>
+<li><strong>加载切分数据</strong>：<ul>
+<li>代码：<code>sharded_strategy.load(...)</code></li>
+<li>解释：这是最重的一步。根据策略，每个 GPU 去硬盘里读取属于自己的那一部分权重。</li>
+</ul>
+</li>
+<li><strong>合并</strong>：<ul>
+<li>代码：<code>merge(common_state_dict, loaded_state_dict)</code></li>
+<li>解释：把公共数据和切分数据合二为一，返回给用户。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 5: 其他辅助功能</h4>
+<p><strong>目标</strong>：了解文件里剩下的那些小函数是干嘛的。</p>
+<ul>
+<li><strong><code>load_tensors_metadata</code></strong>:<ul>
+<li>只读“目录”，不读“内容”。用来快速查看检查点里有哪些 Tensor，形状是多少，而不把几百 GB 的数据读进内存。</li>
+</ul>
+</li>
+<li><strong><code>load_plain_tensors</code></strong>:<ul>
+<li>把分布式的检查点，像普通 Tensor 一样读出来（通常用于转换模型格式或者调试）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结 (Takeaway)</h3>
+<p><strong>一句话概括这个文件：</strong>
+它是一个<strong>调度员</strong>。它不负责底层的“写文件”操作（那是 Strategy 的事），也不负责定义模型结构。它负责协调所有 GPU，有序地将巨大的模型拆解保存，或者从碎片中组装读取。</p>
+<p><strong>你可以尝试这样阅读代码：</strong>
+1.  先看 <code>def save</code>: 关注它是如何把 <code>sharded_state_dict</code> 拆分成 <code>common</code> 和 <code>sharded</code> 两部分的。
+2.  再看 <code>def load</code>: 关注它是如何利用传入的 <code>sharded_state_dict</code> 作为“向导”来加载数据的。</p>

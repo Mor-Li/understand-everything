@@ -1,0 +1,100 @@
+<h1>tests/modules/test_layernorm.py</h1>
+<p>这份代码其实是一个<strong>测试脚本（Unit Test）</strong>。</p>
+<p>它的核心目的是：<strong>验证一种新的、可能为了加速而写的代码（这里称为 <code>tri</code> / <code>fla</code> 库），算出来的结果是否和 PyTorch 官方的标准代码（称为 <code>ref</code>）一模一样。</strong></p>
+<p>为了让你彻底看懂，我为你列了一个 <strong>“学习与阅读任务清单 (To-Do List)”</strong>。你可以按照这个顺序，一步步解锁代码的含义。</p>
+<hr />
+<h3>📋 任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>概念对齐</strong>：理解“基准（Reference）”与“测试对象（Target）”的关系。</li>
+<li><strong>场景设置</strong>：看懂 <code>@pytest.mark.parametrize</code> 是在干什么。</li>
+<li><strong>核心逻辑拆解</strong>：以 <code>test_layernorm</code> 为例，读懂“初始化 -&gt; 同步 -&gt; 计算 -&gt; 对比”的四步走流程。</li>
+<li><strong>进阶逻辑</strong>：理解为什么要测“反向传播（Backward/Gradient）”。</li>
+<li><strong>变体理解</strong>：看懂 <code>RMSNorm</code> 和 <code>GroupNorm</code> 有什么不同。</li>
+<li><strong>融合算子</strong>：理解 <code>..._linear</code> 测试是在测什么。</li>
+</ol>
+<hr />
+<h3>逐步讲解 (Step-by-Step Guide)</h3>
+<h4>任务 1：概念对齐</h4>
+<p>首先你要知道这场“比赛”的双方是谁。
+*   <strong>Ref (Reference)</strong>: 裁判、标准答案。代码里通常是 <code>nn.LayerNorm</code> 或 <code>LlamaRMSNorm</code>。这是 PyTorch 官方或 HuggingFace 经过验证的代码，绝对正确的。
+*   <strong>Tri (Triton/Trial)</strong>: 考生、待测试的新代码。代码里是 <code>fla.modules.LayerNorm</code> 等。这通常是开发者为了追求高性能（比如用 OpenAI Triton 语言写的 GPU 加速内核）而新写的算子。</p>
+<p><strong>目标</strong>：证明 <code>Tri</code> 的计算结果和 <code>Ref</code> 完全一致。</p>
+<h4>任务 2：场景设置 (Parametrize)</h4>
+<p>看代码开头的这一大坨：</p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@pytest</span><span class="o">.</span><span class="n">mark</span><span class="o">.</span><span class="n">parametrize</span><span class="p">(</span><span class="s2">&quot;B&quot;</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">])</span>
+<span class="nd">@pytest</span><span class="o">.</span><span class="n">mark</span><span class="o">.</span><span class="n">parametrize</span><span class="p">(</span><span class="s2">&quot;H&quot;</span><span class="p">,</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">4</span><span class="p">])</span>
+<span class="o">...</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">test_layernorm</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">H</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：这是 <code>pytest</code> 测试框架的写法。
+它在告诉程序：“不要只测一次。要用不同的 <strong>Batch Size (B)</strong>，不同的 <strong>Head (H)</strong>，不同的 <strong>维度 (D)</strong> 组合起来反复测。”
+这样可以确保新写的代码在各种形状的输入下都不会报错。</p>
+<h4>任务 3：核心逻辑拆解 (以 test_layernorm 为例)</h4>
+<p>这是最关键的一步。我们逐行看 <code>test_layernorm</code> 函数内部发生了什么：</p>
+<ol>
+<li>
+<p><strong>造数据 (Data Prep)</strong>:
+    <code>python
+    x = torch.randn(B, H, T, D).to(device).requires_grad_(True)</code>
+    造一个随机的输入张量 <code>x</code>。<code>requires_grad_(True)</code> 意味着我们要对它求导（模拟训练过程）。</p>
+</li>
+<li>
+<p><strong>建模型 (Instantiate Models)</strong>:
+    <code>python
+    ref = nn.LayerNorm(...)  # 官方版
+    tri = LayerNorm(...)     # 我们的加速版</code></p>
+</li>
+<li>
+<p><strong>作弊/同步权重 (Sync Weights)</strong>:
+    <em>这是一步非常关键的操作！</em>
+    <code>python
+    nn.init.normal_(ref.weight)       # 随机初始化官方模型的权重
+    tri.weight.data.copy_(ref.weight.data) # 把官方的权重直接复制给新模型</code>
+    <strong>为什么？</strong> 如果两个模型的初始参数不一样，输出肯定不一样，测试就没意义了。必须让它们在同一起跑线上。</p>
+</li>
+<li>
+<p><strong>前向传播 (Forward Pass)</strong>:
+    <code>python
+    ref_y = ref(x)  # 官方算出的结果
+    tri_y = tri(x)  # 新模型算出的结果</code></p>
+</li>
+<li>
+<p><strong>对比结果 (Assert)</strong>:
+    <code>python
+    torch.testing.assert_close(ref_y, tri_y, rtol=0, atol=1e-4)</code>
+    <strong>意思</strong>：报错如果 <code>ref_y</code> 和 <code>tri_y</code> 的差距超过了 <code>1e-4</code>。如果没报错，说明前向计算是正确的。</p>
+</li>
+</ol>
+<h4>任务 4：进阶逻辑 (反向传播/梯度)</h4>
+<p>光算得对还不行，训练神经网络还需要<strong>梯度（Gradient）</strong>对不对。
+代码里有这样一段：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">ref_dx</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">grad</span><span class="p">(</span><span class="n">ref</span><span class="p">(</span><span class="n">x</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">(),</span> <span class="n">x</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
+<span class="n">tri_dx</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">grad</span><span class="p">(</span><span class="n">tri</span><span class="p">(</span><span class="n">x</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">(),</span> <span class="n">x</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：
+*   这是在手动触发“反向传播”。
+*   它在问：如果输出变了一点点，输入 <code>x</code> 应该变多少？(<code>dx</code>)
+*   同理，它还计算了权重的梯度 <code>dw</code> (weight gradient) 和偏置的梯度 <code>db</code> (bias gradient)。
+*   最后同样用 <code>assert_close</code> 对比梯度。如果梯度不对，模型是没法训练的。</p>
+<h4>任务 5：变体理解 (RMSNorm &amp; GroupNorm)</h4>
+<p>文件里还有 <code>test_rmsnorm</code> 和 <code>test_groupnorm</code>。逻辑和上面完全一样，只是公式不同：
+*   <strong>RMSNorm</strong>: Llama 模型常用的归一化方法（去掉了减均值的步骤，只做缩放）。
+*   <strong>GroupNorm</strong>: 它是把 Channel 分组进行归一化。代码里多了一个 <code>rearrange</code>，是因为 GroupNorm 通常用于图像（CV），数据格式和 NLP 不太一样，需要调整形状来测试。</p>
+<h4>任务 6：融合算子 (Fused Linear)</h4>
+<p>你看到了 <code>test_layernorm_linear</code> 这种带 <code>_linear</code> 后缀的测试。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">ref</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Sequential</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">LayerNorm</span><span class="p">(</span><span class="o">...</span><span class="p">),</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="o">...</span><span class="p">))</span>
+<span class="n">tri</span> <span class="o">=</span> <span class="n">LayerNormLinear</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：
+*   <strong>Ref</strong>: 是把“归一化”和“全连接层(Linear)”分成两步做。
+*   <strong>Tri</strong>: <code>LayerNormLinear</code> 是一个<strong>融合算子(Fused Operator)</strong>。它把这两步合并成一个内核去跑，为了更快、更省显存。
+*   <strong>测试目的</strong>：验证“合在一起算”的结果，和“分开两步算”的结果是否一致。</p>
+<hr />
+<h3>总结 (Summary)</h3>
+<p><strong>这个文件在讲什么？</strong>
+它在说：“嘿，我写了一套新的 LayerNorm/RMSNorm/GroupNorm 代码（在 <code>fla</code> 库里），为了证明我没写错，我把 PyTorch 官方的对应模块拉出来，用相同的输入、相同的权重跑一遍。如果我的输出（Output）和梯度（Gradient）跟官方的一模一样，那我就是对的。”</p>
+<p><strong>你需要关注的重点：</strong>
+如果你不是去开发这个 <code>fla</code> 库，你只需要知道<strong>这个脚本保证了该库中归一化层的数学正确性</strong>即可。</p>

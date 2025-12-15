@@ -1,0 +1,105 @@
+<h1>fla/ops/gla/fused_chunk.py</h1>
+<p>这份代码确实比较硬核，因为它不仅仅是深度学习算法，还是用 <strong>Triton</strong> 编写的高性能底层算子。</p>
+<p>简单来说，这段代码实现的是 <strong>GLA (Gated Linear Attention)</strong> 的一种高效计算方式，叫做 <strong>"Fused Chunk"（融合分块）</strong>。</p>
+<p>为了让你听懂，我们先建立一个核心概念：<strong>GLA 试图结合 RNN（循环神经网络）和 Transformer（注意力机制）的优点。</strong>
+*   <strong>RNN 的优点</strong>：省显存，推理快（因为只存一个状态 $h$）。
+*   <strong>Transformer 的优点</strong>：训练快（可以并行），捕捉局部细节好。
+*   <strong>Chunk（分块）的做法</strong>：把长序列切成小块（比如长度为 16）。
+    *   <strong>块与块之间</strong>：像 RNN 一样传递记忆（Inter-chunk）。
+    *   <strong>块内部</strong>：像 Transformer 一样算注意力（Intra-chunk）。</p>
+<p>下面我为你列一个 <strong>Task To-Do List</strong>，模拟计算机执行这段代码时的逻辑流程，然后一步步解释。</p>
+<hr />
+<h3>📋 Task To-Do List (代码执行流程表)</h3>
+<p>这是一次前向传播（Forward）需要做的事情列表：</p>
+<ol>
+<li><strong>[准备阶段] 数据对齐 (Padding)</strong><ul>
+<li>把输入序列长度补齐，使其能被分块大小（Chunk Size, 这里是16）整除。</li>
+</ul>
+</li>
+<li><strong>[预处理] 门控预计算 (Gate Pre-processing)</strong><ul>
+<li>计算门控信号 $g$ 的累加值（Cumulative Sum）。</li>
+<li><strong>Kernel:</strong> <code>prepare_qg_kg</code></li>
+<li><em>目的：把随时间衰减的逻辑预先乘到 Q 和 K 上，方便后面并行计算。</em></li>
+</ul>
+</li>
+<li><strong>[核心任务 A] 块间循环 (Inter-Chunk / Global RNN)</strong><ul>
+<li>像 RNN 一样，维护一个全局记忆 $h$。</li>
+<li>算出“之前的记忆”对“当前块”的影响。</li>
+<li>更新记忆 $h$，传给下一个块。</li>
+<li><strong>Kernel:</strong> <code>fused_chunk_gla_fwd_kernel</code></li>
+</ul>
+</li>
+<li><strong>[核心任务 B] 块内注意力 (Intra-Chunk / Local Attention)</strong><ul>
+<li>在每个小块内部（比如第1个词到第16个词之间），计算局部的注意力分数。</li>
+<li><strong>Kernel:</strong> <code>fwd_inner_chunk</code></li>
+</ul>
+</li>
+<li><strong>[合并任务] 结果相加</strong><ul>
+<li>最终输出 = 任务 A 的结果 (来自历史) + 任务 B 的结果 (来自当前块局部)。</li>
+</ul>
+</li>
+<li><strong>[收尾] 格式还原</strong><ul>
+<li>去掉第一步补齐的 Padding，返回结果。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🧬 逐步深度解析</h3>
+<p>现在我们对照上面的 List，看看代码里具体发生了什么。</p>
+<h4>1. 准备阶段 (Python 函数 <code>fused_chunk_gla</code>)</h4>
+<p>在代码的最底部，入口函数是 <code>fused_chunk_gla</code>。
+*   <strong>逻辑</strong>：Triton 这种底层 GPU 编程要求数据对齐非常严格。
+*   <strong>代码行为</strong>：如果你的句子长度是 100，块大小是 16，100 除不尽 16。代码会通过 <code>pad</code> 函数把它补到 112，防止程序崩溃。</p>
+<h4>2. 预处理：搞定衰减 (Kernel: <code>prepare_qg_kg</code>)</h4>
+<p>GLA 的核心公式里有一个 $g$ (gate)，代表<strong>遗忘/衰减</strong>。
+*   <strong>通俗理解</strong>：如果 $g$ 很大，说明要记住；如果 $g$ 很小，说明要忘掉之前的。
+*   <strong>代码逻辑</strong>：
+    *   Triton Kernel <code>prepare_qg_kg</code> 被调用。
+    *   它读取原始的 $Q, K, g$。
+    *   它执行 $Q_{new} = Q \times \exp(g)$ 和 $K_{new} = K \times \exp(-g)$。
+    *   <strong>为什么这么做？</strong> 这样后面算矩阵乘法时，不需要每次都算指数衰减，直接乘这就相当于带上了衰减效果。这是一种数学上的变换技巧。</p>
+<h4>3. 核心任务 A：块间循环 (Kernel: <code>fused_chunk_gla_fwd_kernel</code>)</h4>
+<p>这是代码里最长的一个 Kernel 之一。这是 <strong>RNN 部分</strong>。
+*   <strong>输入</strong>：处理过的 $Q, K$ 以及 $V$。
+*   <strong>状态 $h$</strong>：代码里定义了 <code>b_h</code>，这是一个矩阵，代表“此时此刻之前所有信息的压缩包”。
+*   <strong>循环逻辑</strong> (<code>for i in range(0, tl.cdiv(T, BT)):</code>)：
+    *   代码按块（Chunk）遍历序列。
+    *   <strong>读取</strong>：加载当前块的 $K, V$。
+    *   <strong>更新 $h$</strong>：<code>b_h = b_h * decay + K.T @ V</code>。意思是：旧的记忆衰减一点，加上当前块新产生的键值对信息。
+    *   <strong>计算输出</strong>：<code>b_o = Q @ b_h</code>。意思是：用当前的查询 $Q$，去向历史记忆 $h$ 查询结果。
+    *   <strong>保存</strong>：把结果写回显存 <code>o</code>。
+*   <strong>关键点</strong>：这部分负责捕捉<strong>长距离依赖</strong>（很久以前的信息）。</p>
+<h4>4. 核心任务 B：块内注意力 (Kernel: <code>fwd_inner_chunk</code>)</h4>
+<p>这是 <strong>Transformer Attention 部分</strong>。
+*   <strong>为什么需要它？</strong> 上一步的 RNN 只能看到“上一个块”之前的信息。但是在一个块内部（比如第 5 个词），它应该能看到第 1, 2, 3, 4 个词的信息。RNN 粒度太粗了，这里需要细粒度的 Attention。
+*   <strong>逻辑</strong>：
+    *   在这个 16x16 的小窗口内，计算标准的 $Q \times K^T$ 注意力分数。
+    *   乘上局部衰减（Local Decay）。
+    *   乘上 $V$。
+    *   得到结果矩阵 <code>A</code> (代码中 <code>o2 = A @ v2</code>)。
+*   <strong>关键点</strong>：这部分负责捕捉<strong>短距离、高精度的依赖</strong>。</p>
+<h4>5. 合并与反向传播 (Autograd Function)</h4>
+<p>在 <code>FusedChunkGLAFunction</code> 的 <code>forward</code> 方法最后：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">o</span><span class="o">.</span><span class="n">add_</span><span class="p">(</span><span class="n">o2</span><span class="p">)</span> <span class="c1"># 结果相加</span>
+</code></pre></div>
+
+<ul>
+<li><strong>最终输出</strong> = (Inter-Chunk RNN 算出的历史信息) + (Intra-Chunk Attention 算出的局部信息)。</li>
+</ul>
+<p>至于 <code>backward</code> (反向传播) 部分：
+*   那是为了训练用的。逻辑基本是前向传播的“逆运算”。
+*   它需要计算梯度 $dQ, dK, dV, dg$。
+*   代码非常复杂（比如 <code>bwd_decay_global_cumsum</code>），是因为计算 $g$（衰减率）的梯度特别麻烦，需要把整个序列的误差反向累积回来。你只需要知道它是为了让模型能通过梯度下降学习参数即可。</p>
+<h3>总结</h3>
+<p>这份代码实际上是在做一道<strong>平衡题</strong>：</p>
+<ol>
+<li>纯 Transformer 太慢（显存 $O(N^2)$）。</li>
+<li>纯 RNN 这种串行计算无法利用 GPU 并行能力。</li>
+<li><strong>Fused Chunk GLA</strong> 说：<strong>我全都要</strong>。<ul>
+<li>把序列切碎。</li>
+<li><strong>切片之间</strong>串行（RNN模式），省显存。</li>
+<li><strong>切片内部</strong>并行（Attention模式），利用 GPU 算得快。</li>
+</ul>
+</li>
+</ol>
+<p>代码中那些 <code>tl.load</code>, <code>tl.store</code>, <code>tl.make_block_ptr</code> 都是 Triton 为了在 GPU 上极致优化读写速度而写的“汇编级”操作，看不懂细节没关系，理解上面的<strong>分块+融合</strong>逻辑才是核心。</p>

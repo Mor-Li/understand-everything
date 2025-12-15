@@ -1,0 +1,126 @@
+<h1>fla/ops/triton/gla/block_parallel/inter_chunk_contribution/chunk_scan_triton_no_decay.py</h1>
+<p>这份代码确实看起来很硬核，因为它混合了 <strong>Triton（高性能GPU编程）</strong> 和 <strong>Linear Attention（线性注意力机制）</strong> 的数学逻辑。</p>
+<p>别担心，我们把这个复杂的任务拆解成一个 <strong>“学习清单” (Todo List)</strong>，通过 5 个步骤，用通俗的语言和类比带你读懂它。</p>
+<hr />
+<h3>📝 学习任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1: 理解背景故事</strong> —— 这段代码在数学上到底想干什么？（核心概念：前缀和）</li>
+<li><strong>Task 2: 理解数据形状</strong> —— 输入的张量长什么样？为什么要切块？</li>
+<li><strong>Task 3: 拆解 Forward (前向传播)</strong> —— <code>_fwd_recurrence</code> 是怎么一步步累加数据的？</li>
+<li><strong>Task 4: 拆解 Backward (反向传播)</strong> —— <code>_bwd_recurrence</code> 是怎么算梯度的？</li>
+<li><strong>Task 5: 串联整体逻辑</strong> —— 为什么 Python 包装层里要写 <code>output[:, :, 0] = 0</code>？</li>
+</ol>
+<hr />
+<h3>🚀 Task 1: 理解背景故事 (数学逻辑)</h3>
+<p><strong>一句话总结：这段代码实现了一个“没有衰减（No Decay）”的累加操作（Cumulative Sum / Prefix Sum）。</strong></p>
+<p><strong>场景类比：存钱罐</strong>
+想象你在记录每个月的存款。
+*   <strong>Chunk (块)</strong>：代表“每个月”。
+*   <strong>to_add (输入)</strong>：代表你“每个月新存进去的钱”。
+*   <strong>No Decay</strong>：代表没有通货膨胀，钱不会变少，存多少就是多少。
+*   <strong>Output (输出)</strong>：代表“截止到当前月份，存钱罐里总共有多少钱”。</p>
+<p>在 <strong>Gated Linear Attention (GLA)</strong> 这类模型中，我们把长序列切成很多小段（Chunk）。
+*   每个 Chunk 内部自己算完了，会产生一个“记忆状态”（KV Cache）。
+*   这个“记忆”需要传给下一个 Chunk。
+*   <strong>本文件的作用</strong>：就是把前面所有 Chunk 产生的 KV 记忆简单的 <strong>加起来</strong>，传给后面。</p>
+<hr />
+<h3>🧊 Task 2: 理解数据形状</h3>
+<p>看 <code>Chunk_memory_update_no_decay.forward</code> 函数：
+输入张量 <code>to_add</code> 的形状是 <code>[B, H, N, D_k, D_v]</code>。</p>
+<ul>
+<li><strong>B</strong>: Batch size (多少个句子)</li>
+<li><strong>H</strong>: Head (多少个注意力头)</li>
+<li><strong>N</strong>: <strong>Chunk的数量</strong> (比如把长序列切成了 N 段)。这是我们要进行“累加”的维度。</li>
+<li><strong>D_k, D_v</strong>: Key 和 Value 的维度。</li>
+</ul>
+<p><strong>为什么用 Triton？</strong>
+因为 <code>D_k</code> 和 <code>D_v</code> 组成的矩阵（大小 $D_k \times D_v$）可能比较大。Triton 的作用就是把这个大矩阵切成小方块（比如 $32 \times 32$ 的 <code>BLOCK_MODEL</code>），并行地去处理。</p>
+<hr />
+<h3>▶️ Task 3: 拆解 Forward (前向传播)</h3>
+<p>核心函数：<code>_fwd_recurrence</code>
+<strong>目标</strong>：计算累加和。$Output[i] = Input[0] + Input[1] + ... + Input[i]$</p>
+<p>让我们一步步看 Triton 内核做了什么：</p>
+<ol>
+<li>
+<p><strong>定位 (Offset)</strong>：
+    代码开头的一大堆 <code>offset_...</code> 和 <code>S = S + ...</code> 看起来很吓人，其实它们只是在做一件事：<strong>找到当前线程负责的那个 $32 \times 32$ 小方块在显存里的起始位置</strong>。</p>
+</li>
+<li>
+<p><strong>初始化累加器</strong>：
+    <code>python
+    acc = tl.zeros([BLOCK_MODEL, BLOCK_MODEL], dtype=tl.float32)</code>
+    这就是你的“存钱罐”，一开始是空的。</p>
+</li>
+<li>
+<p><strong>加载第一个 Chunk</strong>：
+    <code>python
+    acc += tl.load(S) # 把第0个Chunk的数据加到存钱罐
+    tl.store(O, acc...) # 把当前余额写到输出 O 中
+    S += ... # 指针移动到下一个 Chunk
+    O += ...</code></p>
+</li>
+<li>
+<p><strong>循环累加 (Recurrence)</strong>：
+    <code>python
+    for i in range(NUM_BLOCK-2): # 遍历剩下的 Chunk
+        S_i = tl.load(S)       # 拿下一个Chunk的新钱
+        acc = acc + S_i        # 加进存钱罐
+        tl.store(O, acc...)    # 记录当前总余额
+        # 指针继续后移...</code></p>
+</li>
+</ol>
+<p><strong>总结</strong>：它沿着 <code>N</code> (Chunk) 维度，把矩阵一个个加起来，每加一次就保存一次结果。</p>
+<hr />
+<h3>◀️ Task 4: 拆解 Backward (反向传播)</h3>
+<p>核心函数：<code>_bwd_recurrence</code>
+<strong>目标</strong>：计算梯度。这其实是前向传播的逆运算。</p>
+<p>在数学上，如果你做的是累加 $y_t = x_1 + ... + x_t$，那么反向传播时，梯度的流动是反过来的：<strong>后面的梯度会累加传给前面</strong>。
+*   第 N 个 Chunk 的梯度，会传给第 N-1 个... 一直到第 1 个。</p>
+<p>代码逻辑：
+1.  <strong>从后往前遍历</strong>：
+    注意看 <code>S</code> 和 <code>DS</code> 的指针初始化，加上了 <code>(NUM_BLOCK - 2)</code> 或 <code>(NUM_BLOCK - 1)</code>，说明是从序列的<strong>末尾</strong>开始算的。</p>
+<ol>
+<li><strong>梯度累加</strong>：
+    <code>python
+    Dacc = tl.zeros(...) # 梯度累加器
+    for i in range(NUM_BLOCK - 1):
+        DS_i = tl.load(DS) # 读取后方传来的梯度
+        Dacc += DS_i       # 累加梯度
+        tl.store(S, Dacc...) # 把梯度存回去 (这里复用了S作为输出buffer)
+        # 指针向前移动 (S -= ...)</code></li>
+</ol>
+<p><strong>简单理解</strong>：如果我在第 1 个月存了 100 块，这 100 块会影响第 1 个月、第 2 个月...直到第 N 个月的余额。所以，后面所有月份对余额的“导数/梯度”，都要加回到第 1 个月头上。</p>
+<hr />
+<h3>🔗 Task 5: 串联整体逻辑 (Python Wrapper)</h3>
+<p>最后看 Python 类 <code>Chunk_memory_update_no_decay</code>。</p>
+<p><strong>Forward 中的关键行：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">output</span><span class="p">[:,</span> <span class="p">:,</span> <span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span>
+</code></pre></div>
+
+<p><strong>为什么？</strong>
+*   Triton 内核计算的是 <code>Prefix Sum</code>（前缀和）。
+*   但是，这个算子是用来做 <strong>Inter-Chunk Contribution (块间贡献)</strong> 的。
+*   <strong>第 0 个 Chunk</strong>：它前面没有别的 Chunk，所以它接收到的“前人记忆”应该是 <strong>0</strong>（或者是初始状态，这里假设为0）。
+*   <strong>第 1 个 Chunk</strong>：接收的是第 0 个 Chunk 产生的记忆。
+*   所以代码把 Triton 算出来的结果做了一个类似“右移”的操作，或者强制把第 0 个位置清零，表示“第 0 个块之前没有历史”。</p>
+<p><strong>Backward 中的关键行：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">output</span><span class="p">[:,</span> <span class="p">:,</span> <span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span>
+</code></pre></div>
+
+<p>这是处理梯度的边界条件，逻辑类似。</p>
+<hr />
+<h3>💡 总结 (Takeaway)</h3>
+<p>这个文件的功能可以用一行 Python 代码概括（虽然 Triton 版本是为了极致速度）：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 假设 input 是 (B, H, N, Dk, Dv)</span>
+<span class="c1"># 计算累加和 (CumSum)</span>
+<span class="n">history</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cumsum</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span> 
+
+<span class="c1"># 因为是计算“给下一个Chunk的贡献”，所以要做个移位</span>
+<span class="c1"># 第 i 个 Chunk 看到的应该是 sum(0...i-1)</span>
+<span class="n">output</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros_like</span><span class="p">(</span><span class="n">history</span><span class="p">)</span>
+<span class="n">output</span><span class="p">[:,</span> <span class="p">:,</span> <span class="mi">1</span><span class="p">:]</span> <span class="o">=</span> <span class="n">history</span><span class="p">[:,</span> <span class="p">:,</span> <span class="p">:</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="c1"># 错一位</span>
+<span class="n">output</span><span class="p">[:,</span> <span class="p">:,</span> <span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span> <span class="c1"># 第一个Chunk没有历史</span>
+</code></pre></div>
+
+<p><strong>你现在只需要记住：</strong>
+这就是一个<strong>多维矩阵的高性能累加器</strong>，专门用于在 Transformer 的不同分块之间传递记忆，而且这个记忆是<strong>无损（No Decay）</strong>传递的。</p>

@@ -1,0 +1,55 @@
+<h1>fla/layers/multiscale_retention.py</h1>
+<p>这份代码实现的是 <strong>RetNet (Retentive Network)</strong> 的核心层，叫做 <code>MultiScaleRetention</code>。</p>
+<p>你可以把它想象成 Transformer 中 <strong>Self-Attention（自注意力机制）的升级替代品</strong>。它的核心目的是：<strong>既要有 Transformer 训练时的并行高效率，又要有 RNN 推理时的低显存和快速度。</strong></p>
+<p>为了让你看懂，我把这个复杂的 <code>forward</code> 前向传播过程拆解成一个 <strong>“流水线任务清单 (Todo List)”</strong>。我们假装自己是数据流，一步步通过这个层。</p>
+<hr />
+<h3>📋 任务清单：数据处理流水线</h3>
+<h4>✅ Task 1: 准备原材料 (维度投影)</h4>
+<p><strong>代码位置:</strong> <code>__init__</code> 中的 <code>q_proj</code>, <code>k_proj</code>, <code>v_proj</code> 以及 <code>forward</code> 开头。
+*   <strong>动作:</strong> 把输入的 <code>hidden_states</code> (比如 1024 维) 拆解成三份数据：Query (Q), Key (K), Value (V)。
+*   <strong>解释:</strong> 这和 Transformer 一样。
+    *   <strong>Q (查询):</strong> 我想找什么？
+    *   <strong>K (钥匙):</strong> 我有什么特征？
+    *   <strong>V (值):</strong> 我包含的具体内容是什么？
+*   <strong>RetNet 特色:</strong> 注意 <code>expand_v=2.0</code>，RetNet 通常会把 V 的维度设得比 Q 和 K 大，用来存储更多信息。</p>
+<h4>✅ Task 2: 局部预处理 (Short Convolution / 短卷积)</h4>
+<p><strong>代码位置:</strong> <code>if self.use_short_conv:</code> 代码块。
+*   <strong>动作:</strong> 在进行长距离记忆之前，先用一个小窗口（比如大小为 4 的卷积核）扫一遍数据。
+*   <strong>目的:</strong> <strong>“邻居比远亲重要”</strong>。这个步骤用来提取极局部的特征（比如“不”和“是”连在一起变成“不是”）。如果不做这一步，模型可能对非常局部的依赖关系捕捉得不够好。
+*   <strong>细节:</strong> 这是一个轻量级的 1D 卷积。</p>
+<h4>✅ Task 3: 加上位置信息 (Rotary Embedding / RoPE)</h4>
+<p><strong>代码位置:</strong> <code>self.rotary(q, k, ...)</code>
+*   <strong>动作:</strong> 给 Q 和 K 加上旋转位置编码。
+*   <strong>目的:</strong> 告诉模型单词的顺序。比如，“猫吃鱼”和“鱼吃猫”，虽然词一样，但因为位置不同，Q 和 K 旋转的角度不同，算出来的关联度就不同。</p>
+<h4>✅ Task 4: 核心计算 —— "Retention" (保留机制)</h4>
+<p><strong>代码位置:</strong> <code>chunk_retention</code>, <code>parallel_retention</code> 或 <code>fused_recurrent_retention</code>。
+*   <strong>这是最难懂也是最核心的部分。</strong> 它是 Attention 的替代者。
+*   <strong>动作:</strong> 计算 Q 和 K 的交互，然后作用在 V 上。
+*   <strong>核心魔法 (Mode):</strong> 代码里有多种 <code>mode</code>，这是 RetNet 的杀手锏：
+    *   <strong><code>parallel</code> (并行模式):</strong> <strong>训练时用</strong>。像 Transformer 一样，一次性看完所有单词，计算速度极快（GPU 利用率高）。
+    *   <strong><code>fused_recurrent</code> (循环模式):</strong> <strong>推理/生成时用</strong>。像 RNN 一样，看完一个词，更新一下内部状态 (<code>recurrent_state</code>)，然后扔掉历史数据。这意味着<strong>生成长文时显存不会爆炸</strong>，且速度极快。
+    *   <strong><code>chunk</code> (分块模式):</strong> 混合体。把长序列切成小块，块内并行，块间循环。用来处理超长文本训练。
+*   <strong>数学原理简述:</strong> 它不像 Attention 那样用 <code>Softmax</code>，而是用一种<strong>衰减 (Decay)</strong> 机制。越久远的信息，权重衰减得越厉害（遗忘机制）。</p>
+<h4>✅ Task 5: 门控与归一化 (Gating &amp; Norm)</h4>
+<p><strong>代码位置:</strong> <code>if self.use_output_gate:</code> ... <code>g_norm_swish_gate</code>
+*   <strong>动作:</strong>
+    1.  计算一个门控信号 <code>g</code> (Gate)。
+    2.  对 Retention 的输出 <code>o</code> 做归一化 (GroupNorm/RMSNorm)。
+    3.  把归一化后的 <code>o</code> 乘以 激活后的 <code>g</code>。
+*   <strong>目的:</strong> <strong>“信息过滤器”</strong>。Retention 算出来的东西比较“线性”，表达能力可能不够。通过这个非线性的门控结构（Swish Gate），决定保留多少信息，增加模型的非线性表达能力。</p>
+<h4>✅ Task 6: 最终输出 (Output Projection)</h4>
+<p><strong>代码位置:</strong> <code>o = self.o_proj(o)</code>
+*   <strong>动作:</strong> 把处理好的数据维度变回 <code>hidden_size</code>。
+*   <strong>目的:</strong> 整理好形状，准备传给下一层网络。</p>
+<h4>✅ Task 7: 记忆缓存 (Cache Update)</h4>
+<p><strong>代码位置:</strong> <code>past_key_values.update(...)</code>
+*   <strong>动作:</strong> 如果是在做推理（聊天/生成），把当前的“卷积状态” (<code>conv_state</code>) 和“循环状态” (<code>recurrent_state</code>) 存起来。
+*   <strong>目的:</strong> 下一个字进来的时候，不需要重新计算前面的所有内容，直接读取这个状态接着算就行（O(1) 复杂度）。</p>
+<hr />
+<h3>总结：这段代码到底在干啥？</h3>
+<p>简单来说，这段代码定义了一个层，这个层：
+1.  先看<strong>局部</strong>（短卷积）。
+2.  再看<strong>全局</strong>（Retention 机制，带位置编码）。
+3.  根据<strong>当前是训练还是推理</strong>，智能选择是用“并行计算”（快）还是“循环计算”（省内存）。
+4.  最后通过<strong>门控</strong>机制筛选有用信息输出。</p>
+<p><strong>一句话观点:</strong> 这是一个试图<strong>融合 Transformer 和 RNN 优点</strong>的架构实现，代码写得很复杂主要是为了兼容不同的计算模式（训练 vs 推理）以及底层的 CUDA加速优化（Triton kernel）。</p>

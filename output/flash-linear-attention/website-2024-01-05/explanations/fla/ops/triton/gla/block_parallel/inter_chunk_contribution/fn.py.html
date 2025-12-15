@@ -1,0 +1,112 @@
+<h1>fla/ops/triton/gla/block_parallel/inter_chunk_contribution/fn.py</h1>
+<p>这段代码确实看起来很劝退，因为它属于 <strong>GLA (Gated Linear Attention)</strong> 算法在底层 <strong>Triton</strong>（一种GPU编程语言）实现中的“胶水代码”。它负责协调数据的预处理和核心计算逻辑。</p>
+<p>为了让你听懂，我们不需要去扣每一行代码的语法，而是要把它的<strong>逻辑拆解成一个流水线</strong>。</p>
+<p>我们可以把这个过程想象成：<strong>你在读一本很长的书（序列），你把书分成了很多章（Chunk）。读完一章后，你需要把这一章的重点记在脑子里的“长期记忆”里，带着这个记忆去读下一章。</strong></p>
+<p>这个文件 <code>fn.py</code> 就在做这件事：<strong>计算“块（Chunk）”与“块”之间的记忆传递。</strong></p>
+<p>这里有一个 <strong>6步走的 To-Do List</strong>，我们一步步来拆解：</p>
+<hr />
+<h3>Task List: 读懂 Inter-Chunk Contribution (块间贡献)</h3>
+<h4>✅ Task 1: 搞懂背景 (Context)</h4>
+<ul>
+<li><strong>概念</strong>：这是“线性注意力机制”的变体。</li>
+<li><strong>核心逻辑</strong>：标准 Transformer 是 $Q \times K^T$，算力消耗巨大。GLA 把 $K$ 和 $V$ 先乘起来 ($K^T \times V$) 变成一个“记忆矩阵（Memory）”，然后 $Q$ 再去查这个 Memory。</li>
+<li><strong>Chunking (分块)</strong>：为了并行加速，把长序列切成一块一块的。</li>
+<li><strong>本代码目标</strong>：算出<strong>之前的块</strong>积累下来的记忆，对<strong>当前块</strong>产生了什么影响。</li>
+</ul>
+<h4>✅ Task 2: 搞懂输入 (Ingredients)</h4>
+<p>代码的输入是 <code>query, key, value, gk, gv</code>。
+*   <strong>Q, K, V</strong>: 老朋友了，注意力机制的三大件。
+*   <strong>gk, gv (Gates)</strong>: 这是“遗忘门”。你可以理解为<strong>“衰减率”</strong>。
+    *   比如：我读完上一章，记得的东西要乘以 0.9（稍微忘一点），再读下一章。
+    *   <code>gk</code> 是 Key 的衰减，<code>gv</code> 是 Value 的衰减。</p>
+<h4>✅ Task 3: 预处理衰减 (Preprocessing Gates)</h4>
+<ul>
+<li><strong>代码对应</strong>：<code>PreprocessCumSum_GK</code> 和 <code>PreprocessCumSum_GV</code>。</li>
+<li><strong>解释</strong>：衰减是累乘的（0.9 * 0.9 * 0.9...）。在计算机里，连乘容易数值不稳定，所以通常取对数变成<strong>累加 (Cumulative Sum, CumSum)</strong>。</li>
+<li><strong>作用</strong>：这一步是在算“从开头到现在，一共衰减了多少”，方便后面直接用减法算出任意两点间的衰减量。<ul>
+<li><code>g_key_last_exp</code>: 这一块结束时，Key 剩下的“能量”。</li>
+<li><code>reduce_key</code>: 已经被衰减调整过的 Key。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 压缩当前块的信息 (Compression)</h4>
+<ul>
+<li><strong>代码对应</strong>：<code>to_add = reduce_key.transpose(-1, -2) @ reduce_value</code></li>
+<li><strong>解释</strong>：这是最关键的一步！<ul>
+<li>它计算的是 $K^T \times V$。</li>
+<li>你可以把它理解为<strong>“当前这一章的摘要”</strong>。</li>
+<li>它把这一块里所有的 token 信息压缩成了一个矩阵 <code>to_add</code>。这个矩阵就是要“加”进我们长期记忆里的新知识。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 更新长期记忆 (Memory Update)</h4>
+<ul>
+<li><strong>代码对应</strong>：<code>Chunk_memory_update_...</code> 系列函数。</li>
+<li><strong>解释</strong>：这是一个递归（Recurrent）的过程。<ul>
+<li><strong>公式逻辑</strong>：<code>新记忆 = 旧记忆 * 衰减 + 当前块摘要(to_add)</code>。</li>
+<li>代码里有很多 <code>if/else</code>，只是在处理不同的情况：<ul>
+<li><code>_full</code>: Key 和 Value 都要衰减。</li>
+<li><code>_only_gk</code>: 只衰减 Key。</li>
+<li><code>_no_decay</code>: 完全不衰减（标准的 Linear Attention）。</li>
+</ul>
+</li>
+<li><strong>产出</strong>：<code>memory_cache</code>。这就是处理完当前块后，准备传给下一块的<strong>全局记忆状态</strong>。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 6: 计算贡献 (Contribution)</h4>
+<ul>
+<li><strong>代码对应</strong>：<code>inter_chunk_contribution = ((q_exp) @ memory_cache) * ...</code></li>
+<li><strong>解释</strong>：最后一步。<ul>
+<li>我们有了全局记忆 <code>memory_cache</code>。</li>
+<li>现在的 Query ($Q$) 想知道前面的记忆对自己有什么帮助。</li>
+<li>于是计算 $Q \times \text{Memory}$。</li>
+<li>最后乘上那个 <code>g_value_cumsum_exp</code> 是为了把之前预处理时的衰减给“还原”或者“对齐”回来。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结串讲 (The Story)</h3>
+<p>现在我们连起来看一遍代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">inter_chunk_onc</span><span class="p">(</span><span class="n">query</span><span class="p">,</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span><span class="p">,</span> <span class="n">gk</span><span class="p">,</span> <span class="n">gv</span><span class="p">):</span>
+    <span class="c1"># 1. 预处理：</span>
+    <span class="c1"># 如果有衰减门(gk, gv)，先算出累积的衰减量。</span>
+    <span class="c1"># 这一步把 key 和 value 根据衰减调整好，变成了 reduce_key/value。</span>
+    <span class="k">if</span> <span class="n">gk</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># ...算出 gk 的累积和...</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="c1"># ...没有 gk 就直接用原始 key...</span>
+
+    <span class="k">if</span> <span class="n">gv</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># ...算出 gv 的累积和...</span>
+
+    <span class="c1"># 2. 压缩摘要 (Task 4)：</span>
+    <span class="c1"># 把当前块的 K 和 V 乘在一起。</span>
+    <span class="c1"># 这就是这一块要“贡献”给全局记忆的新增量。</span>
+    <span class="n">to_add</span> <span class="o">=</span> <span class="n">reduce_key</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">2</span><span class="p">)</span> <span class="o">@</span> <span class="n">reduce_value</span>
+
+    <span class="c1"># 3. 记忆迭代 (Task 5)：</span>
+    <span class="c1"># 根据是否有衰减，选择不同的 CUDA/Triton 算子。</span>
+    <span class="c1"># 这些算子的作用是：拿到上一块的记忆，乘上衰减，加上 to_add，得到新的记忆。</span>
+    <span class="k">if</span> <span class="n">gk</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">gv</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">memory_cache</span> <span class="o">=</span> <span class="n">Chunk_memory_update_full</span><span class="o">.</span><span class="n">apply</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+        <span class="c1"># 4. 读取记忆 (Task 6)：</span>
+        <span class="c1"># Q 去读这个记忆 (Q @ Memory)，并调整衰减系数。</span>
+        <span class="n">inter_chunk_contribution</span> <span class="o">=</span> <span class="p">((</span><span class="n">q_exp</span><span class="p">)</span> <span class="o">@</span> <span class="n">memory_cache</span><span class="p">)</span> <span class="o">*</span> <span class="n">g_value_cumsum_exp</span>
+
+    <span class="c1"># ... 下面这几个 elif 只是针对不同衰减配置的简化版，逻辑一样 ...</span>
+    <span class="k">elif</span> <span class="n">gk</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">gv</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># ...</span>
+    <span class="k">elif</span> <span class="n">gk</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">gv</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># ...</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="c1"># 没有任何衰减的情况</span>
+        <span class="n">memory_cache</span> <span class="o">=</span> <span class="n">Chunk_memory_update_no_decay</span><span class="o">.</span><span class="n">apply</span><span class="p">(</span><span class="n">to_add</span><span class="p">)</span>
+        <span class="n">inter_chunk_contribution</span> <span class="o">=</span> <span class="p">((</span><span class="n">query</span><span class="p">)</span> <span class="o">@</span> <span class="n">memory_cache</span><span class="p">)</span>
+
+    <span class="c1"># 返回累积的衰减量，以及计算出的“块间贡献”</span>
+    <span class="k">return</span> <span class="n">g_key_cumsum</span><span class="p">,</span> <span class="n">g_value_cumsum</span><span class="p">,</span> <span class="n">inter_chunk_contribution</span>
+</code></pre></div>
+
+<p><strong>一句话总结：</strong>
+这个函数把输入的数据块压缩成一个更新量 ($K^T V$)，扔进一个循环里去更新全局记忆状态 (Memory)，然后让当前的 Query 去读取这个记忆，从而获取上下文信息。</p>

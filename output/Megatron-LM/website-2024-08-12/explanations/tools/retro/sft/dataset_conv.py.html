@@ -1,0 +1,74 @@
+<h1>tools/retro/sft/dataset_conv.py</h1>
+<p>这份代码确实比较复杂，它是 <strong>NVIDIA Megatron-LM</strong> 项目的一部分，专门用于处理 <strong>SFT（有监督微调）</strong> 阶段的数据。</p>
+<p>简单来说，这个文件的作用是：<strong>把原始的问答（QA）文本数据，加工成模型能吃进去的数字格式（Token IDs），特别是针对一种叫 Retro 的检索增强模型。</strong></p>
+<p>为了让你听懂，我们把这个脚本想象成一个 <strong>“数据加工流水线”</strong>。我们可以把它的工作拆解成一个 <strong>Task To-Do List（任务清单）</strong>。</p>
+<p>下面我按照这个流水线的工序，一步一步给你讲：</p>
+<hr />
+<h3>📋 Task 1：设定加工规则 (Configuration)</h3>
+<p><strong>代码对应部分：</strong> <code>JsonQADatasetConfig</code>, <code>RetroJsonQADatasetConfig</code> 类</p>
+<p>在开工前，必须先定好规则。
+*   <strong>Todo:</strong> 确定我们要处理什么样的数据？
+    *   <code>ft_neighbours</code>: 需要给模型看几条参考资料（Context）？
+    *   <code>longform_answer</code>: 答案是长篇大论还是简短的？
+    *   <code>retro_num_neighbors</code>: (针对Retro模型) 需要检索多少个邻居片段？
+*   <strong>解释：</strong> 这就像是工厂开工前的“参数设置”，告诉流水线接下来按什么标准干活。</p>
+<hr />
+<h3>📋 Task 2：搬运和清洗原料 (Preprocessing)</h3>
+<p><strong>代码对应部分：</strong> <code>preprocess</code> 函数</p>
+<p>原料是硬盘上的 JSON 文件（比如 SQuAD, NewsQA 等数据集）。
+*   <strong>Todo 1:</strong> 读取文件路径下的所有 JSON 数据。
+*   <strong>Todo 2:</strong> 从里面提取出三个核心要素：
+    1.  <strong>Question (问题)</strong>
+    2.  <strong>Answer (答案)</strong>
+    3.  <strong>Neighbours/Context (参考资料/上下文)</strong>：比如从文档里检索到的相关段落。
+*   <strong>Todo 3:</strong> 统一格式。不管原始数据是做选择题的（Multi-choice）还是阅读理解的，都把它们转换成统一的 <code>(问题, 答案, 上下文)</code> 格式存到一个大列表里。
+*   <strong>解释：</strong> 这就是把五花八门的原始文档清洗干净，变成整齐的半成品。</p>
+<hr />
+<h3>📋 Task 3：包装成对话格式 (Prompt Formatting)</h3>
+<p><strong>代码对应部分：</strong> <code>reformat_prompt</code>, <code>reformat_prompt_retro</code> 函数</p>
+<p>模型看不懂干巴巴的数据，它需要看到像人对话一样的格式。
+*   <strong>Todo 1:</strong> 加“系统提示词”（System Prompt）。
+    *   <em>例如：System: This is a chat between a user and an AI...</em>
+*   <strong>Todo 2:</strong> 把“参考资料”塞进去。
+    *   <em>例如：User: Context: [这里是参考资料]...</em>
+*   <strong>Todo 3:</strong> 把“问题”塞进去。
+    *   <em>例如：...Question: [这里是问题] \n\n Assistant:</em>
+*   <strong>解释：</strong> 这就是所谓的 <strong>Prompt Engineering（提示工程）</strong>。代码里针对不同的数据集（如 <code>nq</code>, <code>squad</code>, <code>doc2dial</code>）用了不同的模板，有的加 "User/Assistant"，有的只是简单的问答拼接。</p>
+<hr />
+<h3>📋 Task 4：翻译成数字 (Tokenization)</h3>
+<p><strong>代码对应部分：</strong> <code>JsonQADataset</code> 类中的 <code>__getitem__</code> 方法</p>
+<p>电脑不认识中文或英文，只认识数字。
+*   <strong>Todo:</strong> 调用 Tokenizer（分词器）。
+    *   把刚才拼好的长文本（Prompt + Answer）变成一串数字 ID。
+    *   <em>例如： "User: Hello" -&gt; [101, 567, 890]</em></p>
+<hr />
+<h3>📋 Task 5：裁剪、填充与打掩码 (Padding &amp; Masking)</h3>
+<p><strong>代码对应部分：</strong> <code>pad_and_convert_to_numpy</code> 函数</p>
+<p>模型训练时，输入数据的长度必须是一样的（比如都是 2048 长度）。
+*   <strong>Todo 1 (裁剪):</strong> 如果文本太长，切掉多余的。
+*   <strong>Todo 2 (填充):</strong> 如果文本太短，后面补 <code>0</code> (Pad ID) 补齐到指定长度。
+*   <strong>Todo 3 (制作 Mask):</strong> 这是最关键的一步！<strong>Answer Mask</strong>。
+    *   我们训练模型是让它<strong>学会回答</strong>，而不是学会复读问题。
+    *   所以，代码会生成一个 <code>answer_mask</code>：
+        *   对应“问题”和“参考资料”的位置填 <code>0</code>（不算 Loss，不惩罚模型）。
+        *   对应“答案”的位置填 <code>1</code>（算 Loss，模型必须预测对这里）。
+*   <strong>解释：</strong> 这是为了让模型“只在答案部分”进行学习。</p>
+<hr />
+<h3>📋 Task 6：Retro 模型的特殊处理 (Retro Specifics)</h3>
+<p><strong>代码对应部分：</strong> <code>RetroJsonQADataset</code> 类</p>
+<p>如果你用的是 <strong>Retro</strong> 模型（一种自带检索能力的模型），还需要额外做一步。
+*   <strong>Todo:</strong> 准备 <code>neighbor_tokens</code>。
+    *   Retro 模型不仅看输入的 Prompt，还会去查一个外部数据库（检索邻居）。
+    *   代码里初始化了一个 <code>neighbor_tokens</code> 数组，用来存放这些检索到的信息的 Token。
+    *   <em>(注：在这段代码里，它目前似乎只初始化了全 0 的数组，可能是在其他地方填充，或者这是一个基础实现)</em>。</p>
+<hr />
+<h3>总结</h3>
+<p><strong>这个脚本就是做了这么一件事：</strong></p>
+<blockquote>
+<p><strong>读取 JSON -&gt; 清洗提取 Q&amp;A -&gt; 拼成对话 Prompt -&gt; 转成 Token 数字 -&gt; 统一长度并标记哪里是答案。</strong></p>
+</blockquote>
+<p>最终产出一个字典 <code>train_sample</code>，包含：
+1.  <code>text</code>: 完整的输入数字序列。
+2.  <code>answer_mask</code>: 告诉模型哪里需要重点学习的掩码。
+3.  <code>neighbor_tokens</code>: (Retro专用) 检索到的辅助信息。</p>
+<p>这就是喂给显卡进行训练的最终“饲料”。</p>

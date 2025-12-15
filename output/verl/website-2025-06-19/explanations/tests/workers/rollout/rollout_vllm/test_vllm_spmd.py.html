@@ -1,0 +1,53 @@
+<h1>tests/workers/rollout/rollout_vllm/test_vllm_spmd.py</h1>
+<p>这份代码的核心目的非常明确：<strong>验证“训练模型”的权重能不能正确地同步给“推理引擎”。</strong></p>
+<p>在 RLHF（强化学习人类反馈）的流程中，我们通常有两个主要环节：
+1.  <strong>训练 (Training):</strong> 使用 PyTorch FSDP (Fully Sharded Data Parallel) 来切分模型，进行并行训练。
+2.  <strong>生成/采样 (Rollout):</strong> 使用 vLLM 这样的加速引擎来快速生成文本。</p>
+<p>这个测试就是为了确保：当我们更新了 FSDP 训练模型的权重后，能不能把这些权重无缝地塞进 vLLM 里，并且让 vLLM 产出正确的结果。</p>
+<p>下面我为你列一个 <strong>Task Todo List</strong>，一步步拆解代码在干什么：</p>
+<h3>Task 1: 准备分布式环境 (Setup Environment)</h3>
+<p><strong>代码对应:</strong> <code>initialize_global_process_group</code>, <code>torch.cuda.device_count</code>, <code>init_device_mesh</code>
+*   <strong>做什么:</strong> 检查显卡数量（至少2张），初始化分布式通信组（让显卡之间能说话）。
+*   <strong>为什么:</strong> FSDP 和 vLLM 的并行推理都需要多卡环境。</p>
+<h3>Task 2: 准备测试数据 (Prepare Data)</h3>
+<p><strong>代码对应:</strong> <code>prompts = [...]</code>, <code>tokenizer</code>, <code>pad_sequence_to_length</code>
+*   <strong>做什么:</strong> 准备了3个简单的提示词（比如“苹果的创始人是谁”），并把它们处理成模型能读懂的 Tensor 格式。
+*   <strong>为什么:</strong> 为了后面让模型做填空题，看看它答得对不对。</p>
+<h3>Task 3: 构建“训练端”模型 (Build Source Model - FSDP)</h3>
+<p><strong>代码对应:</strong> <code>actor_model = AutoModel...</code>, <code>fsdp_model = FSDP(...)</code>
+*   <strong>做什么:</strong>
+    1.  加载一个基础的 Qwen 模型 (<code>actor_model</code>)。
+    2.  用 <strong>FSDP</strong> 把它包裹起来。FSDP 会把模型参数切碎，分散存储在不同的显卡上。
+*   <strong>观点:</strong> 这里模拟的是 <strong>“正在训练中的模型”</strong>。它的状态是切片存储的（Sharded）。</p>
+<h3>Task 4: 构建“推理端”引擎 (Build Target Engine - vLLM)</h3>
+<p><strong>代码对应:</strong> <code>llm = LLM(...)</code>
+*   <strong>做什么:</strong> 初始化 vLLM 推理引擎。
+*   <strong>关键点:</strong> 注意参数 <code>enable_sleep_mode=True</code>。这允许 vLLM 引擎在不工作时休眠，方便我们在外部强行修改它的权重。
+*   <strong>观点:</strong> 这里模拟的是 <strong>“负责做生成的引擎”</strong>。</p>
+<h3>Task 5: 第一轮生成：基准测试 (Baseline Generation)</h3>
+<p><strong>代码对应:</strong> <code>outputs = llm.generate(...)</code> (第一次调用)
+*   <strong>做什么:</strong> 让 vLLM 用它刚加载时的初始权重，对那3个问题进行回答。
+*   <strong>为什么:</strong> 记录下“原始模型”生成的答案，作为标准答案（基准）。</p>
+<h3>Task 6: <strong>核心步骤：权重“脑移植” (Weight Transfer)</strong></h3>
+<p><strong>代码对应:</strong>
+1.  <code>state_dict = fsdp_model.state_dict()</code>
+2.  <code>model.load_weights(...)</code>
+*   <strong>做什么:</strong>
+    1.  从 FSDP 模型（训练端）提取出当前的权重字典。
+    2.  <strong>强制</strong>把这些权重加载到 vLLM 的底层模型里去。
+*   <strong>难点:</strong> FSDP 的权重是切碎的，vLLM 的权重也是并行的，代码内部处理了这种复杂的映射关系。
+*   <strong>观点:</strong> 这是全篇最重要的测试点。验证是否能在内存中直接把训练好的参数“热更新”给推理引擎，而不需要保存到硬盘再读取。</p>
+<h3>Task 7: 第二轮生成：验证测试 (Verification Generation)</h3>
+<p><strong>代码对应:</strong> <code>outputs = llm.generate(...)</code> (第二次调用)
+*   <strong>做什么:</strong> 在“脑移植”之后，让 vLLM 再次回答同样的问题。
+*   <strong>为什么:</strong> 如果移植成功，这次生成的答案应该和第一次生成的答案高度一致。</p>
+<h3>Task 8: 结果对比 (Compare Results)</h3>
+<p><strong>代码对应:</strong> <code>are_lists_similar(...)</code>, <code>levenshtein</code>
+*   <strong>做什么:</strong> 比较第一次生成的内容 (<code>vllm_response_tokens</code>) 和第二次生成的内容 (<code>verl_vllm_response_tokens</code>)。
+*   <strong>算法:</strong> 使用了莱文斯坦距离（编辑距离）来计算相似度。
+*   <strong>判定:</strong> 如果两者差异小于 15%（代码里写的逻辑），则测试通过。
+*   <strong>结论:</strong> 证明 FSDP 的权重成功同步给了 vLLM，且没有破坏模型的推理能力。</p>
+<hr />
+<h3>总结</h3>
+<p>这其实是一个<strong>集成测试 (Integration Test)</strong>。</p>
+<p>它想说的是：<strong>“放心吧，在我们的系统里，你可以一边用 PyTorch FSDP 训练，一边把练好的参数扔给 vLLM 做高速推理，数据传输是通的，结果是对的。”</strong></p>

@@ -1,0 +1,57 @@
+<h1>megatron/training/utils.py</h1>
+<p>这份代码文件 <code>megatron/training/utils.py</code> 是 <strong>Megatron-LM</strong>（英伟达开发的一个用于训练超大模型的框架）中的<strong>工具箱</strong>。</p>
+<p>你可以把它想象成一个“后勤总管”。它不负责设计大模型的架构（大脑），也不负责底层的通信协议（神经），而是负责处理训练过程中各种<strong>琐碎但至关重要</strong>的杂务。</p>
+<p>为了让你听懂，我把训练一个大模型的过程拆解成一个 <strong>To-Do List (任务清单)</strong>，然后告诉你这个文件里的函数分别对应清单里的哪一步。</p>
+<hr />
+<h3>📋 大模型训练任务清单 (To-Do List)</h3>
+<h4>✅ Task 1: 搞清楚模型现在的“包装” (模型处理)</h4>
+<p>在分布式训练中，为了加速和省显存，原本的模型会被包裹很多层（比如 <code>DDP</code> 分布式数据并行层，<code>Float16</code> 半精度层）。
+*   <strong>痛点</strong>：有时候我想直接访问最里面的原始模型（比如保存权重时），但这层层包装很烦。
+*   <strong>工具函数</strong>：
+    *   <code>unwrap_model(model)</code>: <strong>剥洋葱</strong>。不管你的模型被包了几层 DDP 或 FP16，这个函数帮你一层层剥开，把最原始的模型还给你。</p>
+<h4>✅ Task 2: 准备喂给模型的数据 (数据预处理)</h4>
+<p>GPT 这类模型是“从左往右”读的，而且训练时我们通常会把好几篇文章拼成一条长数据（为了不浪费计算资源）。
+*   <strong>痛点</strong>：
+    1.  模型不能偷看后面的词（需要 Attention Mask）。
+    2.  如果一条数据里拼了两篇文章，第二篇文章开头不能关注第一篇文章的内容（需要重置 Mask）。
+    3.  位置编码（Position ID）在第二篇文章开头需要归零重算。
+*   <strong>工具函数</strong>：
+    *   <code>get_ltor_masks_and_position_ids(...)</code>: <strong>核心函数</strong>。它负责生成三个关键东西：
+        1.  <strong>Attention Mask</strong>: 一个下三角矩阵，确保模型只能看前面的词。
+        2.  <strong>Loss Mask</strong>: 如果填充了无用的占位符，就把 Loss 设为 0，不参与更新。
+        3.  <strong>Position IDs</strong>: 告诉模型每个词是第几个词。如果数据里有 <code>EOD</code> (文章结束符)，它会自动重置位置索引。</p>
+<h4>✅ Task 3: 把数据分发给几百张显卡 (并行策略分发)</h4>
+<p>大模型训练会用到多种并行方式：数据并行(DP)、张量并行(TP)、流水线并行(PP)、上下文并行(CP)。数据怎么切分、怎么传给每张卡是个大麻烦。
+*   <strong>痛点</strong>：
+    *   <strong>TP/PP</strong>: 如果我开了流水线并行，第1层的显卡需要 <code>tokens</code>（输入），但不需要 <code>labels</code>（标签）；最后一层的显卡需要 <code>labels</code> 算 Loss，但不需要原始 <code>tokens</code>。
+    *   <strong>CP (Context Parallel)</strong>: 序列太长（比如 100k 长度），单卡放不下，需要切开。
+*   <strong>工具函数</strong>：
+    *   <code>get_batch_on_this_tp_rank(...)</code>: <strong>按需分配</strong>。如果你是流水线的第一站，我给你输入；如果你是最后一站，我给你标签。它通过 <code>broadcast</code> 把数据从 CPU 也就是 Rank 0 广播到对应的 GPU 上。
+    *   <code>get_batch_on_this_cp_rank(...)</code>: <strong>切分长序列</strong>。专门处理超长文本。它用了一个很聪明的策略：把长序列切成小块，为了负载均衡，它会让显卡分别拿“头”和“尾”的数据块（防止大家都只拿到计算量大的部分）。</p>
+<h4>✅ Task 4: 检查模型健康状况 (监控与统计)</h4>
+<p>训练过程中，我们需要知道梯度是不是爆炸了，显存是不是快爆了。
+*   <strong>痛点</strong>：模型参数分散在不同显卡上，怎么算全局的参数大小（L2 Norm）？
+*   <strong>工具函数</strong>：
+    *   <code>calc_params_l2_norm(model)</code>: <strong>算参数的“模”</strong>。这涉及到数学计算。难点在于，因为开了并行，有些参数在不同卡上是重复的，有些是切分的。这个函数会聪明地去重、求和，算出准确的全局 L2 Norm。这对“梯度裁剪”非常重要。
+    *   <code>report_memory(name)</code>: <strong>报显存</strong>。打印当前显卡用了多少显存，还有多少空余。
+    *   <code>print_params_min_max_norm(...)</code>: <strong>体检报告</strong>。打印参数的最小值、最大值。如果看到 <code>NaN</code> 或者无穷大，说明训练挂了。</p>
+<h4>✅ Task 5: 算账 (Loss 计算)</h4>
+<p>每张卡只算了一部分数据的 Loss，最后需要汇总。
+*   <strong>工具函数</strong>：
+    *   <code>average_losses_across_data_parallel_group(...)</code>: <strong>汇总账单</strong>。把所有数据并行组（Data Parallel Group）里的 Loss 加起来取平均，得到一个全局的 Loss。</p>
+<h4>✅ Task 6: 应对集群抽风 (容错与断点续训)</h4>
+<p>在超算集群上，作业可能会被系统强行终止（Time limit）或者调度。
+*   <strong>痛点</strong>：如果作业被杀掉，白训了怎么办？
+*   <strong>工具函数</strong>：
+    *   <code>check_adlr_autoresume_termination(...)</code>: <strong>自动存档</strong>。它会检查集群调度系统是否发出了“我要杀你进程了”的信号。如果收到了，它就赶紧保存 Checkpoint（存档），然后优雅退出，方便下次自动续传。</p>
+<hr />
+<h3>总结：这个文件讲了啥？</h3>
+<p><strong><code>megatron/training/utils.py</code> 就是大模型训练的“管家”。</strong></p>
+<ul>
+<li>它帮你<strong>拆快递</strong>（unwrap_model）；</li>
+<li>它帮你<strong>切菜、摆盘</strong>（生成 Mask 和 Position ID）；</li>
+<li>它负责把菜<strong>端给不同桌的客人</strong>（处理 TP/PP/CP 的数据分发）；</li>
+<li>它时刻<strong>盯着账单和库存</strong>（算 Norm，监控显存，平均 Loss）；</li>
+<li>如果<strong>着火了</strong>，它负责<strong>抢救贵重物品并跑路</strong>（处理集群中断信号）。</li>
+</ul>
+<p>如果你是初学者，最需要看懂的是 <strong><code>get_ltor_masks_and_position_ids</code></strong>，因为这是理解 GPT 类模型如何处理长文本和 Attention 机制的核心代码。其他的多是工程实现的细节。</p>

@@ -1,0 +1,113 @@
+<h1>recipe/spin/spin_trainer.py</h1>
+<p>这份代码是一个基于 <strong>Ray</strong> 分布式框架的 <strong>SPIN (Self-Play Fine-Tuning)</strong> 训练器的核心控制逻辑。</p>
+<p>简单来说，SPIN 是一种让大模型“左右互搏”来自我进化的算法。这个脚本就像是一个<strong>总指挥官（Driver）</strong>，它负责指挥一群<strong>工人（Workers，比如 GPU 节点）</strong>去执行生成数据、打分、计算、更新模型等任务。</p>
+<p>为了让你看懂，我把这个脚本的核心逻辑（主要是 <code>fit_dpo</code> 函数）拆解成一个 <strong>Task Todo List</strong>。你可以想象这是总指挥官手里的任务清单，他按顺序一步步执行：</p>
+<h3>第一阶段：战前准备 (初始化)</h3>
+<p>在训练循环开始之前，指挥官需要先把队伍拉起来。</p>
+<ol>
+<li>
+<p><strong>[资源分配] <code>ResourcePoolManager</code> &amp; <code>init_workers</code></strong>:</p>
+<ul>
+<li><strong>任务</strong>：清点 GPU 数量，把计算资源分配给不同的角色。</li>
+<li><strong>角色</strong>：<ul>
+<li><strong>Actor (演员)</strong>：负责生成文本，也是我们要训练的主模型。</li>
+<li><strong>Ref Policy (裁判/旧我)</strong>：作为参考系（Reference Model），通常是上一轮迭代的模型。</li>
+<li><strong>Reward Model (打分员)</strong>：给生成的结果打分。</li>
+</ul>
+</li>
+<li><strong>目的</strong>：确保每个任务都有 GPU 干活。</li>
+</ul>
+</li>
+<li>
+<p><strong>[数据加载] <code>_create_dataloader</code></strong>:</p>
+<ul>
+<li><strong>任务</strong>：加载训练用的 Prompt（提示词）数据。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>第二阶段：核心训练循环 (The Loop)</h3>
+<p>这是代码中最长、最核心的部分，位于 <code>fit_dpo</code> 函数中。SPIN 的核心思想是<strong>“在线生成数据 -&gt; 制造胜负对 -&gt; DPO 训练 -&gt; 更新参考系”</strong>。</p>
+<p>这是一个无限循环的任务清单，每一轮（Step）都要做一遍：</p>
+<h4>✅ Task 1: 进化同步 (Sync Reference Model)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>if self.global_steps % ref_update_freq == 0:</code></li>
+<li><strong>任务</strong>：每隔一段时间，把当前训练好的 <strong>Actor（新我）</strong> 的权重复制给 <strong>Reference Model（旧我）</strong>。</li>
+<li><strong>观点/逻辑</strong>：SPIN 的核心在于“自我博弈”。随着训练进行，你的对手（Ref Model）必须变强，你才能继续进步。所以要定期把“最新的自己”变成“新的对手”。</li>
+</ul>
+<h4>✅ Task 2: 自我生成 (Generation)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>self.actor_rollout_wg.generate_sequences(gen_batch)</code></li>
+<li><strong>任务</strong>：指挥 Actor 拿着 Prompt 去写作文（生成回复）。</li>
+<li><strong>目的</strong>：获取当前模型能力下的输出数据。</li>
+</ul>
+<h4>✅ Task 3: 结果打分 (Scoring)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>self.rm_wg.compute_rm_score(batch)</code> 或 <code>reward_fn</code></li>
+<li><strong>任务</strong>：指挥 Reward Model（或者规则函数）给刚才生成的作文打分。</li>
+<li><strong>目的</strong>：知道哪些写得好，哪些写得烂。</li>
+</ul>
+<h4>✅ Task 4: 制造胜负对 (Construct Preferences)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>compute_onlineDPO_pref(batch)</code></li>
+<li><strong>任务</strong>：根据分数，把数据整理成 DPO 算法需要的格式。<ul>
+<li>分数高的回复标记为 <strong>Chosen (胜者)</strong>。</li>
+<li>分数低的回复标记为 <strong>Rejected (败者)</strong>。</li>
+</ul>
+</li>
+<li><strong>观点/逻辑</strong>：这就是<strong>在线 (Online) DPO</strong> 的关键。我们不使用预先准备好的数据集，而是用模型自己刚刚生成的数据来训练自己。</li>
+</ul>
+<h4>✅ Task 5: 计算概率 (Compute Log Probs)</h4>
+<ul>
+<li><strong>代码位置</strong>：<ul>
+<li><code>self.actor_rollout_wg.compute_log_prob(batch)</code> (当前策略的概率)</li>
+<li><code>self.ref_policy_wg.compute_ref_log_prob(batch)</code> (参考系策略的概率)</li>
+</ul>
+</li>
+<li><strong>任务</strong>：计算“当前模型”和“参考模型”生成这些回复的概率是多少。</li>
+<li><strong>目的</strong>：DPO 损失函数需要用到这些概率值来计算梯度。它希望拉大“好回复”和“坏回复”在概率上的差距，同时不要偏离“参考模型”太远。</li>
+</ul>
+<h4>✅ Task 6: 准备 DPO 数据包 (Prepare Batch)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>dpo_tensors = { ... }</code></li>
+<li><strong>任务</strong>：把 Prompt、Chosen 回复、Rejected 回复、以及刚才算的概率打包成一个大礼包。</li>
+<li><strong>细节</strong>：这里还会处理一下 Mask（掩码），确保只训练回复部分，不训练 Prompt 部分。</li>
+</ul>
+<h4>✅ Task 7: 模型更新 (Update Actor)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>self.actor_rollout_wg.update_actor_dpo(dpo_update_batch_proto)</code></li>
+<li><strong>任务</strong>：利用刚才的数据包，执行反向传播，更新 Actor 的权重。</li>
+<li><strong>结果</strong>：Actor 变得更倾向于生成高分回复，避免生成低分回复。</li>
+</ul>
+<hr />
+<h3>第三阶段：后勤保障 (Housekeeping)</h3>
+<p>在每一轮循环的末尾，还需要做一些维护工作：</p>
+<ol>
+<li>
+<p><strong>[验证] <code>_validate</code></strong>:</p>
+<ul>
+<li><strong>任务</strong>：定期拿出一部分测试题，看看模型现在表现如何，是不是学歪了。</li>
+<li><strong>输出</strong>：生成一些样板文字，记录准确率或奖励值。</li>
+</ul>
+</li>
+<li>
+<p><strong>[存档] <code>_save_checkpoint</code></strong>:</p>
+<ul>
+<li><strong>任务</strong>：把训练好的模型权重保存到硬盘上，防止断电白干。</li>
+</ul>
+</li>
+<li>
+<p><strong>[监控] <code>logger.log</code></strong>:</p>
+<ul>
+<li><strong>任务</strong>：把训练过程中的 Loss、Reward、长度等指标发给 WandB 或 SwanLab，画出折线图。</li>
+</ul>
+</li>
+</ol>
+<h3>总结：文中的核心观点</h3>
+<p>这个脚本实际上在执行一种<strong>迭代式自我进化</strong>的策略：</p>
+<ol>
+<li><strong>不再依赖静态数据</strong>：传统的 DPO 用的是固定的数据集。这个脚本展示的是 <strong>Online DPO</strong>，数据是模型自己边跑边生成的（On-the-fly）。</li>
+<li><strong>动态的参考系</strong>：通过定期更新 Reference Model（Task 1），它实现了 SPIN 的理念——<strong>今天的我要打败昨天的我</strong>。</li>
+<li><strong>Ray 的作用</strong>：因为生成（Rollout）、打分（Reward）、训练（Train）都很费显存，所以用 Ray 把这些任务拆分到不同的 GPU 甚至不同的节点上并行处理。</li>
+</ol>
+<p>这就好比一个学生（Actor），每隔一周就把自己现在的水平定为及格线（Update Ref），然后做题（Generate），老师批改（Score），分析错题（DPO Update），如此循环，不断提升成绩。</p>

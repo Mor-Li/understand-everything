@@ -1,0 +1,75 @@
+<h1>fla/modules/layernorm_gated.py</h1>
+<p>这份代码确实非常硬核，因为它不仅仅是普通的 PyTorch 代码，而是使用了 <strong>Triton</strong> 语言来编写高性能的 <strong>GPU内核（Kernel）</strong>。</p>
+<p>看不懂是很正常的，因为这里面混合了数学逻辑、底层显存管理和并行计算逻辑。</p>
+<p>为了让你能够消化这份代码，我为你列了一个 <strong>“学习任务清单 (Todo List)”</strong>。我们可以把理解这份代码看作是一个通关游戏，分 4 个阶段逐步拆解。</p>
+<hr />
+<h3>阶段一：搞清楚“我们在做什么菜？”（业务逻辑）</h3>
+<p>在看底层代码前，先看懂这个模块的功能是什么。不要管 <code>triton</code> 那些复杂的函数，只看最普通的 Python 部分。</p>
+<p><strong>Task 1: 阅读 <code>rms_norm_ref</code> 函数</strong>
+*   <strong>位置</strong>: 代码开头部分。
+*   <strong>目的</strong>: 这是“参考答案”。它用普通的 PyTorch 写出了这个模块的数学公式。
+*   <strong>核心逻辑</strong>:
+    1.  <strong>输入</strong>: 这是一个归一化层 (Normalization)。
+    2.  <strong>核心公式</strong>: $y = \frac{x - \text{mean}}{\text{std}} \times \text{weight} + \text{bias}$。
+    3.  <strong>变体 1 (RMSNorm)</strong>: 如果 <code>is_rms_norm=True</code>，就不减去均值 (Mean)，只除以标准差 (Std)。这是现在 LLaMA 等大模型常用的。
+    4.  <strong>变体 2 (Gated)</strong>: 这里多了一个输入 <code>z</code>。
+        *   <strong>Gate (门控)</strong>: 类似于水龙头的开关。通常是用 <code>SiLU</code> 激活函数处理 <code>z</code>，然后乘到 <code>x</code> 上。
+        *   公式变成：$\text{Output} = \text{Norm}(x) \times \text{SiLU}(z)$。
+    5.  <strong>变体 3 (Group)</strong>: 如果设置了 <code>group_size</code>，它就变成了 GroupNorm（把特征分成几组分别归一化）。</p>
+<p><strong>Task 2: 阅读 <code>LayerNormGated</code> 和 <code>RMSNormGated</code> 类</strong>
+*   <strong>位置</strong>: 代码最末尾。
+*   <strong>目的</strong>: 这是给用户用的“外壳”。
+*   <strong>解读</strong>:
+    *   这两个类继承自 <code>nn.Module</code>，就是为了让你能像用 <code>nn.Linear</code> 一样用它们。
+    *   它们初始化了 <code>weight</code> (缩放参数) 和 <code>bias</code> (平移参数)。
+    *   <code>forward</code> 函数里，它们调用了那个复杂的 <code>layernorm_fn</code>。</p>
+<hr />
+<h3>阶段二：搞清楚“为什么要这么麻烦？”（优化动机）</h3>
+<p>既然 <code>rms_norm_ref</code> 只有几行代码就能实现，为什么还要写几百行的 Triton 代码？</p>
+<p><strong>Task 3: 理解“算子融合 (Kernel Fusion)”</strong>
+*   <strong>普通 PyTorch</strong>: 
+    1. 计算均值 (读写显存)
+    2. 计算方差 (读写显存)
+    3. 减均值除方差 (读写显存)
+    4. 乘权重 (读写显存)
+    *   <strong>缺点</strong>: 显存带宽瓶颈。数据在 GPU 核心和显存之间来回搬运，太慢。
+*   <strong>Triton 代码</strong>:
+    *   把上面所有步骤合成<strong>一步</strong>。数据读进 GPU 核心后，算完所有东西再写回显存。
+    *   <strong>极速</strong>: 这种写法在大模型训练中能显著提升速度。</p>
+<hr />
+<h3>阶段三：硬啃核心代码（Triton 内核）</h3>
+<p>这是最难的部分。不要试图理解每一行指针操作，只需理解流程。</p>
+<p><strong>Task 4: 略读 <code>layer_norm_fwd_kernel</code> (前向传播)</strong>
+*   <strong>位置</strong>: <code>@triton.jit</code> 装饰的第一个大函数。
+*   <strong>输入</strong>: <code>X</code> (输入数据), <code>Y</code> (输出位置), <code>W</code>, <code>B</code> (权重偏置)。
+*   <strong>流程</strong>:
+    1.  <code>row = tl.program_id(0)</code>: 确定当前线程处理哪一行数据。
+    2.  <code>Load</code>: 把这一行数据 <code>x</code> 从显存加载到 SRAM (片上高速缓存)。
+    3.  <code>Compute Mean/Var</code>: 在 SRAM 里直接算出均值和方差。
+    4.  <code>Normalize</code>: 执行 $(x - \text{mean}) / \text{std}$。
+    5.  <code>Gate</code>: 如果有 <code>z</code>，在这里顺便计算 <code>x * sigmoid(z) * z</code>。
+    6.  <code>Store</code>: 把算好的结果 <code>y</code> 一次性写回显存。</p>
+<p><strong>Task 5: 略读 <code>layer_norm_bwd_kernel</code> (反向传播)</strong>
+*   <strong>位置</strong>: 第二个 <code>@triton.jit</code> 函数。
+*   <strong>目的</strong>: 训练大模型需要算梯度（Gradient），就是计算“为了让误差变小，参数该怎么改”。
+*   <strong>难点</strong>: 这里的代码非常复杂，因为 LayerNorm 的梯度计算涉及很多求和操作。
+*   <strong>关键点</strong>: 作者注释里写了 <em>"keep weight_grad and bias_grad in registers"</em>。这意味着它把梯度的累加放在寄存器里做，避免了反复读写显存，这是为了快！</p>
+<hr />
+<h3>阶段四：串联起来（接口）</h3>
+<p><strong>Task 6: 阅读 <code>LayerNormFn</code></strong>
+*   <strong>位置</strong>: 中间部分，继承自 <code>torch.autograd.Function</code>。
+*   <strong>目的</strong>: 这是 PyTorch 和 Triton 的桥梁。
+*   <strong>解读</strong>:
+    *   <code>forward()</code>: 当你调用模型时，它会启动 <code>layer_norm_fwd_kernel</code> (GPU 计算)，并保存 <code>mean</code> 和 <code>rstd</code> (倒数标准差) 给反向传播用。
+    *   <code>backward()</code>: 当你调用 <code>loss.backward()</code> 时，它会启动 <code>layer_norm_bwd_kernel</code> 来计算梯度。</p>
+<hr />
+<h3>总结：这代码到底讲了啥？</h3>
+<p>如果让我用一句话总结：</p>
+<blockquote>
+<p><strong>这是一个为了在 Llama 70B 等超大模型上极速运行，而用底层 Triton 语言手写的、支持“门控机制 (Gated)”和“RMSNorm”特性的归一化层。</strong></p>
+</blockquote>
+<p><strong>你的阅读顺序建议：</strong>
+1.  先看 <code>rms_norm_ref</code> (懂数学原理)。
+2.  再看 <code>RMSNormGated</code> (懂怎么调用)。
+3.  跳过具体的 Kernel 实现，知道它是为了“快”把所有数学运算融合在一起了即可。
+4.  如果你不需要修改底层 CUDA/Triton 逻辑，完全不需要看懂 <code>_kernel</code> 结尾的函数细节。</p>

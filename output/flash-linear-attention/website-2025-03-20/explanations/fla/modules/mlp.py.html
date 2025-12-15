@@ -1,0 +1,113 @@
+<h1>fla/modules/mlp.py</h1>
+<p>这份代码确实包含了不少“硬核”内容，它不仅涉及<strong>深度学习模型结构</strong>（MLP），还涉及<strong>底层性能优化</strong>（Fused Kernel），甚至还有<strong>分布式并行计算</strong>（Tensor Parallelism）。看不懂是很正常的，因为它把算法和工程实现混合在一起了。</p>
+<p>为了帮你消化这份代码，我制定了一个<strong>4步走的 Task List</strong>。我们可以把它想象成从“设计图纸”到“工厂流水线”的过程。</p>
+<hr />
+<h3>📋 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 01: 理解核心概念 —— 什么是 Gated MLP 和 SwiGLU？</strong> (这是代码的数学灵魂)</li>
+<li><strong>Task 02: 拆解 <code>GatedMLP</code> 类 —— 模型是怎么搭建的？</strong> (这是代码的骨架)</li>
+<li><strong>Task 03: 理解 <code>fuse_swiglu</code> —— 为什么要搞个“融合”？</strong> (这是速度优化的关键)</li>
+<li><strong>Task 04: 攻克 <code>SwiGLULinearParallel</code> —— 如何在多张显卡上跑？</strong> (这是最难的分布式工程部分)</li>
+</ol>
+<hr />
+<h3>逐步讲解</h3>
+<h4>✅ Task 01: 理解核心概念 (Gated MLP &amp; SwiGLU)</h4>
+<p>在看代码前，先要知道它在算什么。
+传统的 MLP（多层感知机）通常是：<code>输入 -&gt; 放大(Linear) -&gt; 激活函数 -&gt; 缩小(Linear) -&gt; 输出</code>。</p>
+<p>但这里用的是 <strong>Gated MLP (带门控的 MLP)</strong>，这是目前 LLaMA 等主流大模型都在用的结构。它的逻辑是：
+1.  <strong>分两路</strong>：输入 <code>x</code> 被复制成两份。
+2.  <strong>Gate (门)</strong>：一路经过 <code>gate_proj</code> 线性层，算出“门控信号”。
+3.  <strong>Value (值)</strong>：另一路经过 <code>up_proj</code> 线性层，算出“特征值”。
+4.  <strong>相乘</strong>：把“门”经过激活函数（Swish）后，和“值”<strong>逐元素相乘</strong>。这就像用水龙头（门）控制水流（值）。
+5.  <strong>输出</strong>：最后经过 <code>down_proj</code> 变回原来的维度。</p>
+<p><strong>公式总结：</strong>
+$$ \text{Output} = \text{DownProj}( \text{Swish}(\text{GateProj}(x)) \times \text{UpProj}(x) ) $$</p>
+<hr />
+<h4>✅ Task 02: 拆解 <code>GatedMLP</code> 类 (模型搭建)</h4>
+<p>现在看代码中的 <code>class GatedMLP</code>。</p>
+<p><strong>1. 维度的魔法 (<code>__init__</code> 部分):</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 代码片段</span>
+<span class="k">if</span> <span class="n">intermediate_size</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">intermediate_size</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">hidden_size</span> <span class="o">*</span> <span class="n">hidden_ratio</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">/</span> <span class="mi">3</span><span class="p">)</span>
+    <span class="n">intermediate_size</span> <span class="o">=</span> <span class="mi">256</span> <span class="o">*</span> <span class="p">((</span><span class="n">intermediate_size</span> <span class="o">+</span> <span class="mi">256</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="mi">256</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>目的</strong>：计算中间层有多宽。</li>
+<li><strong>为什么是 2/3？</strong> 因为 Gated MLP 有三层全连接（Gate, Up, Down），比传统 MLP 多一层。为了保持参数量和传统 MLP 一致，中间层通常缩小为原来的 2/3。</li>
+<li><strong>为什么是 256 的倍数？</strong> 为了 GPU 计算效率。GPU 喜欢处理 256、512 这种整数倍的数据，速度会更快。</li>
+</ul>
+<p><strong>2. 定义层:</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="bp">self</span><span class="o">.</span><span class="n">gate_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 计算门</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">up_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>   <span class="c1"># 计算值</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">down_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 输出层</span>
+</code></pre></div>
+
+<p>这就是 Task 01 里提到的三个核心线性层。</p>
+<hr />
+<h4>✅ Task 03: 理解 <code>fuse_swiglu</code> (性能优化)</h4>
+<p>看 <code>forward</code> 函数：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 代码片段</span>
+<span class="n">gate</span><span class="p">,</span> <span class="n">y</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">gate_proj</span><span class="p">(</span><span class="n">x</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">up_proj</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+<span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">fuse_swiglu</span><span class="p">:</span>
+    <span class="c1"># 方案 A: 融合模式</span>
+    <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">swiglu_linear</span><span class="p">(</span><span class="n">gate</span><span class="p">,</span> <span class="n">y</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">down_proj</span><span class="o">.</span><span class="n">weight</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">down_proj</span><span class="o">.</span><span class="n">bias</span><span class="p">)</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="c1"># 方案 B: 普通模式</span>
+    <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">down_proj</span><span class="p">(</span><span class="n">swiglu</span><span class="p">(</span><span class="n">gate</span><span class="p">,</span> <span class="n">y</span><span class="p">))</span>
+</code></pre></div>
+
+<ul>
+<li>
+<p><strong>普通模式 (方案 B)</strong>：</p>
+<ol>
+<li>算出 Gate 和 Up。</li>
+<li>把它俩从显存读出来，做 Swish 激活，相乘。</li>
+<li>存回显存。</li>
+<li>再读出来做 Down Projection。
+<em>缺点</em>：显存读写次数多，慢。</li>
+</ol>
+</li>
+<li>
+<p><strong>融合模式 (方案 A, <code>fuse_swiglu=True</code>)</strong>：
+    它调用了 <code>SwiGLULinear</code>。这是一个<strong>融合算子 (Fused Kernel)</strong>。
+    它把“激活函数”、“相乘”、“Down Projection”这三步合并成一步操作。数据在 GPU 的高速缓存里一次性跑完，不用反复读写显存。
+    <em>一句话解释</em>：这是一个为了加速训练而写的“作弊代码”。</p>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 04: 攻克 <code>SwiGLULinearParallel</code> (分布式并行)</h4>
+<p>这是代码里最难懂的部分，涉及 <strong>Tensor Parallel (TP，张量并行)</strong>。
+想象一下，模型太大了，一张显卡放不下，怎么办？我们需要把它切开，放在多张卡上算。</p>
+<p><code>class SwiGLULinearParallel(ParallelStyle)</code> 就是在定义“怎么切”和“怎么算”。</p>
+<p><strong>1. 核心逻辑：</strong>
+它使用了 PyTorch 的 <code>DTensor</code> (Distributed Tensor) 和 <code>DeviceMesh</code> (设备网格)。</p>
+<p><strong>2. 输入准备 (<code>_prepare_input_fn</code>):</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这里的逻辑是：</span>
+<span class="c1"># 1. 拿到输入数据 x, y。</span>
+<span class="c1"># 2. Shard(-1): 把数据沿着最后一个维度切开。</span>
+<span class="c1">#    比如 x 是 [Batch, Sequence, Hidden]，Shard(-1) 就是把 Hidden 这一维切碎，分给不同的显卡。</span>
+<span class="c1"># 3. weight (权重): 也是切开的 (Shard(1))。</span>
+</code></pre></div>
+
+<ul>
+<li><strong>目的</strong>：让每张显卡只拿到一部分数据和一部分权重，只计算属于自己的那一小块任务。</li>
+</ul>
+<p><strong>3. 输出处理 (<code>_prepare_output_fn</code>):</strong>
+当每张卡算完自己那部分后，结果是散乱的。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这里的逻辑是：</span>
+<span class="c1"># 如果需要，把大家算出来的结果拼起来 (AllReduce 或 ReduceScatter)。</span>
+<span class="c1"># 最后 .to_local() 变回普通的 Tensor。</span>
+</code></pre></div>
+
+<p><strong>4. 总结这个类：</strong>
+它是一个<strong>包装器</strong>。它告诉 PyTorch：“当执行 SwiGLU 这个操作时，请按照我定义的切分规则（输入切分、权重切分）在多张卡上并行计算，最后把结果拼好给我。”</p>
+<hr />
+<h3>🌟 总结回顾</h3>
+<p>如果你再看一遍代码，可以按照这个心理模型：</p>
+<ol>
+<li><strong><code>GatedMLP</code></strong> 是老板：它定义了我要做什么生意（由三个线性层组成）。</li>
+<li><strong><code>__init__</code></strong> 是装修队：它负责把房间大小（维度）调整成 256 的倍数，方便机器运作。</li>
+<li><strong><code>fuse_swiglu</code></strong> 是加速器：如果开启，它就走“VIP通道”，把好几步操作合并成一步快跑。</li>
+<li><strong><code>SwiGLULinearParallel</code></strong> 是调度中心：当模型太大时，它负责把任务切碎，分发给好几个工人（GPU）同时做，最后再把结果收上来。</li>
+</ol>

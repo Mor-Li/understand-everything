@@ -1,0 +1,67 @@
+<h1>verl/models/README.md</h1>
+<p>没问题。这份文档其实是一份<strong>开发指南</strong>，它的核心目的是：<strong>教你如何把一个普通的 HuggingFace 模型（比如 Llama, Qwen 等）移植到 <code>verl</code> 这个高性能框架中去。</strong></p>
+<p>之所以要这么做，是因为 HuggingFace 的原始代码虽然通用，但在大规模并行训练（多张显卡一起跑）时效率不够高，或者和 PyTorch 原生的并行功能配合得不够好。</p>
+<p>为了让你更容易理解，我把这个过程想象成<strong>改装一辆赛车</strong>。HuggingFace 的模型是“民用版轿车”，功能全但不够快；<code>verl</code> 需要的是“F1赛车”，去掉多余装饰，极致轻量化且支持多引擎（多显卡）。</p>
+<p>下面是为你整理的 <strong>Todo List</strong> 和详细解说：</p>
+<hr />
+<h3>核心任务清单 (Todo List)</h3>
+<ol>
+<li><strong>[搬运]</strong>：把 HuggingFace 的模型代码复制过来。</li>
+<li><strong>[改装]</strong>：修改代码，去掉“内饰”，换上“赛车引擎”（改为 Packed Inputs 和 Flash Attention）。</li>
+<li><strong>[质检]</strong>：写测试代码，确保改装后的车和原车跑出来的结果是一样的。</li>
+<li><strong>[切割引擎 - TP]</strong>：实现张量并行（Tensor Parallelism），让模型能被切开放在不同显卡上算。</li>
+<li><strong>[复制车队 - DP]</strong>：实现数据并行（Data Parallelism），让多组显卡能同时处理不同的数据。</li>
+<li><strong>[流水线 - PP]</strong>：(可选) 实现流水线并行（Pipeline Parallelism），像工厂流水线一样处理模型层。</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>第一步：搬运底盘 (Copy the model)</h4>
+<ul>
+<li><strong>原文意思</strong>：直接从 HuggingFace 的 <code>transformers</code> 库里把模型定义的 Python 文件（比如 <code>modeling_llama.py</code>）复制到 <code>verl</code> 的文件夹里。</li>
+<li><strong>你的任务</strong>：<ul>
+<li>在 <code>verl/models/hf</code> 下新建一个文件。</li>
+<li>只复制模型结构代码，不要复制那些乱七八糟的工具代码。</li>
+</ul>
+</li>
+</ul>
+<h4>第二步：极致改装 (Modify for packed inputs)</h4>
+<p>这是最难理解的一步。
+*   <strong>原文意思</strong>：使用 "Packed Inputs"（打包输入）并移除 KV Cache。
+*   <strong>通俗解释</strong>：
+    *   <strong>移除 KV Cache</strong>：KV Cache 是聊天生成时用来加速的，但训练时不仅没用还占地方。<strong>删掉它</strong>。
+    *   <strong>改为 Packed Inputs</strong>：普通的输入通常需要“补零”（Padding）来对齐长度，这很浪费计算资源。<code>verl</code> 要求把所有句子首尾相连拼成一条长龙（去掉补零），只记录每句话的长度。
+    *   <strong>使用 Flash Attention</strong>：这是目前最快的注意力机制算法，必须用它来配合上面的“长龙”输入。
+*   <strong>你的任务</strong>：修改 <code>forward</code> 函数，把输入参数改成 <code>input_ids</code> (一维长数组) 和 <code>cu_seqlens</code> (记录每句话切分位置的数组)。</p>
+<h4>第三步：质量检测 (Add tests)</h4>
+<ul>
+<li><strong>原文意思</strong>：加测试，对比新旧版本。</li>
+<li><strong>通俗解释</strong>：你改了这么多代码，得保证算出来的数是对的。</li>
+<li><strong>你的任务</strong>：<ul>
+<li>写一个脚本，输入同样的数据。</li>
+<li>让 HuggingFace 原版模型跑一遍，记录输出。</li>
+<li>让你改好的 <code>verl</code> 版模型跑一遍，记录输出。</li>
+<li>对比两者，误差必须极小（接近 0）。</li>
+</ul>
+</li>
+</ul>
+<h4>第四步：横向切割 (Tensor Parallelism - TP)</h4>
+<ul>
+<li><strong>原文意思</strong>：使用 PyTorch 原生 API 实现张量并行。</li>
+<li><strong>通俗解释</strong>：现在的模型太大了（比如 70B 参数），一张显卡装不下。我们需要把模型里的<strong>大矩阵切成几块</strong>，分给不同的显卡存和算。</li>
+<li><strong>注意</strong>：文档强调这在 PyTorch 里不是自动的，你需要手动写配置，告诉程序“这一层切开，那一层合并”。</li>
+<li><strong>你的任务</strong>：参考 PyTorch 文档，给模型的每一层（Linear 层）加上“切分规则”。</li>
+</ul>
+<h4>第五步：纵向扩展 (Data Parallelism - DP)</h4>
+<ul>
+<li><strong>原文意思</strong>：使用 FSDP2 API。</li>
+<li><strong>通俗解释</strong>：如果你有很很多显卡，你可以搞“人海战术”。比如你有 4 张卡，你可以把数据分成 4 份，大家用同样的模型结构（或者切片）同时算，然后汇总学习成果。</li>
+<li><strong>你的任务</strong>：调用 PyTorch 的 FSDP2（Fully Sharded Data Parallel）接口，这通常比 TP 简单一些，主要是配置。</li>
+</ul>
+<h4>第六步：流水线作业 (Pipeline Parallelism - PP)</h4>
+<ul>
+<li><strong>原文意思</strong>：使用 PyTorch 2.4+ 的新功能。</li>
+<li><strong>通俗解释</strong>：如果模型特别深（比如 100 层），可以把前 50 层放在显卡 A，后 50 层放在显卡 B。数据像流水线产品一样流过 A 再流过 B。</li>
+<li><strong>你的任务</strong>：这是一个很新的功能（Alpha 阶段），文档建议你去参考 <code>torchtitan</code> 这个项目怎么写的，照葫芦画瓢。</li>
+</ul>
+<h3>总结</h3>
+<p>这篇文档就是告诉开发者：<strong>别直接用 HuggingFace 的代码，太慢了。按照我的规矩（去掉 Padding、加上并行切分逻辑）重写一遍，才能在我的框架里跑得飞快。</strong></p>

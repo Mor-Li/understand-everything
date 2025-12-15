@@ -1,0 +1,94 @@
+<h1>fla/ops/common/chunk_h_parallel.py</h1>
+<p>这份代码确实非常硬核，它属于 <strong>线性注意力机制（Linear Attention）</strong> 或者 <strong>状态空间模型（SSM/GLA）</strong> 的底层核心算子。</p>
+<p>简单来说，它的作用是：<strong>在一个长序列中，快速、并行地计算“记忆状态”（Hidden State, $h$）。</strong></p>
+<p>为了让你看懂，我制定了一个 <strong>6步走的 Task List</strong>。我们不直接看代码细节，先看它想干什么，再看它是怎么“作弊”来加速的。</p>
+<hr />
+<h3>📝 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1: 搞懂背景</strong> —— 为什么要写这个文件？（解决 RNN 无法并行的问题）</li>
+<li><strong>Task 2: 理解核心逻辑</strong> —— 什么是“分块并行”（Chunkwise Parallelization）？</li>
+<li><strong>Task 3: 拆解第一步 (Map)</strong> —— <code>chunk_fwd_kernel_h_parallel</code> 在干嘛？</li>
+<li><strong>Task 4: 拆解第二步 (Reduce)</strong> —— <code>chunk_fwd_kernel_h_reduction</code> 在干嘛？</li>
+<li><strong>Task 5: 理解那些奇怪的变量</strong> —— <code>g</code>, <code>gk</code>, <code>gv</code> 是什么？</li>
+<li><strong>Task 6: 总结反向传播</strong> —— <code>bwd</code> 函数是干嘛的？</li>
+</ol>
+<hr />
+<h3>逐步讲解</h3>
+<h4>✅ Task 1: 搞懂背景 —— 为什么要写这个文件？</h4>
+<p>在传统的 Transformer 中，计算注意力是 $O(N^2)$ 的。
+在线性注意力（Linear Attention）或 RNN 中，我们维护一个“记忆状态” $h$。
+公式大概是这样的：
+$$ h_t = h_{t-1} \cdot \text{decay} + k_t^T v_t $$
+即：<strong>现在的记忆 = 以前的记忆(衰减后) + 新的信息(KV)</strong>。</p>
+<p><strong>痛点：</strong> 这种写法是串行的。你必须算出 $t=1$ 才能算 $t=2$。如果序列长度 $T=4096$，GPU 就得串行跑 4096 次，效率极低，浪费了 GPU 的并行能力。</p>
+<p><strong>目标：</strong> 这个文件的目标就是<strong>把上面这个串行过程，变成并行的</strong>。</p>
+<h4>✅ Task 2: 理解核心逻辑 —— 什么是“分块并行”？</h4>
+<p>为了并行，作者用了一种类似“接力赛”+“分工合作”的策略，术语叫 <strong>Chunkwise Parallel</strong>。</p>
+<p>假设你要处理一本 100 页的书（序列长度 $T$），计算每一页的总结（状态 $h$）。
+*   <strong>传统做法</strong>：一个人从第 1 页读到第 100 页。
+*   <strong>分块做法（本代码的做法）</strong>：
+    1.  把书分成 10 份（Chunks），每份 10 页。
+    2.  请 10 个人（GPU 线程块），<strong>同时</strong>去读这 10 份书。
+    3.  每个人只负责算出自己那 10 页里产生的“<strong>局部新知识</strong>”（不考虑前一个人的影响）。
+    4.  最后，把第 1 个人的结果传给第 2 个人，第 2 个传给第 3 个……做一个快速的“交接仪式”（Reduction）。</p>
+<p>这个文件就是把这两步分开写的。</p>
+<h4>✅ Task 3: 拆解第一步 (Map) —— <code>chunk_fwd_kernel_h_parallel</code></h4>
+<p>这个 Kernel 对应上面的 <strong>“10个人同时读自己那份书”</strong>。</p>
+<ul>
+<li><strong>输入</strong>：$K$ (Key), $V$ (Value), $G$ (Decay/门控)。</li>
+<li><strong>操作</strong>：<ul>
+<li>代码把整个序列 $T$ 切成了很多小块，每块长度为 <code>BT</code> (例如 64)。</li>
+<li>每个 GPU Block 处理一个小块。</li>
+<li><strong>核心计算</strong>：<code>b_h = tl.dot(b_k, b_v)</code>。它计算的是 <strong>“仅仅在这个小块内部”</strong> 产生的 $K^T V$ 累加值。</li>
+<li><strong>关于衰减 ($G$)</strong>：代码里有很多 <code>tl.exp(b_g_last - b_g)</code>，这是在计算在这个小块内部，信息衰减了多少。</li>
+</ul>
+</li>
+<li><strong>输出</strong>：<code>h</code>。注意，此时的 <code>h</code> <strong>还不是</strong>最终的记忆状态，它只是这个小块内部产生的“增量记忆”。它还没加上前一个小块传过来的历史记忆。</li>
+</ul>
+<blockquote>
+<p><strong>代码对应点：</strong>
+函数名 <code>_parallel</code> 暗示了这是完全并行的，互不依赖。</p>
+</blockquote>
+<h4>✅ Task 4: 拆解第二步 (Reduce) —— <code>chunk_fwd_kernel_h_reduction</code></h4>
+<p>这个 Kernel 对应上面的 <strong>“交接仪式”</strong>。</p>
+<ul>
+<li><strong>现状</strong>：现在我们有了很多小块的“局部记忆”，但它们是断开的。第 2 块不知道第 1 块发生了什么。</li>
+<li><strong>操作</strong>：<ul>
+<li>这是一个串行（或半串行）的过程，沿着 Chunk 的维度扫描。</li>
+<li>它读取前一个 Chunk 的最终状态。</li>
+<li>对前一个状态应用衰减（Decay）。</li>
+<li>把它加到当前 Chunk 的“局部记忆”上。</li>
+<li><code>b_h += tl.load(...)</code> 然后 <code>tl.store(...)</code>。</li>
+</ul>
+</li>
+<li><strong>输出</strong>：修正后的、真正的 <code>h</code>。现在每个位置的 $h$ 都包含了从序列开始到现在的完整信息。</li>
+</ul>
+<blockquote>
+<p><strong>代码对应点：</strong>
+函数名 <code>_reduction</code> 暗示了这是一个归约/累积的过程。</p>
+</blockquote>
+<h4>✅ Task 5: 理解那些奇怪的变量 —— <code>g</code>, <code>gk</code>, <code>gv</code></h4>
+<p>你会看到很多 <code>if USE_G</code>, <code>if USE_GK</code>。这是为了支持不同的“遗忘/衰减”机制，让模型更灵活。</p>
+<ul>
+<li><strong><code>h</code> (Hidden State)</strong>: 记忆矩阵，形状通常是 $[K, V]$。</li>
+<li><strong><code>g</code> (Scalar Decay)</strong>: 标量衰减。每一时刻，整个记忆矩阵都乘以一个系数 $e^{g_t}$。</li>
+<li><strong><code>gk</code> (Vector Decay for Key)</strong>: 向量衰减。针对 $K$ 维度的衰减。相当于 $h$ 的每一行有不同的遗忘速度。</li>
+<li><strong><code>gv</code> (Vector Decay for Value)</strong>: 向量衰减。针对 $V$ 维度的衰减。相当于 $h$ 的每一列有不同的遗忘速度。</li>
+</ul>
+<p>代码里繁琐的 <code>tl.exp(...)</code> 都是在处理这些数学上的指数衰减计算。</p>
+<h4>✅ Task 6: 总结反向传播 —— <code>bwd</code> 函数</h4>
+<ul>
+<li><code>chunk_bwd_kernel_dh_parallel</code></li>
+<li><code>chunk_bwd_kernel_dh_reduction</code></li>
+</ul>
+<p>这俩是给训练用的（反向传播求梯度）。逻辑和前向传播（Forward）完全是镜像的：
+*   前向是：$K, V \to H$
+*   反向是：$H$ 的梯度 $\to K, V$ 的梯度。
+*   同样采用了“先并行计算块内梯度，再归约跨块梯度”的策略。</p>
+<hr />
+<h3>💡 总结：一句话看懂这个文件</h3>
+<p>这个文件实现了一个<strong>分块算法</strong>：它把长序列的 RNN/线性注意力计算拆成了 <strong>“块内并行计算 (Parallel)”</strong> 和 <strong>“块间串行累加 (Reduction)”</strong> 两步，从而极大利用 GPU 算力，让处理长文本变得飞快。</p>
+<ul>
+<li><strong>Parallel Kernel</strong>: 算出每个小段的 $K \times V$。</li>
+<li><strong>Reduction Kernel</strong>: 把这些小段连起来，加上时间衰减，形成完整的记忆链条。</li>
+</ul>

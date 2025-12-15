@@ -1,0 +1,100 @@
+<h1>verl/models/transformers/llama.py</h1>
+<p>这份代码其实就干了一件事：<strong>给 Llama 模型的注意力机制（Attention）装上了一个“分布式加速器”，也就是所谓的 Ulysses 序列并行（Sequence Parallelism）。</strong></p>
+<p>简单来说，当你要处理的文本特别长（比如 100k token），一张显卡显存放不下，计算也太慢。<strong>Ulysses</strong> 是一种并行策略，它把长文本切成几段，分给不同的显卡处理。</p>
+<p>为了让你看懂，我把这个代码的逻辑拆解成一个<strong>“任务清单 (Todo List)”</strong>，你想象自己是其中一张显卡（GPU），正在执行这个流程。</p>
+<h3>核心任务清单 (Todo List)</h3>
+<p>作为一个显卡，在处理 Attention 这一层时，你需要按顺序做以下事情：</p>
+<ol>
+<li><strong>[准备原料]</strong>: 拿到输入的隐藏状态，计算出 Q (Query), K (Key), V (Value)。</li>
+<li><strong>[大挪移 - 关键步骤]</strong>: 因为文本被切分了，我手里的文本是不完整的。为了算 Attention，我需要<strong>和其他显卡交换数据</strong>。<ul>
+<li><em>目标</em>：把“切分的序列”变成“完整的序列”，但作为交换，我只负责“一部分注意力头（Heads）”。</li>
+</ul>
+</li>
+<li><strong>[加位置信息]</strong>: 给现在的完整序列加上旋转位置编码（RoPE）。</li>
+<li><strong>[算 Attention]</strong>: 用 Flash Attention 或其他方法计算注意力分数（因为现在手里有完整序列了，所以能算）。</li>
+<li><strong>[大挪移回原位 - 关键步骤]</strong>: 算完了，结果是按“头”切分的。我得再次<strong>和其他显卡交换数据</strong>。<ul>
+<li><em>目标</em>：把“切分的头”拼回去，变回“切分的序列”，恢复成刚进来时的形状。</li>
+</ul>
+</li>
+<li><strong>[输出]</strong>: 做最后的线性投影输出。</li>
+</ol>
+<hr />
+<h3>详细步骤讲解 (Step-by-Step)</h3>
+<p>代码里有两个函数 <code>llama_flash_attn_forward</code> 和 <code>llama_attn_forward</code>，逻辑是一模一样的，只是为了适配不同版本的 Transformers 库。我们以核心逻辑为例：</p>
+<h4>第一步：准备原料 (Projections)</h4>
+<p>代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">query_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">q_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span><span class="o">...</span>
+<span class="n">key_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">k_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span><span class="o">...</span>
+<span class="n">value_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">v_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span><span class="o">...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：这是标准的 Llama 操作。不管怎么并行，先得把输入的向量变成 Q、K、V 矩阵。</li>
+<li><strong>当前状态</strong>：此时，因为开了序列并行，你这张显卡手里拿到的<strong>只有 1/N 的文本长度</strong>（比如总共 100 个字，你只有前 25 个字），但是你拥有<strong>所有的注意力头</strong>。</li>
+</ul>
+<h4>第二步：乾坤大挪移 (Ulysses All-to-All)</h4>
+<p>代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">ulysses_sp_size</span> <span class="o">=</span> <span class="n">get_ulysses_sequence_parallel_world_size</span><span class="p">()</span>
+<span class="k">if</span> <span class="n">ulysses_sp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+    <span class="c1"># 核心魔法：gather_seq_scatter_heads</span>
+    <span class="n">query_states</span> <span class="o">=</span> <span class="n">gather_seq_scatter_heads</span><span class="p">(</span><span class="n">query_states</span><span class="p">,</span> <span class="n">seq_dim</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span> <span class="n">head_dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+    <span class="c1"># ... K 和 V 也做同样的操作</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：这是这份代码的灵魂。<ul>
+<li><strong>问题</strong>：算 Attention 需要 Q 和 K 点乘。如果我只有前 25 个字，我没法知道第 1 个字和第 99 个字的关系。</li>
+<li><strong>解决</strong>：大家（所有显卡）停下来交换数据。<ul>
+<li><strong>Gather Seq</strong>: 我把其他显卡手里的字都要过来（凑齐 100 个字）。</li>
+<li><strong>Scatter Heads</strong>: 作为代价，我把手里的一部分注意力头分给别人。比如本来我有 32 个头，现在我只留 8 个头自己算。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>结果</strong>：现在你手里有<strong>完整的文本序列</strong>，但是只有<strong>1/N 的注意力头</strong>。</li>
+</ul>
+<h4>第三步：加位置编码 (RoPE)</h4>
+<p>代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">cos</span><span class="p">,</span> <span class="n">sin</span> <span class="o">=</span> <span class="n">position_embeddings</span>
+<span class="n">query_states</span><span class="p">,</span> <span class="n">key_states</span> <span class="o">=</span> <span class="n">apply_rotary_pos_emb</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：既然现在序列完整了，就可以正确地加上位置信息（RoPE），告诉模型哪个词在前，哪个词在后。</li>
+</ul>
+<h4>第四步：计算注意力 (Flash Attention)</h4>
+<p>代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">attn_output</span> <span class="o">=</span> <span class="n">_flash_attention_forward</span><span class="p">(</span><span class="n">query_states</span><span class="p">,</span> <span class="n">key_states</span><span class="p">,</span> <span class="n">value_states</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：这是最耗显存和计算的一步。</li>
+<li><strong>为什么现在能算？</strong> 因为经过第二步的交换，你手里有了完整的 Q, K, V 序列长度。虽然你只算了一部分头（比如第 0-7 号头），但这部分的计算是完全独立的，不需要看别人的头。</li>
+</ul>
+<h4>第五步：乾坤大挪移 - 逆向 (Ulysses All-to-All)</h4>
+<p>代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">ulysses_sp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+    <span class="c1"># 核心魔法：gather_heads_scatter_seq</span>
+    <span class="n">attn_output</span> <span class="o">=</span> <span class="n">gather_heads_scatter_seq</span><span class="p">(</span><span class="n">attn_output</span><span class="p">,</span> <span class="n">seq_dim</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">head_dim</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：算完了，你手里拿的是“完整序列、部分头”的结果。但模型下一层需要的输入必须是“部分序列、所有头”（为了和最开始的输入对齐，方便做残差连接等）。</li>
+<li><strong>解决</strong>：大家再交换一次数据。<ul>
+<li><strong>Gather Heads</strong>: 把别人算好的其他头的结果拿过来（凑齐 32 个头）。</li>
+<li><strong>Scatter Seq</strong>: 把我不该管的那些序列片段还给别人（变回只拿 25 个字）。</li>
+</ul>
+</li>
+<li><strong>结果</strong>：形状变回了第一步刚开始的样子：<strong>部分序列，所有头</strong>。</li>
+</ul>
+<h4>第六步：输出 (Output Projection)</h4>
+<p>代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">attn_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">o_proj</span><span class="p">(</span><span class="n">attn_output</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：最后过一个线性层，把结果整合输出，传给下一层网络。</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件的核心观点就是：<strong>为了解决长文本显存不够的问题，我们在计算 Attention 之前，把“切分序列”换成“切分注意力头”，算完之后再换回来。</strong></p>
+<p>这就是 <strong>Ulysses Attention</strong> 的工作原理。</p>

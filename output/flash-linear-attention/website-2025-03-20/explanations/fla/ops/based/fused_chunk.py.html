@@ -1,0 +1,145 @@
+<h1>fla/ops/based/fused_chunk.py</h1>
+<p>这份代码确实非常晦涩，因为它使用了 <strong>Triton</strong>（一种用于编写高性能 GPU 内核的语言），并且实现的是一个比较前沿的线性 Attention 算法（即 <strong>Based</strong> 架构）。</p>
+<p>看不懂是正常的，因为这不仅仅是 Python 代码，而是直接在操作 GPU 显存和并行计算逻辑。</p>
+<p>为了让你理解，我制定了一个 <strong>5步学习任务清单 (Todo List)</strong>，我们将把这份代码像剥洋葱一样一层层剥开。</p>
+<hr />
+<h3>学习任务清单 (Todo List)</h3>
+<ol>
+<li><strong>任务一：搞清楚这是在算什么？（算法背景）</strong><ul>
+<li>目标：理解 "Based" 线性 Attention 和泰勒展开。</li>
+</ul>
+</li>
+<li><strong>任务二：理解 "Chunk" (分块) 的策略</strong><ul>
+<li>目标：明白为什么要把序列切碎了算（Chunkwise 模式）。</li>
+</ul>
+</li>
+<li><strong>任务三：读懂核心变量名（数学对应关系）</strong><ul>
+<li>目标：将代码中的 <code>0o</code>, <code>1o</code>, <code>2o</code> 与数学公式对应起来。</li>
+</ul>
+</li>
+<li><strong>任务四：宏观流程（Python 包装层）</strong><ul>
+<li>目标：理解 <code>FusedChunkBasedFunction</code> 和 <code>fused_chunk_based</code> 在做什么准备工作。</li>
+</ul>
+</li>
+<li><strong>任务五：微观逻辑（Triton Kernel 内部）</strong><ul>
+<li>目标：逐行解释 <code>fwd_kernel</code> 里的循环在干什么。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>逐步讲解</h3>
+<h4>任务一：搞清楚这是在算什么？（算法背景）</h4>
+<p>这份代码实现的是 <strong>Based</strong> 模型（来自论文 <em>Based: Simple Linear Attention with Based Projections</em>）。</p>
+<ul>
+<li><strong>传统 Attention:</strong> 计算 $Softmax(QK^T)V$。这需要计算 $N \times N$ 的矩阵，序列长了显存会爆。</li>
+<li><strong>Linear Attention:</strong> 试图去掉 Softmax，把计算顺序变成 $Q(K^TV)$，这样就是线性的复杂度了。</li>
+<li><strong>Based 的核心:</strong> 它用 <strong>泰勒展开 (Taylor Expansion)</strong> 来近似指数函数 $e^x$（Softmax 的核心）。
+    公式近似为：
+    $$ e^{qk^T} \approx 1 + qk^T + \frac{1}{2}(qk^T)^2 $$
+    这就解释了为什么代码里全是 <code>0o</code> (0阶), <code>1o</code> (1阶), <code>2o</code> (2阶)。</li>
+</ul>
+<h4>任务二：理解 "Chunk" (分块) 的策略</h4>
+<p>代码文件名叫 <code>fused_chunk</code>。这是一种混合计算策略：</p>
+<ul>
+<li><strong>纯 RNN 模式:</strong> 一个字一个字算，显存小但无法并行，慢。</li>
+<li><strong>纯 Transformer 模式:</strong> 所有字一起算，并行快但显存爆炸。</li>
+<li><strong>Chunk (分块) 模式:</strong><ol>
+<li>把长序列切成小块（比如每块 16 个 token，即代码中的 <code>BT=16</code>）。</li>
+<li><strong>块内部 (Intra-chunk):</strong> 像 Transformer 一样算（矩阵乘法），利用 GPU 并行能力。</li>
+<li><strong>块之间 (Inter-chunk):</strong> 像 RNN 一样传递“记忆”（Hidden State），通过累加的方式传递信息。</li>
+</ol>
+</li>
+</ul>
+<h4>任务三：读懂核心变量名（数学对应关系）</h4>
+<p>在阅读 Kernel 代码前，必须先建立字典：</p>
+<ul>
+<li><strong><code>q, k, v</code></strong>: 输入的 Query, Key, Value。</li>
+<li><strong><code>o</code></strong>: 输出 Output。</li>
+<li><strong><code>z</code></strong>: 归一化因子（因为去掉了 Softmax，最后需要除以 Z 来归一化）。</li>
+<li><strong><code>h</code> (Hidden State)</strong>: 也就是 RNN 的记忆状态。</li>
+<li><strong><code>0o, 1o, 2o</code></strong>: 对应泰勒展开的三项：<ul>
+<li><code>0o</code>: 零阶项（常数 1）。</li>
+<li><code>1o</code>: 一阶项 ($q \cdot k$)。</li>
+<li><code>2o</code>: 二阶项 ($(q \cdot k)^2$)。</li>
+</ul>
+</li>
+<li><strong><code>b_</code> 前缀</strong>: 代表 "Block"，即当前加载到 GPU 极速缓存（SRAM）里的一小块数据。</li>
+</ul>
+<h4>任务四：宏观流程（Python 包装层）</h4>
+<p>先看文件底部的 <code>fused_chunk_based</code> 函数：</p>
+<ol>
+<li><strong>限制维度:</strong> <code>assert q.shape[-1] &lt;= 16</code>。<ul>
+<li>Based 算法通常用于特征维度较小的情况（这里限制为 16），因为泰勒展开会导致特征维度膨胀（二阶项会把维度变成 $16 \times 16$），如果维度太大，计算量会爆炸。</li>
+</ul>
+</li>
+<li><strong>归一化:</strong> <code>o = o / (z[..., None] + 1e-6)</code>。<ul>
+<li>计算出来的结果 <code>o</code> 必须除以 <code>z</code> 才是最终的 Attention 结果。</li>
+</ul>
+</li>
+<li><strong>启动内核:</strong> 调用 <code>FusedChunkBasedFunction.apply</code>，进而启动 Triton kernel。</li>
+</ol>
+<h4>任务五：微观逻辑（Triton Kernel 内部精读）</h4>
+<p>这是最难的部分，我们看 <code>fused_chunk_based_fwd_kernel</code>（前向传播）。</p>
+<p><strong>1. 初始化状态 (RNN 的记忆)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 对应泰勒展开的三项记忆</span>
+<span class="n">b_h_0o</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 0阶记忆</span>
+<span class="n">b_h_1o</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 1阶记忆</span>
+<span class="n">b_h_2o</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 2阶记忆</span>
+</code></pre></div>
+
+<p><strong>2. 循环遍历每一个 Chunk (时间步 T)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">tl</span><span class="o">.</span><span class="n">cdiv</span><span class="p">(</span><span class="n">T</span><span class="p">,</span> <span class="n">BT</span><span class="p">)):</span>
+    <span class="c1"># 加载当前块的 Q, K, V</span>
+    <span class="n">b_k</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_k</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+    <span class="n">b_v</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_v</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+    <span class="n">b_q</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_q</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>3. 计算 Inter-chunk (块间交互 - 读取历史)</strong>
+这一步是计算：<strong>当前块 Q $\times$ 之前的记忆 H</strong>。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 零阶：直接加上之前的累积</span>
+<span class="n">b_o</span> <span class="o">+=</span> <span class="n">b_h_0o</span>
+<span class="c1"># 一阶：Q * H_1阶</span>
+<span class="n">b_o</span> <span class="o">+=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_q</span><span class="p">,</span> <span class="n">b_h_1o</span><span class="o">...</span><span class="p">)</span>
+<span class="c1"># 二阶：Q的平方项 * H_2阶 (注意那个 0.5，对应泰勒展开的 1/2)</span>
+<span class="n">b_q_2o</span> <span class="o">=</span> <span class="o">...</span> <span class="c1"># 计算 Q 的二阶特征</span>
+<span class="n">b_o</span> <span class="o">+=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_q_2o</span><span class="p">,</span> <span class="n">b_h_2o</span><span class="o">...</span><span class="p">)</span> <span class="o">*</span> <span class="mf">0.5</span>
+</code></pre></div>
+
+<p><em>这部分实现了：当前时刻看到的信息 = 历史记忆对我的影响。</em></p>
+<p><strong>4. 更新 Hidden State (更新记忆)</strong>
+这一步是计算：<strong>把当前块的 K 和 V 压缩进记忆 H，传给下一块</strong>。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 更新二阶记忆：H2 = H2 + (K的二阶 * V)</span>
+<span class="n">b_h_2o</span> <span class="o">=</span> <span class="n">b_h_2o</span> <span class="o">+</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_k_2o</span><span class="p">,</span> <span class="n">b_v</span><span class="o">...</span><span class="p">)</span>
+<span class="c1"># 更新一阶记忆：H1 = H1 + (K * V)</span>
+<span class="n">b_h_1o</span> <span class="o">=</span> <span class="n">b_h_1o</span> <span class="o">+</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_k</span><span class="p">,</span> <span class="n">b_v</span><span class="o">...</span><span class="p">)</span>
+<span class="c1"># 更新零阶记忆：H0 = H0 + V</span>
+<span class="n">b_h_0o</span> <span class="o">=</span> <span class="n">b_h_0o</span> <span class="o">+</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">b_v</span><span class="p">,</span> <span class="n">axis</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>5. 计算 Intra-chunk (块内交互 - 标准 Attention)</strong>
+这一步是计算：<strong>当前块内部 Q 和当前块 K 的关系</strong>。因为是同一个块，距离很近，直接算矩阵乘法。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Q * K</span>
+<span class="n">b_s</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_q</span><span class="p">,</span> <span class="n">b_k</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+<span class="c1"># 泰勒展开公式：1 + x + 0.5 * x^2</span>
+<span class="n">b_s</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">+</span> <span class="n">b_s</span> <span class="o">+</span> <span class="mf">0.5</span> <span class="o">*</span> <span class="n">b_s</span> <span class="o">*</span> <span class="n">b_s</span>
+<span class="c1"># Mask 操作 (因果掩码，不能看未来的词)</span>
+<span class="n">b_s</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">m_s</span><span class="p">,</span> <span class="n">b_s</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+<span class="c1"># Attention Score * V</span>
+<span class="n">b_o</span> <span class="o">+=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_s</span><span class="p">,</span> <span class="n">b_v</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>6. 保存结果</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">p_o</span><span class="p">,</span> <span class="n">b_o</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 保存 Output</span>
+<span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">p_z</span><span class="p">,</span> <span class="n">b_z</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 保存归一化因子</span>
+</code></pre></div>
+
+<h3>总结</h3>
+<p>这个文件其实就在做一件事：
+<strong>用 GPU 高效地计算 Based Linear Attention。</strong></p>
+<p>它之所以复杂，是因为它把一个数学公式：
+$$ O = \frac{\sum (1 + qk + \frac{1}{2}(qk)^2)v}{\sum (1 + qk + \frac{1}{2}(qk)^2)} $$
+拆解成了：
+1.  <strong>历史部分 (Inter-chunk):</strong> 用 RNN 方式维护 $h_0, h_1, h_2$ 三个状态。
+2.  <strong>当前部分 (Intra-chunk):</strong> 用矩阵乘法直接算小块内的 Attention。
+3.  <strong>泰勒展开:</strong> 代码中到处可见的 <code>0o, 1o, 2o</code> 和 <code>* 0.5</code> 就是泰勒展开的具体实现。</p>

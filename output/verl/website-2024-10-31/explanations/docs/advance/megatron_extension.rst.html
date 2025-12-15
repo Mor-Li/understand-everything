@@ -1,0 +1,73 @@
+<h1>docs/advance/megatron_extension.rst</h1>
+<p>这份文档确实写得比较硬核，它是写给<strong>底层开发人员</strong>看的，目的是告诉开发者：<strong>“如果你想在这个系统（Verl）里加入一个新的模型（比如你想跑通 Qwen 或者 Baichuan），你需要做哪些代码开发工作。”</strong></p>
+<p>之所以难懂，是因为它涉及到大模型训练中最复杂的<strong>Megatron-LM 分布式训练</strong>概念。</p>
+<p>为了让你听懂，我们把“训练一个大模型”比喻成<strong>“组装并运行一台超级机器”</strong>。现在这台机器太大了，必须拆成好几部分放在不同的房间（GPU）里同时跑。</p>
+<p>下面我把文中的要求拆解成一个 <strong>3步走的 To-Do List</strong>，一步步给你解释：</p>
+<hr />
+<h3>背景知识：为什么要这么麻烦？</h3>
+<p>普通的 PyTorch 模型代码（比如 HuggingFace 上的代码）是默认跑在一个 GPU 上的。
+但是 <strong>Megatron-LM</strong> 后端是为了超大模型设计的，它会把模型“切开”：
+*   <strong>Tensor Parallelism (TP):</strong> 把一个矩阵乘法切成两半，两个 GPU 各算一半。
+*   <strong>Pipeline Parallelism (PP):</strong> 把模型的前几层放在 GPU 1，后几层放在 GPU 2。</p>
+<p>所以，你不能直接用原来的代码，必须重写代码来支持这种“切分”。</p>
+<hr />
+<h3>你的 To-Do List (任务清单)</h3>
+<h4>✅ 任务一：重写模型代码（造机器的零件）</h4>
+<blockquote>
+<p><strong>原文对应：</strong> "1. Implement a model similar to <code>modeling_llama_megatron.py</code>... satisfy parallelism requirements..."</p>
+</blockquote>
+<ul>
+<li><strong>这是在干嘛？</strong>
+    你需要用 Megatron 的方式重新写一遍模型的定义代码。</li>
+<li><strong>具体步骤：</strong><ol>
+<li><strong>找参考：</strong> 打开 <code>modeling_llama_megatron.py</code> 这个文件，看看人家是怎么写 Llama 模型的。</li>
+<li><strong>照猫画虎：</strong> 模仿它的写法，写你要加的新模型（比如 <code>modeling_qwen_megatron.py</code>）。</li>
+<li><strong>关键点：</strong> 你的代码必须支持“切分”（TP, PP, SP）。也就是当系统说“现在用 4 个 GPU 跑”时，你的代码要知道怎么把权重切成 4 份。</li>
+<li><strong>注册：</strong> 写好后，去 <code>registry.py</code> 文件里登记一下，告诉系统：“嘿，我加了个新模型叫 Qwen，代码在这里。”</li>
+</ol>
+</li>
+</ul>
+<h4>✅ 任务二：搞定权重加载（把油灌进机器）</h4>
+<blockquote>
+<p><strong>原文对应：</strong> "2. Checkpoint utils that can load full checkpoint... to partitioned models..."</p>
+</blockquote>
+<ul>
+<li><strong>这是在干嘛？</strong>
+    你从 HuggingFace 下载的权重文件（Checkpoint）通常是一个完整的“大文件”（或者按层切分的）。但你的 Megatron 模型在运行时是“按计算切分”的碎块。直接读是读不进去的。</li>
+<li><strong>具体步骤：</strong><ol>
+<li><strong>写转换工具：</strong> 你需要写一段代码，负责把 HuggingFace 那个“完整的权重”，切碎并塞进你刚才写的“切分版模型”里。</li>
+<li><strong>注册加载器：</strong> 去 <code>weight_loader_registry.py</code> 登记一下，告诉系统：“如果是 Qwen 模型，请用我写的这个工具来加载权重。”</li>
+</ol>
+</li>
+</ul>
+<h4>✅ 任务三：打通训练和推理的桥梁（让机器能变形）</h4>
+<blockquote>
+<p><strong>原文对应：</strong> "3. Weight loader that synchronize the weight from Megatron to rollout (vLLM) model..."</p>
+</blockquote>
+<ul>
+<li><strong>这是在干嘛？</strong>
+    在这个框架（Verl）里，训练过程是这样的：<ol>
+<li><strong>Actor (Megatron):</strong> 负责训练（学习），模型是切碎的。</li>
+<li><strong>Rollout (vLLM):</strong> 负责做题（生成文本/推理），模型也是切碎的，但切法可能不一样，或者库不一样。</li>
+<li><strong>痛点：</strong> 训练完一步后，需要把 Actor 学到的新权重，实时同步给 Rollout 去做题。</li>
+</ol>
+</li>
+<li><strong>具体步骤：</strong><ol>
+<li><strong>写同步逻辑：</strong> 写代码把 Megatron 里的参数复制到 vLLM 里。</li>
+<li><strong>命名对齐（重要提示）：</strong> 原文特别提醒，你在写任务一（模型代码）的时候，变量起名最好和 vLLM 里的一样。<ul>
+<li><em>如果名字一样：</em> 直接复制数值，很简单。</li>
+<li><em>如果名字不一样：</em> 你还得写个映射表（比如把 <code>layer_1</code> 对应到 <code>h_1</code>），甚至要做矩阵转置，这会非常痛苦且容易出错。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结：这篇文档到底在讲啥？</h3>
+<p>它在说：<strong>“如果你想在这个框架里支持一个新模型，别指望开箱即用。你需要自己动手写代码，完成这三件事：”</strong></p>
+<ol>
+<li><strong>改结构：</strong> 写一个支持分布式切分的模型文件。</li>
+<li><strong>改加载：</strong> 写一个能把普通权重切碎读进去的加载器。</li>
+<li><strong>改同步：</strong> 写一个能把训练好的权重传给推理引擎的同步器。</li>
+</ol>
+<p>只要做完这三步，你的新模型就能在这个高性能分布式框架里跑起来了。</p>

@@ -1,0 +1,143 @@
+<h1>verl/models/llama/megatron/checkpoint_utils/llama_saver.py</h1>
+<p>这份代码确实比较晦涩，因为它涉及到了<strong>深度学习中最复杂的工程部分之一：分布式训练的模型合并</strong>。</p>
+<p>简单来说，训练超大模型（如 LLaMA）时，显存不够用，我们把模型像切蛋糕一样切碎了放在不同的显卡（GPU）上。现在训练完了，或者需要保存进度了，我们需要把这些碎块拼回一个完整的蛋糕（checkpoint），存到硬盘上。</p>
+<p>这份代码 <code>llama_saver.py</code> 就是做<strong>“拼图”</strong>工作的。</p>
+<p>为了让你听懂，我把这个过程想象成一个<strong>“组装队长的任务清单”</strong>。你是总指挥（Rank 0），其他显卡是工兵。</p>
+<hr />
+<h3>核心任务：把分散在各地的 LLaMA 零件拼成一个完整的模型</h3>
+<h4>📋 Task List (任务清单)</h4>
+<ol>
+<li><strong>点名与定位 (Mapping)</strong><ul>
+<li>弄清楚一共有多少个工兵（GPU），他们是怎么分组的。</li>
+<li>搞一张“藏宝图”：每一层网络到底藏在哪张显卡上？</li>
+</ul>
+</li>
+<li><strong>定义“回收”技能 (Helper Functions)</strong><ul>
+<li>技能 A：直接拿（针对没切碎的零件）。</li>
+<li>技能 B：拼好再拿（针对横着切或竖着切的零件）。</li>
+<li>技能 C：特殊拼法（针对 LLaMA 特有的复杂零件，如 QKV 和 MLP）。</li>
+</ul>
+</li>
+<li><strong>回收地基 (Embeddings)</strong><ul>
+<li>找到存有词向量（Embedding）的显卡，要把它们拼起来。</li>
+</ul>
+</li>
+<li><strong>按楼层回收主体 (Layers Loop)</strong><ul>
+<li>从第 0 层循环到最后一层。</li>
+<li>每一层里，分别回收：Attention 模块、MLP 模块、以及各种 LayerNorm。</li>
+</ul>
+</li>
+<li><strong>回收屋顶 (Final Norm &amp; Head)</strong><ul>
+<li>回收最后的归一化层。</li>
+<li>回收最后的输出层（LM Head 或 Reward Head）。</li>
+</ul>
+</li>
+<li><strong>统一规格并打包 (Convert &amp; Save)</strong><ul>
+<li>把所有收回来的零件统一转成指定的精度（如 bf16），准备存盘。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🔍 逐步代码解读 (对应上面的 Task)</h3>
+<p>现在我们对应代码，一步步看它是怎么执行这个清单的。</p>
+<h4>第一步：点名与定位</h4>
+<p>代码函数：<code>_megatron_calc_global_rank</code> 和 <code>_megatron_calc_layer_map</code></p>
+<ul>
+<li><strong>背景</strong>：Megatron 训练时有三种切法：<ul>
+<li><strong>TP (Tensor Parallel)</strong>: 把一个矩阵切开算。</li>
+<li><strong>PP (Pipeline Parallel)</strong>: 把模型的层切开（比如前10层在GPU1，后10层在GPU2）。</li>
+<li><strong>DP (Data Parallel)</strong>: 复制多份模型跑不同的数据。</li>
+</ul>
+</li>
+<li><strong>代码做了啥</strong>：<ul>
+<li><code>_megatron_calc_layer_map(config)</code>：这是最关键的。它生成一个字典，比如 <code>Layer 5</code> -&gt; <code>(PP_Rank 1, ...)</code>。意思就是：“第5层网络在 1号流水线分组的显卡上，去那里找。”</li>
+</ul>
+</li>
+</ul>
+<h4>第二步：定义“回收”技能</h4>
+<p>代码位置：<code>merge_megatron_ckpt_llama</code> 内部定义的 <code>def _broadcast_...</code> 函数</p>
+<p>这是代码里最难懂的部分，主要是<strong>通信</strong>。
+*   <strong><code>_broadcast_tensor</code> (简单搬运)</strong>：
+    *   用于 LayerNorm 等没被切开的小参数。
+    *   逻辑：如果我是持有这个参数的显卡，我把它广播出去；如果我是 Rank 0（总指挥），我接收并存起来。
+*   <strong><code>_broadcast_tp_shard_tensor</code> (普通拼接)</strong>：
+    *   用于被 TP 切开的矩阵。
+    *   逻辑：所有持有碎片的显卡把碎片发给 Rank 0，Rank 0 用 <code>torch.concat</code> 把它拼回一个大矩阵。
+*   <strong><code>_broadcast_tp_shard_tensor_qkv</code> (LLaMA 特供拼接)</strong>：
+    *   <strong>难点</strong>：LLaMA 用了 GQA（分组查询注意力），Q、K、V 的头数不一样，而且在 Megatron 里为了计算方便，它们被揉在一起切分了。
+    *   <strong>逻辑</strong>：先把碎片收回来拼成一个巨大的混合体，然后按照 Q、K、V 的维度小心翼翼地切开，再重新按正确的顺序拼合。
+*   <strong><code>_broadcast_tp_shard_tensor_gate_up</code> (LLaMA 特供拼接)</strong>：
+    *   <strong>难点</strong>：LLaMA 的 MLP 层用了 SwiGLU，它把 <code>Gate</code> 和 <code>Up</code> 两个投影层合并在一起计算了。
+    *   <strong>逻辑</strong>：同样，先收回所有碎片，拼成大块，然后要把交错在一起的 Gate 权重和 Up 权重拆分出来，分别存为 <code>gate_proj</code> 和 <code>up_proj</code>。</p>
+<h4>第三步：回收地基</h4>
+<p>代码片段：</p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">if</span> <span class="n">dp_rank</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="c1"># Embeddings</span>
+        <span class="n">print_rank_0</span><span class="p">(</span><span class="s2">&quot;collecting embeddings...&quot;</span><span class="p">)</span>
+        <span class="n">gpt_model_module</span> <span class="o">=</span> <span class="n">_get_gpt_model</span><span class="p">(</span><span class="n">models</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
+        <span class="n">_broadcast_tp_shard_tensor</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="s2">&quot;model.embed_tokens.weight&quot;</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：词表通常很大，也是被切开的（TP）。这里调用通用拼接技能，把词表拼好。</li>
+</ul>
+<h4>第四步：按楼层回收主体 (最长的循环)</h4>
+<p>代码片段：</p>
+<div class="codehilite"><pre><span></span><code>        <span class="n">layer_map</span> <span class="o">=</span> <span class="n">_megatron_calc_layer_map</span><span class="p">(</span><span class="n">config</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">layer</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">):</span>
+            <span class="c1"># 查地图，看这一层在哪个显卡上</span>
+            <span class="n">src_pp_rank</span><span class="p">,</span> <span class="n">src_virtual_pp_rank</span><span class="p">,</span> <span class="n">src_layer_idx</span> <span class="o">=</span> <span class="n">layer_map</span><span class="p">[</span><span class="n">layer</span><span class="p">]</span>
+
+            <span class="c1"># 1. 收 LayerNorm</span>
+            <span class="n">_broadcast_tensor</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">layer_name</span><span class="si">}</span><span class="s2">.input_layernorm.weight&quot;</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+            <span class="c1"># 2. 收 Attention (Q, K, V) -&gt; 用特供技能</span>
+            <span class="n">_broadcast_tp_shard_tensor_qkv</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">layer_name</span><span class="si">}</span><span class="s2">.self_attn.q_proj.weight&quot;</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+            <span class="c1"># 3. 收 Attention Output -&gt; 用普通拼接</span>
+            <span class="n">_broadcast_tp_shard_tensor</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">layer_name</span><span class="si">}</span><span class="s2">.self_attn.o_proj.weight&quot;</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+            <span class="c1"># 4. 收 MLP (Gate, Up) -&gt; 用特供技能</span>
+            <span class="n">_broadcast_tp_shard_tensor_gate_up</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">layer_name</span><span class="si">}</span><span class="s2">.mlp.gate_proj.weight&quot;</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+            <span class="c1"># 5. 收 MLP Down -&gt; 用普通拼接</span>
+            <span class="n">_broadcast_tp_shard_tensor</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">layer_name</span><span class="si">}</span><span class="s2">.mlp.down_proj.weight&quot;</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：这是一个巨大的循环。它不仅要拼凑矩阵，还要处理<strong>跨设备通信</strong>。比如循环到第 30 层时，数据可能在另一台机器的显卡上，代码会自动计算出 <code>src_pp_rank</code>，让那台机器把数据发过来。</li>
+</ul>
+<h4>第五步：回收屋顶</h4>
+<p>代码片段：</p>
+<div class="codehilite"><pre><span></span><code>        <span class="c1"># Final Layernorm</span>
+        <span class="n">_broadcast_tensor</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="s2">&quot;model.norm.weight&quot;</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+        <span class="c1"># LM Head (输出层)</span>
+        <span class="k">if</span> <span class="n">is_value_model</span><span class="p">:</span>
+             <span class="c1"># 如果是训练 Reward Model，名字叫 reward_head</span>
+            <span class="n">_broadcast_tensor</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="s2">&quot;reward_head.weight&quot;</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="c1"># 如果是普通生成模型，名字叫 lm_head</span>
+            <span class="n">_broadcast_tp_shard_tensor</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="s2">&quot;lm_head.weight&quot;</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：收尾工作。注意这里区分了是普通的 LLaMA（生成模型）还是 RLHF 里的 Value Model（评分模型），两者的输出层名字不一样。</li>
+</ul>
+<h4>第六步：统一规格</h4>
+<p>代码片段：</p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">distributed</span><span class="o">.</span><span class="n">get_rank</span><span class="p">()</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="c1"># ... (省略 dtype 判断)</span>
+        <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">state_dict</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="k">if</span> <span class="n">dtype</span> <span class="o">!=</span> <span class="n">v</span><span class="o">.</span><span class="n">dtype</span><span class="p">:</span>
+                <span class="n">state_dict</span><span class="p">[</span><span class="n">k</span><span class="p">]</span> <span class="o">=</span> <span class="n">v</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dtype</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：最后，Rank 0 手里已经有了一个完整的字典 <code>state_dict</code>。为了防止存盘时既有 float32 又有 float16，这里统一转一下格式（通常是 bfloat16），然后就可以返回给调用者去 <code>torch.save</code> 了。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件的逻辑就是：
+<strong>分散的计算 -&gt; 网络通信收集 (Broadcast) -&gt; 复杂的矩阵拼接逻辑 (Reshape/Concat) -&gt; 统一的单机模型参数 (State Dict)。</strong></p>
+<p>之所以你看不懂，是因为它混合了 <strong>PyTorch 分布式通信原语</strong> (<code>dist.broadcast</code>) 和 <strong>LLaMA 模型特殊的矩阵结构</strong> (<code>QKV</code>, <code>GateUp</code>)。希望这个清单能帮你理清思路！</p>

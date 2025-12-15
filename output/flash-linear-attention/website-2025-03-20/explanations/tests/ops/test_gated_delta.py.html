@@ -1,0 +1,58 @@
+<h1>tests/ops/test_gated_delta.py</h1>
+<p>这份代码是一个<strong>测试文件</strong>（Test Suite），用来验证一个名为 <strong>"Gated Delta Rule"</strong>（门控Delta规则）的算法实现是否正确。</p>
+<p>简单来说，这个文件不包含核心算法的底层C++/CUDA代码，而是用Python写了一套“考卷”，用来检查那个核心算法算得对不对、准不准。</p>
+<p>这个算法属于 <strong>线性Attention（Linear Attention）</strong> 或 <strong>RNN（循环神经网络）</strong> 的变种，目的是让模型像RNN一样高效推理，同时保持强大的记忆能力。</p>
+<p>为了让你读懂，我把阅读这份代码的任务拆解成一个 <strong>TODO List</strong>，带你一步步通关：</p>
+<hr />
+<h3>✅ Task 1：准备“尺子” (定义评估标准)</h3>
+<p><strong>代码位置</strong>：<code>get_abs_err</code>, <code>get_err_ratio</code>, <code>assert_close</code>
+<strong>解读</strong>：
+在测试数值计算时，计算机总会有微小的浮点误差。我们不能直接用 <code>==</code> 判断相等。
+*   <strong>要做什么</strong>：定义一套工具，用来对比“标准答案”和“待测代码”的输出结果。
+*   <strong>观点</strong>：只要误差（Error Ratio）小于设定的阈值（比如 0.005），我们就认为测试通过。</p>
+<h3>✅ Task 2：确立“标准答案” (Reference Implementation)</h3>
+<p><strong>代码位置</strong>：<code>recurrent_gated_delta_rule_ref</code>
+<strong>解读</strong>：
+这是算法的<strong>纯Python/PyTorch实现</strong>。
+*   <strong>特点</strong>：它用了一个 <code>for</code> 循环 (<code>for i in range(l):</code>) 一步一步算。
+*   <strong>观点</strong>：这种写法虽然运行<strong>慢</strong>，但是逻辑非常清晰，不容易出错。我们把它当作<strong>真理（Ground Truth）</strong>。如果优化后的加速代码算出来的结果跟这个不一样，那就是加速代码写错了。
+*   <strong>核心逻辑</strong>：这里模拟了一个类似RNN的过程，维护一个状态 $S$，每一步根据输入 $q, k, v$ 和门控 $g, \beta$ 来更新记忆。</p>
+<h3>✅ Task 3：确立“分块版标准答案” (Chunk Reference)</h3>
+<p><strong>代码位置</strong>：<code>chunk_gated_delta_rule_ref</code>
+<strong>解读</strong>：
+这是算法的另一种数学等价形式，叫<strong>Chunkwise（分块）</strong>形式。
+*   <strong>要做什么</strong>：把长序列切成小块（Chunk），块内用Attention算，块间用RNN算。
+*   <strong>观点</strong>：这是为了验证“分块计算”逻辑的正确性。现代显卡（GPU）喜欢并行计算，分块通常比纯循环更快。这个函数是用来验证后续分块加速代码的“参考答案”。</p>
+<h3>✅ Task 4：测试一 —— 循环模式的正确性</h3>
+<p><strong>代码位置</strong>：<code>test_recurrent_forward</code>
+<strong>解读</strong>：
+这是第一个正式的测试用例。
+*   <strong>对比双方</strong>：
+    1.  <code>recurrent_gated_delta_rule_ref</code> (上面的慢速标准答案)。
+    2.  <code>fused_recurrent_gated_delta_rule</code> (待测的、融合了算子的、跑得飞快的加速版代码)。
+*   <strong>测试点</strong>：输入随机生成的 $q, k, v$，看两者的输出 <code>o</code> (output) 和最终状态 <code>ht</code> (final state) 是否一致。
+*   <strong>结论</strong>：如果 <code>assert_close</code> 通过，说明加速版的RNN模式写对了。</p>
+<h3>✅ Task 5：测试二 —— 分块模式及其梯度 (最关键的一步)</h3>
+<p><strong>代码位置</strong>：<code>test_chunk</code>
+<strong>解读</strong>：
+这是最全面的测试。
+*   <strong>对比双方</strong>：
+    1.  <code>chunk_gated_delta_rule_ref</code> (分块版标准答案)。
+    2.  <code>chunk_gated_delta_rule</code> (待测的、高度优化的Triton/CUDA分块实现)。
+*   <strong>核心难点</strong>：不仅比对<strong>前向传播（Forward）</strong>的结果，还比对了<strong>反向传播（Backward/Gradient）</strong>。
+*   <strong>代码细节</strong>：
+    *   <code>backward(retain_graph=True)</code>：模拟神经网络训练时的反向求导。
+    *   <code>assert_close(" dq", ...)</code>：检查输入 $q, k, v$ 的梯度是否计算正确。
+*   <strong>观点</strong>：在深度学习中，算对结果只是一半，能正确算出梯度（Gradient）才能用来训练模型。这个Task确保模型是可以被训练的。</p>
+<h3>✅ Task 6：测试三 —— 变长序列 (Variable Length)</h3>
+<p><strong>代码位置</strong>：<code>test_chunk_varlen</code>
+<strong>解读</strong>：
+真实场景中（比如对话），每句话的长度是不一样的。
+*   <strong>场景</strong>：把好几句长短不一的话拼成一个大Batch（Pack模式），而不是用0去填充（Padding）。
+*   <strong>要做什么</strong>：生成随机的 <code>offsets</code>（每句话的分割点），然后测试在变长输入的情况下，算法是否依然正确。
+*   <strong>观点</strong>：这是为了验证算法在处理高效、无Padding数据时的鲁棒性。</p>
+<hr />
+<h3>总结：这文件讲了啥？</h3>
+<p>这个文件并没有讲“算法原理”，而是在说：
+<strong>“我写了一个很复杂、很快的 Gated Delta Rule 算子（Kernel），为了证明它是对的，我用慢速但逻辑简单的Python代码算了一遍，发现两者的结果和梯度完全一致。”</strong></p>
+<p>如果你是使用者，这文件告诉你：<strong>放心用，这代码没Bug，精度对得上。</strong></p>

@@ -1,0 +1,81 @@
+<h1>docs/workers/megatron_workers.rst</h1>
+<p>这份文档确实涉及很多底层大模型训练和系统架构的专业术语，读起来晦涩是很正常的。它主要是在讲 <strong>如何在 <code>verl</code> 这个强化学习框架中，集成 Megatron-LM（一个超大模型训练框架）作为后端</strong>。</p>
+<p>为了让你能够由浅入深地理解，我为你列了一个<strong>学习任务清单 (Task To-Do List)</strong>。我们可以把理解这份文档拆解为 <strong>6 个步骤</strong>，每一步我都会用通俗的语言解释文档中对应的核心观点。</p>
+<hr />
+<h3>📋 学习任务清单 (Task To-Do List)</h3>
+<h4>✅ Task 1: 理解核心目标 —— 为什么要搞这个 Backend？</h4>
+<p><strong>文档对应部分：</strong> <code>Megatron-LM Backend</code> 开头及 <code>Pros/Cons</code></p>
+<ul>
+<li><strong>核心观点</strong>：<ul>
+<li><strong>背景</strong>：一般的框架可能只支持比较小的模型。但是我们要训练几百亿、几千亿参数的模型（比如 GPT-3, DeepSeek 级别），单卡显存肯定不够。</li>
+<li><strong>解决方案</strong>：引入 <strong>Megatron-LM</strong>。它最擅长把大模型切碎了放在很多张显卡上跑（这就是文档提到的 <strong>5D 并行</strong>：张量并行TP、流水线并行PP、数据并行DP等）。</li>
+<li><strong>代价 (Cons)</strong>：Megatron 的模型格式比较特殊，和大家常用的 HuggingFace 格式不一样，需要转换工具。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 理解最牛的功能 —— "3D HybridEngine" 是什么？</h4>
+<p><strong>文档对应部分：</strong> <code>Megatron-LM Backend</code> 简介及 <code>Actor/Rollout HybridEngine</code></p>
+<ul>
+<li><strong>核心痛点</strong>：在 RLHF（强化学习微调）中，模型要在两种状态下反复横跳：<ol>
+<li><strong>生成文本 (Rollout)</strong>：需要推理速度快（vLLM 擅长）。</li>
+<li><strong>训练更新 (Actor)</strong>：需要计算梯度（Megatron 擅长）。</li>
+<li>如果显卡里同时存两份模型（一份用于推理，一份用于训练），显存瞬间爆炸。</li>
+</ol>
+</li>
+<li><strong>核心观点</strong>：文档提出了 <strong>HybridEngine（混合引擎）</strong>。<ul>
+<li>它让 Megatron（训练用）和 vLLM（推理用）<strong>共享同一份权重</strong>。</li>
+<li><strong>工作流</strong>：推理时用 vLLM 跑，训练时无缝切换回 Megatron 跑，中间通过 <code>MegatronVLLMShardingManager</code> 来管理权重的切分和同步。这样既省显存又快。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 理解代码架构 —— 这些 Worker 是干嘛的？</h4>
+<p><strong>文档对应部分：</strong> <code>Utils of Megatron Workers</code></p>
+<ul>
+<li><strong>核心观点</strong>：在分布式系统中，每个 GPU 上跑的进程叫 "Worker"。文档定义了几种角色的 Worker：<ol>
+<li><strong>MegatronWorker</strong>：这是<strong>基类</strong>（老祖宗），负责获取当前显卡是第几号、属于哪个并行组（Rank info）。</li>
+<li><strong>ActorRolloutRefWorker</strong>：这是<strong>最忙的工人</strong>。它身兼三职：<ul>
+<li><strong>Actor</strong>：主角，负责学习和更新参数。</li>
+<li><strong>Rollout</strong>：负责根据提示词生成回答（用 vLLM）。</li>
+<li><strong>Reference</strong>：参考模型，用来防止主角模型跑偏（计算 KL 散度）。</li>
+</ul>
+</li>
+<li><strong>CriticWorker &amp; RewardWorker</strong>：辅助角色。Critic 负责给动作打分（价值网络），Reward 负责计算奖励模型的分数。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 4: 理解数据怎么传输 —— 什么是 Dispatch Mode？</h4>
+<p><strong>文档对应部分：</strong> 代码片段中的 <code>@register(dispatch_mode=...)</code></p>
+<ul>
+<li><strong>核心观点</strong>：因为模型被切碎在很多显卡上（并行），主控节点（Driver）发数据给显卡时，不能随便发，得按规矩来。这就是 <strong>Dispatch Protocol（分发协议）</strong>。<ul>
+<li><code>ONE_TO_ALL</code>：主控发一条指令（比如“初始化模型”），所有显卡都执行一样的操作。</li>
+<li><code>MEGATRON_PP_AS_DP_PROTO</code>：这是一个很技术的细节。简单说，在混合引擎中，推理（vLLM）和训练（Megatron）对显卡的切分方式可能不同。这个协议是为了把数据重新排列组合，确保在推理完成后，数据能正确地传回给训练模块，即便它们的并行方式（TP/PP）不一样。</li>
+<li><code>MEGATRON_COMPUTE_PROTO</code>：标准的计算协议。数据按“数据并行(DP)”维度切分，大家算完后，只由特定的显卡（Rank 0）把结果汇总回去。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 理解优化手段 —— 显存不够怎么办？</h4>
+<p><strong>文档对应部分：</strong> <code>Utils of Train Optimization</code> (Offload &amp; Profiler)</p>
+<ul>
+<li><strong>核心观点</strong>：<ul>
+<li><strong>Offload (卸载)</strong>：如果显存实在不够了，可以把暂时不用的参数、梯度、优化器状态<strong>搬到 CPU 内存</strong>里去（虽然慢点，但能跑起来）。文档里展示了如何通过配置 <code>param_offload=True</code> 来开启。</li>
+<li><strong>Profiler (性能分析)</strong>：如果你觉得训练太慢，不知道卡在哪一步，可以用 Profiler。它能记录每一步花了多少时间，帮你捉虫（Bottleneck）。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 6: 了解当前进度 —— 现在能支持什么？</h4>
+<p><strong>文档对应部分：</strong> <code>Development Progress</code> 表格</p>
+<ul>
+<li><strong>核心观点</strong>：这是一个功能清单，告诉你哪些可以用，哪些还在画饼。<ul>
+<li><strong>[Done]</strong>：已经做好的。比如支持 vLLM 0.8.2，支持 Qwen2MoE 模型，支持 Context Parallel（长文本并行）。</li>
+<li><strong>[WIP]</strong>：正在做的。比如支持 <strong>DeepSeek-V3</strong> 模型，支持动态 Batch Size。</li>
+<li><strong>[Deprecated]</strong>：废弃不用的旧功能。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结一下 (TL;DR)</h3>
+<p>这篇文章其实就是一份 <strong>技术说明书</strong>，告诉开发者：</p>
+<blockquote>
+<p>"嘿，如果你想用 <code>verl</code> 框架来训练<strong>超大模型</strong>，我们已经集成了 <strong>Megatron</strong> 后端。为了省显存，我们搞了个 <strong>训练(Megatron)+推理(vLLM) 的混合引擎</strong>。文章里写了我们支持哪些功能列表，以及代码里各个 Worker 是怎么分工协作、怎么传数据的，还有怎么开启 CPU 卸载来省显存。"</p>
+</blockquote>
+<p>希望这个 List 能帮你理清思路！如果对某一个具体的 Task 还有疑问，可以随时问我。</p>

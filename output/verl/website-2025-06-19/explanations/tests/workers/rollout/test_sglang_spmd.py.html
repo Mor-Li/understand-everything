@@ -1,0 +1,98 @@
+<h1>tests/workers/rollout/test_sglang_spmd.py</h1>
+<p>这份代码确实涉及了很多底层概念（分布式计算、PyTorch 并行、异步编程），乍一看很难懂。</p>
+<p>简单来说，这是一个 <strong>“自动化测试脚本”</strong>。它的目的是验证 <strong>SGLang</strong> 这个框架在多显卡并行（SPMD/Tensor Parallel）模式下，生成的文本是否正确。</p>
+<p>为了让你更容易理解，我把它拆解成一个 <strong>5步走的任务清单 (Todo List)</strong>，带你一步步看懂它在干什么。</p>
+<hr />
+<h3>任务清单 (Todo List)</h3>
+<h4>✅ 任务 1：准备考场与工具 (环境初始化)</h4>
+<p><strong>目标</strong>：确保有两张显卡，并建立显卡之间的通信连接。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    assert torch.cuda.device_count() &gt;= 2  # 检查显卡够不够
+    initialize_global_process_group(spmd=True) # 建立通信组
+    clean_torchelastic_env()</code></li>
+<li><strong>白话解释</strong>：
+    这就好比考试前，先确认考场里有两个考生（两张显卡），并且发给他们对讲机（初始化通信组），确保他们能互相说话。因为我们要测的是“多人合作”答题的能力。</li>
+</ul>
+<h4>✅ 任务 2：制作“标准答案” (Baseline)</h4>
+<p><strong>目标</strong>：用最传统的 Hugging Face (HF) 方式跑一遍模型，得到正确答案。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    local_model_path = "Qwen/Qwen2.5-0.5B"
+    tokenizer, actor_model = load_tokenizer_and_model(local_model_path)
+    # ... 准备输入 prompts ...
+    hf_response_tokens = generate_hf_output(...) # 跑一遍得到结果</code></li>
+<li><strong>白话解释</strong>：
+    我们要验证 SGLang 算得对不对，得先有个标准。这里加载了一个很小的模型（Qwen-0.5B），问它几个问题（比如“谁赢了2019欧冠？”）。
+    <code>hf_response_tokens</code> 就是<strong>标准答案</strong>。如果 SGLang 跑出来的跟这个不一样，那就说明 SGLang 有 Bug。</li>
+</ul>
+<h4>✅ 任务 3：配置“考生” SGLang (SGLang 引擎设置)</h4>
+<p><strong>目标</strong>：初始化 SGLang 引擎，并开启“张量并行” (Tensor Parallelism)。</p>
+<ul>
+<li>
+<p><strong>代码对应</strong>：
+    ```python
+    inference_device_mesh_cpu = init_device_mesh(...) # 定义并行策略
+    tp_rank = ... # 获取当前显卡的编号</p>
+<p>if tp_rank == 0: # 只有主显卡负责这一步
+    llm = Engine(
+        ...,
+        tp_size=inference_device_mesh_cpu["tp"].size(), # 告诉引擎我们要用几张卡并行
+    )
+<code>``
+*   **白话解释**：
+这是最核心的部分。
+*   我们告诉系统：我们要把模型切开，分给两张显卡一起算（</code>tp_size=2<code>）。
+*   **注意**：代码里有个</code>if tp_rank == 0<code>。这说明只有“班长”（第0号显卡）负责启动引擎对象，其他显卡（第1号）在底层默默配合，不需要在 Python 层面创建</code>Engine` 对象。</p>
+</li>
+</ul>
+<h4>✅ 任务 4：考生答题与同步 (SGLang 推理)</h4>
+<p><strong>目标</strong>：让 SGLang 回答同样的问题，并把结果广播给所有进程。</p>
+<ul>
+<li>
+<p><strong>代码对应</strong>：
+    ```python
+    if tp_rank == 0:
+        # 只有班长负责发号施令，异步生成结果
+        outputs = loop.run_until_complete(llm.async_generate(...))
+    else:
+        outputs = None # 其他人暂时没有结果</p>
+<h1>关键步骤：广播结果</h1>
+<p>[outputs] = broadcast_pyobj(
+    [outputs],
+    rank=..., # 班长把结果发给所有人
+    ...
+)
+<code>``
+*   **白话解释**：
+*   **答题**：班长（Rank 0）调用 SGLang 的</code>async_generate<code>方法开始计算。虽然代码只在 Rank 0 写了，但因为开启了并行，底层的计算其实是两张卡一起完成的。
+*   **广播**：算完后，只有班长手里拿着答案。为了让大家都能核对，班长通过</code>broadcast_pyobj` 把答案复印发给其他所有显卡进程。</p>
+</li>
+</ul>
+<h4>✅ 任务 5：批改试卷 (验证结果)</h4>
+<p><strong>目标</strong>：对比 SGLang 的答案和之前 Hugging Face 的标准答案。</p>
+<ul>
+<li>
+<p><strong>代码对应</strong>：
+    ```python
+    sglang_response_tokens = [output["text"] for output in outputs]
+    print(f"sglang response: {sglang_response_tokens}")</p>
+<h1>核心测试断言</h1>
+<p>assert are_lists_similar(hf_response_tokens, sglang_response_tokens)
+print("SPMD Test Passed!")
+<code>``
+*   **白话解释**：
+最后一步，对比任务2算出的</code>hf_response_tokens<code>和任务4算出的</code>sglang_response_tokens<code>。
+如果两者相似度很高（或者完全一致），就打印 "Test Passed!"，说明 SGLang 在多卡并行模式下工作正常。最后清理现场，把两个显卡解散（</code>destroy_process_group`）。</p>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个脚本的逻辑就是：
+1.  <strong>准备环境</strong>（双卡）。
+2.  <strong>先算一遍</strong>（用普通方法算个标准答案）。
+3.  <strong>再算一遍</strong>（用 SGLang 的多卡并行方法算）。
+4.  <strong>对比</strong>（如果一样，说明 SGLang 没写挂）。</p>
+<p>其中的难点在于 <code>if tp_rank == 0</code> 这种写法，这是并行编程的特色：同一份代码在两张卡上跑，我们通过判断“我是谁”（rank几）来决定我该干什么（是发号施令还是等待同步）。</p>

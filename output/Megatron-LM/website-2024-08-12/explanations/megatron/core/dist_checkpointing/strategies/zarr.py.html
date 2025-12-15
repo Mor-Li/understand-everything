@@ -1,0 +1,103 @@
+<h1>megatron/core/dist_checkpointing/strategies/zarr.py</h1>
+<p>这份代码确实看起来比较枯燥，因为它涉及到底层的分布式存储逻辑。别担心，我们把它想象成一个<strong>“大型拼图游戏的存档管理员”</strong>。</p>
+<p>在分布式训练（Megatron）中，一个巨大的模型（拼图）被拆散在很多张显卡（玩家）上。当需要保存进度（Checkpoint）时，不能只是简单的保存，因为大家手里都只有拼图的一小部分。</p>
+<p>这个文件的作用就是：<strong>教系统如何利用 Zarr 这种格式，把分散在各处的拼图碎片，整齐地存进硬盘里，或者从硬盘里读出来。</strong></p>
+<p>为了让你看懂，我为你列了一个 <strong>“理解任务清单 (To-Do List)”</strong>，我们一步步打钩，把逻辑理顺。</p>
+<hr />
+<h3>✅ Task 1: 搞懂背景设定 (Context)</h3>
+<p><strong>目标</strong>：知道这个文件是干嘛的，以及它的状态。</p>
+<ul>
+<li><strong>核心角色</strong>：<code>Zarr</code>。这是一个用来存储多维数组的格式（类似 HDF5，但更适合云存储和并行读写）。</li>
+<li><strong>当前状态</strong>：代码开头有一个 <code>logger.warning</code>，明确说 <strong>"zarr backend is deprecated"</strong>。<ul>
+<li><strong>含义</strong>：官方已经不推荐用这个方式存模型了，建议改用 <code>torch_dist</code>。</li>
+<li><strong>结论</strong>：这大概率是为了兼容旧版本存档而保留的代码。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 2: 搞懂数据类型转换 (Type Mapping)</h3>
+<p><strong>目标</strong>：理解 Python/Numpy 和 PyTorch 之间语言不通的问题。</p>
+<ul>
+<li><strong>问题</strong>：Zarr 底层是用 Numpy 库的逻辑存数据的，而训练用的是 PyTorch Tensor。两者对数据类型的叫法不一样（比如 <code>torch.float32</code> vs <code>np.dtype('float32')</code>）。</li>
+<li><strong>代码实现</strong>：<ul>
+<li><code>numpy_to_torch_dtype_dict</code>：翻译字典，把 Numpy 类型转成 PyTorch 类型。</li>
+<li><code>torch_to_numpy_dtype_dict</code>：反向翻译。</li>
+<li><strong>特殊处理</strong>：代码里有一大段关于 <code>bfloat16</code> 的逻辑。因为 Numpy 早期版本原生不支持 <code>bfloat16</code>（一种深度学习常用的半精度浮点数），所以这里必须手动打补丁（Hack）来支持它。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 3: 理解“保存”策略 (Saving Strategy)</h3>
+<p><strong>目标</strong>：看懂 <code>ZarrSaveShardedStrategy</code> 类是如何把显卡里的碎片存进硬盘的。</p>
+<p>这是一个多显卡协作的过程，想象有 8 个人（8张卡）要往同一个大本子里写字。</p>
+<ol>
+<li>
+<p><strong>准备阶段</strong>：</p>
+<ul>
+<li><code>save</code> 函数被调用。</li>
+<li>它会把所有的张量（Tensors）列出来。</li>
+</ul>
+</li>
+<li>
+<p><strong>创建/打开文件 (<code>_create_or_open_zarr_arrays</code>)</strong>：</p>
+<ul>
+<li><strong>难点</strong>：8个人不能同时创建一个新本子，否则会打架。</li>
+<li><strong>逻辑</strong>：<ul>
+<li><strong>主负责人（Main Replica）</strong> 且持有 <strong>第一块碎片（Offset 0）</strong> 的人，负责 <strong>创建（Create）</strong> Zarr 数组文件。</li>
+<li>其他人等待（<code>torch.distributed.barrier()</code>，这是一个红绿灯，等大家都这就位）。</li>
+<li>其他人 <strong>打开（Open）</strong> 刚才主负责人创建好的文件。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>写入数据 (<code>_save_to_existing_array</code>)</strong>：</p>
+<ul>
+<li>每张卡把自己显存里的数据 (<code>tensor.data</code>) 搬到 CPU (<code>.cpu()</code>)。</li>
+<li>转成 Numpy 格式。</li>
+<li>如果是 <code>bfloat16</code>，要做特殊转换。</li>
+<li>最后，根据自己手里碎片在全图中的坐标 (<code>global_slice</code>)，把数据填入 Zarr 数组的对应位置。</li>
+</ul>
+</li>
+</ol>
+<h3>✅ Task 4: 理解“加载”策略 (Loading Strategy)</h3>
+<p><strong>目标</strong>：看懂 <code>ZarrLoadShardedStrategy</code> 类是如何把硬盘里的数据读回显卡的。</p>
+<p>这是保存的逆过程：</p>
+<ol>
+<li>
+<p><strong>读取元数据 (<code>load_tensors_metadata</code>)</strong>：</p>
+<ul>
+<li>先不读具体数字，先扫描文件夹，看看有哪些数组，形状是多大，什么类型。</li>
+<li>构建一个“虚拟”的字典，告诉系统硬盘里有哪些货。</li>
+</ul>
+</li>
+<li>
+<p><strong>具体加载 (<code>load</code> -&gt; <code>_load_from_array</code>)</strong>：</p>
+<ul>
+<li>打开 Zarr 文件。</li>
+<li>检查形状对不对（防止你拿 7B 模型的参数去喂 13B 的模型）。</li>
+<li><strong>切片读取</strong>：<code>arr[sharded_tensor.global_slice()]</code>。只读取当前这张显卡负责的那一小块区域，而不是把整个几百GB的模型都读进内存。</li>
+</ul>
+</li>
+<li>
+<p><strong>后处理 (<code>postprocess_numpy_array</code>)</strong>：</p>
+<ul>
+<li>读出来的是 Numpy 数组，要转回 PyTorch Tensor。</li>
+<li><strong>形状对齐</strong>：有时候读出来的数据比显卡需要的少（或者不一致），代码里有 <code>pad_to_expected_shape</code> 函数，负责给数据“补零”或者填充，确保形状完美匹配。</li>
+</ul>
+</li>
+</ol>
+<h3>✅ Task 5: 总结核心逻辑 (Summary)</h3>
+<p>如果让你用一句话总结这个文件：</p>
+<blockquote>
+<p><strong>这是一个适配器文件，它负责在 PyTorch 分布式张量（ShardedTensor）和 Zarr 磁盘数组之间进行搬运。它解决了多进程并发写文件的冲突问题，并处理了 bfloat16 等特殊类型的兼容性。</strong></p>
+</blockquote>
+<hr />
+<h3>💡 快速过一遍代码里的关键函数（中文翻译版）</h3>
+<ol>
+<li><strong><code>ZarrSaveShardedStrategy</code></strong>: "我是存档策略总指挥。"</li>
+<li><strong><code>_create_or_open_zarr_arrays</code></strong>: "我是交通指挥员。如果你是排头兵，你建文件；如果你是跟班，你等排头兵建好后再打开文件。"</li>
+<li><strong><code>_save_to_existing_array</code></strong>: "我是搬运工。把显存里的数据拿出来，转成 Numpy，按坐标填进文件里。"</li>
+<li><strong><code>ZarrLoadShardedStrategy</code></strong>: "我是读档策略总指挥。"</li>
+<li><strong><code>_load_from_array</code></strong>: "我是取货员。去文件里只把属于我这一块的数据切下来，带走。"</li>
+<li><strong><code>pad_to_expected_shape</code></strong>: "我是裁缝。如果读出来的数据尺寸不对，我负责补齐（Padding）。"</li>
+</ol>
+<p>现在再回头看代码，是不是清晰很多了？这个文件其实就是写了一套<strong>读写规则</strong>。</p>

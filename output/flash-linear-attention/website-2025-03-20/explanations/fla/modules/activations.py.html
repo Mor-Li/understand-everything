@@ -1,0 +1,78 @@
+<h1>fla/modules/activations.py</h1>
+<p>这份代码确实一上来会让人有点晕，因为它不仅仅是写神经网络的模型层，而是<strong>为了极致的性能优化，用底层技术重写了常用的激活函数</strong>。</p>
+<p>可以把它想象成一个<strong>“高级赛车零件改装车间”</strong>。普通的PyTorch函数就像原厂零件，能用但不够快；这里面的代码是手搓的“钛合金零件”，为了让大模型跑得飞快。</p>
+<p>为了让你读懂，我制定了一个 <strong>6步走的“通关任务清单” (To-Do List)</strong>。我们一步步来拆解：</p>
+<h3>✅ Task 1: 理解“激活函数”的本质 (基础知识)</h3>
+<p><strong>目标</strong>：知道这文件是干嘛的。
+*   <strong>核心观点</strong>：神经网络里，数据流过一层层网络，需要“激活函数”来增加非线性（否则网络就是一堆线性乘法，没法变聪明）。
+*   <strong>文件里的角色</strong>：这里面列出的 <code>Sigmoid</code>, <code>Swish</code>, <code>GeLU</code>, <code>SwiGLU</code> 全是各种不同的激活函数。
+*   <strong>为什么重写？</strong>：PyTorch自带的虽然好用，但在处理超长序列（比如几万字的文本）时，速度不够快，显存占用太高。这个文件用了更底层的手段来加速。</p>
+<hr />
+<h3>✅ Task 2: 看懂“魔法咒语”——CUDA JIT (加速简单函数)</h3>
+<p><strong>目标</strong>：理解 <code>sigmoid_fwd_codestring</code> 这种字符串是啥。
+*   <strong>代码片段</strong>：
+    <code>python
+    sigmoid_fwd_codestring = """
+    template &lt;typename T&gt; T sigmoid_fwd(T x) {
+        return 1.0f / (1.0f + ::exp(-float(x)));
+    }
+    """</code>
+*   <strong>解释</strong>：
+    *   这不是Python代码，这是 <strong>C++ CUDA 代码</strong>。
+    *   <strong>原理</strong>：Python解释器运行慢。作者直接把计算公式写成C++字符串，通过 <code>torch.cuda.jiterator</code> 这个工具，在程序运行时<strong>即时编译 (JIT)</strong> 成机器码扔给显卡跑。
+    *   <strong>效果</strong>：比普通的PyTorch写法快很多，尤其是 <code>Sigmoid</code> 和 <code>Swish</code> 这种逐元素计算的操作。
+    *   <strong>对应部分</strong>：<code>SigmoidFunction</code>, <code>SwishFunction</code>。</p>
+<hr />
+<h3>✅ Task 3: 挑战“Triton”——GPU编程神器 (LogSigmoid)</h3>
+<p><strong>目标</strong>：理解 <code>logsigmoid_fwd_kernel</code> 这种带 <code>@triton.jit</code> 的函数。
+*   <strong>代码片段</strong>：
+    <code>python
+    @triton.jit
+    def logsigmoid_fwd_kernel(...):
+        # ... 一堆 tl.load, tl.store</code>
+*   <strong>解释</strong>：
+    *   <strong>Triton</strong> 是OpenAI推出的一个用Python写GPU内核的语言。它比写C++ CUDA简单，但比纯PyTorch快。
+    *   <strong>LogSigmoid 的难点</strong>：直接算 <code>log(sigmoid(x))</code> 容易出现数值溢出（变成NaN）。
+    *   <strong>代码逻辑</strong>：它把数据切成小块（Block），在GPU上并行计算。里面用了数学技巧（<code>log-sum-exp</code> trick）来保证数值稳定，防止溢出。
+    *   <strong>forward/backward</strong>：<code>fwd</code> 是前向传播（算结果），<code>bwd</code> 是反向传播（训练时算梯度）。</p>
+<hr />
+<h3>✅ Task 4: 搞定“近似计算”——GeLU 的各种变体</h3>
+<p><strong>目标</strong>：理解为什么会有 <code>bias_gelu</code>, <code>fast_gelu</code>。
+*   <strong>核心观点</strong>：标准的 GeLU 函数包含复杂的数学运算（误差函数 erf），计算很慢。
+*   <strong>优化手段</strong>：
+    *   <strong>Tanh 近似</strong>：代码里的 <code>0.79788456 * x * (1 + 0.044715 * x * x)</code> 是一个经典的数学公式，用 <code>tanh</code> 函数模拟 GeLU 的形状，算起来飞快，误差极小。
+    *   <strong>torch.compile</strong>：你看这些函数头上都有 <code>@torch.compile</code>。这是PyTorch 2.0的新特性，自动把多个小操作合并成一个大操作（算子融合），减少GPU读写内存的次数。</p>
+<hr />
+<h3>✅ Task 5: 终极BOSS——SwiGLU 与“用时间换空间”</h3>
+<p><strong>目标</strong>：理解 <code>SwiGLULinearFunction</code> 这个最复杂的类。
+*   <strong>背景</strong>：SwiGLU 是现在最火的大模型（如 LLaMA）用的激活函数。
+*   <strong>痛点</strong>：它需要保留中间结果以便反向传播算梯度，这非常占显存。
+*   <strong>黑科技 (Activation Checkpointing / Rematerialization)</strong>：
+    *   注意 <code>SwiGLULinearFunction.forward</code> 里有一句：
+        <code>python
+        # We don't store z, will be recomputed in the backward pass to save memory</code>
+    *   <strong>解释</strong>：在前向传播时，算出了中间结果 <code>z</code>，用完立刻扔掉（不存到显存里）。
+    *   <strong>反向传播时</strong>：在 <code>backward</code> 函数里，代码重新运行了一遍计算逻辑 <code>swiglu_fwdbwd</code>，把 <code>z</code> 再次算出来。
+    *   <strong>总结</strong>：虽然多算了一次，但是<strong>省下了巨大的显存</strong>，这样你就能在有限的显卡上训练更大的模型。</p>
+<hr />
+<h3>✅ Task 6: 最后的菜单——ACT2FN</h3>
+<p><strong>目标</strong>：看懂文件末尾。
+*   <strong>代码片段</strong>：
+    <code>python
+    ACT2FN = {
+        'relu': F.relu,
+        'sigmoid': sigmoid,
+        'swish': swish,
+        # ...
+    }</code>
+*   <strong>解释</strong>：这只是一个<strong>字典（目录）</strong>。
+*   <strong>作用</strong>：让用户可以通过字符串名字（比如 "swish"）来调用上面定义的那些复杂的加速函数。</p>
+<hr />
+<h3>总结一下你的学习路径：</h3>
+<ol>
+<li><strong>Sigmoid/Swish</strong>：看懂是为了用 <strong>C++ JIT</strong> 加速简单运算。</li>
+<li><strong>LogSigmoid</strong>：看懂是为了用 <strong>Triton</strong> 处理数值稳定性和并行。</li>
+<li><strong>GeLU</strong>：看懂是为了用 <strong>数学近似</strong> 和 <strong>编译优化</strong> 提速。</li>
+<li><strong>SwiGLU</strong>：看懂是为了用 <strong>重计算策略</strong> 省显存。</li>
+</ol>
+<p>这个文件就是<strong>为了让大模型跑得又快又省显存</strong>而专门定制的一套工具箱。看不懂具体的数学公式没关系，只要知道它们是为了“加速”和“省内存”存在的即可。</p>

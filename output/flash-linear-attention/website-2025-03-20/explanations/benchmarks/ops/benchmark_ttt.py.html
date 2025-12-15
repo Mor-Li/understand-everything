@@ -1,0 +1,106 @@
+<h1>benchmarks/ops/benchmark_ttt.py</h1>
+<p>这份代码是一个<strong>性能基准测试脚本（Benchmark Script）</strong>。</p>
+<p>简单来说，它的作用是让几个不同的算法（都是处理序列数据的模型层）在相同的跑道上“赛跑”，看谁跑得快，以及在不同数据量下它们的表现如何。</p>
+<p>为了让你更容易理解，我把阅读这份代码拆解成一个 <strong>“6步任务清单” (Todo List)</strong>，我们一步步来完成。</p>
+<hr />
+<h3>✅ Task 1: 搞清楚“比赛”的目的是什么？</h3>
+<p><strong>目标：</strong> 理解脚本的核心意图。</p>
+<ul>
+<li><strong>核心功能</strong>：对比四种不同算法的<strong>训练速度</strong>（即：前向传播 Forward + 反向传播 Backward 的总耗时）。</li>
+<li><strong>参赛选手</strong>（代码中的 <code>methods</code>）：<ol>
+<li><code>chunk_gla</code> (Gated Linear Attention 的分块版本)</li>
+<li><code>chunk_delta_rule</code> (Delta Rule 的分块版本)</li>
+<li><code>chunk_ttt_linear</code> (Test-Time Training 层的分块线性版本)</li>
+<li><code>fused_chunk_ttt_linear</code> (TTT 的融合优化版本，通常比上面那个更快)</li>
+</ol>
+</li>
+<li><strong>来自哪里</strong>：这些算法都来自 <code>fla.ops</code> 库（Fast Linear Attention），这是专门做高效注意力机制的库。</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 准备“计时器”工具</h3>
+<p><strong>目标：</strong> 看懂代码前半部分的辅助函数。</p>
+<p>代码定义了三个函数，用来掐表计时：
+*   <code>time_fwd</code>: 只测前向传播（推理速度）。
+*   <code>time_bwd</code>: 只测反向传播（计算梯度的速度）。
+*   <code>time_fwd_bwd</code>: <strong>这是重点</strong>，测两者之和（训练速度）。</p>
+<blockquote>
+<p><strong>代码对应：</strong>
+<code>python
+def time_fwd_bwd(func, *args, **kwargs):
+    # 调用 benchmark_combined 进行测试，返回平均时间
+    time_fb = benchmark_combined(func, *args, **kwargs)
+    return time_fb[1].mean</code></p>
+</blockquote>
+<hr />
+<h3>✅ Task 3: 设定“考卷”的难度</h3>
+<p><strong>目标：</strong> 理解测试的配置变量。</p>
+<p>为了全面评估，不能只测一种情况。代码设置了不同的变量组合：</p>
+<ol>
+<li><strong>数据精度</strong> (<code>dtype</code>): <code>bfloat16</code> (一种半精度浮点数，现在大模型训练常用的格式)。</li>
+<li><strong>题目数量与长度</strong> (<code>bs_seqlen_vals</code>):<ul>
+<li><code>(8, 2048)</code>: 8个样本，每个长度2048。</li>
+<li><code>(4, 4096)</code>: 4个样本，每个长度4096。</li>
+<li><code>(2, 8192)</code>: 2个样本，每个长度8192。</li>
+<li><em>注意：总计算量大致相同，为了看算法对长序列的适应能力。</em></li>
+</ul>
+</li>
+<li><strong>特征维度</strong> (<code>headdim_vals</code>): <code>[64]</code> (每个注意力头的维度)。</li>
+</ol>
+<hr />
+<h3>✅ Task 4: 搭建“赛场” (主循环逻辑)</h3>
+<p><strong>目标：</strong> 理解 <code>for</code> 循环在干什么。</p>
+<p>代码使用了三层嵌套循环，遍历所有的配置组合：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">for</span> <span class="n">causal</span> <span class="ow">in</span> <span class="n">causal_vals</span><span class="p">:</span>       <span class="c1"># 是否是因果（类似GPT，只能看过去）</span>
+    <span class="k">for</span> <span class="n">headdim</span> <span class="ow">in</span> <span class="n">headdim_vals</span><span class="p">:</span> <span class="c1"># 维度大小</span>
+        <span class="k">for</span> <span class="n">B</span><span class="p">,</span> <span class="n">seqlen</span> <span class="ow">in</span> <span class="n">bs_seqlen_vals</span><span class="p">:</span> <span class="c1"># 批次和长度</span>
+            <span class="c1"># ... 在这里进行具体的比赛 ...</span>
+</code></pre></div>
+
+<p>每一次循环，就是一场特定规格的比赛。</p>
+<hr />
+<h3>✅ Task 5: 选手入场与比赛 (核心代码块)</h3>
+<p><strong>目标：</strong> 看懂每个算法是怎么被测试的。这里是代码最长、看似最乱的部分，其实结构完全一样。</p>
+<p>逻辑是：<strong>造假数据 -&gt; 预热 -&gt; 正式计时</strong>。</p>
+<p>以 <strong>TTT (Test-Time Training)</strong> 算法为例（代码中间部分）：</p>
+<ol>
+<li><strong>造数据 (Input Tensors)</strong>:
+    <code>python
+    # q, k, v 是注意力机制的标准输入
+    q = torch.randn(..., requires_grad=True) 
+    # w, b, eta 是 TTT 算法特有的额外参数
+    w = torch.randn(...) 
+    eta = torch.rand(...)</code></li>
+<li><strong>预热 (Warmup)</strong>:
+    <code>python
+    # 先跑一遍，确保CUDA核心启动，并计算一次梯度，构建计算图
+    o3, _, _ = chunk_ttt_linear(q, k, v, w, b, eta, chunk_size=16)
+    o3.sum().backward(retain_graph=True)</code></li>
+<li><strong>正式计时 (Benchmark)</strong>:
+    <code>python
+    # 把函数和参数扔进计时器
+    f_b = time_fwd_bwd(
+        chunk_ttt_linear, q, k, v, w, b, eta, chunk_size=16, verbose=False
+    )
+    # 记录成绩
+    time_f_b[config, "chunk_ttt_linear"] = f_b</code></li>
+</ol>
+<p><strong>观察点：</strong>
+你会发现 <code>chunk_gla</code>，<code>chunk_delta_rule</code> 和 <code>chunk_ttt</code> 的输入参数略有不同（比如 GLA 需要 <code>g</code>，Delta 需要 <code>beta</code>），这反映了它们数学原理的不同，但测试流程是一模一样的。</p>
+<hr />
+<h3>✅ Task 6: 公布成绩单</h3>
+<p><strong>目标：</strong> 理解最后的输出。</p>
+<p>循环结束后，代码会打印结果：</p>
+<div class="codehilite"><pre><span></span><code><span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;### causal=</span><span class="si">{</span><span class="n">causal</span><span class="si">}</span><span class="s2">, ... ###&quot;</span><span class="p">)</span> <span class="c1"># 打印当前的配置</span>
+<span class="k">for</span> <span class="n">method</span> <span class="ow">in</span> <span class="n">methods</span><span class="p">:</span>
+    <span class="c1"># 打印：算法名 + 耗时(毫秒)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">method</span><span class="si">:</span><span class="s2">&gt;50</span><span class="si">}</span><span class="s2"> fwd + bwd:</span><span class="se">\t</span><span class="s2"> </span><span class="si">{</span><span class="n">time_f_b</span><span class="p">[</span><span class="n">config</span><span class="p">,</span><span class="w"> </span><span class="n">method</span><span class="p">]</span><span class="o">*</span><span class="mi">1000</span><span class="si">:</span><span class="s2">&gt;6.4f</span><span class="si">}</span><span class="s2"> ms &quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>被注释掉的代码：</strong>
+后面有一大段被注释掉的代码（<code>speed_f</code>, <code>TFLOPs/s</code> 等）。那些代码原本是用来计算“每秒浮点运算次数”（即算力利用率）的，但在这个版本中被关掉了，只看单纯的时间（毫秒）。</p>
+<hr />
+<h3>总结 (Takeaway)</h3>
+<p><strong>这个脚本讲了啥？</strong>
+它在说：“在处理长度为 2048/4096/8192 的序列时，<strong>TTT算法</strong>（普通版 vs 融合版）相比于 <strong>GLA</strong> 和 <strong>Delta Rule</strong> 算法，到底谁训练得更快？”</p>
+<p><strong>你需要关注什么？</strong>
+如果你是使用者，你只需要运行它，然后看最后打印出的 <code>ms</code> 数值。数值越小，代表该算法在该配置下运行效率越高。通常你会发现 <code>fused_chunk_ttt_linear</code> 应该是最快的，因为它做了底层的融合优化。</p>

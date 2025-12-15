@@ -1,0 +1,134 @@
+<h1>verl/third_party/vllm/vllm_v_0_3_1/parallel_state.py</h1>
+<p>这份代码确实比较晦涩，因为它涉及到了<strong>分布式计算</strong>中最绕的“通信组（Process Group）”管理。而且这是一个连接 <strong>Megatron-LM</strong>（训练框架）和 <strong>vLLM</strong>（推理框架）的“桥梁”文件。</p>
+<p>为了让你看懂，我们把这个过程想象成<strong>“给一群工人重新分组”</strong>的任务。</p>
+<p>我们设定一个 To-Do List，每完成一步，你就理解了代码的一部分。</p>
+<hr />
+<h3>任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1：理解核心背景（我们在做什么？）</strong></li>
+<li><strong>Task 2：搞懂两个关键术语（TP 和 DP）</strong></li>
+<li><strong>Task 3：理解代码的主逻辑（初始化分组）</strong></li>
+<li><strong>Task 4：攻克最难点（当训练和推理的配置不一样时）</strong></li>
+<li><strong>Task 5：理解工具函数（API 暴露）</strong></li>
+</ol>
+<hr />
+<h3>Task 1：理解核心背景（我们在做什么？）</h3>
+<ul>
+<li><strong>场景</strong>：你正在使用 <code>verl</code> 这个框架做大模型强化学习（RLHF）。</li>
+<li><strong>问题</strong>：RLHF 有两个阶段：<ol>
+<li><strong>生成（Inference）</strong>：模型写作文。这步 vLLM 很快。</li>
+<li><strong>训练（Training）</strong>：根据作文的好坏更新模型参数。这步 Megatron 很强。</li>
+</ol>
+</li>
+<li><strong>痛点</strong>：为了省显存，我们不想把模型在显存里复制两份。我们希望 vLLM 和 Megatron <strong>共用同一份显存里的模型权重</strong>。</li>
+<li><strong>本文件的作用</strong>：这是一个<strong>“翻译官”</strong>。Megatron 已经把 GPU 分好组开始训练了，现在轮到 vLLM 上场，它需要读取 Megatron 的分组信息，并根据自己的推理需求，建立一套自己的通信录。</li>
+</ul>
+<h3>Task 2：搞懂两个关键术语（TP 和 DP）</h3>
+<p>在代码中反复出现这两个词，必须先看懂：</p>
+<ul>
+<li><strong>TP (Tensor Parallel，模型并行)</strong>：<ul>
+<li><em>比喻</em>：模型太大，一个脑子装不下。把脑子<strong>切开</strong>，GPU-A 存左半脑，GPU-B 存右半脑。它俩必须紧密合作才能思考。</li>
+<li><em>代码对应</em>：<code>_TENSOR_MODEL_PARALLEL_GROUP</code></li>
+</ul>
+</li>
+<li><strong>DP (Data Parallel，数据并行)</strong>：<ul>
+<li><em>比喻</em>：一个脑子算得太慢。搞两个<strong>一模一样</strong>的脑子（副本）。GPU-A 组处理前 10 道题，GPU-B 组处理后 10 道题。</li>
+<li><em>代码对应</em>：<code>_MICRO_DATA_PARALLEL_GROUP</code>（这里加了 Micro 是因为它是局部的数据并行，后面会细说）。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 3：理解代码的主逻辑（初始化分组）</h3>
+<p>请看函数 <code>initialize_model_parallel_from_megatron</code>。这是全篇的核心。</p>
+<ul>
+<li>
+<p><strong>步骤 3.1：检查入场券</strong></p>
+<ul>
+<li>代码开头引用了 <code>megatron</code>。这说明：<strong>必须先启动 Megatron</strong>，确立了“训练时的 GPU 分组”，然后才能运行这个函数。</li>
+<li>参数 <code>tensor_model_parallel_size</code>：这是你<strong>想要</strong>在推理（vLLM）时使用的 TP 大小。</li>
+</ul>
+</li>
+<li>
+<p><strong>步骤 3.2：最简单的情况（Train TP == Infer TP）</strong></p>
+<ul>
+<li><strong>情况</strong>：训练时用了 4 张卡切分模型，推理时你也想用 4 张卡。</li>
+<li><strong>代码逻辑</strong>：
+    <code>python
+    if tensor_model_parallel_size == mpu.get_tensor_model_parallel_world_size():
+         # 直接照搬 Megatron 的分组
+         ps._TENSOR_MODEL_PARALLEL_GROUP = mpu.get_tensor_model_parallel_group()</code></li>
+<li><strong>解释</strong>：既然配置一样，直接把 Megatron 的通信组拿来用就行了。不需要新建组。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 4：攻克最难点（当训练和推理的配置不一样时）</h3>
+<p>这是代码 <code>else</code> 分支的内容，也是最难理解的 <code>Micro Data Parallel</code> 出现的原因。</p>
+<ul>
+<li>
+<p><strong>场景假设</strong>：</p>
+<ul>
+<li><strong>训练时 (Megatron)</strong>：模型很大，需要 <strong>TP=4</strong>（4 张卡拼成一个脑子）。</li>
+<li><strong>推理时 (vLLM)</strong>：推理通常比训练省显存。你觉得 <strong>TP=2</strong> 就够了（2 张卡拼成一个脑子）。</li>
+<li><strong>总资源</strong>：你有 4 张卡（Rank 0, 1, 2, 3）。</li>
+</ul>
+</li>
+<li>
+<p><strong>现在的尴尬局面</strong>：</p>
+<ul>
+<li>Megatron 看来：(0, 1, 2, 3) 是一个整体。</li>
+<li>vLLM 想要：(0, 1) 是一个脑子，(2, 3) 是另一个脑子。</li>
+</ul>
+</li>
+<li>
+<p><strong>代码是如何“重新分组”的？</strong></p>
+<ol>
+<li>
+<p><strong>切分 Micro DP 组 (Micro Data Parallel)</strong></p>
+<ul>
+<li>代码：<code>new_group(..., group_type='micro_dp')</code></li>
+<li>逻辑：把 4 张卡切成 <code>4 // 2 = 2</code> 份。</li>
+<li>结果：<ul>
+<li>Rank 0 和 1 属于 Micro_DP_Group_0</li>
+<li>Rank 2 和 3 属于 Micro_DP_Group_1</li>
+</ul>
+</li>
+<li><em>意义</em>：这告诉系统，Rank 0 和 Rank 2 其实是在处理模型权重的“同一部分”，只是它们属于不同的推理实例。</li>
+</ul>
+</li>
+<li>
+<p><strong>切分 Inference TP 组 (Tensor Model Parallel)</strong></p>
+<ul>
+<li>代码：<code>new_group(..., group_type='infer_tp')</code></li>
+<li>逻辑：在 4 张卡内部，建立 TP=2 的小圈子。</li>
+<li>结果：<ul>
+<li>(Rank 0, Rank 1) 组成一个推理组。</li>
+<li>(Rank 2, Rank 3) 组成一个推理组。</li>
+</ul>
+</li>
+<li><em>意义</em>：当 vLLM 推理时，Rank 0 和 1 通信，Rank 2 和 3 通信。它们互不干扰，相当于同时跑了两个 vLLM 实例（这就是为什么叫 HybridEngine，混合引擎）。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h3>Task 5：理解工具函数（API 暴露）</h3>
+<p>代码下半部分全是 <code>get_xxx</code> 函数，这很简单：</p>
+<ul>
+<li><strong><code>get_tensor_model_parallel_group()</code></strong><ul>
+<li>vLLM 运行时问：“我的队友是谁？”（用于矩阵乘法切分后的聚合通信）。</li>
+</ul>
+</li>
+<li><strong><code>get_micro_data_parallel_group()</code></strong><ul>
+<li>系统问：“谁是我的替身？”（用于权重共享或同步）。</li>
+</ul>
+</li>
+<li><strong><code>get_tensor_model_parallel_src_rank()</code></strong><ul>
+<li>这是一个数学计算，用于计算当前 GPU 在全局中的定位，方便在加载权重时找到对应的数据源。</li>
+</ul>
+</li>
+</ul>
+<h3>总结（大白话版）</h3>
+<p>这篇文章其实就讲了一件事：</p>
+<blockquote>
+<p><strong>虽然我们都在用同样的 GPU 也就是同样的物理设备，但是“训练”时候的组队方式（比如 4 人一组）和“推理”时候的组队方式（比如 2 人一组）可能不一样。</strong></p>
+<p><strong>这个文件就是负责在“训练队形”的基础上，画出“推理队形”的圈圈，并给这些圈圈起好名字，让 vLLM 知道该怎么发消息。</strong></p>
+</blockquote>

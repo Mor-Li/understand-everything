@@ -1,0 +1,122 @@
+<h1>fla/ops/linear_attn/fused_recurrent.py</h1>
+<p>这份代码是用 <strong>OpenAI Triton</strong> 编写的，目的是为了在 GPU 上极其高效地计算 <strong>线性注意力机制（Linear Attention）</strong> 的 <strong>循环（Recurrent）模式</strong>。</p>
+<p>简单来说，它把 Transformer 中原本 $O(N^2)$ 复杂度的 Attention 变成了类似 RNN 的 $O(N)$ 复杂度，并且写得非常底层以追求极致速度。</p>
+<p>既然你觉得完全看不懂，我们不要直接扣代码细节。我为你列了一个 <strong>学习/理解清单（Todo List）</strong>，我们将分 5 个阶段，一步步揭开它的面纱。</p>
+<hr />
+<h3>🟢 阶段一：搞懂核心概念（数学原理）</h3>
+<p><strong>任务目标</strong>：明白这个代码到底想算个什么公式。</p>
+<ol>
+<li><strong>回顾标准 Attention</strong>：<ul>
+<li>通常是 $Softmax(QK^T)V$。这需要计算 $N \times N$ 的矩阵，序列长了显存就爆了。</li>
+</ul>
+</li>
+<li><strong>理解 Linear Attention (Recurrent View)</strong>：<ul>
+<li>如果我们去掉 Softmax 或者换种写法，利用矩阵乘法结合律，可以先算 $K^T V$。</li>
+<li>这就变成了 RNN 的形式：<ul>
+<li><strong>状态更新 ($H_t$)</strong>：当前的记忆 = 之前的记忆 + 新进来的 Key 和 Value 信息。</li>
+<li>公式：$H_t = H_{t-1} + K_t^T V_t$</li>
+<li><strong>输出计算 ($O_t$)</strong>：当前的输出 = 当前的 Query $\times$ 当前的记忆。</li>
+<li>公式：$O_t = Q_t H_t$</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>对应代码</strong>：<ul>
+<li>这就是代码里 <code>fused_recurrent_linear_attn_fwd_kernel</code> 函数中 <code>for</code> 循环里做的事情：不断更新 <code>b_h</code> (也就是 $H$)，然后算出 <code>b_o</code>。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🟡 阶段二：理解 Triton 的并行策略（网格划分）</h3>
+<p><strong>任务目标</strong>：明白为什么代码里有 <code>BK</code>, <code>BV</code>, <code>NK</code>, <code>NV</code> 这些奇怪的变量。</p>
+<ol>
+<li><strong>GPU 的难点</strong>：<ul>
+<li>GPU 线程很多，但每个线程块（Block）的共享内存（SRAM）很小。</li>
+<li>我们的隐藏状态矩阵 $H$ 的大小是 $[K, V]$（特征维度 $\times$ 特征维度）。如果 $K$和 $V$ 很大（比如 128 或 256），整个矩阵放进 SRAM 可能放不下，或者计算太慢。</li>
+</ul>
+</li>
+<li><strong>分块策略 (Tiling)</strong>：<ul>
+<li>代码把 $K$ 维度切成了小块（<code>BK</code>，比如 32），把 $V$ 维度也切成了小块（<code>BV</code>，比如 32）。</li>
+<li>每个 GPU 程序实例（Program ID）只负责计算矩阵 $H$ 的一小块 $[BK, BV]$。</li>
+</ul>
+</li>
+<li><strong>对应代码</strong>：<ul>
+<li><code>i_v, i_k = tl.program_id(0), tl.program_id(1)</code>：这里确定当前线程负责哪一块。</li>
+<li><code>mask_bk</code>, <code>mask_bv</code>：处理边界情况（防止数组越界）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🟠 阶段三：解析前向传播 (Forward Kernel)</h3>
+<p><strong>任务目标</strong>：读懂 <code>fused_recurrent_linear_attn_fwd_kernel</code> 是怎么跑起来的。</p>
+<p>请跟随这个执行流：</p>
+<ol>
+<li><strong>初始化</strong>：<ul>
+<li>找到当前线程负责的 $Q, K, V$ 数据的内存指针 (<code>p_q</code>, <code>p_k</code>, <code>p_v</code>)。</li>
+<li>初始化隐藏状态 <code>b_h</code> 为 0（或者从 <code>h0</code> 读取初始状态）。</li>
+</ul>
+</li>
+<li><strong>时间步循环 (<code>for _ in range(0, T):</code>)</strong>：<ul>
+<li>这是 RNN 的核心，沿着序列长度 $T$ 一步步走。</li>
+<li><strong>加载数据</strong>：读取当前的 $k_t, v_t, q_t$。</li>
+<li><strong>更新状态</strong>：<code>b_h += b_k[:, None] * b_v[None, :]</code>。这对应数学上的 $H_t = H_{t-1} + K_t^T V_t$。</li>
+<li><strong>计算输出</strong>：<code>b_o = b_h * b_q[None, :]</code>。这对应 $O_t = Q_t H_t$。</li>
+<li><strong>写入结果</strong>：把算出来的 <code>b_o</code> 写回显存 <code>p_o</code>。</li>
+<li><strong>指针移动</strong>：指针向后移动，准备读取下一个时间步的数据。</li>
+</ul>
+</li>
+</ol>
+<blockquote>
+<p><strong>注意一个细节</strong>：因为我们把 $K$ 维度切分了（Split-K），每个线程只算了一部分的 $K$ 对结果的贡献。所以在 Python 的 <code>forward</code> 函数最后，有一句 <code>o = o.sum(0)</code>，就是把不同 $K$ 块算出来的结果加起来，得到最终结果。</p>
+</blockquote>
+<hr />
+<h3>🔴 阶段四：解析反向传播 (Backward Kernel)</h3>
+<p><strong>任务目标</strong>：理解 <code>fused_recurrent_linear_attn_bwd_kernel</code> 怎么算梯度。这是最难的部分。</p>
+<p>这就好比你要倒着播放录像带，去推导“如果我想让结果改变一点点，输入需要改变多少”。</p>
+<ol>
+<li><strong>为什么有两个循环？</strong><ul>
+<li>代码里你会看到两个 <code>for</code> 循环。</li>
+<li><strong>第一个循环 (0 到 T)</strong>：为了计算 $dQ$ (Query 的梯度)。<ul>
+<li>因为 $O = Q \cdot H$，所以 $dQ = dO \cdot H^T$。</li>
+<li>我们需要<strong>重新计算一遍前向过程</strong>来得到每个时刻的 $H$（为了省显存，通常不存中间的 $H$）。</li>
+</ul>
+</li>
+<li><strong>中间同步</strong>：<code>tl.debug_barrier()</code>，确保大家第一步都做完了。</li>
+<li><strong>第二个循环 (T-1 到 0)</strong>：为了计算 $dK$ 和 $dV$。<ul>
+<li>这是真正的时间反向传播（Back-propagation through time）。</li>
+<li>梯度从最后一个时刻 $T$ 往回流传到 $0$。</li>
+<li><code>d_h</code> 累积了未来的梯度信息，用来更新当前的 $dK$ 和 $dV$。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🔵 阶段五：Python 封装与接口</h3>
+<p><strong>任务目标</strong>：看懂 <code>FusedRecurrentLinearAttentionFunction</code> 和 <code>fused_recurrent_linear_attn</code>。</p>
+<ol>
+<li><strong>PyTorch 胶水代码</strong>：<ul>
+<li><code>FusedRecurrentLinearAttentionFunction</code> 继承自 <code>torch.autograd.Function</code>。</li>
+<li>它负责连接 PyTorch 的张量和 Triton 的 Kernel。</li>
+</ul>
+</li>
+<li><strong>网格设置 (Grid)</strong>：<ul>
+<li><code>NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)</code>：计算需要多少个块。</li>
+<li><code>grid = (NV, NK, B * H)</code>：告诉 GPU 启动多少个并行程序实例。</li>
+</ul>
+</li>
+<li><strong>对外接口</strong>：<ul>
+<li><code>fused_recurrent_linear_attn</code> 是给用户调用的函数。</li>
+<li>它处理了一些杂活：比如是否需要把 Head 维度转置（<code>head_first</code>），是否需要缩放（<code>scale</code>）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结：这段代码到底在干啥？</h3>
+<p><strong>一句话总结</strong>：
+这是一个<strong>手写的、高度优化的 GPU 程序</strong>，它用<strong>分块并行</strong>的方式，计算了一个<strong>RNN 形式的线性注意力机制</strong>，并且为了省显存，在反向传播时<strong>重新计算</strong>了前向状态。</p>
+<p><strong>你的阅读顺序建议</strong>：
+1.  先看最后的 <code>fused_recurrent_linear_attn</code> 函数，了解输入输出是什么。
+2.  看 <code>forward</code> 函数里的 <code>grid</code> 计算，明白它是怎么切分数据的。
+3.  看 <code>fwd_kernel</code> 中的 <code>for</code> 循环，对应 $H = H + K^TV$ 和 $O = QH$ 这两个公式。
+4.  反向传播 <code>bwd_kernel</code> 可以先跳过，知道它是算梯度的就行，除非你要修改算法本身。</p>

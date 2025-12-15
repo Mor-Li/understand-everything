@@ -1,0 +1,134 @@
+<h1>recipe/spin/dp_actor.py</h1>
+<p>这份代码确实涉及很多深度学习和强化学习（RLHF/DPO）的术语。为了让你轻松理解，我们可以把这个文件看作是一个 <strong>“学生（Actor）”</strong> 的大脑控制中心。</p>
+<p>这个文件的核心任务是：<strong>管理一个大模型（Actor），让它既能做题（计算概率），又能根据老师的批改（DPO Loss）来修改自己的认知（更新参数）。</strong></p>
+<p>代码主要分为两个大任务。我为你列了一个 <strong>Task To-Do List</strong>，然后一步步解释它是怎么完成的。</p>
+<hr />
+<h3>角色设定</h3>
+<ul>
+<li><strong>Actor (本文件)</strong>：正在接受训练的学生模型。</li>
+<li><strong>Reference Model (参考模型)</strong>：老师或者过去的自己（用来做对比，防止学生改得太离谱）。</li>
+<li><strong>Data (数据)</strong>：试卷，包含“好的回答（Chosen）”和“坏的回答（Rejected）”。</li>
+</ul>
+<hr />
+<h3>📋 Task To-Do List (核心任务清单)</h3>
+<p>这个类 <code>SPINDataParallelPPOActor</code> 主要负责执行以下两项任务：</p>
+<h4>✅ Task 1: “做题并估分” (<code>compute_log_prob</code>)</h4>
+<p><strong>目标</strong>：给定一堆问题和答案，计算模型生成这些答案的概率（对数概率）。
+1.  切换到“考试模式”（Eval mode）。
+2.  把一大摞试卷分成小份（Micro-batching），防止脑子（显存）炸了。
+3.  逐份阅读，计算每个字出现的概率。
+4.  把所有分数的单子拼回去，交卷。</p>
+<h4>✅ Task 2: “根据批改订正” (<code>update_policy_dpo_with_ref</code>)</h4>
+<p><strong>目标</strong>：利用 DPO (Direct Preference Optimization) 算法，让模型更喜欢“好答案”，讨厌“坏答案”。
+1.  切换到“学习模式”（Train mode）。
+2.  <strong>关键点</strong>：直接拿来老师已经算好的“参考分数”（Reference Log Probs），自己不用再算一遍参考分了（省力）。
+3.  分批次（Micro-batch）做以下步骤：
+    *   自己重新看一遍“好答案”和“坏答案”，算出<strong>当前分数</strong>。
+    *   拿<strong>当前分数</strong>和<strong>参考分数</strong>做对比。
+    *   算出一个“损失值（Loss）”：如果给坏答案分高了，或者好答案分低了，Loss 就大。
+    *   反向传播（Backpropagation），记住要怎么改。
+4.  根据记住的修改意见，正式修改大脑神经元（Optimizer Step）。
+5.  输出成绩单（Metrics，如 Loss 多少，准确率多少）。</p>
+<hr />
+<h3>🔍 逐步代码拆解 (中文讲解)</h3>
+<h4>第一部分：Task 1 - <code>compute_log_prob</code> (计算概率)</h4>
+<p>这段代码逻辑比较直观，主要是为了处理<strong>超大批量数据</strong>时的显存问题。</p>
+<ul>
+<li><strong><code>self.actor_module.eval()</code></strong>:<ul>
+<li>喊一声：“大家注意，现在是考试/评估时间，不要乱动参数！”</li>
+</ul>
+</li>
+<li><strong><code>micro_batches = ...</code></strong>:<ul>
+<li><strong>切分数据</strong>。如果一次性把几千条数据喂给 GPU，GPU 会爆显存（OOM）。所以这里把大 Batch 切成了很多小的 Micro-batch。</li>
+</ul>
+</li>
+<li><strong><code>for micro_batch in micro_batches:</code></strong>:<ul>
+<li>开始循环处理每一小份数据。</li>
+</ul>
+</li>
+<li><strong><code>self._forward_micro_batch(...)</code></strong>:<ul>
+<li><strong>模型前向传播</strong>。这就是模型“动脑子”的过程，算出每个 token 的概率。</li>
+</ul>
+</li>
+<li><strong><code>torch.concat(log_probs_lst, dim=0)</code></strong>:<ul>
+<li>把每一小份的结果像拼图一样拼回一张完整的大表。</li>
+</ul>
+</li>
+</ul>
+<h4>第二部分：Task 2 - <code>update_policy_dpo_with_ref</code> (核心训练逻辑)</h4>
+<p>这是最复杂的部分，我们拆细一点：</p>
+<p><strong>1. 准备数据 (The Setup)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 获取预先计算好的参考分数（这是为了省时间，不需要在Actor里再跑一遍Reference Model）</span>
+<span class="n">reference_chosen_logps</span> <span class="o">=</span> <span class="n">batch_td</span><span class="p">[</span><span class="s1">&#39;reference_chosen_logps&#39;</span><span class="p">]</span>
+<span class="n">reference_rejected_logps</span> <span class="o">=</span> <span class="n">batch_td</span><span class="p">[</span><span class="s1">&#39;reference_rejected_logps&#39;</span><span class="p">]</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：这里假设数据里已经包含了“参考模型”对好坏答案的打分。DPO 算法需要对比“现在的我”和“参考模型”的差异。</li>
+</ul>
+<p><strong>2. 梯度累积循环 (The Loop)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 把大Batch分成小份(micro_batch)，一份份吃</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_micro_batches</span><span class="p">):</span>
+    <span class="c1"># ... 切片取出当前这一小份的 input_ids, labels 等 ...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：依然是为了显存考虑。</li>
+</ul>
+<p><strong>3. 混合精度与前向传播 (The Forward Pass)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">autocast</span><span class="p">(</span><span class="o">...</span><span class="p">):</span> <span class="c1"># 使用半精度(bf16)加速，省显存</span>
+    <span class="c1"># 让现在的模型(Actor)去读“好答案”和“坏答案”</span>
+    <span class="n">policy_chosen_outputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">actor_module</span><span class="p">(</span><span class="o">**</span><span class="n">micro_batch_chosen_inputs</span><span class="o">...</span><span class="p">)</span>
+    <span class="n">policy_rejected_outputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">actor_module</span><span class="p">(</span><span class="o">**</span><span class="n">micro_batch_rejected_inputs</span><span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># 算出现在的模型给这些答案打多少分 (Log Probs)</span>
+    <span class="n">policy_chosen_logps</span> <span class="o">=</span> <span class="n">get_batch_logps</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="n">policy_rejected_logps</span> <span class="o">=</span> <span class="n">get_batch_logps</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：这是“现在的我”在做题。注意这里算出来的 <code>policy_chosen_logps</code> 是带梯度的（<code>requires_grad=True</code>），意味着可以通过它来更新模型。</li>
+</ul>
+<p><strong>4. 计算 DPO Loss (The Loss Calculation)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这一步是 DPO 的灵魂</span>
+<span class="n">loss</span> <span class="o">=</span> <span class="n">compute_online_dpo_loss</span><span class="p">(</span>
+    <span class="n">policy_chosen_logps</span><span class="o">=</span><span class="n">policy_chosen_logps</span><span class="p">,</span>      <span class="c1"># 现在的我给好答案的分</span>
+    <span class="n">policy_rejected_logps</span><span class="o">=</span><span class="n">policy_rejected_logps</span><span class="p">,</span>  <span class="c1"># 现在的我给坏答案的分</span>
+    <span class="n">reference_chosen_logps</span><span class="o">=</span><span class="n">micro_ref_chosen_logps</span><span class="p">,</span> <span class="c1"># 参考模型给好答案的分 (固定值)</span>
+    <span class="n">reference_rejected_logps</span><span class="o">=</span><span class="n">micro_ref_rejected_logps</span><span class="p">,</span> <span class="c1"># 参考模型给坏答案的分 (固定值)</span>
+    <span class="n">beta</span><span class="o">=</span><span class="n">beta</span><span class="p">,</span> <span class="o">...</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点解释</strong>：<ul>
+<li>DPO 的逻辑是：<strong>“现在的我”给好答案的分数，相对于“参考模型”，提升的幅度要比坏答案大。</strong></li>
+<li>如果做到了，Loss 就小；如果做不到（比如给坏答案分太高），Loss 就大。</li>
+</ul>
+</li>
+</ul>
+<p><strong>5. 反向传播与记录 (Backward &amp; Metrics)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">scaled_loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>  <span class="c1"># 算出梯度（告诉参数该往哪个方向变）</span>
+<span class="n">total_loss</span> <span class="o">+=</span> <span class="n">loss</span><span class="o">.</span><span class="n">item</span><span class="p">()</span> <span class="c1"># 拿个小本本记下来这次 Loss 是多少</span>
+</code></pre></div>
+
+<p><strong>6. 更新参数 (The Update)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">grad_norm</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_optimizer_step</span><span class="p">()</span> <span class="c1"># 真正的修改模型参数</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：循环结束后，根据刚才积累的所有梯度，统一修改一次模型参数。</li>
+</ul>
+<hr />
+<h3>总结文中的核心观点</h3>
+<p>这个文件 <code>dp_actor.py</code> 其实是一个<strong>工程化优化过</strong>的训练器：</p>
+<ol>
+<li><strong>它不是从零开始写算法</strong>：它继承了 <code>DataParallelPPOActor</code>，复用了并行计算的基础设施。</li>
+<li><strong>它专注于 SPIN/DPO 算法</strong>：虽然名字带 PPO，但 <code>update_policy_dpo_with_ref</code> 函数表明它在执行 DPO 类型的更新（比较 Policy 和 Reference）。</li>
+<li><strong>效率优化</strong>：<ul>
+<li>它支持 <strong>Micro-batching</strong>（切分数据）以适应有限的显存。</li>
+<li>它支持 <strong>Reference Offloading</strong>：它不自己在内部跑 Reference Model 的前向传播，而是直接从输入数据里读取 <code>reference_logps</code>。这通常意味着在分布式系统中，有另一个进程或步骤已经把参考分算好了，这样 Actor 只需要专注于算自己的分和更新参数，速度更快。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话总结</strong>：这是一个“只负责考试和订正，不负责出题和抄写参考答案”的高效学生模型代码。</p>

@@ -1,0 +1,105 @@
+<h1>megatron/core/tensor_parallel/random.py</h1>
+<p>这份代码确实比较晦涩，因为它处理的是分布式大模型训练中最让人头疼的问题之一：<strong>随机性管理（Randomness Management）</strong>。</p>
+<p>简单来说，在训练像 GPT 这样的大模型时，我们有几百张显卡。有些时候我们需要所有显卡生成<strong>一样</strong>的随机数（比如初始化参数），有些时候我们需要它们生成<strong>不一样</strong>的随机数（比如做 Tensor Parallel 切分时的 Dropout）。</p>
+<p>为了让你读懂这份代码，我为你列了一个 <strong>“学习任务清单 (Todo List)”</strong>。按照这个顺序，我们一步步拆解文中的观点和代码逻辑。</p>
+<hr />
+<h3>📋 学习任务清单 (Todo List)</h3>
+<ol>
+<li><strong>Task 0: 理解核心痛点（为什么原生 PyTorch 不够用？）</strong></li>
+<li><strong>Task 1: 打造基础工具（如何高效设置随机种子？）</strong></li>
+<li><strong>Task 2: 构建“多重人格”管理器（RNG Tracker 是什么？）</strong></li>
+<li><strong>Task 3: 分配身份（如何为不同的并行模式分配种子？）</strong></li>
+<li><strong>Task 4: 实战应用——“时光倒流”（Checkpointing 中的随机状态恢复）</strong></li>
+</ol>
+<hr />
+<h3>🟢 Task 0: 理解核心痛点</h3>
+<p><strong>观点：</strong> 在分布式训练中，显卡不仅要知道“我是谁”，还要能在不同的场景下切换“随机数生成模式”。</p>
+<ul>
+<li><strong>场景 A（数据并行）：</strong> 假设你有两组显卡训练同一个模型。为了保证训练一致性，非并行部分的 Dropout 可能需要随机数是一样的。</li>
+<li><strong>场景 B（模型并行）：</strong> 一个大的矩阵被切分到了两张卡上。如果这两张卡在做 Dropout 时生成的随机掩码（mask）一模一样，那就相当于没切分，数学上就错了。所以这里它们必须生成<strong>不同</strong>的随机数。</li>
+</ul>
+<p><strong>结论：</strong> 我们不能只用一个全局的 <code>torch.manual_seed</code>，我们需要一个能随时切换随机数状态的工具。</p>
+<hr />
+<h3>🟢 Task 1: 打造基础工具</h3>
+<p><strong>代码对应：</strong> <code>_set_cuda_rng_state(new_state, device=-1)</code></p>
+<p>这一步很简单，就是造一个轮子。
+*   <strong>功能：</strong> 强行把当前显卡的随机数生成器（RNG）的状态设置成指定的值。
+*   <strong>细节：</strong> 代码里写了一堆 <code>if hasattr... else...</code>，这纯粹是为了兼容不同版本的 PyTorch（旧版和新版 API 不一样）。
+*   <strong>重点：</strong> 注意注释里提到的 <code>cloning</code> 问题。直接设置状态比复制状态要快，这是为了性能优化。</p>
+<hr />
+<h3>🟢 Task 2: 构建“多重人格”管理器</h3>
+<p><strong>代码对应：</strong> <code>class CudaRNGStatesTracker</code></p>
+<p>这是文件的核心类。你可以把它想象成一个<strong>“存档管理器”</strong>。</p>
+<ul>
+<li><strong>它的工作原理：</strong><ul>
+<li>它内部有一个字典 <code>self.states_</code>，用来保存不同名字的随机状态。</li>
+<li>比如：<code>{'model-parallel': 状态A, 'data-parallel': 状态B}</code>。</li>
+</ul>
+</li>
+<li><strong>关键方法 <code>add(name, seed)</code>：</strong><ul>
+<li>给我一个种子，我生成一个状态，存进字典里，标记为 <code>name</code>。</li>
+</ul>
+</li>
+<li><strong>关键方法 <code>fork(name)</code>：</strong> (最重要！)<ul>
+<li>这是一个上下文管理器（<code>with</code> 语句）。</li>
+<li><strong>流程：</strong><ol>
+<li>先保存当前显卡正在用的随机状态（存档）。</li>
+<li>读取你指定的 <code>name</code> 对应的随机状态（读档，比如读取 'model-parallel' 的状态）。</li>
+<li>加载这个状态，让你运行接下来的代码（比如做一次 Dropout）。</li>
+<li>运行完后，把刚才的状态更新回字典（存盘）。</li>
+<li>最后，恢复最开始保存的状态（回档）。</li>
+</ol>
+</li>
+<li><strong>比喻：</strong> 就像你打游戏，进副本前先存个档，切到“副本模式”打怪，打完出来，切回“大地图模式”。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🟢 Task 3: 分配身份（初始化）</h3>
+<p><strong>代码对应：</strong> <code>model_parallel_cuda_manual_seed(seed)</code></p>
+<p>现在工具有了，我们需要在训练开始时给每张卡分配种子。</p>
+<ul>
+<li><strong>逻辑拆解：</strong><ol>
+<li><strong>数据并行种子 (<code>data_parallel_seed</code>)：</strong> 直接等于传入的 <code>seed</code>。这意味着，属于同一个模型并行组的卡，或者不同数据并行组的卡，只要初始 seed 一样，这部分就一样。</li>
+<li><strong>模型并行种子 (<code>tensor_model_parallel_seed</code>)：</strong> <code>seed + rank</code>。<ul>
+<li>注意那个 <code>get_tensor_model_parallel_rank()</code>。这意味着，即便在同一台机器上，负责模型不同切片的显卡，拿到的种子是<strong>不一样</strong>的（因为 rank 不同）。</li>
+</ul>
+</li>
+</ol>
+</li>
+<li><strong>操作流程：</strong><ul>
+<li>初始化 Tracker。</li>
+<li>把 <code>data_parallel_seed</code> 存入 Tracker，起名为 <code>'data-parallel-rng'</code>。</li>
+<li>把 <code>tensor_model_parallel_seed</code> 存入 Tracker，起名为 <code>'model-parallel-rng'</code>。</li>
+</ul>
+</li>
+</ul>
+<p><strong>总结：</strong> 跑完这个函数后，每张显卡都记住了两套（或三套）随机数生成逻辑，随时准备切换。</p>
+<hr />
+<h3>🟢 Task 4: 实战应用——“时光倒流”</h3>
+<p><strong>代码对应：</strong> <code>class CheckpointFunction</code> (以及 <code>checkpoint</code> 函数)</p>
+<p>这是 Megatron 节省显存的大杀器——<strong>激活重算 (Activation Checkpointing)</strong>。</p>
+<ul>
+<li><strong>背景：</strong> 为了省显存，我们在前向传播（Forward）时不保存中间结果，等到反向传播（Backward）时再重新算一遍 Forward。</li>
+<li><strong>问题：</strong> 如果 Forward 里有 Dropout，第一次算和第二次重算时，如果随机数不一样，Dropout 丢掉的神经元就不一样，那算出来的梯度就是错的！</li>
+<li><strong>解决方案（代码逻辑）：</strong><ol>
+<li><strong>Forward 阶段：</strong><ul>
+<li>记录当前的 CPU 和 CUDA 随机状态 (<code>ctx.fwd_cuda_rng_state</code>)。</li>
+<li>记录 Tracker 里所有的状态 (<code>ctx.fwd_cuda_rng_state_tracker</code>)。</li>
+<li>正常计算，不保存中间激活值（省内存）。</li>
+</ul>
+</li>
+<li><strong>Backward 阶段（重算）：</strong><ul>
+<li><strong>时光倒流：</strong> 把当前的随机状态强行设置回 Forward 阶段记录的那个状态 (<code>_set_cuda_rng_state(ctx.fwd_cuda_rng_state)</code>)。</li>
+<li><strong>恢复管理器：</strong> 把 Tracker 的状态也恢复回去。</li>
+<li><strong>重跑 Forward：</strong> 此时因为随机种子完全复原，Dropout 的行为将和第一次一模一样。</li>
+<li>算出梯度。</li>
+<li><strong>还原：</strong> 算完后，再把随机状态恢复成 Backward 开始时的样子，不影响后面的计算。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结：这篇文章到底讲了啥？</h3>
+<p>这个文件其实就是为了解决一个问题：<strong>在显卡很乱、并行模式很复杂的环境下，如何精准控制每一次 Dropout 到底是用“全局统一”的随机数，还是“特立独行”的随机数，并且保证在“为了省显存而重算”的时候，能完美复现之前的随机行为。</strong></p>

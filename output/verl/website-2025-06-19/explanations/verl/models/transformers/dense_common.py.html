@@ -1,0 +1,123 @@
+<h1>verl/models/transformers/dense_common.py</h1>
+<p>这份代码确实比较底层，它是为了在大模型（LLM）上做 <strong>RLHF（基于人类反馈的强化学习）</strong>，特别是 <strong>PPO（Proximal Policy Optimization）</strong> 算法而专门设计的。</p>
+<p>简单来说，普通的 LLM 代码是为了“生成文本”，而这份代码是为了“计算强化学习所需的数值（概率和熵）”。</p>
+<p>为了让你读懂，我们假设你需要<strong>从零开始改造一个 LLaMA 模型来跑 PPO 训练</strong>。我们可以把这个过程拆解成一个 <strong>5步走的 To-Do List</strong>。</p>
+<hr />
+<h3>📝 任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>定义输出格式</strong>：为了跑 PPO，普通模型的输出不够用，我们需要定义一个新的输出包。</li>
+<li><strong>获取基础特征</strong>：利用现有的 LLM 模型，先算出“隐藏状态 (Hidden States)”。</li>
+<li><strong>准备“标准答案”</strong>：处理输入数据，搞清楚我们要预测的下一个词是谁。</li>
+<li><strong>计算 PPO 核心指标 (Torch版)</strong>：计算每个 token 的对数概率 (Log Prob) 和熵 (Entropy)。</li>
+<li><strong>性能加速 (Triton版)</strong>：觉得 Torch 慢？换用更底层的 Triton 内核加速计算。</li>
+</ol>
+<hr />
+<h3>逐步讲解</h3>
+<h4>✅ Task 1: 定义输出格式 (CausalLMOutputForPPO)</h4>
+<p><strong>背景</strong>：
+普通的 Hugging Face 模型输出通常包含 <code>logits</code>（预测分值）。但在 PPO 算法中，我们需要两个特定的东西：
+1.  <strong>Log Probs</strong>: 模型生成某个词的概率的对数（用来算奖励）。
+2.  <strong>Entropy</strong>: 熵（用来衡量模型输出的随机性，防止模型死记硬背，鼓励探索）。</p>
+<p><strong>代码对应</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">CausalLMOutputForPPO</span><span class="p">(</span><span class="n">CausalLMOutputWithPast</span><span class="p">):</span>
+    <span class="n">log_probs</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">FloatTensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">entropy</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">FloatTensor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+</code></pre></div>
+
+<p><strong>解读</strong>：
+这只是一个数据容器。它继承了通用的输出类，然后加了两个口袋：一个装 <code>log_probs</code>，一个装 <code>entropy</code>。</p>
+<hr />
+<h4>✅ Task 2: 获取基础特征 (forward_base_model)</h4>
+<p><strong>背景</strong>：
+不管我们要算什么，第一步都是把输入的 <code>input_ids</code> 扔进 Transformer 模型里，拿到最后一层的 <strong>Hidden States</strong>（隐藏状态，即向量表示）。</p>
+<p><strong>代码对应</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">forward_base_model</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+    <span class="c1"># ... 省略参数 ...</span>
+    <span class="n">outputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 调用内部的 Transformer (如 LLaMA)</span>
+    <span class="k">return</span> <span class="n">outputs</span>
+</code></pre></div>
+
+<p><strong>解读</strong>：
+这个函数是个“二传手”。它不做计算，只是把参数透传给底层的 Transformer 模型，拿到基础的输出。这是为了代码复用，避免把复杂的 Transformer 结构重写一遍。</p>
+<hr />
+<h4>✅ Task 3: 准备“标准答案” (Label Shifting)</h4>
+<p><strong>背景</strong>：
+在大模型训练中，如果输入是 "A B C"，我们希望模型在看到 "A" 时预测 "B"，看到 "B" 时预测 "C"。
+所以，输入是 <code>[A, B, C]</code>，对应的“正确答案（Labels）”应该是 <code>[B, C, 下一个]</code>。这叫 <strong>Next Token Prediction</strong>。</p>
+<p><strong>代码对应</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 在 forward_with_torch_backend 中</span>
+<span class="k">if</span> <span class="n">labels</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">rolled_labels</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">roll</span><span class="p">(</span><span class="n">labels</span><span class="p">,</span> <span class="n">shifts</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span> <span class="n">dims</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span> <span class="c1"># 核心操作</span>
+<span class="k">elif</span> <span class="n">input_ids</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">rolled_labels</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">roll</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">shifts</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span> <span class="n">dims</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解读</strong>：
+<code>torch.roll(..., shifts=-1)</code> 的作用就是把整个序列<strong>向左平移一位</strong>。
+*   原始：<code>[我, 爱, 你]</code>
+*   平移后：<code>[爱, 你, (末尾元素)]</code>
+这样，模型在位置 0 看到“我”，我们要去查它预测“爱”的概率是多少。</p>
+<hr />
+<h4>✅ Task 4: 计算 PPO 核心指标 (Torch后端)</h4>
+<p><strong>背景</strong>：
+这是这份文件的核心逻辑之一。我们需要算出模型在每个位置上，预测出“正确答案”的概率是多少，以及模型当前的“不确定性”（熵）是多少。</p>
+<p><strong>代码对应</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">forward_with_torch_backend</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+    <span class="c1"># 1. 先拿基础特征 (Task 2)</span>
+    <span class="n">outputs</span> <span class="o">=</span> <span class="n">forward_base_model</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+
+    <span class="c1"># 2. 准备答案 (Task 3)</span>
+    <span class="c1"># ... rolled_labels ...</span>
+
+    <span class="c1"># 3. 计算 Log Probs 和 Entropy</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">verl.utils.experimental.torch_functional</span><span class="w"> </span><span class="kn">import</span> <span class="n">FusedLinearForPPO</span>
+    <span class="n">fused_linear_for_ppo</span> <span class="o">=</span> <span class="n">FusedLinearForPPO</span><span class="p">()</span>
+
+    <span class="n">log_probs</span><span class="p">,</span> <span class="n">entropy</span> <span class="o">=</span> <span class="n">fused_linear_for_ppo</span><span class="o">.</span><span class="n">forward</span><span class="p">(</span>
+        <span class="n">hidden_states</span><span class="o">=</span><span class="n">hidden_states</span><span class="p">,</span>
+        <span class="n">vocab_weights</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">lm_head</span><span class="o">.</span><span class="n">weight</span><span class="p">,</span> <span class="c1"># 词表权重</span>
+        <span class="n">input_ids</span><span class="o">=</span><span class="n">rolled_labels</span><span class="p">,</span>           <span class="c1"># 正确答案</span>
+        <span class="n">temperature</span><span class="o">=</span><span class="n">temperature</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="c1"># 4. 打包返回 (Task 1)</span>
+    <span class="k">return</span> <span class="n">CausalLMOutputForPPO</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解读</strong>：
+这里用了一个 <code>FusedLinearForPPO</code>。为什么要“Fused（融合）”？
+通常计算是：<code>Hidden State</code> -&gt; <code>全连接层(Linear)</code> -&gt; <code>Logits</code> -&gt; <code>Softmax</code> -&gt; <code>Log</code> -&gt; <code>Gather(取特定词的概率)</code>。
+这一串操作如果在显存里频繁读写很慢。<code>Fused</code> 意味着把这些步骤合并在一起算，省内存、速度快。</p>
+<hr />
+<h4>✅ Task 5: 性能加速 (Triton后端)</h4>
+<p><strong>背景</strong>：
+当模型非常大或者训练数据非常多时，PyTorch 原生的计算可能还是不够快。Triton 是一种专门用来写 GPU 高性能内核的语言。</p>
+<p><strong>代码对应</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">forward_with_triton_backend</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">verl.utils.kernel</span><span class="w"> </span><span class="kn">import</span> <span class="n">linear_cross_entropy</span> <span class="c1"># 引入高性能内核</span>
+
+    <span class="c1"># ... 前面步骤和 Task 4 完全一样 ...</span>
+
+    <span class="c1"># 区别在这里：直接调用 Triton 写好的底层内核</span>
+    <span class="n">log_probs</span><span class="p">,</span> <span class="n">entropy</span> <span class="o">=</span> <span class="n">linear_cross_entropy</span><span class="p">(</span>
+        <span class="n">hidden_states</span><span class="p">,</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">lm_head</span><span class="o">.</span><span class="n">weight</span><span class="p">,</span>
+        <span class="n">rolled_labels</span><span class="p">,</span>
+        <span class="n">temperature</span><span class="p">,</span>
+        <span class="s2">&quot;none&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
+    <span class="k">return</span> <span class="n">CausalLMOutputForPPO</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解读</strong>：
+逻辑上和 Task 4 一模一样，只是换了把“枪”。
+*   <code>forward_with_torch_backend</code>: 兼容性好，只要装了 PyTorch 就能跑。
+*   <code>forward_with_triton_backend</code>: 速度极快，显存占用更优，但依赖 Triton 库。</p>
+<hr />
+<h3>总结</h3>
+<p>这份文件其实就在做一件事：</p>
+<p><strong>给普通的大模型挂载一个“PPO 专用插件”。</strong></p>
+<p>它接收输入，不仅让模型跑一遍，还顺手把 RL 训练必须的 <strong>“刚才那个词生成的概率是多少”</strong> 和 <strong>“模型现在有多迷茫（熵）”</strong> 这两个数算出来，并且提供了 <strong>普通版 (Torch)</strong> 和 <strong>加速版 (Triton)</strong> 两种计算方式。</p>

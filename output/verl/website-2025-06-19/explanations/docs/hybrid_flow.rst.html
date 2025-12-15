@@ -1,0 +1,61 @@
+<h1>docs/hybrid_flow.rst</h1>
+<p>这篇文章确实涉及了很多分布式系统和强化学习（RL）的底层架构设计，如果对这两个领域不熟悉，读起来会非常晦涩。</p>
+<p>简单来说，这篇文章介绍的是 <strong>verl 框架的核心设计思想</strong>，叫做 <strong>HybridFlow</strong>。它的核心目的是：<strong>让你可以用写单机代码的逻辑，去训练需要几百张显卡的大模型。</strong></p>
+<p>为了让你读懂，我制定了一个 <strong>“学习任务清单 (Todo List)”</strong>，我们将文章拆解为 5 个步骤，由浅入深地理解。</p>
+<hr />
+<h3>🚀 HybridFlow 理解任务清单</h3>
+<h4>✅ Task 1: 理解核心痛点 (Motivation)</h4>
+<p><strong>目标</strong>：明白为什么我们需要这个框架？
+*   <strong>背景</strong>：以前做强化学习（RL），模型很小，一个进程就能搞定“思考（算法逻辑）”和“计算（神经网络运算）”。
+*   <strong>现状</strong>：在大模型（LLM）时代，模型太大了。
+    *   <strong>逻辑流 (Control Flow)</strong>：比如 PPO 算法的步骤（先生成数据 -&gt; 算奖励 -&gt; 更新模型）。这部分很轻量。
+    *   <strong>计算流 (Computation Flow)</strong>：比如“模型前向传播”，这需要多张显卡（多进程）并行计算。
+*   <strong>冲突</strong>：如果把逻辑和计算写在一起，代码会极其复杂，想换个计算后端（比如从 FSDP 换到 Megatron）几乎要重写代码。
+*   <strong>HybridFlow 的解法</strong>：<strong>“脑体分离”</strong>。
+    *   <strong>大脑 (Controller)</strong>：单进程，只负责发号施令（逻辑流）。
+    *   <strong>肢体 (Workers)</strong>：多进程，负责干苦力（计算流）。</p>
+<h4>✅ Task 2: 理解架构图 (Execution Diagram)</h4>
+<p><strong>目标</strong>：在脑海中建立一个指挥官和工人的画面。
+*   <strong>Controller (Driver)</strong>：这是你写的 Python 主程序。它运行在一个单独的进程里。
+*   <strong>Worker Groups (工人组)</strong>：
+    *   <strong>Actor/Rollout</strong>：负责让模型说话（生成文本）。
+    *   <strong>Critic</strong>：负责给生成的文本打分（价值评估）。
+    *   <strong>Reward</strong>：负责计算具体的奖励分数。
+*   <strong>流程</strong>：Controller 说“开始生成”，数据传给 Actor 组；Actor 组算完把结果传回 Controller；Controller 再把数据传给 Critic 组……以此类推。</p>
+<h4>✅ Task 3: 理解代码入口与分工 (Entry Function &amp; Trainer)</h4>
+<p><strong>目标</strong>：知道代码从哪里开始跑。
+*   <strong><code>main_task</code></strong>: 这是入口函数。它就是那个“大脑”。
+    *   <strong>注意点</strong>：它运行在单个进程中。文档建议不要把它放在 Ray 集群的头节点（Head Node），因为它虽然只发指令，但也需要处理回传的数据，比较吃内存。
+*   <strong><code>RayPPOTrainer</code></strong>: 这是一个管家，帮 <code>main_task</code> 管理所有的工人（WorkerGroup）并运行 PPO 的循环。</p>
+<h4>✅ Task 4: 理解最关键的“魔法” (Worker &amp; Decorator)</h4>
+<p><strong>目标</strong>：理解 verl 是如何把复杂的分布式计算伪装成简单的函数调用的。这是<strong>全文最重要</strong>的技术点。
+*   <strong>问题</strong>：Controller 只有一个，但 Worker 有 8 个（假设 8 卡）。Controller 给 Worker 发数据时，需要把数据切成 8 份；收数据时，要把 8 份拼起来。如果手动写，代码会很乱。
+*   <strong>魔法 (<code>@register</code> 装饰器)</strong>：
+    *   在 Worker 的代码里，开发者用 <code>@register(dispatch_mode=...)</code> 装饰函数。
+    *   <strong>作用</strong>：告诉系统，“当大脑调用这个函数时，请自动帮我把数据切片分发 (Dispatch) 给每个显卡，算完后自动帮我收集 (Collect) 并拼接起来”。
+*   <strong>结果</strong>：
+    <code>python
+    # 在 Controller 看来，就像调用普通函数一样简单：
+    output = worker_group.generate_sequences(data)
+    # 但实际上，后台发生了复杂的数据切分、传输、并行计算、回传、拼接。</code></p>
+<h4>✅ Task 5: 串联 PPO 主循环 (The Main Loop)</h4>
+<p><strong>目标</strong>：看懂最后那段伪代码，验证“脑体分离”的好处。
+*   看看文档最后的代码块：
+    <code>python
+    for prompt in dataloader:
+        # 1. 让 Actor 组生成回复（实际上是多卡并行）
+        output = actor_rollout_ref_wg.generate_sequences(prompt)
+        # 2. 让 Critic 组打分
+        values = critic_wg.compute_values(output)
+        # 3. 在本地计算优势函数（逻辑流）
+        advantages = compute_advantages(values, rewards)
+        # 4. 更新模型
+        actor_rollout_ref_wg.update_actor(output)</code>
+*   <strong>总结</strong>：这段代码看起来完全像是在写单机程序，但实际上它驱动着庞大的计算集群。这就是 HybridFlow 的威力——<strong>逻辑与计算解耦</strong>。</p>
+<hr />
+<h3>总结：这篇文章到底在讲啥？</h3>
+<p>它在告诉你：
+1.  <strong>别怕分布式</strong>：verl 帮你把脏活累活（多卡通信、数据切分）都封装好了。
+2.  <strong>怎么写的</strong>：它把 RL 拆成了“单进程的控制器”和“多进程的计算节点”。
+3.  <strong>怎么用的</strong>：你只需要定义好 Worker，用装饰器标记一下，然后在主循环里像写单机代码一样调用它们即可。</p>
+<p>希望这个 List 能帮你把文档看懂！建议对照着这个思路再读一遍原文的 "Codebase walkthrough" 部分。</p>

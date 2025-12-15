@@ -1,0 +1,107 @@
+<h1>fla/models/retnet/modeling_retnet.py</h1>
+<p>这份代码实现的是 <strong>RetNet (Retentive Network)</strong> 的模型架构。RetNet 是一种旨在替代传统 Transformer 的架构，它的核心优势是：<strong>训练时像 Transformer 一样并行（快），推理时像 RNN 一样只需常数内存（省显存且快）。</strong></p>
+<p>这份代码看起来复杂是因为它使用了 Hugging Face 的标准格式，并且包含了很多工程上的优化（比如 Fused Kernel 融合算子）。</p>
+<p>为了让你读懂，我们把它想象成<strong>组装一个乐高机器人</strong>。我们可以把理解这份代码的过程拆解成以下 <strong>5 个 Todo Task</strong>：</p>
+<hr />
+<h3>✅ Task 1: 搞清楚零件 —— <code>RetNetBlock</code> (乐高积木块)</h3>
+<p>这是模型最基础的重复单元。就像盖楼一样，楼是一层一层盖上去的，<code>RetNetBlock</code> 就是其中的“一层”。</p>
+<ul>
+<li><strong>定位代码：</strong> <code>class RetNetBlock(nn.Module):</code></li>
+<li><strong>这一层里有什么？</strong><ol>
+<li><strong>归一化 (Norm)：</strong> 代码里的 <code>self.attn_norm</code> 和 <code>self.mlp_norm</code>。用的是 <code>RMSNorm</code>。<ul>
+<li><em>作用：</em> 把数据整理一下，防止数字过大或过小，让训练更稳定。</li>
+</ul>
+</li>
+<li><strong>核心处理单元 (Mixer)：</strong> 代码里的 <code>self.attn</code>。<ul>
+<li><em>重点：</em> 这里有一个 <code>if/else</code>。如果配置是标准的，它用 <code>Attention</code>；但在 RetNet 里，它通常使用的是 <strong><code>MultiScaleRetention</code></strong>。这是 RetNet 的灵魂，用来捕捉词与词之间的关系。</li>
+</ul>
+</li>
+<li><strong>前馈网络 (MLP)：</strong> 代码里的 <code>self.mlp</code> (<code>RetNetMLP</code>)。<ul>
+<li><em>作用：</em> 增加模型的非线性能力，消化处理过的信息。</li>
+</ul>
+</li>
+</ol>
+</li>
+<li><strong>数据怎么流动的？ (<code>forward</code> 函数)</strong><ol>
+<li><strong>残差连接 (Residual)：</strong> <code>residual = hidden_states</code>。先记住原始输入。</li>
+<li><strong>处理 1：</strong> 输入 -&gt; Norm -&gt; <strong>Retention (核心)</strong> -&gt; 加上原始输入。</li>
+<li><strong>处理 2：</strong> 结果 -&gt; Norm -&gt; <strong>MLP</strong> -&gt; 再加一次残差。</li>
+<li><em>总结：</em> 这一块就是在不断地“搅拌”和“提炼”输入的信息。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 2: 搭建骨架 —— <code>RetNetModel</code> (机器人的身体)</h3>
+<p>有了积木块，现在要把它们堆叠起来，并加上“输入口”。</p>
+<ul>
+<li><strong>定位代码：</strong> <code>class RetNetModel(RetNetPreTrainedModel):</code></li>
+<li><strong>这一步做了什么？</strong><ol>
+<li><strong>词嵌入 (Embeddings)：</strong> <code>self.embeddings = nn.Embedding(...)</code>。<ul>
+<li><em>作用：</em> 计算机不认识中文或英文，只认识数字。这一步把单词（token）转换成一串向量（数字）。</li>
+</ul>
+</li>
+<li><strong>堆叠积木：</strong> <code>self.layers = nn.ModuleList(...)</code>。<ul>
+<li><em>作用：</em> 循环创建了 N 个 <code>RetNetBlock</code>。比如 Llama-7B 有 32 层，这里就是 32 个 Block。</li>
+</ul>
+</li>
+<li><strong>最终整理：</strong> <code>self.norm</code>。<ul>
+<li><em>作用：</em> 在输出之前，最后做一次 RMSNorm 归一化。</li>
+</ul>
+</li>
+</ol>
+</li>
+<li><strong>数据怎么流动的？ (<code>forward</code> 函数)</strong><ul>
+<li>输入单词 ID -&gt; 变成向量 (Embedding) -&gt; <strong>For 循环穿过每一层 Block</strong> -&gt; 最后归一化 -&gt; 输出特征 (Hidden States)。</li>
+<li><em>注意：</em> 这里处理了 <code>past_key_values</code>（KV Cache），这是为了让推理（生成文本）时不用每次都从头算，而是利用之前的缓存，RetNet 的优势就在于这个缓存很小。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 3: 安装大脑和嘴巴 —— <code>RetNetForCausalLM</code> (用于生成的完整模型)</h3>
+<p>光有身体不行，还得能说话（输出预测的下一个词）。这是用户实际调用的类。</p>
+<ul>
+<li><strong>定位代码：</strong> <code>class RetNetForCausalLM(RetNetPreTrainedModel, GenerationMixin):</code></li>
+<li><strong>这一步做了什么？</strong><ol>
+<li><strong>包含身体：</strong> <code>self.model = RetNetModel(config)</code>。</li>
+<li><strong>安装嘴巴 (LM Head)：</strong> <code>self.lm_head = nn.Linear(...)</code>。<ul>
+<li><em>作用：</em> 把身体输出的特征向量（比如 4096 维），映射回词表大小（比如 32000 个词）。算出每个词作为“下一个词”的概率。</li>
+</ul>
+</li>
+</ol>
+</li>
+<li><strong>核心功能 (<code>forward</code> 函数)：</strong><ol>
+<li><strong>推理时：</strong> 计算出 <code>logits</code>（预测概率）。</li>
+<li><strong>训练时：</strong> 计算 <code>loss</code>（损失）。代码里写了很多 <code>FusedCrossEntropyLoss</code>，这是为了<strong>加速</strong>计算损失函数，本质上就是看模型预测的词和真实答案差多少。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 4: 理解那些“看不懂”的优化 (工程细节)</h3>
+<p>你会看到很多奇怪的词，比如 <code>Chunkwise</code>、<code>Fused</code>、<code>Cache</code>。这些不是模型原理，而是为了<strong>快</strong>。</p>
+<ol>
+<li><strong><code>MultiScaleRetention</code> (在 Block 里)：</strong><ul>
+<li>RetNet 不使用标准的 $QK^T$ Attention。它使用一种特殊的衰减机制。代码里根据 <code>config.attn_mode</code> 选择不同的计算方式（并行、递归或分块）。这部分逻辑被封装在 <code>fla.layers.multiscale_retention</code> 里了，本文件只是调用。</li>
+</ul>
+</li>
+<li><strong><code>FusedCrossEntropy</code> / <code>FusedLinearCrossEntropy</code>：</strong><ul>
+<li>这是 <code>fla</code> 库的特色。它把“线性层映射”和“计算损失”这两个步骤合并成一步在 GPU 上运行，为了省显存和加速。</li>
+</ul>
+</li>
+<li><strong><code>gradient_checkpointing</code>：</strong><ul>
+<li>一种用“时间换空间”的技术，为了能在显存有限的卡上训练大模型。</li>
+</ul>
+</li>
+</ol>
+<h3>✅ Task 5: 总结流程 (Todo List 回顾)</h3>
+<p>如果你要调试或修改这个代码，按这个顺序看：</p>
+<ol>
+<li><strong>数据进来</strong> (<code>RetNetForCausalLM.forward</code>)：拿到 <code>input_ids</code>。</li>
+<li><strong>过身体</strong> (<code>RetNetModel.forward</code>)：<ul>
+<li>变成向量。</li>
+<li><strong>Loop</strong>：一层层过 <code>RetNetBlock</code>。</li>
+<li>每一层里：先做 Retention（看上下文），再做 MLP（思考），中间夹杂着 Norm 和加法。</li>
+</ul>
+</li>
+<li><strong>出结果</strong>：拿到最后一层的输出。</li>
+<li><strong>算概率</strong> (<code>lm_head</code>)：映射成词表概率。</li>
+<li><strong>算误差</strong> (<code>loss</code>)：如果是训练模式，对比标准答案算 Loss。</li>
+</ol>
+<p><strong>一句话总结：</strong>
+这个文件定义了一个<strong>标准的层级式大模型架构</strong>，只是把中间最核心的“Attention 零件”换成了“RetNet 的 Retention 零件”，并加上了大量底层的加速算子。</p>

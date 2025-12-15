@@ -1,0 +1,102 @@
+<h1>verl/utils/megatron/tensor_parallel.py</h1>
+<p>这份代码确实涉及到了深度学习中比较硬核的<strong>大模型分布式训练（Tensor Parallelism / 张量并行）</strong>部分。如果没接触过Megatron-LM，看懂确实很难。</p>
+<p>为了让你更容易理解，我们可以把这个文件的功能想象成<strong>“为了让一个超大模型被切分到多张显卡上运行，我们需要做的准备工作清单”</strong>。</p>
+<p>这个文件就是 <code>verl</code> 库为了调用 <code>Megatron-LM</code>（一个著名的分布式训练框架）而写的一组<strong>工具箱（Utilities）</strong>。</p>
+<p>下面我为你列一个 <strong>Task List (任务清单)</strong>，把代码中的功能对应到这个清单的每一个步骤中，带你一步步看懂。</p>
+<hr />
+<h3>任务清单：如何让模型在多张卡上跑起来？</h3>
+<p>想象你现在是一个大模型训练系统的总指挥，你的任务是把一个巨大的神经网络切开，分给几个小弟（GPU）去算。你需要完成以下 TODO List：</p>
+<ol>
+<li><strong>【配置准备】</strong>：给 Megatron 框架写好配置文件，告诉它我们想怎么切分模型。</li>
+<li><strong>【层级设置】</strong>：针对不同的层（比如线性层、Embedding层），准备专门的初始化参数。</li>
+<li><strong>【参数检查】</strong>：能够随时检查某个参数是不是已经被切分了，是怎么切的。</li>
+<li><strong>【并行计算】</strong>：在切分状态下，直接计算数学指标（如熵、对数概率），而不需要把数据拼回去（为了省显存）。</li>
+</ol>
+<hr />
+<h3>逐步讲解（对应代码）</h3>
+<h4>Step 1: 【配置准备】搞定 Megatron 的设置</h4>
+<p>Megatron-LM 是一个很复杂的框架，初始化它的层需要传入一个 <code>ModelParallelConfig</code> 对象。这部分代码就是为了<strong>偷懒</strong>，快速生成默认配置。</p>
+<ul>
+<li><strong>代码位置</strong>：<code>update_kwargs_with_config</code>, <code>get_default_kwargs_for_model_parallel_config</code>, <code>get_default_model_parallel_config</code></li>
+<li><strong>白话解释</strong>：<ul>
+<li>这些函数就是“填表单”。</li>
+<li>比如 <code>get_default_kwargs...</code> 设置了默认参数：用 <code>float32</code>，不使用 CPU 初始化，不开启梯度累积融合等。</li>
+<li><strong>目的</strong>：为了后续能一键生成 <code>config</code> 对象，不用每次手动敲一堆参数。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 2: 【层级设置】告诉线性层怎么切</h4>
+<p>在张量并行中，线性层（Linear Layer）有两种切法：<strong>按列切（Column Parallel）</strong> 和 <strong>按行切（Row Parallel）</strong>。</p>
+<ul>
+<li><strong>代码位置</strong>：<ul>
+<li><code>get_common_default_kwargs_for_parallel_linear</code></li>
+<li><code>get_default_kwargs_for_column_parallel_linear</code></li>
+<li><code>get_default_kwargs_for_row_parallel_linear</code></li>
+<li><code>get_default_kwargs_for_parallel_embedding</code></li>
+</ul>
+</li>
+<li><strong>白话解释</strong>：<ul>
+<li>这些函数是在准备“套餐”。</li>
+<li>如果你要创建一个“按列切分的线性层”，就调用 <code>column</code> 那个函数，它会把配置里的 <code>async_tensor_model_parallel_allreduce</code> 设为 False（同步模式）。</li>
+<li>如果你要创建一个“Embedding层”，就调用 <code>embedding</code> 那个函数。</li>
+<li><strong>目的</strong>：统一管理不同类型层的初始化参数，保证大家用一样的标准去切分模型。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 3: 【参数检查】查户口</h4>
+<p>有时候我们需要知道某个权重矩阵（Parameter）到底有没有被切分，或者它是沿着哪一个维度切分的。</p>
+<ul>
+<li><strong>代码位置</strong>：<code>is_tensor_parallel_param</code>, <code>get_tensor_parallel_partition_dim</code>, <code>get_tensor_parallel_partition_stride</code></li>
+<li><strong>白话解释</strong>：<ul>
+<li><code>is_tensor_parallel_param</code>: 检查这个参数身上有没有贴着“我是并行参数”的标签（属性）。</li>
+<li><code>get_tensor_parallel_partition_dim</code>: 问这个参数：“你是横着切的还是竖着切的？”</li>
+<li><strong>目的</strong>：在训练或保存模型时，用来判断需不需要特殊处理这个张量。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 4: 【并行计算】最难的部分——切分状态下算数学题</h4>
+<p>这是整个文件最硬核的部分。
+<strong>场景</strong>：模型的输出层（Logits）通常非常大（比如词表大小 10万 x Batch Size）。为了省显存，Logits 也是被切分在不同显卡上的。
+<strong>问题</strong>：如果我们要算熵（Entropy）或者 Loss，通常需要把 Logits 拼成完整的。但那样显存会爆。
+<strong>解决</strong>：这部分代码实现了<strong>不用拼合，直接在切分状态下算出结果</strong>。</p>
+<ul>
+<li>
+<p><strong>代码 4.1: <code>_VocabParallelEntropy</code> (自定义反向传播)</strong></p>
+<ul>
+<li><strong>功能</strong>：计算熵 $H(p) = -\sum p(x) \log p(x)$。</li>
+<li><strong>流程</strong>：<ol>
+<li>每张卡算自己那部分 Logits 的最大值，然后大家通信（<code>all_reduce</code>），找到全局最大值（为了数值稳定性）。</li>
+<li>算指数和（Exp Sum），再通信，得到全局的分母。</li>
+<li>算出 Softmax 和对应的熵。</li>
+</ol>
+</li>
+<li><strong>目的</strong>：显存优化。你不需要在一张卡上放下整个 <code>[Batch, Vocab_Size]</code> 的大矩阵。</li>
+</ul>
+</li>
+<li>
+<p><strong>代码 4.2: <code>vocab_parallel_log_probs_from_logits</code></strong></p>
+<ul>
+<li><strong>功能</strong>：计算对数概率（Log Probs）。</li>
+<li><strong>白话</strong>：其实就是算 Cross Entropy Loss 的相反数。它直接调用了 Megatron 内部的 <code>vocab_parallel_cross_entropy</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>代码 4.3: <code>vocab_parallel_log_probs_from_logits_response_rmpad</code></strong></p>
+<ul>
+<li><strong>功能</strong>：处理变长序列（Remove Padding）的并行概率计算。</li>
+<li><strong>场景</strong>：我们在训练时，一句话长一句话短，通常会补0（Padding）。为了效率，我们有时会把 Padding 去掉（rmpad），把所有数据拼成一条长龙（1D Tensor）。</li>
+<li><strong>流程</strong>：<ol>
+<li><code>unpad_input</code>: 把输入数据里的 Padding 去掉，压扁。</li>
+<li><code>vocab_parallel_log_probs</code>: 在并行的状态下算出概率。</li>
+<li><code>pad_input</code>: 把算出来的结果再按照原来的形状填回去（补回 Padding），方便后续处理。</li>
+</ol>
+</li>
+<li><strong>目的</strong>：结合了 <strong>FlashAttention 的去Padding技术</strong> 和 <strong>Megatron 的张量并行技术</strong>，极致地压榨显存和计算效率。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件讲的是：</p>
+<blockquote>
+<p>既然我们要用 Megatron-LM 来做分布式训练，那就先把<strong>配置</strong>搞好，把<strong>参数检查</strong>工具备好，最重要的是，实现了<strong>在数据被切分的情况下，如何高效地计算 Loss 和 Entropy</strong>，而不需要把数据合并，从而节省宝贵的显存。</p>
+</blockquote>

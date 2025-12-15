@@ -1,0 +1,120 @@
+<h1>tools/checkpoint/hybrid_conversion.py</h1>
+<p>这份代码的核心功能是：<strong>模型权重转换（Checkpoint Conversion）</strong>。</p>
+<p>具体来说，它是针对 <strong>Hybrid Mamba-Transformer</strong> 架构模型的。它的作用是改变模型在多张显卡上的分布方式（即改变 Tensor Parallel (TP) 和 Pipeline Parallel (PP) 的大小）。</p>
+<p>比如：你原本是用 8 张卡训练的模型（TP=4, PP=2），现在你想把模型合并成 1 个文件（TP=1, PP=1）用来推理，或者想转换成 4 张卡（TP=2, PP=2）继续微调，就需要用这个脚本。</p>
+<p>为了让你更容易理解，我把你当作这个程序的执行者，给你列一个 <strong>Task Todo List</strong>，按顺序执行这些任务就是这个脚本的逻辑：</p>
+<hr />
+<h3>📋 任务清单 (Task Todo List)</h3>
+<ol>
+<li><strong>准备阶段</strong>：读取用户配置，找到旧模型在哪里。</li>
+<li><strong>加载元数据</strong>：读取旧模型的参数配置（比如层数、隐藏层大小、原本是用几张卡训练的）。</li>
+<li><strong>还原完整模型 (核心步骤 1)</strong>：<ul>
+<li>遍历旧的流水线（PP）分块。</li>
+<li>遍历旧的张量并行（TP）分块。</li>
+<li>把这些零散的碎片“拼”回一个完整的、未切割的模型参数（Full Model）。</li>
+</ul>
+</li>
+<li><strong>重新切割模型 (核心步骤 2)</strong>：<ul>
+<li>根据用户想要的新 TP 和 PP 大小。</li>
+<li>把刚才拼好的完整模型，按新的规则“切”成新的碎片。</li>
+</ul>
+</li>
+<li><strong>保存新模型</strong>：<ul>
+<li>更新模型的配置信息（Args）。</li>
+<li>把切好的新碎片保存到硬盘上。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🧐 逐步详细讲解</h3>
+<p>下面我结合代码中的关键部分，一步步给你讲讲它是怎么完成上面的 List 的。</p>
+<h4>Task 1: 准备与配置</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>main(args)</code> 函数开头 和 <code>if __name__ == "__main__":</code></li>
+<li><strong>解释</strong>：
+    程序启动，读取命令行参数。比如 <code>--load-dir</code>（旧模型在哪），<code>--target-tp-size</code>（目标切成几份）。
+    同时，它定义了一个字典 <code>tp_split_dim</code>，这个很重要。它告诉程序：<strong>每一层权重该怎么切</strong>。<ul>
+<li><code>0</code> 代表按行切（横着切）。</li>
+<li><code>1</code> 代表按列切（竖着切）。</li>
+<li><code>-1</code> 代表不切（每张卡都复制一份完整的）。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 加载元数据</h4>
+<ul>
+<li><strong>代码位置</strong>：
+    <code>python
+    tracker_filename = os.path.join(args.load_dir, 'latest_checkpointed_iteration.txt')
+    # ... 读取 iteration ...
+    sample_model = torch.load(sample_model_file)</code></li>
+<li><strong>解释</strong>：
+    它先看 <code>latest_checkpointed_iteration.txt</code> 知道训练到第几步了。然后随便加载一个模型文件 (<code>sample_model</code>)，不是为了读权重，而是为了读 <code>args</code>（配置），看看旧模型原本是 TP 多少，PP 多少。</li>
+</ul>
+<h4>Task 3: 还原完整模型 (Gather)</h4>
+<p>这是最复杂的一步，因为 Mamba 模型的参数拼接比较特殊。</p>
+<ul>
+<li>
+<p><strong>代码位置</strong>：
+    ```python
+    # 遍历 Pipeline Parallel (PP)
+    for pp in range(input_pp_rank):
+        # 遍历 Tensor Parallel (TP)
+        for tp in range(input_tp_rank):
+             # ... 加载文件 ...</p>
+<div class="codehilite"><pre><span></span><code><span class="gh">#</span> 合并 TP 分片
+combined_tensor = combine_tp_tensors(...)
+</code></pre></div>
+
+<p><code>``
+*   **解释**：
+1.  **合并 TP（横向合并）**：如果旧模型 TP&gt;1，同一个权重被拆在不同文件里。</code>combine_tp_tensors<code>函数负责把它们拼起来。
+    *   *难点*：对于 Mamba 模型的</code>mixer.in_proj.weight<code>等层，参数是交错排列的（Interleaved），不能简单地</code>cat<code>（拼接）。代码里有专门针对</code>mamba_version == 1<code>和</code>2<code>的特殊处理逻辑，把打散的数据重新理顺拼好。
+2.  **合并 PP（纵向合并）**：PP 是把模型的层（Layer）拆分。比如 0-10 层在 GPU1，11-20 层在 GPU2。
+    代码通过</code>new_key = key.replace(...)<code>修改层号，把 GPU2 里的 "第 0 层" 改名为全局的 "第 11 层"，存入</code>full_model` 字典。</p>
+<p><strong>此时，内存里的 <code>full_model</code> 就是一个完整的、单卡的模型。</strong></p>
+</li>
+</ul>
+<h4>Task 4: 重新切割模型 (Scatter)</h4>
+<p>现在要把完整模型按你的新需求（Target TP/PP）切开。</p>
+<ul>
+<li><strong>代码位置</strong>：
+    <code>python
+    # 遍历目标 PP
+    for pp in range(args.target_pp_size):
+        # ...
+        # 遍历 full_model 中的每一层
+        for ii, (key, original_tensor) in enumerate(full_model.items()):
+            # ...
+            # 切割 TP
+            tensor_sliced = split_tensor_for_tp(args, new_key, split_dim, original_tensor)</code></li>
+<li><strong>解释</strong>：<ol>
+<li><strong>分配 PP</strong>：计算每一张 PP 卡应该分到哪些层。如果层号不属于当前 PP 卡，就跳过。</li>
+<li><strong>切割 TP</strong>：对于属于当前卡的层，调用 <code>split_tensor_for_tp</code>。<ul>
+<li>这个函数是 <code>combine_tp_tensors</code> 的逆操作。它根据 <code>tp_split_dim</code> 定义的规则（0 或 1），把大张量切成小块。</li>
+<li>同样，针对 Mamba 的特殊层，这里也有复杂的逻辑，确保切分后的参数顺序符合 Megatron/Mamba 的并行计算要求。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>Task 5: 保存新模型</h4>
+<ul>
+<li><strong>代码位置</strong>：
+    <code>python
+    model = finalize_checkpoint(sample_model, tp_models[tp], args, verbose=False)
+    # ...
+    torch.save(model, model_file)</code></li>
+<li><strong>解释</strong>：<ol>
+<li><code>finalize_checkpoint</code>：把切好的权重放进字典，同时把 <code>args.tensor_model_parallel_size</code> 改成新的数值。如果你选了 <code>--reset-iterations</code>，它还会把训练步数归零。</li>
+<li><code>torch.save</code>：把处理好的字典保存为 <code>.pt</code> 文件，路径格式通常是 <code>mp_rank_00/model_optim_rng.pt</code>。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p><strong>这个脚本就是一个“模型手术台”：</strong>
+1.  先把分散的“肢体”（旧权重）缝合起来（Combine/Merge）。
+2.  然后根据新的“手术方案”（Target TP/PP），重新切割这些“肢体”（Split/Slice）。
+3.  最后缝合好伤口打包带走（Save）。</p>
+<p><strong>为什么要这么麻烦？</strong>
+因为 Mamba 模型的某些层（如 <code>in_proj</code>）内部包含了多个不同的参数矩阵（x, z, B, C, dt），它们在张量并行时不是简单的“切两半”，而是需要按照特定的分组逻辑去切分，否则模型计算就会出错。代码中大量的 <code>if 'mixer.in_proj.weight' in key...</code> 就是在处理这种复杂的对齐逻辑。</p>

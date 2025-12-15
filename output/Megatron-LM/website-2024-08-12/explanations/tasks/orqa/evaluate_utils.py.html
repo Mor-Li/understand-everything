@@ -1,0 +1,100 @@
+<h1>tasks/orqa/evaluate_utils.py</h1>
+<p>这份代码 <code>tasks/orqa/evaluate_utils.py</code> 是 NVIDIA Megatron-LM 项目中用于 <strong>ORQA (Open Retrieval Question Answering, 开放域检索问答)</strong> 任务的评估脚本。</p>
+<p>简单来说，它的核心目的是：<strong>给模型一堆问题，让模型去海量的 Wikipedia（维基百科）文章中把包含答案的段落找出来，然后计算找得准不准。</strong></p>
+<p>为了让你听懂，我把整个流程拆解成一个 <strong>“To-Do List” (任务清单)</strong>，然后一步步给你讲每一个步骤在代码里是怎么实现的。</p>
+<hr />
+<h3>📋 任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>准备阶段</strong>：加载模型（Query Encoder）和“证据库”（Wikipedia 所有段落的原文）。</li>
+<li><strong>建立索引</strong>：把 Wikipedia 的海量向量数据装进搜索引擎（FAISS）里，准备好被搜索。</li>
+<li><strong>问题编码</strong>：把要测试的“问题”（Questions）全部喂给模型，转换成向量（Vectors）。</li>
+<li><strong>集合数据</strong>：因为是多显卡并行，需要把分散在各张卡上的问题向量汇总到主卡上。</li>
+<li><strong>执行检索</strong>：在主卡上，拿着问题向量去 Wikipedia 库里搜，找出最相似的前 K 个段落。</li>
+<li><strong>分发结果</strong>：把搜到的结果发回给各个显卡。</li>
+<li><strong>核对答案</strong>：检查搜到的段落里有没有包含标准答案，计算准确率（Top-K Accuracy）。</li>
+</ol>
+<hr />
+<h3>🧐 逐步解析 (Step-by-Step Explanation)</h3>
+<h4>1. 准备阶段：加载模型与数据</h4>
+<p><strong>代码位置</strong>：<code>__init__</code> 和 <code>get_evidence_dataset</code></p>
+<ul>
+<li><strong>观点</strong>：ORQA 是一个“双编码器”（Bi-encoder）架构。评估时，我们只需要用到 <strong>Query Encoder（问题编码器）</strong>，因为文档编码器已经把维基百科编好存起来了。</li>
+<li><strong>动作</strong>：<ul>
+<li><code>get_evidence_dataset()</code>: 加载维基百科的文本数据（ID 到 文本的映射），后续用来核对答案。</li>
+<li><code>load_biencoder_checkpoint(...)</code>: 加载训练好的模型参数。这里特意设置了 <code>only_query_model=True</code>，只加载处理问题的部分，节省显存。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 建立索引：FAISS 搜索引擎</h4>
+<p><strong>代码位置</strong>：<code>faiss_wrapper</code> 和 <code>get_evidence_embedding</code></p>
+<ul>
+<li><strong>观点</strong>：在几千万个段落中通过向量相似度找答案，暴力遍历太慢，必须用 <strong>FAISS</strong> (Facebook AI Similarity Search) 这种高效库。</li>
+<li><strong>难点</strong>：多显卡（Distributed）环境下，FAISS 不能在所有卡上都跑，太占内存且线程不安全。</li>
+<li><strong>动作</strong>：<ul>
+<li>代码判断 <code>if args.local_rank == 0:</code>，也就是只让<strong>每台机器的主显卡（Rank 0）</strong> 去干这件重活。</li>
+<li><code>OpenRetreivalDataStore(load_from_path=True)</code>: 从硬盘读取预先计算好的 Wikipedia 向量。</li>
+<li><code>FaissMIPSIndex(...)</code>: 建立索引（MIPS = 最大内积搜索，等同于余弦相似度搜索）。</li>
+<li><code>torch.distributed.barrier()</code>: 其他显卡在旁边等着，直到主卡把索引建好。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 问题编码：把文字变成数学向量</h4>
+<p><strong>代码位置</strong>：<code>generate_query_vectors</code></p>
+<ul>
+<li><strong>观点</strong>：模型看不懂文字，只能看懂向量。我们需要把测试集里的问题（比如“谁发明了灯泡？”）变成一个固定长度的数字列表。</li>
+<li><strong>动作</strong>：<ul>
+<li><code>get_nq_dataset(...)</code>: 加载 NQ (Natural Questions) 测试集。</li>
+<li>循环 <code>dataloader</code>，拿到 <code>query_tokens</code>。</li>
+<li>调用 <code>unwrapped_model.embed_text(...)</code>: 让模型计算出问题的向量 (<code>query_logits</code>)。</li>
+<li>同时保存 <code>reference</code>（标准答案），比如“爱迪生”，后面算分用。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 集合数据：多卡汇总</h4>
+<p><strong>代码位置</strong>：<code>evaluate</code> 函数的前半部分</p>
+<ul>
+<li><strong>观点</strong>：Megatron 是用来跑超大模型的，通常用了多张显卡并行处理数据。卡 A 算了一部分问题，卡 B 算了一部分。但 FAISS 索引只在 Rank 0 上。所以必须把大家算好的向量凑到一起。</li>
+<li><strong>动作</strong>：<ul>
+<li>计算节点逻辑：<code>node_id</code>, <code>device_count</code> 等。</li>
+<li><code>torch.distributed.all_gather(...)</code>: 这是一个集合通信操作。它把同一个节点内所有显卡上的 <code>query_tensor</code> 收集起来，汇总成一个大的列表 <code>tensor_list</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 执行检索：大海捞针</h4>
+<p><strong>代码位置</strong>：<code>evaluate</code> 函数中 <code>if local_rank == 0 ...</code></p>
+<ul>
+<li><strong>观点</strong>：现在 Rank 0 手里有了所有的问题向量，也有了 Wikipedia 的索引，可以开始搜了。</li>
+<li><strong>动作</strong>：<ul>
+<li><code>all_query_tensor = torch.cat(...)</code>: 把收集来的向量拼成一个大矩阵。</li>
+<li><code>self.mips_index.search_mips_index(...)</code>: <strong>核心步骤</strong>。让 FAISS 算出每个问题最相似的 <code>top_k</code> 个文章段落的 ID (<code>topkindex</code>) 和相似度分数 (<code>distance</code>)。</li>
+</ul>
+</li>
+</ul>
+<h4>6. 分发结果：广播回各卡</h4>
+<p><strong>代码位置</strong>：<code>evaluate</code> 函数中 <code>torch.distributed.broadcast</code></p>
+<ul>
+<li><strong>观点</strong>：Rank 0 搜完了，但评估逻辑（算分）是分布式的，或者说为了代码逻辑闭环，需要把结果发回给对应的显卡。</li>
+<li><strong>动作</strong>：<ul>
+<li><code>torch.distributed.broadcast(distance, ...)</code>: 把搜到的分数发给大家。</li>
+<li><code>torch.distributed.broadcast(topkindex, ...)</code>: 把搜到的文章 ID 发给大家。</li>
+<li><code>torch.split(...)</code>: 每张卡只切分出属于自己处理的那部分问题的结果。</li>
+</ul>
+</li>
+</ul>
+<h4>7. 核对答案：算分</h4>
+<p><strong>代码位置</strong>：<code>evaluate</code> 函数末尾</p>
+<ul>
+<li><strong>观点</strong>：检索出来了 ID 没用，得看内容对不对。</li>
+<li><strong>动作</strong>：<ul>
+<li><code>passages = self.evidence_dataset.id2text</code>: 通过 ID 查找到段落的真实文本。</li>
+<li><code>calculate_matches(...)</code>: 这是一个工具函数。它会检查：<strong>检索出的段落文本里，是否包含了标准答案的字符串？</strong></li>
+<li><strong>Top-K Hits</strong>: 只要前 K 个检索结果里有一个包含答案，就算命中。</li>
+<li>最后打印结果：<code>print_rank_0("top-{}: {:.2f}".format(...))</code>，比如 Top-5 准确率是多少。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件的逻辑就是：
+<strong>加载数据 -&gt; (只在主卡)建索引 -&gt; (所有卡)算问题向量 -&gt; 汇总向量给主卡 -&gt; 主卡搜答案 -&gt; 结果发回各卡 -&gt; 比对文本算准确率。</strong></p>
+<p>之所以写得这么复杂（又是 barrier 又是 broadcast），完全是为了适应 <strong>多GPU分布式</strong> 的环境，避免每张卡都去加载巨大的索引导致内存爆炸。</p>

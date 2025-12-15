@@ -1,0 +1,118 @@
+<h1>fla/ops/triton/gla/block_parallel/inter_chunk_contribution/chunk_scan_triton_only_gv.py</h1>
+<p>完全理解，这段代码涉及到底层算子优化（Triton）和线性注意力机制（Linear Attention）的具体实现，直接看确实像天书。</p>
+<p>这段代码的核心功能是：<strong>处理线性注意力机制中，“块”（Chunk）与“块”之间的记忆（State）传递和衰减。</strong></p>
+<p>为了让你听懂，我们把它拆解成一个 <strong>5步的学习清单 (To-Do List)</strong>，由浅入深。</p>
+<hr />
+<h3>Task 1: 理解背景故事 (What &amp; Why?)</h3>
+<p><strong>概念：</strong> 现在的长序列模型（如 GLA, Mamba, RWKV）为了加速，通常会把长长的序列切成很多小段，叫做 <strong>Chunk（块）</strong>。</p>
+<ul>
+<li><strong>块内（Intra-chunk）：</strong> 块里面的计算可以并行（大家一起算）。</li>
+<li><strong>块间（Inter-chunk）：</strong> 块与块之间必须串行（因为第2块需要第1块留下的记忆）。</li>
+</ul>
+<p><strong>这个文件的作用：</strong> 它专门负责 <strong>“接力赛”</strong>。
+想象每个 Chunk 跑完后，都会产生一个“记忆包”（KV State）。这个代码负责把第 $i$ 个块的记忆包，经过衰减（Decay/Gate），传递给第 $i+1$ 个块，并加上第 $i+1$ 个块新产生的记忆。</p>
+<ul>
+<li><strong>关键词 <code>only_gv</code>：</strong> 意思是这里的衰减（Gating）只作用在 Value ($V$) 维度上，而不是 Key ($K$) 维度。</li>
+</ul>
+<hr />
+<h3>Task 2: 搞定输入变量 (Who is Who?)</h3>
+<p>在看 Triton 代码前，先看 Python 接口 <code>forward</code> 函数，搞清楚谁是谁：</p>
+<ol>
+<li>
+<p><strong><code>to_add</code> (对应代码里的 <code>S</code>)</strong>:</p>
+<ul>
+<li>这是当前这个 Chunk 自己新产生的“记忆增量”。</li>
+<li>形状：<code>[Batch, Head, Num_Chunks, D_k, D_v]</code>。</li>
+<li>你可以把它理解为：这一段路程中新收集到的信息。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>decay_value_last</code> (对应代码里的 <code>p2</code>)</strong>:</p>
+<ul>
+<li>这是衰减系数（Gate）。</li>
+<li>形状：<code>[Batch, Head, Num_Chunks, D_v]</code>。注意它比 <code>S</code> 少一个 <code>D_k</code> 维度，说明它是对 $V$ 维度进行广播的。</li>
+<li>理解为：遗忘率。从上一个块传过来时，要忘掉多少信息。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>output</code> (对应代码里的 <code>O</code>)</strong>:</p>
+<ul>
+<li>这是计算后的累积记忆状态（Hidden State）。</li>
+<li>理解为：当前块结束时，脑子里总共剩下的记忆。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>Task 3: 拆解前向传播逻辑 (Forward Pass)</h3>
+<p>现在我们看核心函数 <code>_fwd_recurrence</code>。别被 <code>offset</code> 吓到，那些只是为了在显存中找到正确的位置。</p>
+<p><strong>核心逻辑 (伪代码)：</strong>
+这是一个循环，沿着 <code>NUM_BLOCK</code>（块的数量）方向走。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 假设 acc 是累积的记忆（State）</span>
+<span class="n">acc</span> <span class="o">=</span> <span class="mi">0</span> 
+
+<span class="c1"># 1. 初始化：先读取第0个块产生的新信息</span>
+<span class="n">acc</span> <span class="o">+=</span> <span class="n">load</span><span class="p">(</span><span class="n">S_chunk_0</span><span class="p">)</span>
+<span class="n">store</span><span class="p">(</span><span class="n">acc</span><span class="p">,</span> <span class="n">O_chunk_0</span><span class="p">)</span> <span class="c1"># 存下第0个块的状态</span>
+
+<span class="c1"># 2. 循环：从第1个块开始一直到最后</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">NUM_BLOCK</span><span class="p">):</span>
+    <span class="c1"># 读取衰减系数 (p2)</span>
+    <span class="n">decay</span> <span class="o">=</span> <span class="n">load</span><span class="p">(</span><span class="n">p2_chunk_prev</span><span class="p">)</span> 
+
+    <span class="c1"># 读取当前块的新增信息 (S)</span>
+    <span class="n">new_info</span> <span class="o">=</span> <span class="n">load</span><span class="p">(</span><span class="n">S_chunk_i</span><span class="p">)</span>
+
+    <span class="c1"># 【核心公式】：旧记忆 * 衰减 + 新记忆</span>
+    <span class="n">acc</span> <span class="o">=</span> <span class="n">acc</span> <span class="o">*</span> <span class="n">decay</span> <span class="o">+</span> <span class="n">new_info</span> 
+
+    <span class="c1"># 存下当前块的状态</span>
+    <span class="n">store</span><span class="p">(</span><span class="n">acc</span><span class="p">,</span> <span class="n">O_chunk_i</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>Triton 的骚操作：</strong>
+由于 $D_k$ 和 $D_v$ 维度可能很大，Triton 把它们切成了 $32 \times 32$ 的小方块 (<code>BLOCK_MODEL</code>) 并行计算。
+*   <code>tl.program_id(1)</code> 处理 $D_k$ 的切分。
+*   <code>tl.program_id(2)</code> 处理 $D_v$ 的切分。
+*   每个线程块只负责计算矩阵中的一小块 $32 \times 32$ 区域的累加。</p>
+<hr />
+<h3>Task 4: 拆解反向传播 (Backward Pass)</h3>
+<p><code>_bwd_recurrence</code> 是最难懂的，因为它是计算梯度。在深度学习里，前向是从 $0$ 到 $N$，<strong>反向传播是从 $N$ 到 $0$</strong>。</p>
+<p><strong>目标：</strong> 计算 <code>DO</code> (输出的梯度) 对 <code>S</code> (输入增量) 和 <code>p2</code> (衰减系数) 的梯度影响。</p>
+<p><strong>核心逻辑 (链式法则)：</strong>
+如果 $H_t = H_{t-1} \cdot g + S_t$，那么：
+1.  当前的梯度 <code>Dacc</code> 来源于两部分：
+    *   当前时刻输出传回来的梯度 <code>DS_i</code> (其实是 <code>DO</code>)。
+    *   下一时刻传回来的梯度（被下一时刻的 decay 衰减过）。</p>
+<p><strong>代码中的循环：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 倒着循环</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">NUM_BLOCK</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">):</span>
+    <span class="c1"># 1. 累加梯度</span>
+    <span class="n">DS_i</span> <span class="o">=</span> <span class="n">load</span><span class="p">(</span><span class="n">DS</span><span class="p">)</span> <span class="c1"># 这里的 DS 其实是外部传入的梯度 DO</span>
+    <span class="n">Dacc</span> <span class="o">+=</span> <span class="n">DS_i</span>    <span class="c1"># Dacc 是累积的梯度流</span>
+
+    <span class="c1"># 2. 计算对 decay (p2) 的梯度</span>
+    <span class="c1"># 梯度 * 这一时刻之前的累积状态 S_i</span>
+    <span class="n">dp_i</span> <span class="o">=</span> <span class="n">Dacc</span> <span class="o">*</span> <span class="n">S_i</span> 
+    <span class="c1"># 求和存入 Dp2 (因为 p2 是向量，需要把矩阵梯度求和塌缩)</span>
+    <span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">Dp2</span><span class="p">,</span> <span class="nb">sum</span><span class="p">(</span><span class="n">dp_i</span><span class="p">))</span>
+
+    <span class="c1"># 3. 计算对输入 S 的梯度</span>
+    <span class="c1"># 其实就是 Dacc 本身，存回去</span>
+    <span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">S</span><span class="p">,</span> <span class="n">Dacc</span><span class="p">)</span>
+
+    <span class="c1"># 4. 准备下一个循环的 Dacc</span>
+    <span class="c1"># 梯度要往前传，必须乘以当前的衰减系数</span>
+    <span class="n">Dacc</span> <span class="o">*=</span> <span class="n">p_value</span> 
+</code></pre></div>
+
+<p><em>注：代码里为了节省显存，直接复用了 <code>S</code> 和 <code>DS</code> 的指针位置来读写，所以看起来有点乱。</em></p>
+<hr />
+<h3>Task 5: 总结与关键点 (The "Aha!" Moment)</h3>
+<p>这个脚本其实就干了一件事：<strong>实现了一个带衰减的累加器 (Leaky Integrator)。</strong></p>
+<p>$$ H_t = H_{t-1} \odot \text{decay} + \text{Input}_t $$</p>
+<p><strong>为什么要写这么复杂的 Triton 代码？</strong>
+1.  <strong>PyTorch 慢：</strong> 如果用 PyTorch 的 <code>for</code> 循环在 Python 层面做这个 $0 \to N$ 的循环，速度会极慢（串行）。
+2.  <strong>IO 优化：</strong> 这是一个 IO 密集型操作。Triton 允许我们在 SRAM（显卡高速缓存）里把 <code>acc</code> 一直拿在手里，不用每次从 HBM（显存）读写，直到循环结束。
+3.  <strong>并行：</strong> 虽然时间维度（Chunk）必须串行，但它把 $D_k, D_v$ 维度切碎了并行，极大利用了显卡算力。</p>
+<p><strong>一句话概括：</strong>
+这是一个<strong>并行化</strong>的、<strong>针对 GPU 优化</strong>的、<strong>块与块之间</strong>的<strong>记忆状态更新</strong>算法。</p>

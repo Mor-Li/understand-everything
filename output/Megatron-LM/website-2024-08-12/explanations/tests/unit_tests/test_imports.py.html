@@ -1,0 +1,116 @@
+<h1>tests/unit_tests/test_imports.py</h1>
+<p>完全没问题。这段代码初看确实有点绕，因为它用了很多 Python 的<strong>动态特性</strong>（比如根据字符串名字来加载代码，而不是直接写 <code>import</code>）。</p>
+<p>简单来说，这个文件的核心目的是：<strong>体检</strong>。它要检查 <code>megatron.core</code> 这个库里的各个核心模块能不能被正常加载，有没有写错路径、缺漏依赖或者语法错误。</p>
+<p>我们可以把这个文件的逻辑拆解成一个 <strong>4步走的 Task List（任务清单）</strong>。</p>
+<hr />
+<h3>任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1: 准备工具</strong> —— 制造一种“万能钥匙”，只要给它一个字符串路径（比如 <code>"megatron.core.models.GPT"</code>），它就能把对应的代码加载进来。</li>
+<li><strong>Task 2: 定义安检标准</strong> —— 规定什么样的代码才算“合格”。（必须能加载，且必须是一个神经网络模型类）。</li>
+<li><strong>Task 3: 批量扫描</strong> —— 给定一个文件夹（比如 <code>models</code>），自动把里面所有的东西都试一遍，看看哪些能过安检，哪些会报错。</li>
+<li><strong>Task 4: 执行全身体检</strong> —— 按照清单，依次扫描 <code>models</code>、<code>tensor_parallel</code>、<code>distributed</code> 等所有核心部门。</li>
+</ol>
+<hr />
+<h3>逐步讲解 (Step-by-Step)</h3>
+<p>下面我们按照上面的任务清单，一步步看代码是怎么实现的。</p>
+<h4>Task 1: 准备工具 (如何动态加载？)</h4>
+<p>代码里定义了几个辅助函数，用来把字符串变成真正的代码对象。</p>
+<ul>
+<li>
+<p><strong><code>import_class_by_path(path)</code></strong>:</p>
+<ul>
+<li><strong>作用</strong>：这是最底层的工具。</li>
+<li><strong>逻辑</strong>：你给它 <code>"megatron.core.transformer.TransformerBlock"</code>，它就帮你把这个类 import 进来。</li>
+<li><strong>代码对应</strong>：
+    <code>python
+    def import_class_by_path(path: str):
+        # 把路径切分开，最后一段是类名，前面是模块路径
+        paths = path.split('.')
+        ...
+        # 使用 Python 内置的 __import__ 动态加载
+        mod = __import__(path, fromlist=[class_name])
+        ...
+        return mod</code></li>
+</ul>
+</li>
+<li>
+<p><strong><code>_build_import_path</code></strong>:</p>
+<ul>
+<li><strong>作用</strong>：拼凑路径字符串。它只是简单地把 <code>["megatron", "core"]</code> 和你传入的子目录拼在一起。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 定义安检标准 (我们要找什么？)</h4>
+<p>有了加载工具，我们还得判断加载进来的东西对不对。</p>
+<ul>
+<li><strong><code>_get_class_from_path(subdomains, imp)</code></strong>:<ul>
+<li><strong>作用</strong>：尝试加载，并进行“安检”。</li>
+<li><strong>逻辑</strong>：<ol>
+<li>调用 Task 1 的工具尝试加载。</li>
+<li><strong>安检规则</strong>：<ul>
+<li>它必须是一个 <strong>类 (Class)</strong> (<code>inspect.isclass</code>)。</li>
+<li>它必须是 <strong>MegatronModule</strong> 或者 <strong>PyTorch Module</strong> 的子类 (<code>issubclass(..., torch.nn.Module)</code>)。也就是说，它得是神经网络的一部分。</li>
+</ul>
+</li>
+<li>如果加载出错（比如文件里有语法错误，或者缺包），它会捕捉异常 (<code>traceback</code>) 并记录下来。</li>
+</ol>
+</li>
+<li><strong>代码对应</strong>：
+    <code>python
+    try:
+        class_ = import_class_by_path(path)
+        # 检查是不是类，是不是 PyTorch 的模型
+        if inspect.isclass(class_) and issubclass(class_, (MegatronModule, torch.nn.Module)):
+            result = class_ # 合格！
+    except Exception:
+        # 记录报错信息
+        error = traceback.format_exc()</code></li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 批量扫描 (一个部门一个部门查)</h4>
+<p>这是代码里最复杂的一个函数。</p>
+<ul>
+<li><strong><code>_test_domain_module_imports(module, subdomains)</code></strong>:<ul>
+<li><strong>作用</strong>：给它一个子模块名（比如 <code>tensor_parallel</code>），它负责把这个模块下所有的东西都测一遍。</li>
+<li><strong>逻辑</strong>：<ol>
+<li>先尝试导入这个子模块本身。</li>
+<li><strong>遍历 (<code>dir(module)</code>)</strong>：查看这个模块里有什么东西（变量、函数、类）。</li>
+<li>对每一个东西，调用 Task 2 的 <code>_get_class_from_path</code> 进行安检。</li>
+<li><strong>分类记录</strong>：<ul>
+<li><code>module_list</code>: 成功加载且是合格的模型。</li>
+<li><code>failed_list</code>: 成功加载但不是模型（比如只是个普通函数，这不算错误，只是忽略）。</li>
+<li><code>error_list</code>: <strong>加载崩溃了</strong>（这是重点要抓的 bug）。</li>
+</ul>
+</li>
+<li><strong>汇报</strong>：打印成功了哪些，忽略了哪些。如果有崩溃（<code>error_list</code> 不为空），打印详细报错并返回 <code>False</code>（测试失败）。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 执行全身体检 (主程序)</h4>
+<p>最后，主函数把上面所有的逻辑串起来。</p>
+<ul>
+<li><strong><code>test_domain_mcore()</code></strong>:<ul>
+<li><strong>作用</strong>：列出所有需要检查的关键目录，逐一扫描。</li>
+<li><strong>逻辑</strong>：<ul>
+<li>检查 <code>models</code> 目录</li>
+<li>检查 <code>pipeline_parallel</code> 目录</li>
+<li>检查 <code>tensor_parallel</code> 目录</li>
+<li>... (以此类推)</li>
+</ul>
+</li>
+<li><strong>结果</strong>：只要有任何一个环节返回了 <code>False</code> (即 <code>not all_passed</code>)，程序就以错误码退出 (<code>exit(1)</code>)，告诉开发者：“你的代码有问题，没跑通”。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件的作用就是：<strong>防止开发者提交了坏的代码。</strong></p>
+<p>比如，程序员小王修改了 <code>tensor_parallel</code> 里的一个文件，但是他忘记导入 <code>torch</code> 了。
+1.  如果没有这个测试脚本，用户在跑训练任务时，程序跑了一半才会崩，浪费时间和算力。
+2.  有了这个脚本，CI/CD（自动测试系统）会先运行它。
+3.  脚本会扫描到 <code>tensor_parallel</code>，尝试加载小王写的类。
+4.  加载失败（因为缺 <code>torch</code>），脚本捕获异常，打印 Traceback，并报错退出。
+5.  小王的代码就被拦下来了，必须修好才能合并。</p>

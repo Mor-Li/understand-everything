@@ -1,0 +1,107 @@
+<h1>megatron/core/datasets/t5_dataset.py</h1>
+<p>没问题。这份代码的核心作用是<strong>为 T5 模型准备预训练数据</strong>。</p>
+<p>T5（Text-to-Text Transfer Transformer）模型的特点是“填空题”做得特别花哨：它不是简单的把一个词盖住让你猜，而是把<strong>一连串的片段（Span）</strong>挖掉，用特殊的占位符（Sentinel Token，比如 <code>&lt;extra_id_0&gt;</code>）代替，然后让模型在解码器（Decoder）里把这一串被挖掉的内容生成出来。</p>
+<p>为了让你看懂，我把你想象成一个<strong>数据流水线工人</strong>，这份代码就是你的<strong>操作手册（SOP）</strong>。我们将整个 <code>__getitem__</code> 函数（这是数据处理的核心）拆解成一个 <strong>To-Do List</strong>。</p>
+<hr />
+<h3>📋 T5 数据处理工人的 To-Do List</h3>
+<h4>任务 1：准备原材料 (Fetch Raw Data)</h4>
+<p><strong>目标</strong>：从巨大的文本库里捞出一段话来处理。
+*   <strong>动作</strong>：根据索引 <code>idx</code>，去数据库里找一段文本。
+*   <strong>代码对应</strong>：
+    <code>python
+    # 拿到开始和结束的位置
+    idx_beg, idx_end, target_sequence_length = self.sample_index[idx]
+    # 把这段文本取出来
+    sample = [self.dataset[i] for i in range(idx_beg, idx_end)]
+    # 把句子拍扁成一串 token (比如：[101, 25, 33, ...])
+    tokens = [token for sentence in sample for token in sentence]</code></p>
+<h4>任务 2：裁剪长度 (Truncate)</h4>
+<p><strong>目标</strong>：如果拿出来的文本太长，超过了规定的长度，就砍掉多余的。
+*   <strong>动作</strong>：确保手里的 token 数量不超过 <code>target_sequence_length</code>。
+*   <strong>代码对应</strong>：
+    <code>python
+    tokens = tokens[:target_sequence_length]</code></p>
+<h4>任务 3：制造“完形填空” (Span Masking)</h4>
+<p><strong>目标</strong>：这是 T5 的核心。我们要随机选几个片段挖掉。
+*   <strong>动作</strong>：调用父类的方法，随机把一些词变成“被掩盖”的状态。
+*   <strong>代码对应</strong>：
+    <code>python
+    # masked_spans 里存的是被挖掉的内容和它们的位置
+    (tokens, _, _, _, masked_spans,) = self._create_masked_lm_predictions(...)</code>
+    *   <em>例子</em>：
+        *   原句：<code>今天 天气 真 不错 我 想 去 公园</code>
+        *   挖掉后：<code>今天 &lt;MASK&gt; 我 想 &lt;MASK&gt; 公园</code>
+        *   <code>masked_spans</code> 记录了：第一个空是“天气 真 不错”，第二个空是“去”。</p>
+<h4>任务 4：组装 Encoder 和 Decoder 的输入 (Build Input/Output)</h4>
+<p><strong>目标</strong>：T5 是 Encoder-Decoder 架构，我们需要分别准备给 Encoder 看的题，和给 Decoder 抄的答案。
+*   <strong>动作</strong>：
+    1.  <strong>Encoder 输入</strong>：把挖掉的地方换成特殊的“哨兵符号”（Sentinel，如 <code>&lt;extra_id_0&gt;</code>, <code>&lt;extra_id_1&gt;</code>）。
+    2.  <strong>Decoder 输入/输出</strong>：告诉 Decoder 刚才那个哨兵符号代表啥内容。
+*   <strong>代码对应</strong>：
+    这是代码里最长的那个 <code>for</code> 循环：
+    ```python
+    sentinels = deque(self.config.tokenizer.additional_special_tokens_ids) # 拿到 <extra_id_0> 等符号</p>
+<div class="codehilite"><pre><span></span><code>for indices, labels in masked_spans:
+    sentinel = sentinels.popleft() # 取出一个哨兵，比如 &lt;extra_id_0&gt;
+
+    # --- Encoder 侧 ---
+    # 放入正常文本，遇到被挖的地方，放入哨兵 &lt;extra_id_0&gt;
+    encoder_input.extend(tokens[idx_beg:idx_end])
+    encoder_input.append(sentinel)
+
+    # --- Decoder 侧 ---
+    # Decoder 看到 &lt;extra_id_0&gt;，就要预测出原来被挖掉的 labels
+    decoder_input.append(sentinel)
+    decoder_input.extend(labels)
+
+    # Decoder 的预期输出（Labels）也是一样的
+    decoder_output.append(sentinel)
+    decoder_output.extend(labels)
+```
+<span class="k">*</span>   <span class="gs">*处理后的样子*</span>：
+    <span class="k">*</span>   **Encoder 输入**：`今天 &lt;extra_id_0&gt; 我 想 &lt;extra_id_1&gt; 公园`
+    <span class="k">*</span>   **Decoder 输出**：`&lt;extra_id_0&gt; 天气 真 不错 &lt;extra_id_1&gt; 去 &lt;eos&gt;`
+</code></pre></div>
+
+<h4>任务 5：补齐长度 (Padding)</h4>
+<p><strong>目标</strong>：因为 GPU 喜欢整齐的矩阵，我们要把短句子补齐到固定的长度。
+*   <strong>动作</strong>：
+    *   Encoder 输入补齐到 <code>sequence_length_encoder</code>。
+    *   Decoder 输入补齐到 <code>sequence_length_decoder</code>。
+    *   补齐用的填充符通常是 <code>pad_token</code>。
+*   <strong>代码对应</strong>：
+    <code>python
+    # 计算需要补多少个 0
+    length_pads_encoder = self.config.sequence_length_encoder - length_toks_encoder
+    # 执行 Padding
+    encoder_input = numpy.pad(..., constant_values=self.config.tokenizer.pad)</code></p>
+<h4>任务 6：制作“眼罩” (Attention Masks)</h4>
+<p><strong>目标</strong>：告诉模型哪些地方能看，哪些地方不能看（比如 Padding 的部分不能看，Decoder 预测未来时不能偷看后面）。
+*   <strong>动作</strong>：
+    1.  <code>mask_encoder</code>：Encoder 内部互相看（除了 Padding）。
+    2.  <code>mask_decoder</code>：Decoder 内部只能看左边（历史），不能看右边（未来），且不能看 Padding。
+    3.  <code>mask_encoder_decoder</code>：Decoder 看 Encoder 时，能看所有非 Padding 的部分。
+*   <strong>代码对应</strong>：
+    <code>python
+    mask_encoder = self._make_attention_mask(...)
+    mask_decoder = ... * self._make_history_mask(...) # history_mask 就是那个三角形的掩码</code></p>
+<h4>任务 7：打包出货 (Return)</h4>
+<p><strong>目标</strong>：把上面做好的所有零件打包成一个字典，丢给模型去训练。
+*   <strong>动作</strong>：返回字典。
+*   <strong>代码对应</strong>：
+    <code>python
+    return {
+        "text_enc": encoder_input,      # 题目
+        "text_dec": decoder_input,      # 提示词
+        "labels": decoder_output,       # 答案
+        "loss_mask": loss_mask,         # 告诉模型计算 Loss 时忽略 Padding 部分
+        ...
+    }</code></p>
+<hr />
+<h3>总结</h3>
+<p>这文件其实就干了一件事：
+把一段<strong>普通的文本</strong>，变成了 <strong>T5 模型专用的“填空题”格式</strong>。</p>
+<p>它把一句话拆成了两半：
+1.  <strong>一半给 Encoder</strong>：带洞的句子（洞里填的是 <code>&lt;extra_id_0&gt;</code>）。
+2.  <strong>一半给 Decoder</strong>：洞里的内容（以 <code>&lt;extra_id_0&gt;</code> 开头）。</p>
+<p>所有的 Padding、Masking 都是为了让这些数据能塞进 Transformer 模型里运算而已。</p>

@@ -1,0 +1,130 @@
+<h1>verl/models/llama/megatron/checkpoint_utils/llama_loader_depracated.py</h1>
+<p>这份代码确实非常硬核，因为它涉及到了<strong>大模型分布式训练</strong>中最繁琐的部分——<strong>权重加载（Checkpoint Loading）</strong>。</p>
+<p>简单来说，这个脚本的任务是：<strong>把一个完整的（或者合并过的）LLaMA模型权重文件，切分并分发到多张显卡（GPU）上，以便使用 Megatron 框架进行训练。</strong></p>
+<p>因为模型太大，一张卡放不下，所以内存里模型是“碎”的（被切分过的），但硬盘上的权重文件通常是完整的。这个脚本就是负责把完整的“大蛋糕”切好，准确地分给每一张卡。</p>
+<p>我把它拆解成一个 <strong>To-Do List</strong>，一步步带你把逻辑理顺。</p>
+<hr />
+<h3>任务清单：如何把大模型加载到分布式显卡集群</h3>
+<h4>✅ Step 1: 搞清楚“我们在哪，要去哪” (环境初始化)</h4>
+<p><strong>代码对应位置：</strong> <code>load_state_dict_to_megatron_llama</code> 函数开头部分。</p>
+<ul>
+<li><strong>背景知识：</strong> 在 Megatron 中，显卡被分成了三种角色：<ul>
+<li><strong>TP (Tensor Parallel)</strong>：把一个大的矩阵切成小块，几张卡合起来算一个层。</li>
+<li><strong>PP (Pipeline Parallel)</strong>：把模型的层（Layers）切分，卡A算前10层，卡B算后10层。</li>
+<li><strong>DP (Data Parallel)</strong>：大家模型都一样，只是处理的数据不同。</li>
+</ul>
+</li>
+<li><strong>代码逻辑：</strong><ul>
+<li>获取当前显卡的身份（我是第几号 rank？属于哪个组？）。</li>
+<li><strong>Rank 0 (主节点)</strong> 负责拿着完整的权重字典 (<code>state_dict</code>)。</li>
+<li><strong>其他节点</strong> 两手空空，等着 Rank 0 给它们发数据。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Step 2: 制作“地图” (Layer Mapping)</h4>
+<p><strong>代码对应位置：</strong> <code>_megatron_calc_layer_map</code> 函数。</p>
+<ul>
+<li><strong>问题：</strong> 假设模型有 80 层，我有 4 个流水线阶段（PP=4）。每一张卡应该负责加载哪几层？</li>
+<li><strong>解决：</strong> 这个函数计算一个映射表：<ul>
+<li>比如：全局第 5 层 -&gt; 应该去 <strong>PP Rank 0</strong> 的卡上，放在它本地的第 5 个位置。</li>
+<li>比如：全局第 25 层 -&gt; 应该去 <strong>PP Rank 1</strong> 的卡上，放在它本地的第 5 个位置。</li>
+</ul>
+</li>
+<li><strong>目的：</strong> 确保加载的时候，不会把第 10 层的权重塞进第 20 层的肚子里。</li>
+</ul>
+<h4>✅ Step 3: 准备“切蛋糕的刀” (定义广播函数)</h4>
+<p><strong>代码对应位置：</strong> <code>_broadcast_tensor</code>, <code>_broadcast_tp_shard_tensor</code> 等内部函数。</p>
+<p>这是最复杂的部分，因为不同的权重，切法不一样。Rank 0 读取数据，切好，然后通过网络广播（Broadcast）给其他卡。</p>
+<ul>
+<li>
+<p><strong>工具 A (<code>_broadcast_tensor</code>)：</strong></p>
+<ul>
+<li><strong>用途：</strong> 用于那些不需要切分的参数（比如 LayerNorm 的参数，或者标量）。</li>
+<li><strong>动作：</strong> Rank 0 读出来 -&gt; 发送给组内所有人 -&gt; 所有人直接存下。</li>
+</ul>
+</li>
+<li>
+<p><strong>工具 B (<code>_broadcast_tp_shard_tensor</code>)：</strong></p>
+<ul>
+<li><strong>用途：</strong> 用于普通的线性层（Linear Layer）。</li>
+<li><strong>动作：</strong> 这是一个大矩阵。Megatron 使用 <strong>TP</strong> (张量并行) 将其切分。</li>
+<li>Rank 0 把大矩阵切成几块（Chunk） -&gt; 挨个发给对应的卡 -&gt; 对应的卡只收属于自己的那一小块。</li>
+</ul>
+</li>
+<li>
+<p><strong>工具 C (<code>_broadcast_tp_shard_tensor_qkv</code>)：</strong></p>
+<ul>
+<li><strong>用途：</strong> 专门处理 Attention 里的 Q、K、V 矩阵。</li>
+<li><strong>难点：</strong> LLaMA 的 Q、K、V 在权重文件里可能是分开的，但在 Megatron 内部，为了计算加速，通常把 QKV 拼在一起变成一个大矩阵。</li>
+<li><strong>动作：</strong> Rank 0 先把 Q、K、V 读取出来 -&gt; 按照 TP 的逻辑拼装好 -&gt; 再切分 -&gt; 发给各卡。</li>
+</ul>
+</li>
+<li>
+<p><strong>工具 D (<code>_broadcast_tp_shard_tensor_gate_up</code>)：</strong></p>
+<ul>
+<li><strong>用途：</strong> 专门处理 LLaMA 的 MLP 层（SwiGLU 结构）。</li>
+<li><strong>难点：</strong> LLaMA 的 MLP 有 <code>gate_proj</code> 和 <code>up_proj</code> 两个矩阵。Megatron 同样喜欢把它们拼在一起。</li>
+<li><strong>动作：</strong> Rank 0 读取 Gate 和 Up -&gt; 拼起来 -&gt; 切分 -&gt; 发给各卡。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Step 4: 开始流水线作业 (主循环加载)</h4>
+<p><strong>代码对应位置：</strong> <code>if dp_rank == 0:</code> 下面的大循环。</p>
+<p>现在工具备齐了，开始一层层装填：</p>
+<ol>
+<li>
+<p><strong>加载 Embedding (词表)：</strong></p>
+<ul>
+<li>这是模型的第一层，把词转成向量。</li>
+<li>使用工具 B 切分（因为词表很大，通常也做切分）。</li>
+</ul>
+</li>
+<li>
+<p><strong>加载 Transformer Layers (核心循环 <code>for layer in range...</code>)：</strong></p>
+<ul>
+<li>根据 Step 2 的地图，判断当前这层属于哪个 PP Rank。</li>
+<li><strong>Input LayerNorm</strong>：用工具 A（不切分）。</li>
+<li><strong>Attention QKV</strong>：用工具 C（拼装后切分）。</li>
+<li><strong>Attention Output</strong>：用工具 B（切分）。</li>
+<li><strong>Post LayerNorm</strong>：用工具 A（不切分）。</li>
+<li><strong>MLP Gate/Up</strong>：用工具 D（拼装后切分）。</li>
+<li><strong>MLP Down</strong>：用工具 B（切分）。</li>
+</ul>
+</li>
+<li>
+<p><strong>加载 Final Norm (最后的归一化)：</strong></p>
+<ul>
+<li>用工具 A。</li>
+</ul>
+</li>
+<li>
+<p><strong>加载 LM Head (输出层)：</strong></p>
+<ul>
+<li>这是最后预测下一个词的层。</li>
+<li>如果是训练 Reward Model（奖励模型），这里可能叫 <code>value_head</code>。</li>
+<li>根据情况选择工具 A 或 B。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Step 5: 同步给所有人 (Data Parallel Sync)</h4>
+<p><strong>代码对应位置：</strong> <code>broadcast_params</code>。</p>
+<ul>
+<li><strong>现状：</strong> 上面的步骤只在 <strong>DP Rank 0</strong> 的那一组卡上完成了加载。<ul>
+<li>假设你有 16 张卡，DP=2。那么前 8 张卡（第一组）已经加载好模型了，后 8 张卡（第二组）还是空的。</li>
+</ul>
+</li>
+<li><strong>动作：</strong> 第一组的卡作为“老师”，把它们显存里已经切分好的模型参数，直接广播给第二组、第三组对应的卡。</li>
+<li><strong>结果：</strong> 所有显卡都拥有了正确的、切分好的权重。</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底在干啥？</h3>
+<p>想象你在组装一个巨型乐高（LLaMA模型）：</p>
+<ol>
+<li><strong><code>state_dict</code></strong> 是说明书和所有零件的原始大盒子。</li>
+<li><strong>Rank 0</strong> 是总指挥，只有他手里有说明书和零件盒。</li>
+<li><strong>其他 GPU</strong> 是组装工人，每个人只负责一小块区域。</li>
+<li>因为乐高太大，总指挥必须先把零件（矩阵）<strong>切开</strong>（Tensor Parallel），或者按<strong>步骤</strong>（Pipeline Parallel）分堆。</li>
+<li>代码里那些 <code>_broadcast_...</code> 函数，就是总指挥把切好的零件扔给对应工人的动作。</li>
+<li>特别是 <code>qkv</code> 和 <code>gate_up</code>，因为 LLaMA 的特殊结构，总指挥得先拼一下再切，才能扔给工人。</li>
+</ol>
+<p>这就是这个文件的全部核心逻辑。</p>

@@ -1,0 +1,80 @@
+<h1>fla/ops/rwkv6/fused_recurrent.py</h1>
+<p>这份代码确实非常硬核，因为它不是普通的 Python 代码，而是用 <strong>Triton</strong> 编写的高性能 GPU 算子。它的作用是实现 <strong>RWKV6 模型的核心循环机制（Recurrent Step）</strong>。</p>
+<p>为了让你听懂，我们不需要纠结每一行代码的指针计算，而是要把这个文件看作是一个 <strong>“流水线任务说明书”</strong>。</p>
+<p>我为你列了一个 <strong>“理解任务清单 (Todo List)”</strong>，我们一步步把这个复杂的代码拆解成人类能懂的逻辑。</p>
+<hr />
+<h3>任务清单：一步步拆解 RWKV6 Fused Recurrent</h3>
+<h4>✅ Task 1: 搞清楚这是在干什么？(宏观概念)</h4>
+<p><strong>核心观点：</strong> 这是一个“记忆更新”的过程。
+RWKV 是一种 RNN（循环神经网络）。想象你在读一本书：
+1.  你有一个<strong>当前的大脑状态（Hidden State, <code>h</code>）</strong>。
+2.  你读到了<strong>新的一页（输入 <code>k</code>, <code>v</code>）</strong>。
+3.  你需要决定：
+    *   <strong>遗忘</strong>多少旧的记忆（由 <code>w</code> 控制）。
+    *   <strong>存入</strong>多少新的信息（由 <code>k</code>, <code>v</code> 决定）。
+    *   根据记忆和当前信息，<strong>输出</strong>什么理解（由 <code>q</code>, <code>u</code> 决定）。</p>
+<p>这个文件就是告诉 GPU：<strong>“别一个个循环慢吞吞地算，用最快的方法把这一整本书读完，并算出每一页的理解。”</strong></p>
+<hr />
+<h4>✅ Task 2: 认识主要角色 (变量含义)</h4>
+<p>在代码中，有几个字母反复出现，它们是算法的主角：</p>
+<ul>
+<li><strong><code>r</code> 或 <code>q</code> (Receptance/Query)</strong>: 接收端。相当于“我想从记忆里提取什么信息”。</li>
+<li><strong><code>k</code> (Key)</strong>: 索引。相当于“这段新信息的主题是什么”。</li>
+<li><strong><code>v</code> (Value)</strong>: 内容。相当于“这段新信息的具体内容是什么”。</li>
+<li><strong><code>w</code> (Decay/Log Gate)</strong>: <strong>关键角色！</strong> 这是一个衰减率（遗忘门）。RWKV6 的特点是每一刻的遗忘率都不一样（Data-dependent decay）。它决定了 <code>h</code> (记忆) 随时间衰减的速度。</li>
+<li><strong><code>u</code> (Bonus)</strong>: 奖励项。为了弥补当前的 <code>v</code> 还没来得及存入长时记忆 <code>h</code>，我们给当前时刻的信息一个“特权通道”，直接加到输出里。</li>
+<li><strong><code>h</code> (Hidden State)</strong>: 也就是代码里的 <code>h0</code> (初始状态) 和 <code>ht</code> (最终状态)。这是传递的“记忆”。</li>
+</ul>
+<hr />
+<h4>✅ Task 3: 解析核心逻辑 —— 前向传播 (Forward)</h4>
+<p><strong>对应代码函数：</strong> <code>fused_recurrent_rwkv6_fwd_kernel</code></p>
+<p>这是最重要的一步。这段代码描述了如何处理序列。请看代码中的 <code>for _ in range(0, T):</code> 循环部分，这是逻辑核心：</p>
+<p><strong>步骤分解：</strong>
+1.  <strong>加载数据</strong>：从显存读取当前的 <code>q, k, v, w</code>。
+2.  <strong>计算输出 (<code>b_o</code>)</strong>：
+    *   公式逻辑：<code>输出 = (旧记忆 + 当前信息的特权通道) * 提取指令</code>
+    *   代码对应：<code>b_o = tl.sum((b_h + b_kv * b_u[:, None]) * b_q[:, None], 0)</code>
+    *   解释：<code>b_h</code> 是旧记忆，<code>b_kv * b_u</code> 是给当前信息的特权（不用等下一轮，马上就能用），然后乘上 <code>b_q</code> 得到输出。
+3.  <strong>更新记忆 (<code>b_h</code>)</strong>：
+    *   公式逻辑：<code>新记忆 = 旧记忆 * 遗忘率 + 新信息</code>
+    *   代码对应：<code>b_h = b_h * tl.exp(b_w)[:, None] + b_kv</code>
+    *   解释：这是 RNN 的精髓。<code>tl.exp(b_w)</code> 是衰减系数（比如 0.9），旧记忆变淡了，然后加上新的 <code>b_kv</code>（当前时刻的 Key-Value 乘积）。
+4.  <strong>移动指针</strong>：准备处理下一个时间步 (<code>p_q += ...</code>)。</p>
+<p><strong>观点总结：</strong> 这段代码证明了 RWKV6 是一个 <strong>线性 Attention</strong>，它的计算量是随长度线性增长的（因为只维护一个固定的 <code>h</code> 状态），而不是像传统 Transformer 那样随长度平方增长。</p>
+<hr />
+<h4>✅ Task 4: 解析反向传播 (Backward)</h4>
+<p><strong>对应代码函数：</strong> <code>fused_recurrent_rwkv6_bwd_kernel_...</code></p>
+<p>这是为了训练模型用的。如果你只是用模型（推理），可以忽略这部分。
+简单来说，它是 Task 3 的<strong>逆过程</strong>。</p>
+<ul>
+<li><strong>目标</strong>：算出为了让结果更好，<code>q, k, v, w</code> 应该怎么改（求梯度）。</li>
+<li><strong>逻辑</strong>：<ul>
+<li>从序列的<strong>最后一个词</strong>往前倒着算（<code>for _ in range(T - 1, -1, -1):</code>）。</li>
+<li>计算“遗忘率 <code>w</code>”的梯度最麻烦，因为当前的遗忘率会影响后面所有时刻的记忆。代码里专门有一个 <code>_dw</code> 的 kernel 来处理这个复杂的累积影响。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 5: 为什么要写得这么复杂？("Fused" 的含义)</h4>
+<p>你可能会问：“为什么不用 PyTorch 直接写 <code>h = h * w + k * v</code>？为什么要写这些 <code>tl.load</code>, <code>tl.program_id</code>？”</p>
+<p><strong>观点：</strong> 为了<strong>极致的速度</strong>。</p>
+<ol>
+<li><strong>IO 瓶颈</strong>：在 GPU 上，计算很快，但把数据从内存搬到计算核心（SRAM）很慢。</li>
+<li><strong>Fused (融合)</strong>：普通的 PyTorch 写法会每一行代码都搬运一次数据。这个脚本把“读取、计算输出、更新记忆、写入”全部融合在一个<strong>内核（Kernel）</strong>里。数据读进芯片后，算完所有步骤才写回去。</li>
+<li><strong>并行化</strong>：代码里的 <code>Block</code> (<code>BK</code>, <code>BV</code>) 是把大的向量切成小块，让 GPU 的几千个核心同时处理不同的块。</li>
+</ol>
+<hr />
+<h3>总结：这个文件讲了什么？</h3>
+<p>如果把这个文件翻译成一段人话，它在说：</p>
+<blockquote>
+<p>“这是一个针对 RWKV6 模型 <strong>Time-Mixing（时间混合）</strong> 层的<strong>极速版</strong>实现。</p>
+<p>它的核心任务是维护一个记忆矩阵 $H$。
+对于每一个时刻 $t$：
+1. 先用当前的记忆 $H_{t-1}$ 和当前输入 $K_t, V_t, U$ 来回答问题（计算 $O_t$）。
+2. 然后根据衰减率 $W_t$ 让旧记忆衰减，并把当前的新知识 $K_t V_t$ 存入记忆，变成 $H_t$。</p>
+<p>我们用 Triton 语言重写了逻辑，为了让 GPU 不需要反复读写内存，从而跑得飞快。”</p>
+</blockquote>
+<p><strong>你现在的 Todo List：</strong>
+1.  <strong>忽略</strong> 指针计算（<code>p_q + ...</code>）和掩码（<code>mask_k</code>），这些是底层实现细节。
+2.  <strong>聚焦</strong> 在 <code>fwd_kernel</code> 里的 <code>for</code> 循环内部，那是算法的灵魂。
+3.  <strong>理解</strong> <code>w</code> (decay) 是 RWKV6 区别于旧版 RWKV 的最大特征（每一刻的遗忘速度可以随内容变化）。</p>

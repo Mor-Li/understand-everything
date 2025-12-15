@@ -1,0 +1,120 @@
+<h1>fla/layers/rwkv6.py</h1>
+<p>这段代码实现的是 <strong>RWKV-6</strong>（论文 "Eagle and Finch" 中的架构）的核心层。RWKV 是一种像 RNN 一样推理（速度快、省显存），但像 Transformer 一样训练（可并行）的模型。</p>
+<p>既然你觉得很难懂，我们把它拆解成一个 <strong>“任务清单” (Task List)</strong>。我们就想象你是数据，正在流经这个层，我们一步步看发生了什么。</p>
+<hr />
+<h3>🗺️ 总览：这个文件在干嘛？</h3>
+<p>这个文件定义了一个类 <code>RWKV6Attention</code>，它是 RWKV-6 模型的一层。它的核心逻辑是：<strong>混合当前词和上一个词的信息，然后计算一种特殊的线性注意力。</strong></p>
+<p>下面是你的学习/阅读任务清单：</p>
+<hr />
+<h3>✅ Task 1: 先看懂“积木” (Helper Classes)</h3>
+<p>在看主类之前，先看文件底部的三个辅助类，它们是搭建主类的砖块。</p>
+<ol>
+<li>
+<p><strong><code>LoRA</code></strong>:</p>
+<ul>
+<li><strong>是什么</strong>：Low-Rank Adaptation（低秩适应）。</li>
+<li><strong>作用</strong>：就是一个省参数的 <code>Linear</code> 层。它把一个大矩阵乘法拆成两个小矩阵乘法（先降维再升维）。</li>
+<li><strong>代码里</strong>：<code>nn.Linear(..., low_rank_dim)</code> -&gt; <code>Activation</code> -&gt; <code>nn.Linear(low_rank_dim, ...)</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>LerpLinear</code> (Learned Interpolation Linear)</strong>:</p>
+<ul>
+<li><strong>是什么</strong>：带“插值”功能的线性层。</li>
+<li><strong>核心逻辑</strong>：RWKV 的特色是“时间混合”（Time Mixing）。它不仅仅看当前时刻的输入 $x_t$，还要看上一时刻的输入 $x_{t-1}$。</li>
+<li><strong>公式</strong>：它计算 <code>x + (上一时刻x - 当前x) * mu</code>。</li>
+<li><strong>人话</strong>：我在处理当前字的时候，偷瞄一眼上一个字，<code>mu</code> 决定了我偷瞄多少。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>DDLerpLinear</code> (Data-Dependent Lerp Linear)</strong>:</p>
+<ul>
+<li><strong>是什么</strong>：更高级的插值层。</li>
+<li><strong>区别</strong>：上面的 <code>LerpLinear</code> 里，<code>mu</code> 是一个固定的参数。而在这里，<code>mu</code> 是<strong>由数据动态决定</strong>的（Data-Dependent）。</li>
+<li><strong>作用</strong>：根据当前的内容，智能决定要融合多少上文信息。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 2: 理解核心角色 (RWKV6Attention 的参数)</h3>
+<p>回到 <code>RWKV6Attention</code> 类。RWKV 也是一种注意力机制，所以它有类似 Q, K, V 的概念，但名字略有不同。</p>
+<p>在 <code>forward</code> 函数中，你会看到数据被拆分成了 5 个部分：
+*   <strong>R (Receptance)</strong>: 类似于 Transformer 里的 <strong>Q (Query)</strong>。表示“我想要接收什么信息”。
+*   <strong>K (Key)</strong>: 同 Transformer，内容的索引。
+*   <strong>V (Value)</strong>: 同 Transformer，实际的内容。
+*   <strong>W (Decay/Weight)</strong>: <strong>这是 RWKV 的灵魂</strong>。它代表“遗忘率”。决定了过去的信息在传递过程中会衰减多少。
+*   <strong>G (Gate)</strong>: 门控机制，决定最后的输出有多少能通过。</p>
+<hr />
+<h3>✅ Task 3: 走一遍数据流程 (Forward Pass)</h3>
+<p>现在我们进入 <code>forward</code> 函数，看看数据 <code>hidden_states</code> 进来后经历了什么。</p>
+<h4>第 1 步：时间平移 (Time Shift)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">shifted</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">time_shift</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+<span class="n">delta</span> <span class="o">=</span> <span class="n">shifted</span> <span class="o">-</span> <span class="n">hidden_states</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：把整个序列向右挪一位，算出 <code>delta</code>（变化量）。</li>
+<li><strong>目的</strong>：让模型知道“上一个词”是什么，以及“当前词”和“上一个词”的差异。</li>
+</ul>
+<h4>第 2 步：计算混合系数 (Token Mixing / X Projection)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">x</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">x_proj</span><span class="p">[</span><span class="mi">0</span><span class="p">](</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">delta</span><span class="p">)</span><span class="o">...</span>
+<span class="n">r</span><span class="p">,</span> <span class="n">w</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">g</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">add_</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">x_bias</span><span class="p">)</span><span class="o">.</span><span class="n">unbind</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：使用一个小型的神经网络 (<code>x_proj</code>)，根据当前输入，计算出 5 个向量 (<code>r, w, k, v, g</code>) 对应的<strong>混合系数</strong>。</li>
+<li><strong>目的</strong>：RWKV-6 的强大之处在于，它对 R, K, V, W, G 每一个向量，都使用了不同的、动态计算的“偷瞄上文”的比例。</li>
+</ul>
+<h4>第 3 步：生成核心向量 (Projections)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">r</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">r_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">r</span><span class="p">,</span> <span class="n">delta</span><span class="p">)</span>
+<span class="n">w</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">w_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="n">w</span><span class="p">,</span> <span class="n">delta</span><span class="p">)</span>
+<span class="o">...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：调用刚才看过的 <code>DDLerpLinear</code>。</li>
+<li><strong>逻辑</strong>：利用第 2 步算出来的混合系数，结合当前输入和上一个输入，生成最终用于计算注意力的 R, W, K, V, G 向量。</li>
+<li><strong>注意</strong>：<code>w = -torch.exp(w)</code>。这里把 W 变成了负指数形式，因为 W 代表衰减（遗忘），必须保证数值在数学上是让信号变小的。</li>
+</ul>
+<h4>第 4 步：核心注意力计算 (The RWKV Kernel)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">mode</span> <span class="o">==</span> <span class="s1">&#39;fused_recurrent&#39;</span><span class="p">:</span>
+    <span class="n">o</span><span class="p">,</span> <span class="n">recurrent_state</span> <span class="o">=</span> <span class="n">fused_recurrent_rwkv6</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="k">elif</span> <span class="n">mode</span> <span class="o">==</span> <span class="s1">&#39;chunk&#39;</span><span class="p">:</span>
+    <span class="n">o</span><span class="p">,</span> <span class="n">recurrent_state</span> <span class="o">=</span> <span class="n">chunk_rwkv6</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：这是最硬核的部分，调用了 CUDA 算子（在 <code>fla.ops</code> 里）。</li>
+<li><strong>逻辑</strong>：<ul>
+<li><strong>Chunk Mode (训练时用)</strong>：并行计算。把长序列切成小块（Chunk），块内像 Transformer 一样并行，块间像 RNN 一样传递状态。</li>
+<li><strong>Fused Recurrent (推理/长序列用)</strong>：串行计算。像 RNN 一样，一个字一个字地过，更新隐藏状态。</li>
+</ul>
+</li>
+<li><strong>输入</strong>：把刚才算好的 R, K, V, W 扔进去。</li>
+<li><strong>输出</strong>：得到注意力结果 <code>o</code> 和新的隐藏状态 <code>recurrent_state</code>。</li>
+</ul>
+<h4>第 5 步：输出处理 (Output &amp; Gating)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">o</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">g_norm</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">gate_fn</span><span class="p">(</span><span class="n">g</span><span class="p">)</span>
+<span class="n">o</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">o_proj</span><span class="p">(</span><span class="n">o</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：<ol>
+<li><strong>GroupNorm</strong>：对多头注意力的输出做归一化。</li>
+<li><strong>Gating</strong>：乘以 <code>G</code> (Gate) 向量。类似于 LSTM 的门控，过滤掉不需要的信息。</li>
+<li><strong>Output Projection</strong>：最后过一个线性层，把维度变回 <code>hidden_size</code>。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>📝 总结：这个文件的逻辑链</h3>
+<ol>
+<li><strong>准备数据</strong>：拿到当前词向量，算出和上个词的差值。</li>
+<li><strong>动态混合</strong>：根据数据内容，智能决定 R, W, K, V, G 每一个向量应该混合多少上文信息。</li>
+<li><strong>生成向量</strong>：生成具体的 R, W, K, V, G。</li>
+<li><strong>RWKV 核心计算</strong>：利用 W (衰减率) 在时间轴上整合 K 和 V，然后用 R (Query) 去读取信息。</li>
+<li><strong>后续处理</strong>：归一化、门控、输出。</li>
+</ol>
+<h3>💡 为什么这叫 RWKV-6 (Eagle)？</h3>
+<p>RWKV-5 之前的版本，衰减率 <code>w</code> 只是基于通道的（每个特征维度的衰减速度不一样，但随时间不变）。
+<strong>RWKV-6 (这段代码)</strong> 的核心改进在于 <code>DDLerpLinear</code> 和那复杂的 <code>x_proj</code>：<strong>衰减率 <code>w</code> 变成了随时间、随数据动态变化的</strong>。这意味着模型可以根据上下文，动态决定“这一刻我要记得久一点”还是“这一刻我要赶紧忘掉”。</p>

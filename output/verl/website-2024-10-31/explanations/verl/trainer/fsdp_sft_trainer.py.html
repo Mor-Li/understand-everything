@@ -1,0 +1,121 @@
+<h1>verl/trainer/fsdp_sft_trainer.py</h1>
+<p>这份代码是一个用于<strong>大语言模型（LLM）监督微调（SFT, Supervised Fine-Tuning）</strong>的训练脚本。</p>
+<p>它的核心特点是使用了 <strong>FSDP (Fully Sharded Data Parallel)</strong> 技术。简单来说，就是把一个巨大的模型切碎，分散存放在多个显卡上，这样你才能用有限的显存训练大模型。</p>
+<p>为了让你更容易理解，我把这个代码的逻辑拆解成一个 <strong>“项目经理的任务清单 (To-Do List)”</strong>。想象这个脚本就是一个项目经理，通过以下步骤一步步完成训练任务：</p>
+<hr />
+<h3>📋 任务清单：FSDP SFT 训练流程</h3>
+<h4>Phase 1: 准备工作 (初始化阶段)</h4>
+<ol>
+<li>
+<p><strong>[环境搭建] 初始化分布式环境</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>main</code> 函数</li>
+<li><strong>要做的事</strong>: 看看咱们有多少张显卡（GPU），建立通讯机制。</li>
+<li><strong>解释</strong>: 代码里的 <code>init_device_mesh</code> 就是把所有显卡连成一张网，准备好一起干活。</li>
+</ul>
+</li>
+<li>
+<p><strong>[资源分配] 调整工作量 (Batch Size)</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>_normalize_config_bsz</code></li>
+<li><strong>要做的事</strong>: 根据显卡数量，重新计算每张卡该分多少数据。</li>
+<li><strong>解释</strong>: 如果配置文件说总共要一次训练 128 条数据，你有 8 张卡，那么每张卡实际只需要领 16 条数据。这一步就是做除法。</li>
+</ul>
+</li>
+<li>
+<p><strong>[准备教材] 构建数据加载器</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>_build_dataloader</code></li>
+<li><strong>要做的事</strong>: 把原本的文本数据（Parquet文件）变成模型能读懂的数字（Token）。</li>
+<li><strong>解释</strong>:<ul>
+<li>使用了 <code>SFTDataset</code>：负责把“提问”和“回答”拼在一起，并截断到最大长度。</li>
+<li>使用了 <code>DistributedSampler</code>：确保每张显卡拿到的数据是不重复的（大家分着学，别学重了）。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>[招聘员工] 加载模型与优化器 (最核心步骤)</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>_build_model_optimizer</code></li>
+<li><strong>要做的事</strong>: 把预训练好的大模型请出来，并给它穿上“FSDP 战衣”。</li>
+<li><strong>关键点</strong>:<ul>
+<li><code>copy_local_path_from_hdfs</code>: 如果模型在云端（HDFS），先下到本地。</li>
+<li><code>AutoModelForCausalLM.from_pretrained</code>: 加载原始模型。</li>
+<li><strong><code>FSDP(...)</code></strong>: <strong>这是全篇最重要的代码</strong>。它把模型包裹起来，将参数切分（Sharding）到不同显卡上。没有这一步，显存瞬间爆炸。</li>
+<li><code>optim.AdamW</code>: 设置优化器，决定怎么更新参数（学习率等）。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<h4>Phase 2: 正式开工 (训练循环)</h4>
+<ol>
+<li>
+<p><strong>[启动项目] 开始循环 (<code>fit</code>)</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>fit</code></li>
+<li><strong>要做的事</strong>: 控制整个训练的大节奏（跑多少个 Epoch）。</li>
+<li><strong>解释</strong>: 这是一个外层循环，负责协调训练、记录日志、保存进度。</li>
+</ul>
+</li>
+<li>
+<p><strong>[日常搬砖] 训练一步 (<code>training_step</code>)</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>training_step</code></li>
+<li><strong>要做的事</strong>: 这是模型真正“学习”的地方。</li>
+<li><strong>流程拆解</strong>:<ol>
+<li><strong>清空大脑</strong>: <code>optimizer.zero_grad()</code>，忘掉上一步的梯度。</li>
+<li><strong>微批次处理 (Micro-batch)</strong>: 为了省显存，把一大批数据切成更小的几份，分几次算。</li>
+<li><strong>算算错哪了</strong>: 调用 <code>_compute_loss</code> 计算损失。</li>
+<li><strong>反向传播</strong>: <code>loss.backward()</code>，计算需要怎么修改参数。</li>
+<li><strong>梯度裁剪</strong>: <code>clip_grad_norm_</code>，防止修改幅度过大把模型改坏了。</li>
+<li><strong>更新参数</strong>: <code>optimizer.step()</code>，正式修改模型参数。</li>
+</ol>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>[考试评分] 计算损失 (<code>_compute_loss</code>)</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>_compute_loss</code></li>
+<li><strong>要做的事</strong>: 算算模型预测的下一个字，和标准答案差多少。</li>
+<li><strong>解释</strong>:<ul>
+<li>SFT 的核心是预测下一个 Token。</li>
+<li>代码里有一个 <code>loss_mask</code>，意思是我们<strong>只关心“回答”部分的准确率</strong>，不关心“提问”部分的预测（因为提问是给定的）。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>[阶段测验] 验证集评估 (<code>validation_step</code>)</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>validation_step</code></li>
+<li><strong>要做的事</strong>: 跑完一部分训练后，用验证集考考模型，看它是不是真学会了，还是只是死记硬背（过拟合）。</li>
+</ul>
+</li>
+<li>
+<p><strong>[写工作日志] 记录数据</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>fit</code> 函数里的 <code>tracking.log</code></li>
+<li><strong>要做的事</strong>: 把 Loss（误差）和 Learning Rate（学习率）记下来，通常会画成图表（比如发给 WandB）。</li>
+</ul>
+</li>
+</ol>
+<h4>Phase 3: 收尾工作</h4>
+<ol>
+<li><strong>[存档] 保存模型 (<code>save_checkpoint</code>)</strong><ul>
+<li><strong>代码位置</strong>: <code>save_checkpoint</code></li>
+<li><strong>要做的事</strong>: 定期把训练好的模型存下来。</li>
+<li><strong>难点</strong>: 因为用了 FSDP，参数是碎在各地的。这里需要用 <code>FSDP.state_dict_type</code> 把分散的参数<strong>收集（Gather）</strong>起来，拼成一个完整的模型，然后只由“0号显卡”保存到硬盘或云端。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结：这代码到底在干嘛？</h3>
+<p>简单一句话：
+<strong>这是一个用来微调大模型的“管家”，它帮你在多张显卡上，通过 FSDP 技术节省显存，读取数据，计算误差，更新模型，并定期保存成果。</strong></p>
+<p>如果你要修改或调试，主要关注这三个地方：
+1.  <strong>数据不对？</strong> 查 <code>_build_dataloader</code>。
+2.  <strong>显存爆了？</strong> 查 <code>_build_model_optimizer</code> 里的 FSDP 配置。
+3.  <strong>Loss 不下降？</strong> 查 <code>_compute_loss</code> 里的 mask 逻辑是否正确。</p>

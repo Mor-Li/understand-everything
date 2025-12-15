@@ -1,0 +1,91 @@
+<h1>tests/unit_tests/dist_checkpointing/conftest.py</h1>
+<p>这段代码确实涉及了几个比较深的概念：<strong>Pytest 测试框架</strong>、<strong>分布式系统（多进程）</strong> 以及 <strong>Mock（模拟对象）</strong>。看不懂是很正常的。</p>
+<p>为了让你能够循序渐进地理解，我为你制定了一个 <strong>“学习任务清单” (To-Do List)</strong>。我们可以把这段代码想象成是在为一场大型考试（测试分布式训练）做考场布置。</p>
+<p>请按照以下步骤阅读：</p>
+<hr />
+<h3>✅ 任务 1：搞懂背景 —— 这个文件是干嘛的？</h3>
+<ul>
+<li><strong>概念</strong>：<code>conftest.py</code> 是 Pytest 框架中的一个特殊文件。</li>
+<li><strong>通俗解释</strong>：把它想象成 <strong>“考场后勤部”</strong>。</li>
+<li><strong>作用</strong>：这里面定义的函数（被 <code>@pytest.fixture</code> 装饰的），是给同目录下的其他测试文件提供“基础设施”的。比如提供一个临时文件夹、初始化一些配置。其他测试文件不用自己写这些，直接用就行。</li>
+</ul>
+<hr />
+<h3>✅ 任务 2：解决第一个难题 —— 多人协作时的“共享文件夹”</h3>
+<p><strong>代码对应部分：</strong> <code>tmp_path_dist_ckpt</code> 函数</p>
+<p><strong>场景设定</strong>：
+我们在测试分布式训练（Distributed Training）。这意味着会有多个进程（Rank 0, Rank 1, ...）同时运行，就像好几个学生同时在做实验。</p>
+<p><strong>问题</strong>：
+如果直接用 Pytest 自带的临时目录，每个学生（进程）可能会拿到不同的文件夹，或者从属进程（Rank &gt; 0）试图去访问一个主进程（Rank 0）还没建好的文件夹，导致报错。</p>
+<p><strong>代码逻辑拆解</strong>：</p>
+<ol>
+<li>
+<p><strong><code>scope="session"</code></strong>：</p>
+<ul>
+<li>意思是：整个测试过程只做一次，不要每个测试用例都做一遍。大家共用这一套环境。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>tmp_dir = ...</code></strong>：</p>
+<ul>
+<li>这里在手动指定一个固定的、大家都能访问到的路径，而不是随机生成的隔离路径。</li>
+</ul>
+</li>
+<li>
+<p><strong>核心逻辑：Rank 0 (班长) vs 其他人 (组员)</strong></p>
+<ul>
+<li><code>if Utils.rank == 0:</code> (如果是班长/主进程)<ul>
+<li><code>with TempNamedDir(tmp_dir, sync=False):</code></li>
+<li><strong>解释</strong>：班长负责<strong>创建</strong>这个文件夹，并且负责在用完后<strong>清理</strong>它。<code>yield tmp_dir</code> 把这个路径交出去给测试用例使用。</li>
+</ul>
+</li>
+<li><code>else:</code> (如果是组员/从属进程)<ul>
+<li><code>yield tmp_dir</code></li>
+<li><strong>解释</strong>：组员不需要创建，也不要删除。他们只需要知道“哦，路径是这个”，然后拿去用就行了。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<p><strong>总结</strong>：这个函数的目的是为了<strong>安全地创建一个所有进程都能读写的公共临时文件夹</strong>，用来存检查点（Checkpoint）。</p>
+<hr />
+<h3>✅ 任务 3：解决第二个难题 —— 强制规定“考试大纲”</h3>
+<p><strong>代码对应部分：</strong> <code>set_default_dist_ckpt_strategy</code> 函数</p>
+<p><strong>场景设定</strong>：
+Megatron-LM 有很多种保存模型（Checkpointing）的策略。但是在这次测试中，我们不想让系统随机选，或者用原来的默认值。我们需要强制系统使用一种特定的策略（PyTorch Distributed 格式）。</p>
+<p><strong>问题</strong>：
+代码深处有一个函数叫 <code>get_default_save_sharded_strategy</code>，它决定了默认用什么策略。我们想在不修改源码的情况下，临时改变它的行为。</p>
+<p><strong>代码逻辑拆解</strong>：</p>
+<ol>
+<li>
+<p><strong><code>autouse=True</code></strong>：</p>
+<ul>
+<li>意思是：不需要测试用例显式调用我，我会<strong>自动</strong>在所有测试开始前生效。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>def get_pyt_dist_save_sharded_strategy(): ...</code></strong>：</p>
+<ul>
+<li>这是我们捏造的一个“假函数”。它不管三七二十一，直接返回我们想要的配置：<code>StrategyAction.SAVE_SHARDED</code> 和 <code>'torch_dist'</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>核心逻辑：Mock (偷天换日)</strong></p>
+<ul>
+<li><code>with mock.patch(..., new=get_pyt_dist_save_sharded_strategy)</code>：</li>
+<li><strong>解释</strong>：这是 Python 的魔法。<ul>
+<li>它对系统说：“嘿，等会儿如果有任何人调用 <code>megatron...serialization.get_default_save_sharded_strategy</code> 这个原版函数...”</li>
+<li>“...请直接拦截，并运行我上面写的那个<strong>假函数</strong> (<code>new=...</code>)。”</li>
+</ul>
+</li>
+<li><strong>作用</strong>：通过这种“偷梁换柱”的方式，确保了在这一组测试中，默认的保存策略永远是我们指定的 <code>torch_dist</code>。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>📝 最终总结 (Takeaway)</h3>
+<p>如果把这个文件看作一个<strong>“考场守则”</strong>，它规定了两件事：</p>
+<ol>
+<li><strong>考场桌椅（Fixture 1）</strong>：所有考生（进程）必须把试卷（Checkpoint 文件）放在讲台旁边的<strong>同一个箱子</strong>里。班长（Rank 0）负责准备箱子和扔垃圾，其他人只管放。</li>
+<li><strong>考试规则（Fixture 2）</strong>：不管课本上怎么写的，本次考试统一规定：解题方法（Checkpoint 策略）必须默认为 <strong>Torch Distributed</strong> 格式。这是通过“催眠”（Mock）系统来实现的。</li>
+</ol>
+<p>现在再回头看代码，是不是清晰一些了？</p>

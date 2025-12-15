@@ -1,0 +1,118 @@
+<h1>examples/ppo_trainer/run_deepseek7b_llm_sp2.sh</h1>
+<p>这份脚本确实看起来很吓人，里面充满了各种深度学习、强化学习（RL）和分布式训练的专业术语。</p>
+<p>把这份脚本想象成一份<strong>“训练 AI 做数学题的详细任务说明书”</strong>。为了让你读懂它，我们把它拆解成一个 <strong>5步走的 To-Do List（任务清单）</strong>。</p>
+<p>我们现在的目标是：<strong>使用 PPO（一种强化学习算法）来微调 DeepSeek-7B 模型，让它更擅长做 GSM8K（小学数学应用题）。</strong></p>
+<hr />
+<h3>Task 1: 准备教材 (数据配置)</h3>
+<p><strong>目标</strong>：告诉 AI 该学什么，以及一次学多少。</p>
+<ul>
+<li>
+<p><strong>要做的事</strong>：</p>
+<ol>
+<li>指定训练书本（GSM8K 训练集）。</li>
+<li>指定考试试卷（GSM8K 测试集）。</li>
+<li>规定一次读多少题，每道题最长能写多少字。</li>
+</ol>
+</li>
+<li>
+<p><strong>对应代码解读</strong>：</p>
+<ul>
+<li><code>data.train_files=.../gsm8k/train.parquet</code>: 这是教材路径。</li>
+<li><code>data.train_batch_size=1024</code>: 这是一个巨大的数字，表示每一步更新模型时，要用到 1024 个样本的数据（通常是累计出来的）。</li>
+<li><code>data.max_prompt_length=512</code>: 题目最长 512 个 token。</li>
+<li><code>data.max_response_length=512</code>: 回答最长 512 个 token。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 2: 组建团队 (模型角色分配)</h3>
+<p><strong>目标</strong>：在强化学习（PPO）中，我们需要三个角色（通常由模型扮演）。</p>
+<ul>
+<li>
+<p><strong>要做的事</strong>：</p>
+<ol>
+<li><strong>Actor (演员)</strong>：负责做题的模型。</li>
+<li><strong>Ref (参考者)</strong>：原始模型，用来对比，防止演员改得面目全非（虽然这脚本里把 KL 惩罚关了，但架构上通常需要）。</li>
+<li><strong>Critic (评论家)</strong>：负责给演员做的题打分，告诉它这一步走得好不好。</li>
+</ol>
+</li>
+<li>
+<p><strong>对应代码解读</strong>：</p>
+<ul>
+<li><code>actor_rollout_ref.model.path=deepseek-ai/deepseek-llm-7b-chat</code>: 演员和参考模型都用 DeepSeek 7B Chat 版本。</li>
+<li><code>critic.model.path=deepseek-ai/deepseek-llm-7b-chat</code>: 评论家也用 DeepSeek 7B Chat 版本作为底座来初始化。</li>
+<li><code>actor...optim.lr=1e-6</code>: 演员的学习率很低（小心翼翼地学）。</li>
+<li><code>critic.optim.lr=1e-5</code>: 评论家的学习率稍高（学得快一点）。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 3: 安排工位 (显卡资源与并行策略) —— <strong>这是最难懂的部分</strong></h3>
+<p><strong>目标</strong>：模型很大（7B），数据很长，单张显卡装不下或跑太慢。我们需要把模型切碎了放在不同的显卡上。</p>
+<ul>
+<li>
+<p><strong>要做的事</strong>：</p>
+<ol>
+<li><strong>切分模型 (Tensor Parallel, TP)</strong>：把模型每一层切开，横向分布在多张卡上。</li>
+<li><strong>切分句子 (Sequence Parallel / Ulysses)</strong>：把很长的输入文字切成段，让不同的卡处理不同的段落。</li>
+<li><strong>生成加速 (Rollout)</strong>：做题（生成答案）的时候需要极快，使用 <code>vllm</code> 引擎。</li>
+</ol>
+</li>
+<li>
+<p><strong>对应代码解读</strong>：</p>
+<ul>
+<li><code>trainer.n_gpus_per_node=8</code>: 我们用一台 8 卡的机器跑。</li>
+<li><code>actor_rollout_ref.rollout.tensor_model_parallel_size=4</code>: <strong>(TP=4)</strong> 演员模型被切分到 4 张卡上运行。</li>
+<li><code>actor_rollout_ref.actor.ulysses_sequence_parallel_size=2</code>: <strong>(SP=2)</strong> 采用了“尤利西斯(Ulysses)”序列并行技术，并行度为 2。<ul>
+<li><em>注：4 (TP) * 2 (SP) = 8，正好占满 8 张卡。</em></li>
+</ul>
+</li>
+<li><code>actor_rollout_ref.rollout.name=vllm</code>: 生成答案时，调用 vLLM 库加速（比原生 PyTorch 快很多）。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 4: 制定奖惩规则 (PPO 算法细节)</h3>
+<p><strong>目标</strong>：告诉 AI 怎么根据分数来改进自己。</p>
+<ul>
+<li>
+<p><strong>要做的事</strong>：</p>
+<ol>
+<li>选择计算优势（Advantage）的方法。</li>
+<li>决定要不要限制 AI 和原始模型的差异（KL Divergence）。</li>
+</ol>
+</li>
+<li>
+<p><strong>对应代码解读</strong>：</p>
+<ul>
+<li><code>algorithm.adv_estimator=gae</code>: 使用 GAE (Generalized Advantage Estimation) 算法，这是一种让训练更稳定的数学技巧。</li>
+<li><code>algorithm.use_kl_in_reward=False</code>: <strong>这里很关键</strong>。通常 PPO 会在奖励里减去 KL 散度（防止模型乱来）。这里把它设为 False，意味着我们更鼓励模型去探索，哪怕和原模型差别很大也不惩罚（或者通过其他方式控制）。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 5: 启动与监控 (训练循环)</h3>
+<p><strong>目标</strong>：设置训练时长，并保存进度。</p>
+<ul>
+<li>
+<p><strong>要做的事</strong>：</p>
+<ol>
+<li>给项目起个名。</li>
+<li>设置跑多少轮（Epochs）。</li>
+<li>设置多久存一次档，多久测一次试。</li>
+</ol>
+</li>
+<li>
+<p><strong>对应代码解读</strong>：</p>
+<ul>
+<li><code>trainer.project_name='verl_example_gsm8k'</code>: 项目名。</li>
+<li><code>trainer.total_epochs=15</code>: 一共把所有题学 15 遍。</li>
+<li><code>trainer.save_freq=20</code>: 每 20 步存一次档。</li>
+<li><code>trainer.logger=['console','wandb']</code>: 训练日志打印在屏幕上，同时也传到 WandB（一个可视化的网页后台）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个脚本到底在干嘛？</h3>
+<p>一句话总结：
+<strong>这个脚本在一个 8 张显卡的机器上，使用 DeepSeek-7B 作为底座，利用 vLLM 加速生成和 Ulysses+TP 混合并行技术，通过 PPO 强化学习算法，训练该模型做 GSM8K 数学题，目标是训练 15 轮。</strong></p>
+<p><strong>为什么这个脚本看起来很高级？</strong>
+主要是因为它使用了 <strong>混合并行（Hybrid Parallelism）</strong>：
+*   它同时用了 <strong>TP=4</strong> (模型切分) 和 <strong>SP=2</strong> (序列切分)。
+*   文件名里的 <code>sp2</code> 指的就是 <code>Sequence Parallel = 2</code>。这通常是为了处理更长的上下文或者节省显存而设计的配置。</p>

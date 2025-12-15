@@ -1,0 +1,73 @@
+<h1>megatron/training/checkpointing.py</h1>
+<p>这个文件 <code>megatron/training/checkpointing.py</code> 是 Megatron-LM 训练框架中的 <strong>“存档管理员”</strong>。</p>
+<p>它的核心作用只有两个：<strong>存（Save）</strong> 和 <strong>取（Load）</strong>。</p>
+<p>但在大模型分布式训练中，“存”和“取”非常复杂，因为模型被切分到了几百上千张显卡上（Tensor Parallel, Pipeline Parallel），而且还需要保存优化器状态、随机数种子等，以保证断点续训时能完美复原。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“存档管理员的任务清单 (ToDo List)”</strong>，然后一步步解释代码是如何完成这些任务的。</p>
+<hr />
+<h3>📋 存档管理员的 ToDo List</h3>
+<ol>
+<li><strong>[路径规划]</strong>：搞清楚这次存档该叫什么名字，放在哪个文件夹里？（考虑到分布式切分）</li>
+<li><strong>[版本检查]</strong>：读取存档前，先检查存档的配置（Args）和当前代码的配置是否冲突？</li>
+<li><strong>[打包数据]</strong>：把模型权重、优化器状态、随机数种子（RNG）打包成一个字典（State Dict）。</li>
+<li><strong>[执行保存]</strong>：<ul>
+<li>如果是传统模式：主进程写入磁盘。</li>
+<li>如果是分布式模式：大家各自写入自己负责的那一部分碎片。</li>
+<li><em>可选：是否在后台异步写入，不卡住训练？</em></li>
+</ul>
+</li>
+<li><strong>[执行加载]</strong>：<ul>
+<li>读取“最新存档记录文件”（tracker）。</li>
+<li>把数据从硬盘读回内存。</li>
+<li>把读回来的权重填入当前的 PyTorch 模型中。</li>
+<li>处理旧版本兼容性问题（比如旧存档的矩阵形状和现在不一样）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>逐步详解：代码中的观点与逻辑</h3>
+<h4>第一步：路径规划 (Path &amp; Naming)</h4>
+<p><strong>代码对应函数：</strong> <code>get_checkpoint_name</code>, <code>get_checkpoint_tracker_filename</code>, <code>find_checkpoint_rank_0</code></p>
+<p>在大模型训练中，不能把所有东西存成一个 <code>model.pth</code>。
+*   <strong>观点</strong>：文件命名必须包含“迭代步数”和“并行Rank信息”。
+*   <strong>逻辑</strong>：
+    *   文件夹通常叫 <code>iter_0001000</code>（第1000步）。
+    *   文件名通常叫 <code>mp_rank_00_001_000</code>（代表这是 Tensor Parallel 第0号，Pipeline Parallel 第1号... 的显卡数据）。
+    *   代码中 <code>tracker_filename</code> 指向一个 <code>latest_checkpointed_iteration.txt</code> 文件，里面只写了一个数字（例如 1000），告诉程序下次启动从哪一步开始读。</p>
+<h4>第二步：版本与参数检查 (Compatibility)</h4>
+<p><strong>代码对应函数：</strong> <code>check_checkpoint_args</code>, <code>fix_query_key_value_ordering</code>, <code>load_args_from_checkpoint</code></p>
+<p>当你加载一个旧存档时，必须防止“张冠李戴”。
+*   <strong>观点</strong>：模型的核心架构参数（层数、隐藏层大小）必须一致，否则无法加载。
+*   <strong>逻辑</strong>：
+    *   <code>check_checkpoint_args</code> 会对比存档里的参数和当前传入的参数。比如你存档里是 12 层，现在想用 24 层跑，程序会直接报错（Assert error）。
+    *   <code>fix_query_key_value_ordering</code> 是为了兼容旧版本 Megatron。以前的版本 QKV（Query, Key, Value）矩阵的排列方式和现在不同，如果检测到是旧版本（Version &lt; 2.0），代码会自动把矩阵转置（Transpose），帮你修好。</p>
+<h4>第三步：打包数据 (Gathering State)</h4>
+<p><strong>代码对应函数：</strong> <code>generate_state_dict</code>, <code>get_rng_state</code></p>
+<p>保存不仅仅是保存模型权重（Weights）。
+*   <strong>观点</strong>：为了能“完美复现”训练，必须保存所有上下文。
+*   <strong>逻辑</strong>：
+    *   <strong>Model</strong>：模型的参数。
+    *   <strong>Optimizer</strong>：优化器的状态（比如 Adam 优化器的动量 momentum，方差 variance）。这部分通常比模型参数还大。
+    *   <strong>RNG State</strong>：随机数生成器的状态。如果不存这个，断点续训后的 Dropout 随机性或者数据增强的随机性就会和原来不一样，导致训练曲线抖动。
+    *   <strong>Args</strong>：当时的训练参数。</p>
+<h4>第四步：执行保存 (Saving)</h4>
+<p><strong>代码对应函数：</strong> <code>save_checkpoint</code></p>
+<p>这是最核心的写入逻辑。
+*   <strong>观点 1：分布式存档（Distributed Checkpointing）是未来。</strong>
+    *   代码里区分了 <code>args.use_dist_ckpt</code>。
+    *   <strong>老方法</strong>：Rank 0 收集数据写入，或者每个 Rank 写一个文件。
+    *   <strong>新方法 (<code>dist_checkpointing</code>)</strong>：使用更高效的格式（如 Zarr），支持“不同并行度之间转换”。比如你用 8 卡训练存的档，可以用新格式在 16 卡上加载继续训，这在老格式里很难做到。
+*   <strong>观点 2：不要阻塞训练（Async Save）。</strong>
+    *   代码中出现了 <code>schedule_async_save</code>。
+    *   保存几百 GB 的数据很慢。代码支持把数据拷贝到内存缓冲，然后让训练继续跑，后台起一个线程慢慢往硬盘写。</p>
+<h4>第五步：执行加载 (Loading)</h4>
+<p><strong>代码对应函数：</strong> <code>load_checkpoint</code>, <code>_load_base_checkpoint</code></p>
+<p>这是断点续训的入口。
+*   <strong>观点：加载策略要灵活。</strong>
+    *   <strong>Resume（恢复）</strong>：完全恢复所有状态（模型+优化器+步数），接着练。
+    *   <strong>Finetune（微调）</strong>：只加载模型权重，丢弃优化器状态，步数重置为0。代码里通过 <code>args.finetune</code> 或 <code>args.no_load_optim</code> 来控制。
+    *   <strong>Strictness（严格模式）</strong>：默认情况下，存档里的键值必须和模型一一对应。但 <code>load_checkpoint</code> 里处理了很多例外情况，允许一定的灵活性（比如加载时忽略某些不匹配的层）。</p>
+<h3>总结</h3>
+<p>这段代码虽然长，但其实就是围绕着<strong>如何在一个大规模、多显卡的分布式环境下，安全、准确、高效地把内存里的那一坨数据（模型+状态）搬到硬盘上，以及怎么搬回来。</strong></p>
+<p><strong>重点关注：</strong>
+1.  <strong><code>save_checkpoint</code></strong>: 看它是如何判断是用 <code>torch.save</code> (老) 还是 <code>dist_checkpointing.save</code> (新)。
+2.  <strong><code>load_checkpoint</code></strong>: 看它是如何处理 <code>finetune</code> 逻辑的（不加载优化器），以及如何通过 <code>read_metadata</code> 找到最新存档的。</p>

@@ -1,0 +1,72 @@
+<h1>utils/convert_from_rwkv6.py</h1>
+<p>这份代码的核心功能非常简单，一句话总结就是：<strong>模型权重转换（Weight Conversion）</strong>。</p>
+<p>它把 <strong>RWKV-6</strong> 原版格式的模型参数（权重），“搬运”并转换成 <strong>FLA (Fast Linear Attention)</strong> 库所能识别的格式。</p>
+<p>你可以把这个过程想象成<strong>给模型“搬家”</strong>：房子（代码架构）变了，但家具（权重参数）还是那一套，只是摆放的位置和组合方式变了。</p>
+<p>下面我为你列一个 <strong>Task To-Do List</strong>，一步步拆解这段代码在干什么：</p>
+<h3>核心任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>准备阶段</strong>：设定好“搬家”的起点（原模型路径）和终点（新模型配置与保存路径）。</li>
+<li><strong>加载原版模型 (Donor)</strong>：把 RWKV-6 的原版模型加载到内存里。</li>
+<li><strong>搭建新模型骨架 (Recipient)</strong>：根据 FLA 的配置文件，初始化一个“空壳”模型（只有架构，参数是随机初始化的）。</li>
+<li><strong>搬运底层地基 (Embeddings)</strong>：复制词向量层。</li>
+<li><strong>逐层搬运核心家具 (Layers Loop)</strong>：<strong>这是最复杂的一步</strong>。遍历每一层，把原模型的参数经过计算、拼接、变形后，塞入新模型的对应位置。<ul>
+<li>搬运归一化层 (Layer Norms)。</li>
+<li>搬运注意力机制 (Attention / Time Mixing) —— <em>涉及复杂的参数重组</em>。</li>
+<li>搬运前馈神经网络 (Feed Forward / Channel Mixing)。</li>
+</ul>
+</li>
+<li><strong>搬运屋顶 (Final Layers)</strong>：复制最后的归一化层和输出层 (Head)。</li>
+<li><strong>验收与保存 (Save)</strong>：检查无误后，把转换好的新模型保存到硬盘。</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<p>下面我结合代码片段，给你详细讲讲每一步都在干啥：</p>
+<h4>Step 1: 准备与加载 (Loading)</h4>
+<p>代码首先做的是加载工作。
+*   <code>AutoTokenizer...</code>: 加载分词器（Tokenizer），这个不用变，直接存到新目录。
+*   <code>AutoModelForCausalLM.from_pretrained(rwkv6...)</code>: <strong>加载原版 RWKV6 模型</strong>。这是我们要提取数据的“供体”。</p>
+<h4>Step 2: 初始化新模型 (Initializing)</h4>
+<ul>
+<li><code>config = AutoConfig.from_pretrained(config)</code>: 读取一个新的配置文件（json格式）。这个配置定义了 FLA 库中模型长什么样。</li>
+<li><code>model = AutoModelForCausalLM.from_config(config)</code>: <strong>创建一个空的 FLA 模型</strong>。此时它的权重是随机生成的，没有智能。</li>
+</ul>
+<h4>Step 3: 搬运 Embeddings (词向量)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">model</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">embeddings</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">copy_</span><span class="p">(</span><span class="n">rwkv6</span><span class="o">.</span><span class="n">rwkv</span><span class="o">.</span><span class="n">embeddings</span><span class="o">.</span><span class="n">weight</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：直接把原模型的 <code>embeddings</code> 复制给新模型。</li>
+<li><strong>验证</strong>：代码里随处可见 <code>torch.testing.assert_close(...)</code>，这是为了确保“搬运”过去的数据和原来的一模一样，没有精度损失。</li>
+</ul>
+<h4>Step 4: 逐层循环搬运 (The Loop)</h4>
+<p>代码进入 <code>for i in range(config.num_hidden_layers):</code> 循环。这是最繁琐的部分，因为两个模型的内部命名和结构不完全一致。</p>
+<p><strong>4.1 归一化层 (Layer Norms)</strong>
+*   代码中出现 <code>pre_norm</code> 和 <code>attn_norm</code> 的部分。
+*   它把 RWKV6 的 <code>pre_ln</code> 和 <code>ln1</code> 的权重（weight）和偏置（bias）复制过去。</p>
+<p><strong>4.2 注意力机制 (Attention / Time Mixing)</strong>
+RWKV6 的注意力机制参数非常多且独特（比如 <code>time_maa</code> 系列参数）。FLA 库为了计算效率，可能把这些参数合并了。
+*   <strong>参数重组</strong>：
+    *   你看代码里有 <code>torch.cat((wr, ww, wk, wv, wg), -1)</code> 这样的操作。
+    *   <strong>原因</strong>：原版 RWKV6 把 <code>receptance</code>, <code>weight</code>, <code>key</code>, <code>value</code>, <code>gate</code> 的混合因子分开存了，但 FLA 的实现里希望把它们拼成一个大矩阵来一次性计算。所以这里在做<strong>拼接（Concat）</strong>和<strong>转置（Transpose）</strong>。
+*   <strong>LoRA 映射</strong>：
+    *   代码里提到了 <code>w_proj.linear.lora[0]</code>。
+    *   这是因为 RWKV6 的 <code>time_decay</code> 机制在数学上等价于一种低秩适应（LoRA）结构，所以脚本把原参数映射到了新模型的 LoRA 模块里。</p>
+<p><strong>4.3 前馈网络 (Feed Forward / Channel Mixing)</strong>
+*   对应代码中的 <code>feed_forward</code> 部分。
+*   同样涉及把 <code>key</code>, <code>value</code>, <code>receptance</code> 的权重和 <code>time_maa</code>（混合因子）复制到新模型对应的 <code>ffn</code> 模块中。</p>
+<h4>Step 5: 收尾 (Final Layers)</h4>
+<p>循环结束后，处理模型的最后部分：
+*   <code>ln_out</code> -&gt; <code>norm</code>: 最后的归一化层。
+*   <code>head</code> -&gt; <code>lm_head</code>: 输出层（决定下一个词概率的那一层）。</p>
+<h4>Step 6: 保存 (Saving)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">model</span><span class="o">.</span><span class="n">save_pretrained</span><span class="p">(</span><span class="n">output</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li>把填满正确参数的新模型保存到 <code>output</code> 指定的文件夹。</li>
+</ul>
+<h3>总结</h3>
+<p>你看不懂的主要原因可能是<strong>变量名映射</strong>太复杂。</p>
+<p><strong>你只需要理解：</strong>
+左边是 <strong>RWKV-6 原版</strong>（变量名如 <code>time_maa_w1</code>, <code>time_decay</code>），右边是 <strong>FLA 库的新架构</strong>（变量名如 <code>x_proj</code>, <code>lora</code>）。
+这个脚本就是一个<strong>翻译器</strong>，把左边的数学参数“翻译”并填空到右边的结构里，让 RWKV-6 模型能在 FLA 这个加速库里跑起来。</p>

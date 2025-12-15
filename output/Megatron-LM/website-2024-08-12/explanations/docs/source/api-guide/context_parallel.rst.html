@@ -1,0 +1,47 @@
+<h1>docs/source/api-guide/context_parallel.rst</h1>
+<p>这篇文章确实充满了深度学习系统优化的专业术语（如TP、SP、KV Cache、All-gather等），如果没有相关背景，读起来就像天书。</p>
+<p>为了让你听懂，我把阅读和理解这篇文章的过程拆解成一个 <strong>“学习任务清单 (Todo List)”</strong>。我们像剥洋葱一样，一层一层把它的核心逻辑剥开。</p>
+<hr />
+<h3>🟢 阶段一：理解背景与痛点 (为什么要搞这个东西？)</h3>
+<p><strong>Task 1：理解“长文本训练”的困境</strong>
+*   <strong>背景：</strong> 现在的大模型（LLM）需要处理越来越长的文本（Context），比如输入一本书让它总结（Sequence Length 变长）。
+*   <strong>问题 (OOM)：</strong> 文本越长，显存（Memory）消耗越大。就像你的内存条爆了一样，会出现 Out Of Memory (OOM)。
+*   <strong>旧的解决办法 A (重计算 Recompute)：</strong> 显存不够，就算两遍。第一遍不算完，第二遍再算。
+    *   <em>原文观点：</em> 这虽然省显存，但太慢了，会增加约 30% 的额外开销。
+*   <strong>旧的解决办法 B (张量并行 TP)：</strong> 把模型切得更碎，用更多 GPU 分担。
+    *   <em>原文观点：</em> 切得太碎，每个 GPU 算的活儿太少（Compute too short），大部分时间都在等数据传输（Communication latency），效率反而低。</p>
+<p><strong>Task 2：明确 Context Parallelism (CP) 的目标</strong>
+*   <strong>核心目标：</strong> 既要能跑超长文本（解决 OOM），又不能像“重计算”那样慢，还要比单纯堆“张量并行(TP)”效率高。</p>
+<hr />
+<h3>🔵 阶段二：理解 Context Parallelism (CP) 是怎么工作的</h3>
+<p><strong>Task 3：理解 CP 的核心切分逻辑</strong>
+*   <strong>怎么切？</strong> 以前的方法（TP）是切模型参数（横着切矩阵），CP 是<strong>切输入的数据长度</strong>（竖着切文本）。
+*   <strong>举个栗子：</strong> 假设你要处理 8000 个字的文本，你有 2 张显卡。
+    *   <strong>CP 的做法：</strong> 显卡 0 处理前 4000 字，显卡 1 处理后 4000 字。
+*   <strong>好处：</strong> 显卡 0 只需要存 4000 字的数据，显存压力瞬间减半。
+    *   <em>原文引用：</em> "CP partitions the network inputs... along sequence dimension."（CP 沿着序列维度切分输入）。</p>
+<p><strong>Task 4：攻克难点——注意力机制 (Attention)</strong>
+*   <strong>难点：</strong> 神经网络里的大部分层（如 Linear, LayerNorm）只关心当前的字，切分后互不影响。但 <strong>Attention 层</strong>是个“交际花”，第 8000 个字需要回头看第 1 个字（计算相关性）。如果第 1 个字在显卡 0，第 8000 个字在显卡 1，它们怎么“见面”？
+*   <strong>解决方案 (KV 通信)：</strong>
+    *   显卡之间必须交换信息。具体来说，交换的是 <strong>KV (Key-Value)</strong> 数据。
+    *   <strong>Forward (前向传播时)：</strong> 显卡们通过 <code>All-Gather</code>（全收集）操作，把各自手里的 KV 数据发给对方。虽然我只算一部分 Q（Query），但我能拿到所有的 KV，这样就能算出完整的 Attention。
+    *   <strong>Backward (反向传播时)：</strong> 算出梯度后，再用 <code>Reduce-Scatter</code> 把梯度还给原本负责的显卡。
+*   <strong>优化：</strong> 为了省显存，显卡平时只存自己那部分 KV。计算时才把别人的借过来，算完就扔。
+    *   <em>原文引用：</em> "CP requires additional all-gather across GPUs to collect the full sequence of KV."</p>
+<hr />
+<h3>🟠 阶段三：CP 的优势与对比</h3>
+<p><strong>Task 5：为什么 CP 比其他方法好？</strong>
+*   <strong>对比 Ring Attention：</strong> CP 和 Ring Attention 很像，但 CP 用了最新的 cuDNN 库，去掉了不必要的计算，负载更均衡，所以更快。
+*   <strong>对比 TP (张量并行)：</strong> CP 减少了显存占用，让 GPU 既不会闲着（计算量适中），也不会爆显存。
+*   <strong>结论：</strong> 如图 2 所示，TP 和 CP 混合使用，能达到最佳速度，且不需要“重计算”。</p>
+<hr />
+<h3>🟣 阶段四：实操 (怎么用？)</h3>
+<p><strong>Task 6：如何开启 CP？</strong>
+*   <strong>前提条件：</strong> 你的代码得是基于 GPT 架构的（比如 Llama），并且安装了 Megatron-Core (&gt;=0.5.0) 和 Transformer Engine (&gt;=1.1)。
+*   <strong>开关：</strong> 在运行命令里加一个参数：
+    <code>context_parallel_size=&lt;你要几张卡并行&gt;</code>
+    *   默认是 1（不开启）。
+*   <strong>兼容性：</strong> 它可以和 TP（张量并行）、PP（流水线并行）、DP（数据并行）一起混用。</p>
+<hr />
+<h3>总结：一句话概括全文</h3>
+<p><strong>Context Parallelism (CP)</strong> 是一种为了训练<strong>超长文本</strong>大模型而设计的并行技术，它通过把<strong>长序列切分</strong>给不同的 GPU，并在 Attention 计算时巧妙地<strong>交换 KV 数据</strong>，从而在不爆显存的前提下，比传统方法跑得更快。</p>

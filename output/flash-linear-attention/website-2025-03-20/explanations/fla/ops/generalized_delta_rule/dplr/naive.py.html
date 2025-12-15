@@ -1,0 +1,68 @@
+<h1>fla/ops/generalized_delta_rule/dplr/naive.py</h1>
+<p>这份代码确实比较硬核，它属于<strong>线性注意力机制（Linear Attention）</strong>的一个变种，具体来说是实现了 <strong>DPLR (Diagonal Plus Low-Rank)</strong> 更新规则的广义 Delta Rule。</p>
+<p>简单来说，这是在尝试把 Transformer 和 RNN 的优点结合起来：既要有 Transformer 的并行训练能力，又要有 RNN 的推理速度（恒定内存）。</p>
+<p>为了让你看懂，我为你制定了一个 <strong>4步走的 Task List</strong>。请按照这个顺序阅读，不要一上来就看最复杂的 <code>chunkwise</code> 函数。</p>
+<hr />
+<h3>🗓️ 学习任务清单 (To-Do List)</h3>
+<h4>✅ Task 1: 搞懂背景与输入 (Context &amp; Inputs)</h4>
+<p><strong>目标</strong>：知道这些变量代表什么物理意义。
+<strong>阅读范围</strong>：<code>dplr_recurrence</code> 函数的开头部分。</p>
+<ul>
+<li><strong>Q, K, V</strong>: 和 Transformer 一样，是 Query, Key, Value。维度是 <code>[Batch, Head, Length, Dimension]</code>。</li>
+<li><strong>S (State)</strong>: 这是 RNN 的核心——<strong>记忆状态</strong>（Memory Matrix）。在标准 Attention 里你需要存所有的 K 和 V，但在这种模型里，所有的历史信息都被压缩进了矩阵 $S$ 中。</li>
+<li><strong>gk (Gate/Decay)</strong>: 遗忘门。控制每一时刻要“忘记”多少旧的记忆。</li>
+<li><strong>alpha, beta</strong>: 这是这个算法特有的。它们用于计算一种“修正项”，让模型能根据当前的记忆状态 $S$ 来动态调整更新量（这就是所谓的 Delta Rule）。</li>
+</ul>
+<h4>✅ Task 2: 核心逻辑 - 循环模式 (The Recurrence)</h4>
+<p><strong>目标</strong>：读懂 <code>dplr_recurrence</code> 函数。这是算法的<strong>数学定义</strong>，也是最容易理解的版本。
+<strong>核心代码段</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 遍历序列的每一步</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">l</span><span class="p">):</span>
+    <span class="c1"># ... 取出当前时刻的 q, k, v, alpha, beta ...</span>
+
+    <span class="c1"># 1. 计算更新量 _kv</span>
+    <span class="c1"># 第一部分：标准的 Linear Attention 更新 (k * v)</span>
+    <span class="c1"># 第二部分：Delta Rule 修正项 ((S * alpha).sum * beta)</span>
+    <span class="c1"># 这一步的意思是：根据当前的记忆 S 和输入 alpha，计算出一个修正方向，然后用 beta 投影回去。</span>
+    <span class="n">_kv</span> <span class="o">=</span> <span class="n">_k</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">_v</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="p">:]</span> <span class="o">+</span> \
+          <span class="p">(</span><span class="n">S</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span> <span class="o">*</span> <span class="n">_alpha</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">])</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">,</span> <span class="n">keepdim</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span> <span class="o">*</span> <span class="n">_beta</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span>
+
+    <span class="c1"># 2. 更新记忆状态 S</span>
+    <span class="c1"># S_new = S_old * 衰减(decay) + 新增信息(_kv)</span>
+    <span class="n">S</span> <span class="o">=</span> <span class="n">S</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span> <span class="o">*</span> <span class="n">gk</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">exp</span><span class="p">()[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">+</span> <span class="n">_kv</span>
+
+    <span class="c1"># 3. 计算输出 o</span>
+    <span class="c1"># Output = q * S</span>
+    <span class="n">o</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">einsum</span><span class="p">(</span><span class="s1">&#39;bhd,bhdm-&gt;bhm&#39;</span><span class="p">,</span> <span class="n">_q</span><span class="p">,</span> <span class="n">S</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>这一步的总结</strong>：
+这是一个 RNN。每一步，它根据输入更新记忆 $S$，然后用 $Q$ 去查询这个记忆 $S$ 得到输出。</p>
+<h4>✅ Task 3: 进阶逻辑 - 分块并行 (The Chunkwise)</h4>
+<p><strong>目标</strong>：理解 <code>dplr_chunkwise</code> 存在的意义，而不是深究每一行代码。
+<strong>痛点</strong>：Task 2 中的 <code>for</code> 循环在 Python/PyTorch 里非常慢，无法利用 GPU 的并行能力。
+<strong>解决方案</strong>：
+1.  把长序列（比如 L=2048）切成小块（Chunk，比如大小为 32）。
+2.  <strong>块内并行</strong>：在每一个 32 大小的块内部，不像 RNN 那样一步步算，而是用类似 Attention 的矩阵乘法一次性算完（利用 GPU 优势）。
+3.  <strong>块间串行</strong>：块与块之间，依然传递 $S$ 状态。</p>
+<p><strong>代码解读关键点</strong>：
+*   <code>gk_cumsum</code>: 计算累加的衰减，这是为了把 RNN 的连乘变成对数域的加法，方便并行计算。
+*   <code>A_qk, A_qb...</code>: 这些是在计算块内的“局部 Attention”。
+*   <code>mask</code>: 因为是因果模型（Causal，不能看未来），所以需要三角掩码。
+*   <strong>结论</strong>：这个函数的数学结果和 Task 2 完全一样，只是为了快。如果你不是为了写 CUDA 内核，<strong>看不懂细节没关系</strong>，只要知道它是在做“分块加速”即可。</p>
+<h4>✅ Task 4: 验证与测试 (Verification)</h4>
+<p><strong>目标</strong>：看 <code>if __name__ == '__main__':</code> 部分。
+<strong>逻辑</strong>：
+1.  随机生成数据。
+2.  运行慢速版 <code>dplr_recurrence</code> 得到结果 <code>o</code>。
+3.  运行快速版 <code>dplr_chunkwise</code> 得到结果 <code>o2</code>。
+4.  <code>assert_close</code>：确保两个函数输出的误差极小（证明数学上等价）。
+5.  <strong>Backward 测试</strong>：不仅前向传播要一致，反向传播（梯度）也要一致，保证训练没问题。</p>
+<hr />
+<h3>总结文中的核心观点 (Key Takeaways)</h3>
+<ol>
+<li><strong>这是一个 RNN 模型</strong>：它维护一个固定大小的状态 $S$，而不是像 Transformer 那样随着序列变长显存爆炸。</li>
+<li><strong>Generalized Delta Rule</strong>：它不仅仅是简单的 $S_{new} = S_{old} + K^TV$，而是引入了 $S_{new} = S_{old} + K^TV + (S_{old}\alpha)\beta^T$。这种 $S\alpha\beta$ 项使得更新规则更复杂、更强，能根据当前记忆去调整写入的内容。</li>
+<li><strong>工程实现技巧</strong>：为了在 GPU 上训练得快，代码实现了 <code>Chunkwise</code> 形式，兼顾了 Transformer 的并行训练速度和 RNN 的推理效率。</li>
+</ol>
+<p>建议你现在回到代码，只盯着 <code>dplr_recurrence</code> 函数看，把那个 <code>for</code> 循环里的数学公式在纸上写一遍，你就完全懂了。</p>

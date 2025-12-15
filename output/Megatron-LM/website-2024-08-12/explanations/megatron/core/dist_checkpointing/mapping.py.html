@@ -1,0 +1,84 @@
+<h1>megatron/core/dist_checkpointing/mapping.py</h1>
+<p>这份代码确实比较抽象，因为它是 <strong>Megatron-LM</strong>（一个训练超大模型的框架）中处理 <strong>分布式检查点（Distributed Checkpointing）</strong> 的核心逻辑。</p>
+<p>简单来说，它的作用是：<strong>当一个巨大的模型被切分（Sharding）在几百个 GPU 上时，如何描述每个 GPU 手里的那“一小块”数据，在整个“大图”中的位置，以便保存和加载。</strong></p>
+<p>为了让你读懂，我们可以把这个过程想象成在<strong>拼图</strong>。</p>
+<p>下面是一个由浅入深的学习任务清单（Task List），带你一步步拆解这个文件：</p>
+<hr />
+<h3>✅ Task 1: 理解核心背景 —— "拼图"的概念</h3>
+<p>在看代码之前，先建立这个心理模型：
+*   <strong>Global Tensor (全局张量)</strong>：完整的拼图画面（比如一个 [1024, 1024] 的大矩阵）。
+*   <strong>Local Tensor (本地张量)</strong>：你手里拿的那一块拼图（比如 GPU 0 拿着左上角的 [512, 512]）。
+*   <strong>Sharding (切分)</strong>：把大图切成碎片的规则。</p>
+<p><strong>这个文件的目的：</strong> 就是给每个 GPU 手里的碎片贴一个标签，标签上写着：“我是这一大块拼图里的哪一部分”。</p>
+<hr />
+<h3>✅ Task 2: 攻克主角 —— <code>ShardedTensor</code> 类</h3>
+<p>这是文件中最重要的类（第 45 行）。请重点关注它的几个属性，不要被其他细节吓跑。</p>
+<ul>
+<li><strong>它的作用</strong>：它是一个包装器（Wrapper），把普通的 <code>torch.Tensor</code> 包起来，加上“坐标信息”。</li>
+<li><strong>核心字段解读</strong>：<ol>
+<li><code>key</code>: 这块拼图的名字（比如 "layer1.weight"）。</li>
+<li><code>data</code>: 实际的数据（GPU 上的那个小张量）。</li>
+<li><code>global_shape</code>: <strong>完整</strong>拼图有多大（例如 <code>(1024, 1024)</code>）。</li>
+<li><code>local_shape</code>: <strong>这一块</strong>拼图有多大（例如 <code>(512, 1024)</code>）。</li>
+<li><code>global_offset</code>: <strong>这一块在全图中的坐标</strong>（这是最关键的！）。<ul>
+<li>比如 GPU 0 负责上半部分，Offset 是 <code>(0, 0)</code>。</li>
+<li>比如 GPU 1 负责下半部分，Offset 是 <code>(512, 0)</code>。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<p><strong>小结</strong>：看到 <code>ShardedTensor</code>，就把它理解为一个<strong>带有“全局坐标说明书”的张量</strong>。</p>
+<hr />
+<h3>✅ Task 3: 理解辅助构造函数 —— <code>from_rank_offsets</code></h3>
+<p>直接手写 <code>global_offset</code>（比如算出是第 512 行）很麻烦。通常我们只知道“我是第几个 GPU”。</p>
+<p>请看第 212 行的 <code>from_rank_offsets</code> 方法：
+*   <strong>场景</strong>：我是第 2 个 GPU，我们一共把数据切了 8 份。
+*   <strong>逻辑</strong>：你只需要告诉它 <code>(axis, axis_rank_offset, axis_fragm)</code>。
+    *   <code>axis</code>: 沿着哪个轴切的？（比如第 0 维）。
+    *   <code>axis_rank_offset</code>: 我是第几块？（比如第 2 块）。
+    *   <code>axis_fragm</code>: 一共切了多少块？（比如 8 块）。
+*   <strong>结果</strong>：这个函数会自动帮你算出具体的 <code>global_offset</code> 像素坐标。</p>
+<hr />
+<h3>✅ Task 4: 理解“不存数据”的占位符 —— <code>ShardedBase.without_data</code></h3>
+<ul>
+<li><strong>问题</strong>：有时候我们只需要元数据（Metadata），不需要真的把巨大的 Tensor 加载进内存（比如在主进程做规划时）。</li>
+<li><strong>代码体现</strong>：<code>without_data()</code> 方法。</li>
+<li><strong>含义</strong>：把 <code>data</code> 设为 <code>None</code>，只保留形状和坐标信息。这在保存/加载的元数据解析阶段非常有用，省内存。</li>
+</ul>
+<hr />
+<h3>✅ Task 5: 进阶 —— <code>ShardedTensorFactory</code> (工厂模式)</h3>
+<p>请看第 365 行。这是为了处理更复杂的情况，比如<strong>优化器状态（Optimizer States）</strong>。</p>
+<ul>
+<li><strong>痛点</strong>：有时候，我们要保存的数据，并不是内存里直接存在的那个 Tensor，而是需要经过计算或转换的。或者加载回来后，需要把多个碎片合并成一个对象。</li>
+<li><strong>机制</strong>：<ul>
+<li>它不直接存 Tensor。</li>
+<li>它存两个函数：<code>build_fn</code>（保存前运行，用来生成 ShardedTensor）和 <code>merge_fn</code>（加载后运行，用来把读取的数据还原）。</li>
+</ul>
+</li>
+<li><strong>比喻</strong>：这就像是宜家家具。存的时候是拆散的零件（ShardedTensor），但说明书里带了一个 <code>merge_fn</code>（组装指南），告诉你加载回来后怎么把它拼成桌子。</li>
+</ul>
+<hr />
+<h3>✅ Task 6: 边缘角色 —— 其他小类</h3>
+<ul>
+<li><strong><code>LocalNonpersistentObject</code></strong> (第 307 行):<ul>
+<li><strong>含义</strong>：告诉保存程序，“这个东西别存进硬盘，它是临时的”。加载的时候，会在本地重新生成一个初始值。</li>
+</ul>
+</li>
+<li><strong><code>ShardedObject</code></strong> (第 326 行):<ul>
+<li><strong>含义</strong>：和 <code>ShardedTensor</code> 类似，但它存的不是 Tensor，而是普通的 Python 对象（比如一个列表或字典），但这个对象也是分布在不同机器上的。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📝 总结回顾（你的学习路径）</h3>
+<p>如果你要使用或修改这个文件，请按这个顺序思考：</p>
+<ol>
+<li><strong>我要存什么？</strong> -&gt; 一个被切分的大 Tensor。</li>
+<li><strong>用什么类描述它？</strong> -&gt; <code>ShardedTensor</code>。</li>
+<li><strong>怎么描述位置？</strong> -&gt; 告诉它 <code>global_shape</code>（全图大小）和 <code>global_offset</code>（我的坐标）。</li>
+<li><strong>不想手算坐标？</strong> -&gt; 用 <code>ShardedTensor.from_rank_offsets</code>，告诉它我是第几号切片。</li>
+<li><strong>数据需要预处理？</strong> -&gt; 用 <code>ShardedTensorFactory</code>。</li>
+</ol>
+<p><strong>一句话总结代码核心：</strong>
+这是一个<strong>分布式元数据管理系统</strong>，它定义了一套标准协议，让每个 GPU 都能通过“坐标”和“形状”来描述自己持有的那部分数据，从而实现把碎片数据还原成整体，或者从整体中读取碎片。</p>

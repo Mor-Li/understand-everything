@@ -1,0 +1,95 @@
+<h1>fp16/fp16.py</h1>
+<p>这份代码确实比较硬核，它是 NVIDIA Apex 库中早期的<strong>混合精度训练（Mixed Precision Training）</strong>的核心逻辑。</p>
+<p>简单来说，它的目的是：<strong>为了让模型训练更快、显存占用更小，我们用 FP16（半精度浮点数）来跑模型，但是为了保证不损失精度，我们在后台偷偷维护一份 FP32（单精度浮点数）的权重来进行更新。</strong></p>
+<p>想象这个脚本是一个<strong>“精细的工匠”</strong>。为了帮你理清思路，我把这个工匠在一次训练循环中需要做的工作列成了一个 <strong>To-Do List</strong>。</p>
+<hr />
+<h3>📋 工匠（FP16_Optimizer）的每日任务清单</h3>
+<h4>阶段一：入职准备（初始化 <code>__init__</code>）</h4>
+<p>当你刚把这个优化器创建出来时，它需要做以下准备工作：</p>
+<ol>
+<li><strong>[ ] 检查装备</strong><ul>
+<li>确认你有 CUDA（显卡），没显卡玩不了 FP16。</li>
+</ul>
+</li>
+<li><strong>[ ] 建立“主权重”备份 (Master Weights)</strong><ul>
+<li><em>这是最关键的一步。</em> 你的模型原本是 FP16 的（为了快）。</li>
+<li>工匠会遍历模型的所有参数，如果发现是 FP16 的参数，就<strong>复制一份 FP32 的副本</strong>存起来。</li>
+<li><strong>为什么？</strong> 因为 FP16 精度太低，更新时的微小变化（梯度）可能会因为太小而被当成 0（下溢出）。所以我们需要在高精度的 FP32 副本上做加减法。</li>
+</ul>
+</li>
+<li><strong>[ ] 设置“放大镜” (Loss Scaler)</strong><ul>
+<li>准备一个 <code>loss_scale</code>（损失缩放因子）。</li>
+<li><strong>为什么？</strong> FP16 的梯度通常非常非常小，小到电脑存不下。我们需要先把它放大几千倍（乘以 scale），算完后再除回去。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>阶段二：干活循环（每次 <code>backward</code> 和 <code>step</code>）</h4>
+<p>这是你在训练循环里写 <code>optimizer.backward(loss)</code> 和 <code>optimizer.step()</code> 时，这个工匠在后台默默做的一系列复杂的步骤：</p>
+<ol>
+<li>
+<p><strong>[ ] 放大损失 (Scale Loss)</strong></p>
+<ul>
+<li><strong>代码位置：</strong> <code>backward</code> 方法。</li>
+<li><strong>任务：</strong> 拿到你算出来的 <code>loss</code>，先把它转成 FP32，然后乘以 <code>loss_scale</code>（比如乘以 1024）。</li>
+<li><strong>目的：</strong> 防止梯度太小消失不见。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 计算梯度 (Backward)</strong></p>
+<ul>
+<li><strong>任务：</strong> 调用 PyTorch 原生的反向传播。</li>
+<li><strong>结果：</strong> 此时，模型里的 FP16 参数上挂载了<strong>被放大了的</strong> FP16 梯度。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 搬运梯度 (Copy Gradients)</strong></p>
+<ul>
+<li><strong>代码位置：</strong> <code>_model_grads_to_master_grads</code>。</li>
+<li><strong>任务：</strong> 把模型上那些 FP16 的梯度，复制给我们在阶段一里备份的 FP32 主权重。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 还原梯度 (Unscale)</strong></p>
+<ul>
+<li><strong>代码位置：</strong> <code>_downscale_master</code>。</li>
+<li><strong>任务：</strong> 刚才我们在第 4 步把 Loss 乘了 <code>scale</code>，现在必须把 FP32 主权重上的梯度<strong>除以 <code>scale</code></strong>。</li>
+<li><strong>目的：</strong> 还原真实的梯度大小，否则步子迈太大了。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 检查是否“爆炸” (Check Overflow)</strong></p>
+<ul>
+<li><strong>代码位置：</strong> <code>_check_overflow</code>。</li>
+<li><strong>任务：</strong> 检查梯度里有没有 <code>NaN</code> (不是数) 或者 <code>Inf</code> (无穷大)。</li>
+<li><strong>逻辑：</strong><ul>
+<li><strong>如果有爆炸：</strong> 这一步白干了！<strong>跳过更新</strong>，不要动权重。同时，把“放大镜”倍数调小一点（下一次不容易炸）。</li>
+<li><strong>如果没爆炸：</strong> 安全，继续下一步。如果连续很多次都没炸，尝试把“放大镜”调大一点（动态调整）。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 更新主权重 (Optimizer Step)</strong></p>
+<ul>
+<li><strong>代码位置：</strong> <code>step</code> 方法中的 <code>self.optimizer.step()</code>。</li>
+<li><strong>任务：</strong> 使用基础优化器（比如 SGD 或 Adam），利用刚才处理好的 FP32 梯度，去更新 <strong>FP32 主权重</strong>。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 同步回模型 (Sync Weights)</strong></p>
+<ul>
+<li><strong>代码位置：</strong> <code>_master_params_to_model_params</code>。</li>
+<li><strong>任务：</strong> FP32 主权重更新完了，现在把它<strong>转换回 FP16</strong>，并覆盖掉模型原本的参数。</li>
+<li><strong>目的：</strong> 确保下一次做前向传播（Forward）时，模型用的是最新的参数。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结一下核心观点</h3>
+<p>这篇代码其实就在解决 FP16 训练的两个致命问题：</p>
+<ol>
+<li><strong>精度不够，更新无效</strong> -&gt; <strong>解决方案：</strong> 维护一份 <strong>FP32 Master Weights</strong>，更新都在 FP32 上做，做完转回 FP16。</li>
+<li><strong>梯度太小，变成 0</strong> -&gt; <strong>解决方案：</strong> <strong>Loss Scaling</strong>，先放大 Loss 算出大梯度，更新前再除回去。如果放大过头导致溢出（NaN），就跳过这次更新并缩小放大倍数。</li>
+</ol>
+<p>你看懂这个 List，基本就看懂了这个文件的核心逻辑。其他代码（如 <code>fp32_to_fp16</code> 函数）都只是为了支持上述流程的工具函数。</p>

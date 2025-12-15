@@ -1,0 +1,95 @@
+<h1>megatron/core/datasets/retro/query/query.py</h1>
+<p>这份代码是 <strong>NVIDIA Megatron-LM</strong> 项目中关于 <strong>RETRO (Retrieval-Enhanced Transformer)</strong> 模型预处理的一部分。</p>
+<p>简单来说，它的核心功能是：<strong>给正在训练的 GPT 模型“找参考资料”</strong>。</p>
+<p>为了让你更容易理解，我们可以把这个任务想象成<strong>“为开卷考试做准备”</strong>。
+*   <strong>GPT 模型</strong>是考生。
+*   <strong>GPTChunkDataset</strong> 是考生要写的作文（训练数据）。
+*   <strong>Index (FAISS)</strong> 是图书馆的索引目录。
+*   <strong>DBDataset</strong> 是图书馆里所有的书（知识库）。</p>
+<p>这份代码的任务就是：<strong>遍历考生要写的每一段话，去图书馆里找出最相关的几段话，把它们的编号记下来，以后考试（训练）的时候给考生看。</strong></p>
+<p>下面我为你列一个 <strong>Task Todo List</strong>，按执行顺序一步步拆解这份代码在干什么：</p>
+<hr />
+<h3>📋 任务清单：为训练数据寻找“邻居”（参考资料）</h3>
+<h4>Phase 1: 准备阶段 (Setup)</h4>
+<p>这一步由主函数 <code>query_neighbors</code> 负责。</p>
+<ol>
+<li><strong>[ ] 加载“图书馆”名录 (<code>get_db_merged_train_dataset</code>)</strong><ul>
+<li>要把所有的知识库切片（Chunks）的元数据加载进来，特别是要知道每一段话属于哪本书（Document ID），这为了后面防止作弊用。</li>
+</ul>
+</li>
+<li><strong>[ ] 加载“搜索引擎” (<code>get_index</code>)</strong><ul>
+<li>从硬盘加载 FAISS 索引。这是一个巨大的向量数据库，能让我们快速通过“语义相似度”找到相关内容。</li>
+</ul>
+</li>
+<li><strong>[ ] 确定要处理哪些“作文” (<code>config.retro_gpt_chunk_datasets</code>)</strong><ul>
+<li>确认我们要处理的是训练集、验证集还是测试集。</li>
+</ul>
+</li>
+</ol>
+<h4>Phase 2: 宏观循环 (Looping Datasets)</h4>
+<p>这一步由 <code>query_dataset_neighbors</code> 负责。</p>
+<ol>
+<li><strong>[ ] 任务切分 (Block Splitting)</strong><ul>
+<li>因为数据量太大了（可能有几千亿个 Token），不能一次性处理完。</li>
+<li>代码把整个数据集切分成很多个 <strong>Block</strong>（块）。</li>
+<li><strong>多卡并行</strong>：如果有很多个 GPU 在跑，它们会分工，每个人领一部分 Block 回去干活 (<code>get_blocks_by_rank</code>)。</li>
+</ul>
+</li>
+</ol>
+<h4>Phase 3: 处理单个数据块 (Processing a Block)</h4>
+<p>这是最核心的干活部分，由 <code>query_block_neighbors</code> 负责。</p>
+<ol>
+<li>
+<p><strong>[ ] 建立映射关系 (Sample Map)</strong></p>
+<ul>
+<li>搞清楚当前处理的这一段话，属于原始数据的哪一篇文章。</li>
+<li><em>目的：</em> 如果我正在写《哈利波特》读后感，我去搜索资料，不能搜出《哈利波特》这本书原文给我抄，那叫作弊（Data Leakage）。所以要先记下身份。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 把文字变成数字/向量 (<code>embed_block</code>)</strong></p>
+<ul>
+<li>调用一个 BERT 模型（Retriever），把当前的 GPT 文本切片转换成数学向量（Embeddings）。</li>
+<li>因为计算机只能通过比较向量的距离来判断两段话意思是否相近。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 去图书馆搜索 (<code>query_embedding_block</code> -&gt; <code>query_embeddings</code>)</strong></p>
+<ul>
+<li><strong>核心动作</strong>：拿着刚才算好的向量，去 FAISS 索引里搜，问：“谁跟这段话长得像？”</li>
+<li>索引会返回一堆候选项的 ID（Neighbor IDs）。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 过滤“作弊”数据 (Filter Banned Neighbors)</strong></p>
+<ul>
+<li><em>这是代码中逻辑最复杂的一步。</em></li>
+<li>检查搜回来的邻居：如果这个邻居和当前正在处理的输入数据属于<strong>同一个文档 (Document ID)</strong>，把它踢掉。</li>
+<li><strong>补位</strong>：如果踢掉了一些，不够数量了，用 <code>-1</code> 填充。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 保存结果 (<code>h5py</code>)</strong></p>
+<ul>
+<li>把筛选后剩下的“邻居 ID”保存到硬盘上的 <code>.h5</code> 文件里。</li>
+<li>以后真正训练 RETRO 模型时，就会直接读取这个文件，把对应的参考文本提取出来喂给模型。</li>
+</ul>
+</li>
+</ol>
+<h4>Phase 4: 收尾 (Finalize)</h4>
+<ol>
+<li><strong>[ ] 同步进度 (<code>torch.distributed.barrier</code>)</strong><ul>
+<li>大家（所有 GPU 进程）互相等一等，确保这一个 Block 大家都干完了，再进行下一个。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结一下代码里的关键函数对应关系：</h3>
+<ul>
+<li><strong>我是总指挥，负责初始化</strong> $\rightarrow$ <code>query_neighbors</code></li>
+<li><strong>我是工头，负责分发任务块</strong> $\rightarrow$ <code>query_dataset_neighbors</code></li>
+<li><strong>我是工人，负责处理具体的一块数据</strong> $\rightarrow$ <code>query_block_neighbors</code></li>
+<li><strong>我是翻译官，把字变成向量</strong> $\rightarrow$ <code>embed_block</code></li>
+<li><strong>我是图书管理员，负责查找和过滤</strong> $\rightarrow$ <code>query_embeddings</code></li>
+</ul>
+<p>你看懂了吗？其实就是<strong>遍历数据 -&gt; 算向量 -&gt; 搜向量 -&gt; 剔除自己 -&gt; 存盘</strong> 的过程。</p>

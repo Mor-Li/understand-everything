@@ -1,0 +1,130 @@
+<h1>tools/preprocess_data.py</h1>
+<p>这个脚本 <code>tools/preprocess_data.py</code> 是 <strong>Megatron-LM</strong>（一个用于训练超大语言模型的框架）中非常核心的数据预处理脚本。</p>
+<p>简单来说，它的作用是：<strong>把原始的文本数据（JSON格式），转换成模型训练时能高效读取的二进制（Binary）格式（.bin 和 .idx 文件）。</strong></p>
+<p>因为原始文本读取太慢了，训练大模型需要极高的数据吞吐量，所以必须先“预处理”成数字和索引。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>Task Todo List（任务清单）</strong>，然后一步步带你走一遍流程。</p>
+<hr />
+<h3>核心任务清单 (Task Todo List)</h3>
+<p>想象你是一个厨师（脚本），你要处理一堆刚从地里挖出来的土豆（原始数据），做成可以在快餐店直接炸的冷冻薯条（预处理后的数据）。</p>
+<ol>
+<li>
+<p><strong>[准备工作] 读取配置与环境检查</strong></p>
+<ul>
+<li>看看用户想要处理哪个文件？</li>
+<li>用什么切法（Tokenizer）？</li>
+<li>要不要把土豆切成小块（分句）？</li>
+<li>有多少个工人（CPU核心）可以用？</li>
+</ul>
+</li>
+<li>
+<p><strong>[分堆] 数据分片 (Partitioning)</strong></p>
+<ul>
+<li>如果土豆堆太大（文件太大），为了加快速度，先把它分成几小堆（Partition），分配给不同的生产线。</li>
+</ul>
+</li>
+<li>
+<p><strong>[粗加工] 分句 (Sentence Splitting - 可选)</strong></p>
+<ul>
+<li>如果任务需要（比如BERT训练），需要先把长文章切分成一个个句子。</li>
+</ul>
+</li>
+<li>
+<p><strong>[精加工] 分词与编码 (Tokenization &amp; Encoding)</strong></p>
+<ul>
+<li>这是最核心的一步。把文字（Text）变成数字 ID（Token IDs）。</li>
+<li>比如 "Hello World" 变成 <code>[101, 7592, 2088, 102]</code>。</li>
+<li>同时记录每一句话的长度。</li>
+</ul>
+</li>
+<li>
+<p><strong>[打包] 写入二进制文件 (Indexing &amp; Saving)</strong></p>
+<ul>
+<li>把变成数字的数据，压缩存入 <code>.bin</code> 文件（实际数据）。</li>
+<li>生成 <code>.idx</code> 文件（索引，告诉电脑第几篇文章在 <code>.bin</code> 文件的哪个位置）。</li>
+</ul>
+</li>
+<li>
+<p><strong>[收尾] 合并索引 (Merging)</strong></p>
+<ul>
+<li>如果在第2步把数据分堆了，最后要把所有小堆的索引合并成一个总索引。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>详细流程解析 (Step-by-Step)</h3>
+<p>现在我们结合代码逻辑，一步步看它是怎么完成上面的 Todo List 的。</p>
+<h4>第一步：准备工作 (<code>main</code> 和 <code>get_args</code> 函数)</h4>
+<p>代码从 <code>if __name__ == '__main__': main()</code> 开始。
+*   <strong><code>get_args()</code></strong>: 它会解析你命令行输入的参数。
+    *   <code>--input</code>: 原始 JSON 数据在哪里。
+    *   <code>--tokenizer-type</code>: 用 GPT2、Llama 还是 BERT 的分词器？
+    *   <code>--workers</code>: 雇佣多少个 CPU 进程来干活。
+*   <strong>初始化</strong>: 如果需要分句（<code>--split-sentences</code>），它会检查你有没有装 <code>nltk</code>（一个自然语言处理库）。</p>
+<h4>第二步：数据分片 (Partitioning)</h4>
+<p>代码位置：<code>main</code> 函数中 <code>if args.partitions == 1: ... else: ...</code> 部分。
+*   <strong>为什么要做这个？</strong> 如果你有一个 500GB 的 <code>data.json</code>，单进程处理太慢。
+*   <strong>怎么做？</strong> 脚本会计算总行数，然后把这个大文件拆分成 <code>data_0.json</code>, <code>data_1.json</code> 等等。这样后面就可以并行处理了。</p>
+<h4>第三步：分句 (Sentence Splitting - 可选)</h4>
+<p>代码位置：<code>Partition.split_sentences</code> 方法。
+*   <strong>逻辑</strong>：
+    *   如果参数开启了分句，它会启动多个进程（<code>multiprocessing</code>）。
+    *   使用 <code>Encoder</code> 类中的 <code>split</code> 方法。
+    *   利用 <code>nltk</code> 库，根据标点符号把一大段话切成句子列表。
+    *   结果存入临时文件（文件名带 <code>_ss</code> 后缀）。</p>
+<h4>第四步：核心分词 (Tokenization)</h4>
+<p>这是最耗时的一步。代码位置：<code>Partition.process_json_file</code> 和 <code>Encoder.encode</code>。
+*   <strong><code>Encoder</code> 类</strong>: 这是一个工人模版。
+    *   <code>initializer</code>: 每个工人上班前，先加载好 Tokenizer（分词字典）。
+    *   <code>encode(json_line)</code>:
+        1.  拿到一行文本。
+        2.  调用 <code>tokenizer.tokenize(text)</code> 把文字转成 ID 列表。
+        3.  如果设置了 <code>--append-eod</code>，会在末尾加一个“结束符”（End of Document）。
+        4.  返回 ID 列表和长度信息。
+*   <strong>并行加速</strong>: 代码使用了 <code>multiprocessing.Pool</code>。假设你有 64 核 CPU，它就同时处理 64 行数据，极大加速。</p>
+<h4>第五步：写入二进制文件 (Building Datasets)</h4>
+<p>代码位置：<code>process_json_file</code> 中的 <code>indexed_dataset.IndexedDatasetBuilder</code>。
+*   Megatron 使用一种特殊的格式：
+    *   <strong>.bin</strong>: 纯二进制流，把所有数字 ID 紧挨着存进去，省空间。
+    *   <strong>.idx</strong>: 记录“第 N 篇文章是从第几个字节开始，到第几个字节结束”。
+*   在分词的同时，脚本会把结果实时通过 <code>builder.add_document()</code> 写入这两个文件。</p>
+<h4>第六步：合并 (Merging)</h4>
+<p>代码位置：<code>main</code> 函数的最后部分。
+*   如果你之前设定了 <code>partitions &gt; 1</code>，你会得到一堆小文件：<code>output_0.bin</code>, <code>output_1.bin</code>...
+*   代码最后会把这些小文件的索引信息读取出来，合并生成一个最终的 <code>output.idx</code>。
+*   <strong>注意</strong>：<code>.bin</code> 文件通常不需要合并，因为 <code>.idx</code> 会指向不同部分，或者可以通过简单的 <code>cat</code> 命令合并，但这里的代码逻辑主要是处理索引的合并（<code>builders[key].add_index</code>）。</p>
+<hr />
+<h3>关键代码片段解释</h3>
+<p><strong>1. 自定义分句逻辑 (<code>CustomLanguageVars</code>)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这段代码是为了让 NLTK 分句时，不要把换行符吞掉。</span>
+<span class="c1"># 比如 &quot;Hello.\nWorld.&quot; 应该分成 &quot;Hello.&quot; 和 &quot;World.&quot;，但保留换行格式。</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">CustomLanguageVars</span><span class="p">(</span><span class="n">nltk</span><span class="o">.</span><span class="n">tokenize</span><span class="o">.</span><span class="n">punkt</span><span class="o">.</span><span class="n">PunktLanguageVars</span><span class="p">):</span>
+    <span class="o">...</span>
+</code></pre></div>
+
+<p><strong>2. 编码器 (<code>Encoder.encode</code>)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">encode</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">json_line</span><span class="p">):</span>
+    <span class="n">data</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">json_line</span><span class="p">)</span> <span class="c1"># 读取一行 JSON</span>
+    <span class="c1"># ...</span>
+    <span class="k">for</span> <span class="n">sentence</span> <span class="ow">in</span> <span class="n">sentences</span><span class="p">:</span>
+        <span class="c1"># 核心：把文字变成数字</span>
+        <span class="n">sentence_ids</span> <span class="o">=</span> <span class="n">Encoder</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">tokenize</span><span class="p">(</span><span class="n">sentence</span><span class="p">)</span>
+        <span class="n">doc_ids</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">sentence_ids</span><span class="p">)</span>
+    <span class="c1"># ...</span>
+    <span class="c1"># 加上结束符 &lt;eod&gt;</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">doc_ids</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">append_eod</span><span class="p">:</span>
+        <span class="n">doc_ids</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">Encoder</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">eod</span><span class="p">)</span>
+    <span class="c1"># 返回 ID 列表</span>
+    <span class="k">return</span> <span class="n">ids</span><span class="p">,</span> <span class="n">lens</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">json_line</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>3. 多进程处理 (<code>Partition.process_json_file</code>)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 创建一个进程池，workers 是进程数量</span>
+<span class="n">pool</span> <span class="o">=</span> <span class="n">multiprocessing</span><span class="o">.</span><span class="n">Pool</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">workers</span><span class="p">,</span> <span class="n">initializer</span><span class="o">=</span><span class="n">encoder</span><span class="o">.</span><span class="n">initializer</span><span class="p">)</span>
+<span class="c1"># imap 是并行映射，把文件里的每一行(fin)都丢给 encoder.encode 去处理</span>
+<span class="n">encoded_docs</span> <span class="o">=</span> <span class="n">pool</span><span class="o">.</span><span class="n">imap</span><span class="p">(</span><span class="n">encoder</span><span class="o">.</span><span class="n">encode</span><span class="p">,</span> <span class="n">fin</span><span class="p">,</span> <span class="mi">32</span><span class="p">)</span>
+</code></pre></div>
+
+<h3>总结</h3>
+<p>这个脚本虽然看着长，核心就是：
+<strong>多进程读取 JSON -&gt; NLTK 分句(可选) -&gt; Tokenizer 转数字 -&gt; 存成 Megatron 专用的 .bin/.idx 格式。</strong></p>
+<p>你看不懂可能是因为里面夹杂了大量的 <code>multiprocessing</code>（并行处理）和文件切分逻辑，把主要的数据流打散了。按照上面的 Task List 去看，就会清晰很多。</p>

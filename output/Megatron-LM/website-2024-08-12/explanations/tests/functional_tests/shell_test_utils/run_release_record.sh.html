@@ -1,0 +1,106 @@
+<h1>tests/functional_tests/shell_test_utils/run_release_record.sh</h1>
+<p>这段脚本看起来很复杂，主要是因为它涉及到了<strong>高性能计算集群（SLURM）</strong>、<strong>容器化（Docker/Enroot）</strong>以及<strong>断点续训</strong>的逻辑。</p>
+<p>简单来说，这个脚本的目标是：<strong>训练一个 AI 模型，直到它跑完指定的步数，然后把这次训练的结果（checkpoint 和日志）保存下来，作为未来测试的“标准答案”（Golden Values）。</strong></p>
+<p>为了让你听懂，我把这个脚本拆解成一个<strong>任务清单（Todo List）</strong>，我们按照这个清单一步一步看。</p>
+<hr />
+<h3>📋 脚本执行任务清单 (Todo List)</h3>
+<p>这个脚本按顺序做了以下 5 件事：</p>
+<ol>
+<li><strong>[配置阶段]</strong>：填写“我要训练谁”、“数据在哪”、“用多少卡”。</li>
+<li><strong>[环境准备]</strong>：准备好容器镜像（Image）和文件路径挂载。</li>
+<li><strong>[循环训练]</strong>：这是一个死循环，直到训练步数达标才停止。<ul>
+<li><em>Task 3.1</em>: 检查当前训练到第几步了？如果够了，跳出循环。</li>
+<li><em>Task 3.2</em>: 向集群申请资源（提交作业）。</li>
+<li><em>Task 3.3</em>: 在申请到的机器上，启动容器跑训练代码。</li>
+<li><em>Task 3.4</em>: 等这次作业跑完（或超时），回到 Task 3.1 继续检查。</li>
+</ul>
+</li>
+<li><strong>[生成标准]</strong>：(代码被注释掉了) 分析日志，算出这次训练的 Loss 或精度，作为“黄金标准”。</li>
+<li><strong>[归档上传]</strong>：把训练好的模型和文件上传到云端仓库保存。</li>
+</ol>
+<hr />
+<h3>🧐 逐步详细解读</h3>
+<h4>1. [配置阶段]：填空题</h4>
+<p>脚本开头的这一大段 <code>OVERRIDE_GOLDEN_VALUES</code> 到 <code>WAND_API_KEY</code> 都是变量定义。</p>
+<ul>
+<li><strong>你的任务</strong>：把脚本里尖括号 <code>&lt;...&gt;</code> 的内容填上。</li>
+<li><strong>关键点</strong>：<ul>
+<li><code>MODEL</code>: 你要跑哪个模型（比如 GPT-3）。</li>
+<li><code>DATA_PATH</code>: 训练数据存在硬盘哪里。</li>
+<li><code>ITERATIONS</code>: 目标是跑多少步（比如 1000 步）。</li>
+<li><code>NODES</code>: 需要几台服务器。</li>
+</ul>
+</li>
+</ul>
+<h4>2. [环境准备]：打包行李</h4>
+<div class="codehilite"><pre><span></span><code><span class="nv">IMAGE</span><span class="o">=</span><span class="s2">&quot;gitlab-master.nvidia.com/...&quot;</span>
+<span class="nv">MOUNTS</span><span class="o">=</span><span class="s2">&quot;</span><span class="si">${</span><span class="nv">DATA_PATH</span><span class="si">}</span><span class="s2">:</span><span class="si">${</span><span class="nv">DATA_PATH</span><span class="si">}</span><span class="s2">...&quot;</span>
+<span class="nv">ARGUMENTS</span><span class="o">=(</span>...<span class="o">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>含义</strong>：这里定义了训练用的<strong>Docker 容器镜像</strong>，以及要把物理机的哪些硬盘目录<strong>挂载（Mount）</strong>进容器里（否则容器里读不到数据）。<code>ARGUMENTS</code> 数组是准备传给训练脚本的参数。</li>
+</ul>
+<h4>3. [循环训练]：核心逻辑 (重点！)</h4>
+<p>这里有一个 <code>while :</code> (无限循环)，这是为了处理<strong>断点续训</strong>。</p>
+<p><strong>为什么要循环？</strong>
+在超算集群上，任务通常有时间限制（比如脚本里写的 <code>04:00:00</code>，4小时）。大模型训练往往需要几天。所以策略是：<strong>跑4小时 -&gt; 自动保存进度(checkpoint) -&gt; 任务结束 -&gt; 脚本发现没跑完 -&gt; 再次提交任务 -&gt; 接着上次的进度跑</strong>。</p>
+<ul>
+<li>
+<p><strong>Task 3.1: 检查进度</strong>
+    <code>bash
+    ACTUAL_ITERATIONS=$(cat "$OUTPUT_PATH/.../latest_checkpointed_iteration.txt" || 0)
+    if [[ $ACTUAL_ITERATIONS -gt $ITERATIONS ]]; then
+        break
+    fi</code></p>
+<ul>
+<li><strong>解释</strong>：去读取 checkpoint 文件夹里的记录，看现在跑了多少步。如果 <code>当前步数 &gt; 目标步数</code>，恭喜，训练完成了，<code>break</code> 跳出循环。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 3.2 &amp; 3.3: 提交并运行 (sbatch)</strong>
+    <code>bash
+    sbatch -W &lt;&lt;EOF
+    ...
+    #SBATCH --time "04:00:00"
+    ...
+    srun ... bash ./tests/.../_run_local_training.sh ...
+    EOF</code></p>
+<ul>
+<li><strong><code>sbatch</code></strong>: 这是向 SLURM 集群提交作业的命令。</li>
+<li><strong><code>-W</code></strong>: 意思是 <strong>Wait（等待）</strong>。脚本会卡在这里，直到这次提交的 4 小时任务跑完，才会往下执行。</li>
+<li><strong><code>srun ... --container-image ...</code></strong>: 这是真正干活的命令。它启动一个容器，并在容器里运行 <code>_run_local_training.sh</code>（这才是真正的训练脚本）。</li>
+</ul>
+</li>
+</ul>
+<h4>4. [生成标准]：算分 (目前被注释了)</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Generate golden values</span>
+<span class="c1"># This code will be added later</span>
+<span class="c1"># ...</span>
+<span class="c1"># GOLDEN_VALUES=$(python .../get_test_results_from_tensorboard_logs.py ...)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>含义</strong>：这段代码目前被 <code>#</code> 注释掉了。</li>
+<li><strong>原本意图</strong>：训练完后，运行一个 Python 脚本去分析 TensorBoard 日志，提取出 Loss 曲线或准确率。</li>
+<li><strong>目的</strong>：如果 <code>OVERRIDE_GOLDEN_VALUES=true</code>，它会把这些数据存成一个 JSON 文件，作为以后版本发布时的<strong>参考标准（Golden Values）</strong>。如果以后改了代码，跑出来的分跟这个对不上，就说明代码有 Bug。</li>
+</ul>
+<h4>5. [归档上传]：保存成果</h4>
+<div class="codehilite"><pre><span></span><code>jet<span class="w"> </span>artifacts<span class="w"> </span>registry<span class="w"> </span>add<span class="w"> </span>...
+</code></pre></div>
+
+<ul>
+<li><strong>含义</strong>：<code>jet</code> 看起来是 NVIDIA 内部的一个工具（类似于 Git LFS 或 S3 上传工具）。</li>
+<li><strong>作用</strong>：把生成的 checkpoints 和日志上传到服务器（Registry），打上标签（Tag），归档保存。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个脚本就是一个<strong>“自动续训并归档”</strong>的管家。</p>
+<p>你只需要告诉它：“我要训练模型 A，数据在 B，要跑 5000 步”。
+它就会：
+1.  看一眼跑完没？没跑完。
+2.  去集群申请机器跑 4 小时。
+3.  4 小时后，机器被收回。
+4.  它醒过来，回到第 1 步：看一眼跑完没？（发现只跑了 1000 步）。
+5.  继续申请机器接着跑...
+6.  直到跑完 5000 步，把结果打包上传。</p>

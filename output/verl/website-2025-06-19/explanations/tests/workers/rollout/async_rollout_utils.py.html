@@ -1,0 +1,99 @@
+<h1>tests/workers/rollout/async_rollout_utils.py</h1>
+<p>这份代码确实比较硬核，因为它涉及到 <strong>分布式计算（Ray）</strong> 和 <strong>强化学习（RL）</strong> 的底层架构配置。</p>
+<p>简单来说，这段代码是一个<strong>“包工头”的初始化脚本</strong>。它的作用是：<strong>在多张显卡（GPU）上组建一支“打工团队”，并给它们指派任务，最后选出一个经理来管理它们。</strong></p>
+<p>为了让你更容易理解，我把这段代码做的事情拆解成一个 <strong>Task To-Do List</strong>，然后逐一讲解。</p>
+<h3>📋 Task To-Do List (代码执行清单)</h3>
+<ol>
+<li><strong>定义工种</strong>：确定我们要招聘什么样的工人（Worker Class）。</li>
+<li><strong>圈地盘（资源池）</strong>：确定我们有多少计算资源（GPU）可以用。</li>
+<li><strong>分配岗位</strong>：把工人和地盘对应起来，并进行“合岗”（为了省钱省地，让一个人干多份活）。</li>
+<li><strong>正式招工并培训</strong>：启动这些工人进程，并让它们加载好模型（初始化）。</li>
+<li><strong>任命经理</strong>：创建一个总管对象，以后外部只需要跟总管对接。</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解 (Step-by-Step)</h3>
+<h4>Task 1: 定义工种 (Define Worker Role)</h4>
+<p><strong>代码片段：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">role_worker_mapping</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="n">Role</span><span class="o">.</span><span class="n">ActorRollout</span><span class="p">:</span> <span class="n">ray</span><span class="o">.</span><span class="n">remote</span><span class="p">(</span><span class="n">AsyncActorRolloutRefWorker</span><span class="p">),</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><strong>解析：</strong>
+*   <strong>观点</strong>：在强化学习中，有不同的角色。这里定义了一个复合角色叫 <code>ActorRollout</code>。
+*   <strong>通俗解释</strong>：我们定义了一种全能型工人，叫 <code>AsyncActorRolloutRefWorker</code>。这个工人非常厉害，他既能负责写文章（Actor，生成内容），又能负责评估环境（Rollout），还能拿着参考答案做对比（Ref）。
+*   <strong>Ray的作用</strong>：<code>ray.remote</code> 相当于给这个工人发了一张“远程工作证”，让他可以在别的服务器或显卡上运行。</p>
+<h4>Task 2: 圈地盘 (Create Resource Pool)</h4>
+<p><strong>代码片段：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">global_pool_id</span> <span class="o">=</span> <span class="s2">&quot;global_pool&quot;</span>
+<span class="n">resource_pool_spec</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="n">global_pool_id</span><span class="p">:</span> <span class="p">[</span><span class="n">config</span><span class="o">.</span><span class="n">trainer</span><span class="o">.</span><span class="n">n_gpus_per_node</span><span class="p">]</span> <span class="o">*</span> <span class="n">config</span><span class="o">.</span><span class="n">trainer</span><span class="o">.</span><span class="n">nnodes</span><span class="p">,</span>
+<span class="p">}</span>
+<span class="n">mapping</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="n">Role</span><span class="o">.</span><span class="n">ActorRollout</span><span class="p">:</span> <span class="n">global_pool_id</span><span class="p">,</span>
+<span class="p">}</span>
+<span class="n">resource_pool_manager</span> <span class="o">=</span> <span class="n">ResourcePoolManager</span><span class="p">(</span><span class="n">resource_pool_spec</span><span class="o">=</span><span class="n">resource_pool_spec</span><span class="p">,</span> <span class="n">mapping</span><span class="o">=</span><span class="n">mapping</span><span class="p">)</span>
+<span class="n">resource_pool_manager</span><span class="o">.</span><span class="n">create_resource_pool</span><span class="p">()</span>
+</code></pre></div>
+
+<p><strong>解析：</strong>
+*   <strong>观点</strong>：我们需要管理物理硬件资源（GPU）。
+*   <strong>通俗解释</strong>：
+    *   <code>resource_pool_spec</code> 是在盘点家底：比如你有 2 台机器，每台 8 张显卡。
+    *   <code>mapping</code> 是在规划：所有的 <code>ActorRollout</code> 工人，都去 <code>global_pool</code> 这个大池子里领显卡用。
+    *   <code>create_resource_pool()</code>：正式把这些显卡资源锁定，准备分配。</p>
+<h4>Task 3: 分配岗位与“合岗” (Colocation &amp; Class Creation)</h4>
+<p><strong>代码片段：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">resource_pool_to_cls</span> <span class="o">=</span> <span class="p">{</span><span class="n">pool</span><span class="p">:</span> <span class="p">{}</span> <span class="k">for</span> <span class="n">pool</span> <span class="ow">in</span> <span class="n">resource_pool_manager</span><span class="o">.</span><span class="n">resource_pool_dict</span><span class="o">.</span><span class="n">values</span><span class="p">()}</span>
+
+<span class="c1"># create actor and rollout</span>
+<span class="n">resource_pool</span> <span class="o">=</span> <span class="n">resource_pool_manager</span><span class="o">.</span><span class="n">get_resource_pool</span><span class="p">(</span><span class="n">Role</span><span class="o">.</span><span class="n">ActorRollout</span><span class="p">)</span>
+<span class="n">actor_rollout_cls</span> <span class="o">=</span> <span class="n">RayClassWithInitArgs</span><span class="p">(</span><span class="bp">cls</span><span class="o">=</span><span class="n">role_worker_mapping</span><span class="p">[</span><span class="n">Role</span><span class="o">.</span><span class="n">ActorRollout</span><span class="p">],</span> <span class="n">config</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">actor_rollout_ref</span><span class="p">,</span> <span class="n">role</span><span class="o">=</span><span class="s2">&quot;actor_rollout&quot;</span><span class="p">)</span>
+<span class="n">resource_pool_to_cls</span><span class="p">[</span><span class="n">resource_pool</span><span class="p">][</span><span class="s2">&quot;actor_rollout&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">actor_rollout_cls</span>
+</code></pre></div>
+
+<p><strong>解析：</strong>
+*   <strong>观点</strong>：配置具体的运行参数，并准备实例化。
+*   <strong>通俗解释</strong>：
+    *   这里在准备工人的“入职合同” (<code>RayClassWithInitArgs</code>)。合同里写明了：你用什么代码（<code>cls</code>），你的配置参数是什么（<code>config</code>），你的职位名称叫 <code>actor_rollout</code>。
+    *   <strong>Colocated (合岗)</strong>：虽然代码里看着像是在分配，但 <code>verl</code> 这个框架的一个核心观点是 <strong>“能省则省”</strong>。它把 Actor（策略模型）、Rollout（采样）、Ref（参考模型）这三个原本可能分开的进程，强制塞到同一个 Python 类里。这样可以避免模型权重在不同显卡间传来传去，极大节省显存。</p>
+<h4>Task 4: 正式招工并培训 (Spawn &amp; Init)</h4>
+<p><strong>代码片段：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">all_wg</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="k">for</span> <span class="n">resource_pool</span><span class="p">,</span> <span class="n">class_dict</span> <span class="ow">in</span> <span class="n">resource_pool_to_cls</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+    <span class="n">worker_dict_cls</span> <span class="o">=</span> <span class="n">create_colocated_worker_cls</span><span class="p">(</span><span class="n">class_dict</span><span class="o">=</span><span class="n">class_dict</span><span class="p">)</span>
+    <span class="n">wg_dict</span> <span class="o">=</span> <span class="n">RayWorkerGroup</span><span class="p">(</span><span class="n">resource_pool</span><span class="o">=</span><span class="n">resource_pool</span><span class="p">,</span> <span class="n">ray_cls_with_init</span><span class="o">=</span><span class="n">worker_dict_cls</span><span class="p">)</span>
+    <span class="n">spawn_wg</span> <span class="o">=</span> <span class="n">wg_dict</span><span class="o">.</span><span class="n">spawn</span><span class="p">(</span><span class="n">prefix_set</span><span class="o">=</span><span class="n">class_dict</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
+    <span class="n">all_wg</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">spawn_wg</span><span class="p">)</span>
+
+<span class="n">actor_rollout_wg</span> <span class="o">=</span> <span class="n">all_wg</span><span class="p">[</span><span class="s2">&quot;actor_rollout&quot;</span><span class="p">]</span>
+<span class="n">actor_rollout_wg</span><span class="o">.</span><span class="n">init_model</span><span class="p">()</span>
+</code></pre></div>
+
+<p><strong>解析：</strong>
+*   <strong>观点</strong>：利用 Ray 启动分布式进程，并加载神经网络权重。
+*   <strong>通俗解释</strong>：
+    *   <code>create_colocated_worker_cls</code>：把上面定义的“入职合同”打包好。
+    *   <code>RayWorkerGroup</code> 和 <code>.spawn()</code>：这是最关键的一步。<strong>“开工！”</strong> 此时，Ray 会在真实的 GPU 上启动 Python 进程。
+    *   <code>actor_rollout_wg.init_model()</code>：工人上岗后的第一件事——<strong>培训</strong>。也就是把巨大的大语言模型（LLM）权重加载到显存里。这步通常最慢。</p>
+<h4>Task 5: 任命经理 (Manager Setup)</h4>
+<p><strong>代码片段：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># =========================== 2. Create AsyncLLMServerManager  ===========================</span>
+<span class="n">async_rollout_manager</span> <span class="o">=</span> <span class="n">AsyncLLMServerManager</span><span class="p">(</span>
+    <span class="n">config</span><span class="o">=</span><span class="n">config</span><span class="p">,</span>
+    <span class="n">worker_group</span><span class="o">=</span><span class="n">actor_rollout_wg</span><span class="p">,</span>
+<span class="p">)</span>
+
+<span class="k">return</span> <span class="n">async_rollout_manager</span>
+</code></pre></div>
+
+<p><strong>解析：</strong>
+*   <strong>观点</strong>：封装底层的分布式复杂性，提供统一接口。
+*   <strong>通俗解释</strong>：
+    *   前面的 Task 1-4 搞定了一大堆复杂的分布式进程。外部（比如训练循环 Loop）不想管这么细。
+    *   于是创建了 <code>AsyncLLMServerManager</code>。
+    *   <strong>它的作用</strong>：外部只需要对这个 Manager 说：“给我生成 100 条数据”。Manager 就会在后台异步地调度那些工人去干活，干完了把结果拿回来。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件的核心逻辑就是：
+<strong>“为了训练大模型，我们需要在多张显卡上启动一个复杂的推理引擎。这个脚本负责把显卡资源划好，把代码加载进去，最后返回一个控制器（Manager），让你可以通过这个控制器来发送推理请求。”</strong></p>

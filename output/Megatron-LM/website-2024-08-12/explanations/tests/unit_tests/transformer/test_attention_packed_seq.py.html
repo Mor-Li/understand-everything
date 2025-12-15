@@ -1,0 +1,123 @@
+<h1>tests/unit_tests/transformer/test_attention_packed_seq.py</h1>
+<p>这份代码确实比较硬核，因为它涉及到大模型训练中非常底层的<strong>性能优化</strong>逻辑。如果不懂背景，看这些参数就像看天书。</p>
+<p>别担心，我们按照你的要求，把理解这份代码拆解成一个 <strong>Task List (任务清单)</strong>，然后一步步攻克。</p>
+<hr />
+<h3>📋 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1: 理解核心概念 "Packed Sequence" (打包序列)</strong><ul>
+<li><em>目标</em>：搞懂为什么要“打包”？解决了什么问题？</li>
+</ul>
+</li>
+<li><strong>Task 2: 看懂元数据 <code>cu_seqlens</code></strong><ul>
+<li><em>目标</em>：理解代码中 <code>[0, 6, 19, 22...]</code> 这串数字代表什么含义。</li>
+</ul>
+</li>
+<li><strong>Task 3: 分析测试环境 Setup</strong><ul>
+<li><em>目标</em>：看懂 <code>SelfAttention</code> 模块是在什么配置下运行的（BF16, FlashAttention）。</li>
+</ul>
+</li>
+<li><strong>Task 4: 解析三个核心测试用例</strong><ul>
+<li><em>目标</em>：<ul>
+<li>基础测试 (<code>test_gpu_forward</code>)</li>
+<li>位置编码测试 (<code>test_fused_rope_gpu_forward</code>)</li>
+<li>显存优化测试 (<code>test_checkpointed_gpu_forward</code>)</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 1: 理解核心概念 "Packed Sequence" (打包序列)</h4>
+<p><strong>背景问题：</strong>
+在训练大模型时，通常一个 Batch（批次）里有多条数据。
+比如：
+*   句子 A: "你好" (长度 2)
+*   句子 B: "今天天气真不错，我想去公园玩" (长度 14)</p>
+<p>为了把它们放进同一个矩阵计算，通常做法是<strong>补零 (Padding)</strong>，把句子 A 强行补到 14 长度。
+*   结果：<code>[2个有义词, 12个0]</code> vs <code>[14个有义词]</code>。
+*   <strong>坏处</strong>：GPU 在那 12 个 0 上做了大量无用功，浪费算力。</p>
+<p><strong>解决方法 (Packed Sequence)：</strong>
+不补零了！直接把句子 A 和句子 B 首尾相连，拼成一个长条：
+<code>[句子A内容, 句子B内容]</code> (总长度 16)。
+这就是 <strong>Packed Sequence (打包序列)</strong>。</p>
+<p><strong>代码对应：</strong>
+文件名 <code>test_attention_packed_seq.py</code> 意思就是：“测试注意力机制模块能不能正确处理这种首尾相连、没有补零的打包数据”。</p>
+<hr />
+<h4>Task 2: 看懂元数据 <code>cu_seqlens</code></h4>
+<p>既然把不同句子拼在一起了，GPU 怎么知道哪里是句子 A 的结尾，哪里是句子 B 的开头？我们需要一张“地图”。</p>
+<p>请看代码中的函数 <code>make_test_packed_seq_params</code>:</p>
+<div class="codehilite"><pre><span></span><code><span class="n">cu_seqlens</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">IntTensor</span><span class="p">([</span><span class="mi">0</span><span class="p">,</span> <span class="mi">6</span><span class="p">,</span> <span class="mi">19</span><span class="p">,</span> <span class="mi">22</span><span class="p">,</span> <span class="n">sequence_length</span><span class="p">])</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span>
+</code></pre></div>
+
+<ul>
+<li><strong><code>cu_seqlens</code></strong> 是 "Cumulative Sequence Lengths" (累积序列长度) 的缩写。</li>
+<li>这串数字 <code>[0, 6, 19, 22, 32]</code> (假设 sequence_length=32) 告诉 GPU：<ul>
+<li><strong>第 1 个句子</strong>：从索引 0 开始，到 6 结束 (长度 6)。</li>
+<li><strong>第 2 个句子</strong>：从索引 6 开始，到 19 结束 (长度 13)。</li>
+<li><strong>第 3 个句子</strong>：从索引 19 开始，到 22 结束 (长度 3)。</li>
+<li><strong>第 4 个句子</strong>：从索引 22 开始，到 32 结束 (长度 10)。</li>
+</ul>
+</li>
+</ul>
+<p><strong>代码解读：</strong>
+<code>PackedSeqParams</code> 这个类，就是把这张“地图”打包传给 Attention 模块，告诉它：“虽然我给你的是一大长串数据，但你要按照这张地图，把它们当成 4 个独立的句子来计算注意力，不要搞混了。”</p>
+<hr />
+<h4>Task 3: 分析测试环境 Setup</h4>
+<p>看 <code>setup_method</code> 函数：</p>
+<ol>
+<li>
+<p><strong><code>TransformerConfig(...)</code></strong>: 配置 Transformer 的参数。</p>
+<ul>
+<li><code>hidden_size=64</code>, <code>num_attention_heads=4</code>: 模型很小，为了测试跑得快。</li>
+<li><code>bf16=True</code>: 使用 <strong>BFloat16</strong> 格式。这是现代大模型训练的标准精度（比 FP32 快，比 FP16 稳）。</li>
+<li><code>qkv_format='thd'</code>: 这是一个关键信号。<code>thd</code> 通常指在使用 <strong>FlashAttention</strong> 时的一种数据格式，专门用于处理这种 Packed Sequence。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>SelfAttention(...)</code></strong>:</p>
+<ul>
+<li>这就是被测试的主角。Megatron-Core 里的自注意力模块。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>Task 4: 解析三个核心测试用例</h4>
+<p>这个文件包含三个测试函数，分别测试三种情况：</p>
+<p><strong>1. <code>test_gpu_forward</code> (基础 GPU 前向传播)</strong></p>
+<ul>
+<li><strong>做什么</strong>：最基本的测试。</li>
+<li><strong>输入</strong>：<ul>
+<li><code>hidden_states</code>: 一个形状为 <code>[32, 1, 64]</code> 的张量。注意这里的 <code>32</code> 是总长度，里面其实塞了上面说的 4 个小句子。</li>
+<li><code>packed_seq_params</code>: 把上面的“地图”传进去。</li>
+</ul>
+</li>
+<li><strong>过程</strong>：运行 <code>self.parallel_attention(...)</code>。</li>
+<li><strong>验证</strong>：<code>assert output.shape ...</code> 检查输出的形状是不是和输入一样。如果形状对了，说明 Attention 机制没崩，能“吃”进去这种打包数据。</li>
+</ul>
+<p><strong>2. <code>test_fused_rope_gpu_forward</code> (带位置编码的测试)</strong></p>
+<ul>
+<li><strong>难点</strong>：<strong>RoPE (旋转位置编码)</strong> 是目前 LLaMA 等模型标配的位置编码。</li>
+<li><strong>问题</strong>：如果数据是打包的，位置编码不能从 0 编到 31。<ul>
+<li>句子 1 应该是 pos 0~5。</li>
+<li>句子 2 应该是 pos 0~12 (重新从 0 开始！)。</li>
+</ul>
+</li>
+<li><strong>做什么</strong>：开启 <code>apply_rope_fusion = True</code>。</li>
+<li><strong>目的</strong>：测试 Attention 模块里的 RoPE 功能，能不能利用 <code>cu_seqlens</code> 那张地图，正确地给每个小句子的开头重置位置编码。</li>
+</ul>
+<p><strong>3. <code>test_checkpointed_gpu_forward</code> (带重计算优化的测试)</strong></p>
+<ul>
+<li><strong>概念</strong>：<strong>Activation Checkpointing (重计算)</strong> 是一种用“时间换空间”的技术。为了省显存，前向传播时不存中间结果，反向传播时再算一遍。</li>
+<li><strong>配置</strong>：<code>recompute_granularity='selective'</code> (选择性重计算)。</li>
+<li><strong>目的</strong>：测试当开启了显存优化（重计算）时，Packed Sequence 逻辑是否依然正常工作，不会报错。</li>
+</ul>
+<hr />
+<h3>💡 总结</h3>
+<p><strong>这一大段代码到底在讲啥？</strong></p>
+<p>这是一个<strong>单元测试 (Unit Test)</strong> 文件。</p>
+<p>它的作用是验证 NVIDIA Megatron-Core 库中的 <strong>SelfAttention (自注意力)</strong> 模块，在处理 <strong>Packed Sequence (打包序列)</strong> 这种高效数据格式时：
+1.  能不能正常运行？(Test 1)
+2.  能不能正确处理位置编码重置？(Test 2)
+3.  能不能和显存优化技术（重计算）兼容？(Test 3)</p>
+<p><strong>P.S.</strong> 注意文件开头和结尾有 <code>"""</code> 注释符号，且有一个 <code>FIXME</code>。这说明这个测试目前在当前的测试环境中跑不通，被开发者暂时<strong>屏蔽</strong>（注释掉）了，等待未来修复。</p>

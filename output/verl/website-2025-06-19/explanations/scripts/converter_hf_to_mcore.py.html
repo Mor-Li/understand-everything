@@ -1,0 +1,105 @@
+<h1>scripts/converter_hf_to_mcore.py</h1>
+<p>完全理解你的困惑。这种代码涉及<strong>深度学习框架底层的模型转换</strong>，如果没有背景知识，确实像看天书。</p>
+<p>简单来说，这个脚本的任务就是<strong>搬家</strong>。</p>
+<p>你可以把<strong>Hugging Face (HF)</strong> 格式的模型想象成“旧房子”，把 <strong>Megatron-Core (MCore)</strong> 格式的模型想象成“新房子”。虽然家具（模型参数/权重）是一样的，但是房间布局、柜子的名字、甚至抽屉的形状（张量形状）都不一样。</p>
+<p>这个脚本的作用就是把家具从旧房子里搬出来，改个标签，甚至重新组装一下，塞进新房子的对应位置里。</p>
+<p>下面我为你列一个 <strong>Task To-Do List</strong>，把代码拆解成人类能看懂的步骤：</p>
+<hr />
+<h3>📋 任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>准备工地 (Environment Setup)</strong>: 伪造一个分布式训练环境（因为目标框架 Megatron 必须在分布式环境下运行）。</li>
+<li><strong>看图纸 (Config Loading)</strong>: 读取旧模型（HF）的配置，并转换成新模型（MCore）的图纸。</li>
+<li><strong>搭空架子 (Model Initialization)</strong>: 根据图纸，在内存里搭建一个空的新模型框架（还没填入数据）。</li>
+<li><strong>进货 (Load Source Model)</strong>: 把旧模型（HF）完整加载到内存里。</li>
+<li><strong>搬运与改装 (Weight Mapping &amp; Copying)</strong>: <strong>【核心步骤】</strong> 逐层逐个把旧模型的参数复制给新模型。<ul>
+<li><em>难点</em>：名字对不上（改名），形状对不上（拼接或拆分）。</li>
+</ul>
+</li>
+<li><strong>打包入库 (Save Checkpoint)</strong>: 把填好数据的新模型保存到硬盘。</li>
+<li><strong>质检 (Testing)</strong>: (可选) 重新加载新模型，对比一下数据是不是和旧模型完全一致。</li>
+</ol>
+<hr />
+<h3>🧐 逐步讲解 (Step-by-Step)</h3>
+<p>现在我们对应代码，一步步看它是怎么完成上面这个 List 的。</p>
+<h4>第一步：准备工地 (Environment Setup)</h4>
+<p><strong>代码位置</strong>：<code>convert_hf_to_mcore</code> 函数的前几行。
+*   <strong>在做什么</strong>：Megatron 是为了在大规模集群上跑大模型设计的。即使你只是在单机上做转换，也得骗它说“我们现在在一个集群里”。
+*   <strong>代码解读</strong>：
+    <code>python
+    os.environ["RANK"] = "0" ... # 设置假的分布式环境变量
+    mpu.initialize_model_parallel(...) # 初始化 Megatron 的并行状态</code></p>
+<h4>第二步：看图纸 (Config Loading)</h4>
+<p><strong>代码位置</strong>：<code>hf_config = AutoConfig.from_pretrained(...)</code> 和 <code>hf_to_mcore_config(...)</code>。
+*   <strong>在做什么</strong>：
+    *   先看 HF 模型有多大（多少层、隐藏层多大、几个注意力头）。
+    *   然后把这些参数翻译成 Megatron 能听懂的配置对象 <code>tfconfig</code>。</p>
+<h4>第三步：搭空架子 (Model Initialization)</h4>
+<p><strong>代码位置</strong>：<code>megatron_model_provider</code> 和 <code>get_model(...)</code>。
+*   <strong>在做什么</strong>：利用刚才的图纸，创建一个<strong>空的</strong> Megatron 模型。
+*   <strong>关键点</strong>：<code>use_cpu_initialization</code>。如果模型很大，显存放不下，就先在 CPU 内存里搭这个架子。此时，新模型里的数字都是随机的或者空的。</p>
+<h4>第四步：进货 (Load Source Model)</h4>
+<p><strong>代码位置</strong>：<code>hf_model = AutoModelForCausalLM.from_pretrained(...)</code>。
+*   <strong>在做什么</strong>：利用 <code>transformers</code> 库，把原始的 Hugging Face 模型加载进来。这时候我们手里有两个模型对象：
+    1.  <code>model</code> (Megatron 格式，空的/随机的)
+    2.  <code>hf_model</code> (HF 格式，装着我们要的真金白银的参数)</p>
+<h4>第五步：搬运与改装 (Weight Mapping &amp; Copying) —— <strong>全篇最难懂的地方</strong></h4>
+<p><strong>代码位置</strong>：中间那一堆 <code>if ... elif ...</code> 判断模型架构，以及具体的转换函数（如 <code>convert_checkpoint_from_transformers_to_megatron</code>）。</p>
+<p>这里就像是一个精密的<strong>翻译和搬运工</strong>。因为两个框架对同一个东西的命名不同，形状也不同。</p>
+<p><strong>举个例子（代码中的逻辑）：</strong></p>
+<ol>
+<li>
+<p><strong>注意力层的 Q/K/V (Query, Key, Value)</strong>:</p>
+<ul>
+<li><strong>HF 习惯</strong>：把 Q, K, V 分成三个独立的矩阵 (<code>q_proj</code>, <code>k_proj</code>, <code>v_proj</code>)。</li>
+<li><strong>Megatron 习惯</strong>：为了计算快，喜欢把 Q, K, V 拼在一起变成一个大矩阵 (<code>linear_qkv</code>)。</li>
+<li><strong>代码操作</strong>：
+    <code>python
+    # 拿到 HF 的 Q, K, V
+    q = hf_layer.self_attn.q_proj.weight...
+    k = hf_layer.self_attn.k_proj.weight...
+    v = hf_layer.self_attn.v_proj.weight...
+    # 拼起来 (cat)
+    qkv = torch.cat([q, k, v], dim=1)...
+    # 塞给 Megatron
+    layer.self_attention.linear_qkv.weight.copy_(qkv)</code></li>
+</ul>
+</li>
+<li>
+<p><strong>不同的模型有不同的搬运工</strong>：</p>
+<ul>
+<li>代码里针对 <code>Qwen2_5_VL</code> (视觉语言模型)、<code>DeepseekV3</code>、<code>Qwen2Moe</code> 写了不同的函数。</li>
+<li>比如 <code>convert_checkpoint_from_transformers_to_megatron_qwen2_5_vl</code> 里面不仅搬运文字部分（LLM），还要搬运视觉部分（Vision Model），把图片编码器的参数也一一对应过去。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>safe_copy</code> 函数</strong>：</p>
+<ul>
+<li>这是一个安全保障。在复制之前，先检查一下形状（Shape）对不对。如果形状不对，强行复制会报错或者导致模型这就废了。</li>
+</ul>
+</li>
+</ol>
+<h4>第六步：打包入库 (Save Checkpoint)</h4>
+<p><strong>代码位置</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">megatron_state_dict</span> <span class="o">=</span> <span class="n">model</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">module</span><span class="o">.</span><span class="n">sharded_state_dict</span><span class="p">()</span>
+<span class="n">dist_checkpointing</span><span class="o">.</span><span class="n">save</span><span class="p">(</span><span class="n">megatron_state_dict</span><span class="p">,</span> <span class="n">output_path</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>在做什么</strong>：现在 <code>model</code> (Megatron) 已经被填满了正确的参数。代码调用 <code>dist_checkpointing.save</code> 把它按照 Megatron 的专用格式保存到硬盘指定路径。</li>
+</ul>
+<h4>第七步：质检 (Testing)</h4>
+<p><strong>代码位置</strong>：<code>if test:</code> 块和 <code>test_conversion</code> 函数。
+*   <strong>在做什么</strong>：
+    1.  把刚才保存好的新模型重新读进来。
+    2.  把内存里的旧模型拿出来。
+    3.  逐个参数对比数值。
+    4.  如果 <code>assert (dut_data == ref_data).all()</code> 通过，说明搬运完美成功，一个数字都没错。</p>
+<hr />
+<h3>总结</h3>
+<p>这篇文章（代码）就是一个<strong>格式转换器</strong>。</p>
+<ul>
+<li><strong>输入</strong>：Hugging Face 格式的模型（大家常用的）。</li>
+<li><strong>处理</strong>：建立映射关系，把张量（Tensor）从左手倒右手，中间可能涉及改名、拼接、变形。</li>
+<li><strong>输出</strong>：Megatron-Core 格式的模型（用于在超算或多卡集群上进行大规模训练）。</li>
+</ul>
+<p>你之所以看不懂，是因为它包含了大量的<strong>硬编码映射</strong>（比如 <code>hf_layer.mlp.gate_proj</code> 对应 <code>layer.mlp.router</code>），这些是需要对着两个框架的源代码一行行比对才能写出来的。你只需要理解它在做“搬运和对齐”这件事就可以了。</p>

@@ -1,0 +1,85 @@
+<h1>fla/ops/delta_rule/parallel.py</h1>
+<p>这份代码确实非常硬核，因为它主要由 <strong>Triton</strong>（一种用于编写高性能 GPU 内核的语言）写成，充斥着内存指针操作，非常晦涩。</p>
+<p>简单来说，这份代码实现了一种叫 <strong>"Parallel Delta Rule" (并行 Delta 规则)</strong> 的算法。这是一种<strong>线性 Attention</strong> 的变体。</p>
+<p>为了让你听懂，我们把“理解这份代码”当作一个项目，我给你列一个 <strong>Task List (任务清单)</strong>，我们一步步把这个算法拆解开。</p>
+<hr />
+<h3>✅ Task 1: 搞懂核心概念 —— 什么是 Delta Rule？</h3>
+<p>在看代码前，先建立直觉。</p>
+<ul>
+<li><strong>标准 Attention (Softmax):</strong> 像是在<strong>累加</strong>。我看过很多书，我把所有书的内容都记住（加权求和）。</li>
+<li><strong>Delta Rule (RNN 风格):</strong> 像是<strong>更新/覆写</strong>。我看了一本新书，如果新知识和旧知识冲突，我要用新的修正旧的（$S_{new} = S_{old} + \beta (V - S_{old}K)K^T$）。这里的 $\beta$ 控制更新的力度。</li>
+</ul>
+<p><strong>痛点：</strong> Delta Rule 本质是串行的（看一页书，更新一次脑子，再看下一页）。
+<strong>目标：</strong> 这份代码的目标是<strong>把这个串行的过程并行化</strong>，让它能在 GPU 上像 FlashAttention 一样飞快地跑。</p>
+<hr />
+<h3>✅ Task 2: 策略规划 —— 分块 (Chunking)</h3>
+<p>代码里反复出现 <code>BT</code>, <code>BS</code>, <code>Chunk</code> 等词。为了并行，我们采用“分治法”。</p>
+<ul>
+<li><strong>步骤：</strong> 把长序列（比如长度 4096）切成很多小块（比如每块长度 32 或 128）。</li>
+<li><strong>逻辑：</strong><ol>
+<li><strong>块内 (Intra-chunk):</strong> 小块内部的计算，我们先处理好。</li>
+<li><strong>块间 (Inter-chunk):</strong> 处理完块内后，再把块与块之间的关系连起来。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 代码流程拆解 (Step-by-Step)</h3>
+<p>现在我们对照代码里的函数，按执行顺序来看：</p>
+<h4>1. 准备工作 (<code>naive_delta_rule_parallel</code> 函数开头)</h4>
+<p>这是 PyTorch 的参考实现，比 Triton 好懂。
+*   <strong>Todo:</strong> 拿到输入 $Q, K, V$ 和 $\beta$。
+*   <strong>操作:</strong> 把 $V$ 和 $K$ 都乘以 $\beta$。
+    *   <em>直觉:</em> $\beta$ 是学习率/更新门控，先把力度乘进去，后面计算方便。</p>
+<h4>2. 第一阶段：块内变换 (<code>chunk_transform_qk_fwd</code>)</h4>
+<p>这是代码中第一个 Triton kernel。</p>
+<ul>
+<li><strong>Todo:</strong> 计算每个小块（Chunk）内部的“局部状态更新”，并改造 $Q$ 和 $K$。</li>
+<li><strong>核心逻辑:</strong><ul>
+<li>在普通的 Attention 里，Q 和 K 是直接相乘的。</li>
+<li>但在 Delta Rule 里，后面的 token 会“覆写”前面的 token。</li>
+<li>这个 Kernel 计算了一个矩阵 $T$（你可以理解为块内的“修正矩阵”）。</li>
+<li><strong>输出:</strong> 得到新的 <code>q_new</code> 和 <code>k_new</code>。</li>
+<li><strong>为什么？</strong> 经过这个变换后，我们就可以用<strong>标准的矩阵乘法</strong>（像普通 Attention 那样）来模拟那个复杂的“覆写/更新”过程了。这是数学上的一个 trick。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 第二阶段：全局并行计算 (<code>parallel_delta_rule_fwd_kernel</code>)</h4>
+<p>这是代码中最复杂的 Triton kernel，类似于 FlashAttention 的写法。</p>
+<ul>
+<li><strong>Todo:</strong> 利用刚才算好的 <code>q_new</code> 和 <code>k_new</code>，计算全局的输出 $O$。</li>
+<li><strong>流程:</strong><ol>
+<li>加载当前的 Query 块。</li>
+<li><strong>从右向左</strong>（或者说从后往前）扫描之前的 Key/Value 块。</li>
+<li>计算 Attention 分数：$S = Q \cdot K^T$。</li>
+<li><strong>关键点 (The "Delta"):</strong> 注意代码里有一行 <code>b_q -= tl.dot(...)</code>。<ul>
+<li>这代表：计算完当前块的贡献后，要从 Query 中<strong>减去</strong>这部分信息。</li>
+<li><em>直觉:</em> “我已经根据之前的 Key 更新过记忆了，接下来的计算要基于‘更新后剩下’的需求（Residual Query）来做。”</li>
+</ul>
+</li>
+<li>累加结果到 Output ($O$)。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 总结 —— 这份代码到底在干啥？</h3>
+<p>如果把这个文件看作一个黑盒：</p>
+<ol>
+<li><strong>输入:</strong> $Q, K, V$ 和 $\beta$ (数据随时间的衰减/更新系数)。</li>
+<li><strong>黑盒内部:</strong><ul>
+<li>先把长序列切碎。</li>
+<li><strong>数学魔改 ($Q, K \to Q_{new}, K_{new}$):</strong> 把“串行的递归更新”转化为“修正后的矩阵乘法”。</li>
+<li><strong>并行扫描:</strong> 用 Triton 写的高性能 Kernel，一边算 Attention，一边根据 Delta Rule 修正 Query，算出最终结果。</li>
+</ul>
+</li>
+<li><strong>输出:</strong> $O$ (经过 Delta Rule 记忆机制处理后的输出) 和 Attention Map。</li>
+</ol>
+<h3>💡 核心难点翻译</h3>
+<p>代码里最难懂的 <code>chunk_transform</code> 其实是在做这件事：</p>
+<blockquote>
+<p>"原本我要一个个 token 顺序读并更新记忆。现在我想一次算完一个块。为了数学上等价，我必须把 Q 和 K 修改一下（正交化/修正），这样直接相乘的结果，就等于一个个顺序更新的结果。"</p>
+</blockquote>
+<h3>建议阅读顺序</h3>
+<p>不要直接读 Triton (<code>.py</code> 上半部分)，先读文件末尾的 <code>naive_delta_rule_parallel</code> 函数。
+1.  看它怎么切分循环 (<code>for i in range(0, l, BM)</code>).
+2.  看它里面的数学公式：<code>q_i = q_i - A_ij @ k_beta</code> (这行代码就是 Delta Rule 的灵魂：减去已知信息)。
+3.  理解了 Python 版逻辑后，Triton 版只是这个逻辑的高性能 GPU 翻译。</p>

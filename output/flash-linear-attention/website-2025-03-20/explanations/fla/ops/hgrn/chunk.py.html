@@ -1,0 +1,112 @@
+<h1>fla/ops/hgrn/chunk.py</h1>
+<p>这份代码实现的是 <strong>HGRN (Hierarchical Gated Recurrent Network)</strong> 的一种<strong>加速算法</strong>，叫做 <strong>Chunkwise（分块）</strong> 实现。</p>
+<p>简单来说，它的目的是：<strong>让原本只能串行（一步步算）的 RNN，变成可以在 GPU 上并行（同时算）的高效模型。</strong></p>
+<p>为了让你看懂，我们先定一个核心公式，HGRN 的核心逻辑就是这一行（类似于 LSTM/GRU，但简化了）：
+$$ h_t = h_{t-1} \cdot \exp(g_t) + x_t $$
+*   $x_t$: 当前时刻的输入。
+*   $g_t$: 门控（Gate），控制我们要“遗忘”多少之前的记忆。
+*   $h_t$: 当前时刻的记忆状态。</p>
+<p>传统的 RNN 必须等 $h_{t-1}$ 算完才能算 $h_t$，这在 GPU 上很慢。<strong>Chunkwise</strong> 的思路是：把长序列切成一段一段（Chunk），先各自算，最后再把它们连起来。</p>
+<p>下面我按照<strong>Todo List</strong>的形式，一步步带你走完代码的逻辑。</p>
+<hr />
+<h3>📝 Task List: HGRN Chunkwise 算法流程</h3>
+<h4>✅ Phase 0: 准备工作 (理解输入)</h4>
+<ul>
+<li><strong>Todo 0.1</strong>: 拿到输入数据。<ul>
+<li><code>x</code>: 输入序列 (形状: Batch, Time, Dimension)。</li>
+<li><code>g</code>: 门控信号 (控制记忆衰减)。</li>
+</ul>
+</li>
+<li><strong>Todo 0.2</strong>: 确定分块大小 (<code>BT</code>).<ul>
+<li>代码中设定 <code>BT = 128</code>。这意味着每 128 个时间步作为一个 Chunk（小块）。</li>
+<li>比如序列长度是 1024，我们就把它切成 8 个块，GPU 可以同时处理这 8 个块。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Phase 1: 前向传播 (Forward Pass) - 算结果</h4>
+<p>这是 <code>ChunkHGRNFunction.forward</code> 里的逻辑，涉及两个 Triton Kernel。</p>
+<ul>
+<li>
+<p><strong>Todo 1.1: 块内计算 (Intra-Chunk Calculation)</strong></p>
+<ul>
+<li><strong>负责代码</strong>: <code>chunk_hgrn_fwd_kernel_h</code></li>
+<li><strong>任务</strong>: 每个 Chunk 内部先自己算自己的，假设每个 Chunk 的初始状态都是 0。</li>
+<li><strong>步骤</strong>:<ol>
+<li>启动很多 GPU 线程，每个线程负责一个 Chunk。</li>
+<li><strong>循环</strong>: 从 $i=0$ 到 $127$ (BT大小)：<ul>
+<li>读取当前的 $x$ 和 $g$。</li>
+<li>执行公式：<code>b_h = exp(b_g) * b_h + b_x</code>。</li>
+<li><strong>关键</strong>: 同时计算一个累加的 Gate 值 <code>gc</code> (Gate Cumulative)。这代表这个 Chunk 内部总共衰减了多少信息。</li>
+</ul>
+</li>
+<li><strong>保存</strong>: 把算出来的局部状态 $o$ 和累积门控 $gc$ 存回显存。</li>
+</ol>
+</li>
+<li><strong>结果</strong>: 此时每个 Chunk 都有了结果，但它们之间是断开的（Chunk 2 不知道 Chunk 1 的结尾是什么）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 1.2: 块间连接 (Inter-Chunk Linking)</strong></p>
+<ul>
+<li><strong>负责代码</strong>: <code>chunk_hgrn_fwd_kernel_o</code></li>
+<li><strong>任务</strong>: 把断开的 Chunk 连起来，把前一个 Chunk 的结尾“传递”给后一个 Chunk。</li>
+<li><strong>步骤</strong>:<ol>
+<li><strong>循环</strong>: 遍历所有的 Chunk (从第 2 个块开始)。</li>
+<li><strong>读取</strong>: 拿前一个 Chunk 最后一个时间步的状态 $h_{last}$。</li>
+<li><strong>修正</strong>: 当前 Chunk 的每一个时间步的值，都需要加上前一个 Chunk 传过来的影响。</li>
+<li><strong>公式</strong>: <code>当前值 = 当前局部值 + 前一个块的末尾值 * exp(当前块累积的门控)</code>。</li>
+</ol>
+</li>
+<li><strong>结果</strong>: 得到最终正确的输出 $o$，就像是串行算出来的一样，但速度快得多。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Phase 2: 反向传播 (Backward Pass) - 算梯度</h4>
+<p>这是 <code>ChunkHGRNFunction.backward</code> 里的逻辑，用于训练神经网络。逻辑和前向传播类似，但是方向是反的（从未来传向过去）。</p>
+<ul>
+<li>
+<p><strong>Todo 2.1: 块内反向计算</strong></p>
+<ul>
+<li><strong>负责代码</strong>: <code>chunk_hgrn_bwd_kernel_h</code></li>
+<li><strong>任务</strong>: 在每个 Chunk 内部，根据输出的梯度 <code>do</code>，反推 $x$ 的梯度 <code>dx</code>。</li>
+<li><strong>步骤</strong>:<ol>
+<li>因为是反向传播，时间是从后往前走的 (Time $T \to 0$)。</li>
+<li>计算梯度公式（链式法则）：<code>dx</code> 会受到后续梯度的影响，影响因子是 <code>exp(g)</code>。</li>
+<li>算出每个位置局部的梯度。</li>
+</ol>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 2.2: 块间反向连接 &amp; 算门控梯度</strong></p>
+<ul>
+<li><strong>负责代码</strong>: <code>chunk_hgrn_bwd_kernel_o</code></li>
+<li><strong>任务</strong>: 修正梯度，并计算门控 $g$ 的梯度 <code>dg</code>。</li>
+<li><strong>步骤</strong>:<ol>
+<li><strong>跨块传递</strong>: 后一个 Chunk 的梯度会传回前一个 Chunk。</li>
+<li><strong>计算 dg</strong>: 门控 $g$ 的梯度取决于 $o$ (输出) 和 $dx$ (输入梯度) 的乘积。</li>
+<li><strong>修正</strong>: 结合跨块传来的梯度，修正当前块的 <code>dx</code> 和 <code>dg</code>。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：为什么要这么写？</h3>
+<p>你可以把这个过程想象成<strong>“接力跑”</strong>的变种：</p>
+<ol>
+<li><strong>串行 (Recurrent)</strong>: 只有一个人跑，必须跑完第一圈才能跑第二圈。</li>
+<li><strong>分块 (Chunkwise - 本文代码)</strong>:<ul>
+<li><strong>Step 1</strong>: 安排 8 个人同时站在第 1、2、3...8 圈的起跑线上。</li>
+<li><strong>Step 2</strong>: 每个人同时开跑（并行计算 <code>kernel_h</code>），假设自己是从零开始跑。</li>
+<li><strong>Step 3</strong>: 跑完后，第 2 个人问第 1 个人：“你跑完的时候体力剩多少？”然后根据这个数值修正自己的状态（并行修正 <code>kernel_o</code>）。</li>
+</ul>
+</li>
+</ol>
+<p><strong>代码结构映射：</strong>
+*   <code>chunk_hgrn_fwd_kernel_h</code> = <strong>大家各自先跑各自的圈</strong>。
+*   <code>chunk_hgrn_fwd_kernel_o</code> = <strong>把前一个人的接力棒补交给下一个人，并修正后续状态</strong>。</p>
+<p><strong>文件开头的表格证明了效果</strong>：
+当序列长度 (<code>seq_len</code>) 达到 16384 时，Chunk（分块）方法只需要 <strong>1.27ms</strong>，而 Recurrent（串行）需要 <strong>7.52ms</strong>。快了 6 倍！</p>

@@ -1,0 +1,95 @@
+<h1>fla/ops/triton/retention/naive.py</h1>
+<p>这就对啦！这段代码其实是 <strong>RetNet (Retentive Network)</strong> 论文中核心算法的“朴素（Naive）”实现版本。RetNet 是 Transformer 的一个变种，旨在替代标准的注意力机制（Attention）。</p>
+<p>这段代码如果不加注释确实像天书。为了让你彻底搞懂，我为你设计了一个 <strong>“六步通关任务清单” (To-Do List)</strong>。只要按顺序完成这 6 个任务，你就能完全掌握这段代码的逻辑。</p>
+<hr />
+<h3>📋 你的学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 01: 搞清楚我们在做什么 (Context)</strong> —— 了解这是在算什么东西。</li>
+<li><strong>Task 02: 准备数据 (Preparation)</strong> —— 看懂输入是什么，为什么要转换类型。</li>
+<li><strong>Task 03: 理解“遗忘机制” (The Decay)</strong> —— 这是全篇最难也是最核心的点：计算每个头（Head）的衰减率。</li>
+<li><strong>Task 04: 构建“时间距离矩阵” (The Mask)</strong> —— 搞懂如何根据 token 之间的距离来计算权重衰减。</li>
+<li><strong>Task 05: 计算相关性 (Q-K Interaction)</strong> —— 看懂 Query 和 Key 是怎么交互的。</li>
+<li><strong>Task 06: 输出结果 (The Output)</strong> —— 最后的加权求和。</li>
+</ol>
+<hr />
+<h3>🚀 逐步通关讲解</h3>
+<h4>✅ Task 01: 搞清楚我们在做什么</h4>
+<p><strong>目标：</strong> 知道这段代码是标准 Attention 的“替代品”。</p>
+<ul>
+<li><strong>传统 Attention:</strong> $Softmax(Q \cdot K^T) \cdot V$</li>
+<li><strong>这段代码 (Retention):</strong> $(Q \cdot K^T \odot D) \cdot V$<ul>
+<li><strong>区别：</strong> 这里<strong>没有 Softmax</strong>，取而代之的是一个衰减矩阵 $D$（代码中的 <code>n</code>）。意味着：距离越远的词，我对它的“记忆”就越模糊。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 02: 准备数据</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">orig_type</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">dtype</span>
+<span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">float</span><span class="p">(),</span> <span class="n">k</span><span class="o">.</span><span class="n">float</span><span class="p">(),</span> <span class="n">v</span><span class="o">.</span><span class="n">float</span><span class="p">()</span>
+<span class="n">_</span><span class="p">,</span> <span class="n">n_heads</span><span class="p">,</span> <span class="n">seq_len</span><span class="p">,</span> <span class="n">d_head</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">shape</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+*   <strong>输入：</strong> <code>q, k, v</code> 是三个张量，形状通常是 <code>[Batch, Heads, Length, Dim]</code>。
+*   <strong>类型转换：</strong> 强制转成 <code>float32</code> (<code>.float()</code>)。这是为了防止在后面做指数运算（<code>pow</code>, <code>exp2</code>）时发生溢出或精度丢失，算完后再转回去。</p>
+<h4>✅ Task 03: 理解“遗忘机制” (The Decay) —— <strong>核心难点</strong></h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">s</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1</span> <span class="o">-</span> <span class="n">q</span><span class="o">.</span><span class="n">new_tensor</span><span class="p">(</span><span class="mf">2.</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float</span><span class="p">)</span><span class="o">.</span><span class="n">pow</span><span class="p">(</span><span class="o">-</span><span class="mf">5.</span> <span class="o">-</span> <span class="n">q</span><span class="o">.</span><span class="n">new_tensor</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">n_heads</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float</span><span class="p">)))</span><span class="o">.</span><span class="n">log2</span><span class="p">()</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+RetNet 的特点是<strong>多头（Multi-head）具有不同的记忆力</strong>。
+*   有的头记得久（衰减慢），有的头记得短（衰减快）。
+*   <strong>数学原理：</strong>
+    *   RetNet 定义了一个衰减率 $\gamma$ (Gamma)。
+    *   公式大约是 $\gamma = 1 - 2^{-(5 + head_index)}$。
+    *   比如第0个头，$\gamma \approx 1 - 1/32$（接近1，记得久）。
+    *   第1个头，$\gamma \approx 1 - 1/64$（更接近1）。
+*   <strong>代码技巧：</strong> 代码里最后加了个 <code>.log2()</code>。
+    *   它存的不是 $\gamma$，而是 $\log_2(\gamma)$。
+    *   <strong>为什么？</strong> 因为后面要算 $\gamma^n$。在计算机里，乘法 $\gamma^n$ 不如加法 $2^{n \cdot \log_2 \gamma}$ 稳定和快。</p>
+<h4>✅ Task 04: 构建“时间距离矩阵” (The Mask)</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">n</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">new_tensor</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">seq_len</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float</span><span class="p">)</span>
+<span class="n">n</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">exp2</span><span class="p">((</span><span class="n">n</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">-</span> <span class="n">n</span><span class="p">)</span> <span class="o">*</span> <span class="n">s</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span> <span class="o">*</span> <span class="n">n</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">ge</span><span class="p">(</span><span class="n">n</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+这一步是生成一个 <code>[Seq_len, Seq_len]</code> 的矩阵，表示 token 之间的相互作用权重。
+1.  <strong>距离计算：</strong> <code>n.unsqueeze(-1) - n</code> 计算的是位置索引 $i - j$。
+    *   比如我现在在第 5 个词，看第 3 个词，距离就是 2。
+2.  <strong>指数衰减：</strong>
+    *   我们要算 $\gamma^{(i-j)}$。
+    *   利用 Task 03 的结果，代码写成了 <code>exp2((i-j) * log2(gamma))</code>。
+    *   这就实现了：<strong>距离越远，权重越小</strong>。
+3.  <strong>因果遮罩 (Causal Masking)：</strong>
+    *   <code>n.unsqueeze(-1).ge(n)</code>：意思是 <code>i &gt;= j</code>。
+    *   这保证了<strong>后面的词看不到前面的词</strong>（只能看过去，不能看未来）。
+    *   如果是“未来”的位置，权重直接乘 0。</p>
+<h4>✅ Task 05: 计算相关性 (Q-K Interaction)</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">s</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">einsum</span><span class="p">(</span><span class="s1">&#39;bhqd,bhkd,hqk-&gt;bhqk&#39;</span><span class="p">,</span> <span class="n">q</span> <span class="o">*</span> <span class="n">d_head</span> <span class="o">**</span> <span class="o">-</span><span class="mf">0.5</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">n</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">q</span><span class="o">.</span><span class="n">dtype</span><span class="p">))</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+这里用 <code>einsum</code>（爱因斯坦求和约定）一次性完成了三件事：
+1.  <strong>Q 缩放：</strong> <code>q * d_head ** -0.5</code>，类似 Attention 里的除以 $\sqrt{d}$。
+2.  <strong>Q 乘 K：</strong> 计算 Query 和 Key 的相似度。
+3.  <strong>乘上衰减矩阵：</strong> <code>hqk</code> 对应的就是上面算出来的衰减矩阵 <code>n</code>。
+    *   <strong>翻译成人话：</strong> 算出 Q 和 K 的相似度，然后根据它们距离的远近，把这个相似度打个折（衰减）。</p>
+<h4>✅ Task 06: 输出结果 (The Output)</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">o</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">einsum</span><span class="p">(</span><span class="s1">&#39;bhqk,bhkd-&gt;bhqd&#39;</span><span class="p">,</span> <span class="n">s</span><span class="p">,</span> <span class="n">v</span><span class="p">)</span>
+<span class="k">return</span> <span class="n">o</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">orig_type</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+*   <strong>加权求和：</strong> 拿着刚才算好并衰减过的分数 <code>s</code>，去乘以 Value (<code>v</code>)。
+*   <strong>还原类型：</strong> 把 <code>float32</code> 转回原来的类型（比如 <code>float16</code> 或 <code>bfloat16</code>）。</p>
+<hr />
+<h3>💡 总结 (The Big Picture)</h3>
+<p>如果不看代码细节，这个函数就在做一件事：</p>
+<blockquote>
+<p><strong>“我（Query）想看看过去发生的事（Key/Value），但我记性不好，离我越远的事我记得越模糊（Decay），而且我每个脑细胞（Head）遗忘的速度还不一样。”</strong></p>
+</blockquote>
+<p>这就是 <strong>Naive Retention</strong> 的全部含义。之所以叫 <code>naive</code>，是因为它显式地计算了那个巨大的 <code>seq_len x seq_len</code> 矩阵，这在序列很长时会非常慢且占显存（也就是 $O(N^2)$ 复杂度）。RetNet 的厉害之处在于它还有一种 $O(N)$ 的递归写法（Recurrent），但逻辑和这个是一模一样的。</p>

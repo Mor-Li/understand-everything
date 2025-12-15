@@ -1,0 +1,97 @@
+<h1>examples/multimodal/evaluate_mmmu.py</h1>
+<p>没问题，这个脚本其实就是一个<strong>“整理员”兼“联络员”</strong>。</p>
+<p>它的核心任务是：把你模型生成的一堆零散的预测结果收集起来，整理成标准格式，然后交给官方的评分脚本去打分。</p>
+<p>为了让你更容易理解，我把这个脚本做的事情拆解成一个 <strong>Task To-Do List（任务清单）</strong>，然后一步步给你讲。</p>
+<h3>核心任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>[准备]</strong> 接收命令：弄清楚输入文件在哪里，标准答案在哪里。</li>
+<li><strong>[整理]</strong> 收集碎片：找到所有分散的模型预测结果文件（通常是 JSONL 格式）。</li>
+<li><strong>[清洗]</strong> 格式统一：把这些分散的结果合并成一个官方能读懂的 JSON 字典文件。</li>
+<li><strong>[考试]</strong> 召唤考官：调用外部的官方评分脚本（MMMU 官方代码），把整理好的卷子和标准答案传给它。</li>
+<li><strong>[结果]</strong> 公布成绩：把考官算出来的分数打印在屏幕上。</li>
+</ol>
+<hr />
+<h3>逐步讲解 (Step-by-Step)</h3>
+<h4>Task 1: [准备] 接收命令</h4>
+<p><strong>代码位置：</strong> <code>main()</code> 函数里的 <code>argparse</code> 部分。</p>
+<p><strong>讲解：</strong>
+这就好比你告诉脚本：“嘿，我的作业放在 <code>examples/output</code> 文件夹里了，你去处理一下。”
+*   <code>--input-path</code>: 必填。告诉脚本你的模型预测结果文件的文件名前缀在哪里。
+*   <code>--groundtruth-path</code>: 选填。告诉脚本标准答案（正确选项）在哪里。如果没填，它默认去 <code>examples/multimodal/MMMU/eval/answer_dict_val.json</code> 找。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># 设置参数解析器</span>
+    <span class="n">parser</span> <span class="o">=</span> <span class="n">argparse</span><span class="o">.</span><span class="n">ArgumentParser</span><span class="p">()</span>
+    <span class="c1"># 必须提供输入路径</span>
+    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">&quot;--input-path&quot;</span><span class="p">,</span> <span class="nb">type</span><span class="o">=</span><span class="nb">str</span><span class="p">,</span> <span class="n">required</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+    <span class="c1"># 可以提供标准答案路径，不提供就用默认的</span>
+    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">&quot;--groundtruth-path&quot;</span><span class="p">,</span> <span class="nb">type</span><span class="o">=</span><span class="nb">str</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="n">default_groundtruth_path</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<h4>Task 2 &amp; 3: [整理] &amp; [清洗] 格式统一</h4>
+<p><strong>代码位置：</strong> <code>convert_to_mmmu_format(input_path)</code> 函数。</p>
+<p><strong>讲解：</strong>
+这是这个脚本最累的活儿。
+通常在大模型跑测试时，为了快，会把任务切分成很多块并行跑，所以生成的结果不是一个文件，而是像 <code>output-MMMU-0.jsonl</code>, <code>output-MMMU-1.jsonl</code> 这样的一堆碎片文件。</p>
+<p>MMMU 的官方评分工具不认这些碎片，它只认一个完整的 JSON 文件。</p>
+<ol>
+<li><strong><code>glob.glob(pattern)</code></strong>: 这是一个“吸尘器”，它根据你提供的路径，把所有名字里带 <code>-MMMU-[数字]</code> 的文件全找出来。</li>
+<li><strong><code>json.loads(line)</code></strong>: 读取这些文件里的每一行（每一行是一个题目的回答）。</li>
+<li><strong><code>output[sample_id] = prediction</code></strong>: 把题目ID和你的模型的预测结果（比如 "A", "B", "C"）提取出来，存到一个大字典里。</li>
+<li><strong><code>json.dump</code></strong>: 最后把这个整理好的大字典，保存为一个新文件，后缀是 <code>-MMMU-merged.json</code>。</li>
+</ol>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">convert_to_mmmu_format</span><span class="p">(</span><span class="n">input_path</span><span class="p">):</span>
+    <span class="c1"># 定义输出文件名：原文件名 + &quot;-MMMU-merged.json&quot;</span>
+    <span class="n">output_file_path</span> <span class="o">=</span> <span class="n">input_path</span> <span class="o">+</span> <span class="s2">&quot;-MMMU-merged.json&quot;</span>
+
+    <span class="c1"># 寻找所有的碎片文件，比如 xxx-MMMU-0.jsonl, xxx-MMMU-1.jsonl</span>
+    <span class="n">pattern</span> <span class="o">=</span> <span class="n">input_path</span> <span class="o">+</span> <span class="s2">&quot;-MMMU-[0-9].*jsonl&quot;</span>
+    <span class="n">input_file_paths</span> <span class="o">=</span> <span class="n">glob</span><span class="o">.</span><span class="n">glob</span><span class="p">(</span><span class="n">pattern</span><span class="p">)</span>
+
+    <span class="n">output</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">()</span>
+
+    <span class="c1"># 遍历每一个碎片文件</span>
+    <span class="k">for</span> <span class="n">input_file_path</span> <span class="ow">in</span> <span class="n">input_file_paths</span><span class="p">:</span>
+        <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">input_file_path</span><span class="p">,</span> <span class="s2">&quot;r&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">input_file</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">line</span> <span class="ow">in</span> <span class="n">input_file</span><span class="p">:</span>
+                <span class="c1"># 提取每一行的数据</span>
+                <span class="n">res</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">line</span><span class="p">)</span>
+                <span class="c1"># 只要 ID 和 预测结果</span>
+                <span class="n">output</span><span class="p">[</span><span class="n">res</span><span class="p">[</span><span class="s2">&quot;sample_id&quot;</span><span class="p">]]</span> <span class="o">=</span> <span class="n">res</span><span class="p">[</span><span class="s2">&quot;prediction&quot;</span><span class="p">]</span>
+
+    <span class="c1"># 保存成一个整洁的 JSON 文件</span>
+    <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">output_file_path</span><span class="p">,</span> <span class="s2">&quot;w&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">output_file</span><span class="p">:</span>
+        <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">output</span><span class="p">,</span> <span class="n">output_file</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="n">output_file_path</span> <span class="c1"># 返回整理好的文件路径</span>
+</code></pre></div>
+
+<h4>Task 4: [考试] 召唤考官</h4>
+<p><strong>代码位置：</strong> <code>main()</code> 函数里的 <code>subprocess.run</code> 部分。</p>
+<p><strong>讲解：</strong>
+这一步很有意思。这个脚本<strong>自己并不会打分</strong>（它不知道哪道题选A是对还是错）。它只是一个“中间人”。
+它使用 <code>subprocess.run</code> 假装自己在终端里敲了一个命令，去运行<strong>另一个</strong> Python 脚本。</p>
+<p>那个被调用的脚本是 <code>examples/multimodal/MMMU/eval/main_eval_only.py</code>，那才是真正的“考官”（来自 MMMU 官方仓库）。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># 这一步相当于你在命令行敲了：</span>
+    <span class="c1"># python examples/multimodal/MMMU/eval/main_eval_only.py --output_path 你的整理好的文件 --answer_path 标准答案</span>
+    <span class="n">output</span> <span class="o">=</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">run</span><span class="p">(</span>
+        <span class="p">[</span>
+            <span class="s2">&quot;python&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;examples/multimodal/MMMU/eval/main_eval_only.py&quot;</span><span class="p">,</span> <span class="c1"># 真正的评分脚本</span>
+            <span class="s2">&quot;--output_path&quot;</span><span class="p">,</span>
+            <span class="n">result_file</span><span class="p">,</span>  <span class="c1"># 刚才整理好的那个 merged.json</span>
+            <span class="s2">&quot;--answer_path&quot;</span><span class="p">,</span>
+            <span class="n">default_groundtruth_path</span><span class="p">,</span> <span class="c1"># 标准答案</span>
+        <span class="p">],</span>
+        <span class="n">capture_output</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="c1"># 把输出结果抓回来</span>
+        <span class="n">text</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="p">)</span>
+</code></pre></div>
+
+<h4>Task 5: [结果] 公布成绩</h4>
+<p><strong>代码位置：</strong> <code>print(output.stdout)</code></p>
+<p><strong>讲解：</strong>
+刚才那个“考官”脚本运行完后，会输出准确率（比如 "Accuracy: 45.2%"）。这个脚本把抓取到的这些文字打印出来给你看。</p>
+<h3>总结</h3>
+<p><strong>一句话概括：</strong>
+你看不懂这个脚本是因为它<strong>不干核心业务</strong>（推理或打分），它只是负责把你的模型输出的<strong>乱七八糟的碎片文件</strong>，<strong>拼</strong>成一张整洁的卷子，然后<strong>递</strong>给官方的评分器去改卷。</p>
+<p><strong>为什么需要它？</strong>
+因为你的模型推理代码（生成结果的代码）和官方的评分代码（MMMU repo）通常格式对不上。这个脚本就是两者之间的<strong>适配器（Adapter）</strong>。</p>

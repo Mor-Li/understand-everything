@@ -1,0 +1,111 @@
+<h1>fla/layers/gla.py</h1>
+<p>这份代码确实比较硬核，它实现的是 <strong>GLA (Gated Linear Attention)</strong>，这是一种为了解决传统 Transformer 速度慢、显存占用大而设计的“高效注意力机制”。</p>
+<p>为了让你看懂，我们可以把这个 <code>GatedLinearAttention</code> 类想象成一个<strong>工厂流水线</strong>。每一个输入的数据（Hidden States）进来，都要经过一系列工序，最后变成处理好的输出。</p>
+<p>我们将这个过程拆解为一个 <strong>Task List (任务清单)</strong>，然后一步步对照代码讲解。</p>
+<hr />
+<h3>📋 Task List: GLA 处理流水线</h3>
+<ol>
+<li><strong>Task 1: 原料准备 (Setup)</strong><ul>
+<li>确定要把输入切分成多少个“头”(Heads)，每个头有多大。</li>
+</ul>
+</li>
+<li><strong>Task 2: 局部润色 (Short Convolution)</strong><ul>
+<li><em>可选步骤</em>：在做大运算之前，先看看“邻居”的信息（局部卷积）。</li>
+</ul>
+</li>
+<li><strong>Task 3: 提取特征 (Projections)</strong><ul>
+<li>把输入变换成 Q (Query), K (Key), V (Value) 以及最重要的 G (Gate/Decay)。</li>
+</ul>
+</li>
+<li><strong>Task 4: 确定“遗忘率” (Gate Calculation)</strong><ul>
+<li>计算 <code>gk</code>，决定我们要记住多少过去的信息，忘掉多少旧信息。</li>
+</ul>
+</li>
+<li><strong>Task 5: 核心组装 (Core Attention Kernel)</strong><ul>
+<li>这是最难的一步。使用高效算法（Chunk 或 Recurrent）融合 Q, K, V 和遗忘率，生成注意力结果。</li>
+</ul>
+</li>
+<li><strong>Task 6: 质检与出厂 (Output Gating &amp; Norm)</strong><ul>
+<li>对结果进行归一化，并再次通过一个门控机制筛选信息，最后输出。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>逐步讲解 (Step-by-Step)</h3>
+<h4>Task 1: 原料准备 (Setup)</h4>
+<p><strong>代码位置：</strong> <code>__init__</code> 方法
+<strong>通俗解释：</strong>
+你需要定义这个层有多宽（<code>hidden_size</code>），要把数据切成几份并行处理（<code>num_heads</code>）。
+GLA 有个特点，它的 K 和 V 的维度通常比 Q 小（或者通过 <code>num_kv_heads</code> 分组），这叫 MQA/GQA 技术，为了省显存。</p>
+<ul>
+<li><code>self.head_k_dim</code>: 每个头 K 矩阵的大小。</li>
+<li><code>self.head_v_dim</code>: 每个头 V 矩阵的大小。</li>
+</ul>
+<h4>Task 2: 局部润色 (Short Convolution)</h4>
+<p><strong>代码位置：</strong> <code>forward</code> 方法中的 <code>if self.use_short_conv:</code> 代码块
+<strong>通俗解释：</strong>
+线性注意力机制有时候会忽略“紧挨着”的词之间的关系。
+这个步骤是用一个很短的 1D 卷积（窗口大小通常是 4），在处理长距离依赖之前，先让每个词“看一眼”它左右两边的词。
+*   <strong>代码行为：</strong> 输入 <code>hidden_states</code> -&gt; 经过 <code>q_conv1d</code>, <code>k_conv1d</code>, <code>v_conv1d</code> -&gt; 得到带有局部信息的 Q, K, V。</p>
+<h4>Task 3: 提取特征 (Projections)</h4>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">q</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">q_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+<span class="n">k</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">k_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+<span class="n">v</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">v_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+<span class="n">gk</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">gk_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span> <span class="c1"># 注意这个 gk</span>
+</code></pre></div>
+
+<p><strong>通俗解释：</strong>
+这是 Transformer 的标配。把输入向量映射到不同的空间：
+*   <strong>Q (Query):</strong> 我想找什么？
+*   <strong>K (Key):</strong> 我有什么特征？
+*   <strong>V (Value):</strong> 我包含的具体内容是什么？
+*   <strong>GK (Gate for K):</strong> <strong>这是 GLA 的核心！</strong> 这是一个专门用来计算“衰减/遗忘”的门。</p>
+<h4>Task 4: 确定“遗忘率” (Gate Calculation)</h4>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">gk</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">logsigmoid</span><span class="p">(</span><span class="n">gk</span><span class="p">)</span> <span class="o">/</span> <span class="bp">self</span><span class="o">.</span><span class="n">gate_logit_normalizer</span>
+</code></pre></div>
+
+<p><strong>通俗解释：</strong>
+GLA 是基于 RNN (循环神经网络) 思想的。它需要决定：<strong>处理当前词的时候，之前的记忆要保留多少？</strong>
+*   <code>gk</code> 经过 <code>logsigmoid</code> 处理，变成了一个控制“遗忘速度”的参数（在论文里通常对应 $\alpha$ 或 $\beta$）。
+*   如果 <code>gk</code> 的值让遗忘率很高，模型就会只关注最近的词；如果遗忘率低，模型就能记住很远的词。</p>
+<h4>Task 5: 核心组装 (Core Attention Kernel)</h4>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">mode</span> <span class="o">==</span> <span class="s1">&#39;fused_recurrent&#39;</span><span class="p">:</span>
+    <span class="n">o</span><span class="p">,</span> <span class="n">recurrent_state</span> <span class="o">=</span> <span class="n">fused_recurrent_gla</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="k">elif</span> <span class="n">mode</span> <span class="o">==</span> <span class="s1">&#39;chunk&#39;</span><span class="p">:</span>
+    <span class="n">o</span><span class="p">,</span> <span class="n">recurrent_state</span> <span class="o">=</span> <span class="n">chunk_gla</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>通俗解释：</strong>
+这是这个文件存在的意义。传统的 Attention 是 $O(N^2)$ 复杂度（词越多越慢）。GLA 是线性的 $O(N)$。
+这里根据 <code>mode</code> 选择了不同的计算方式，但数学结果是一样的：
+1.  <strong>Chunk (分块模式):</strong> 训练时用。把长序列切成小块，并行计算，速度快。
+2.  <strong>Fused Recurrent (融合循环模式):</strong> 推理（生成文本）或序列很短时用。像 RNN 一样一个词一个词处理，显存占用极低。</p>
+<p><strong>这一步做的事情：</strong> 利用 Q 去查询记忆状态（由 K, V 和 <code>gk</code> 维护），得到输出 <code>o</code>。</p>
+<h4>Task 6: 质检与出厂 (Output Gating &amp; Norm)</h4>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_output_gate</span><span class="p">:</span>
+    <span class="n">g</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">g_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span> <span class="c1"># 计算输出门</span>
+    <span class="c1"># ... 中间省略归一化代码 ...</span>
+    <span class="n">o</span> <span class="o">=</span> <span class="n">o</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">gate_fn</span><span class="p">(</span><span class="n">g</span><span class="p">)</span> <span class="c1"># 门控机制</span>
+<span class="n">o</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">o_proj</span><span class="p">(</span><span class="n">o</span><span class="p">)</span> <span class="c1"># 最终线性映射</span>
+</code></pre></div>
+
+<p><strong>通俗解释：</strong>
+从核心 Attention 出来的结果 <code>o</code>，可能比较“粗糙”。
+1.  <strong>RMSNorm:</strong> 先做个归一化，把数据拉回到正常的分布。
+2.  <strong>Output Gate (<code>g</code>):</strong> 再算一个门控信号，决定 Attention 的结果里哪些特征是真正需要的，哪些是噪音。
+3.  <strong>Output Projection (<code>o_proj</code>):</strong> 最后调整一下维度，让它能顺利进入神经网络的下一层。</p>
+<hr />
+<h3>总结：这代码到底在干啥？</h3>
+<p>如果不看细节，这个类就是做了一个 <strong>“带遗忘功能的、速度极快的注意力层”</strong>。</p>
+<ul>
+<li><strong>普通 Transformer:</strong> 我看一本书，我要把每一页都反复对比（全量 Attention），书越厚我越慢。</li>
+<li><strong>GLA (这个代码):</strong> 我看一本书，我一边读一边做笔记（Hidden State）。每读新的一行，我根据这一行的重要性（Gate），决定更新笔记还是忘掉旧笔记。读完最后一行，我的笔记就是结果。</li>
+</ul>
+<p><strong>你需要关注的重点变量：</strong>
+*   <code>gk</code>: 控制记忆衰减的关键。
+*   <code>mode</code>: 决定了是用并行加速（训练）还是串行省内存（推理）。
+*   <code>past_key_values</code>: 这里的 Cache 存的不是巨大的矩阵，而是很小的 RNN 状态（<code>recurrent_state</code>），这就是它为什么生成长文本不卡顿的原因。</p>

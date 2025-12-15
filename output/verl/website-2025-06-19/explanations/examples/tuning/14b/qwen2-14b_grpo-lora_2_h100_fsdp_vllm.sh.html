@@ -1,0 +1,90 @@
+<h1>examples/tuning/14b/qwen2-14b_grpo-lora_2_h100_fsdp_vllm.sh</h1>
+<p>这份脚本看起来确实非常“硬核”，因为它涉及到了当前大模型训练中最前沿、最复杂的几个概念的组合：<strong>强化学习（RL）、LoRA微调、全分片数据并行（FSDP）以及 vLLM 加速推理</strong>。</p>
+<p>简单来说，这是一个<strong>训练大模型做数学题</strong>的启动脚本。</p>
+<p>为了让你看懂，我把你（作为这个脚本的执行者）的任务拆解成一个 <strong>To-Do List</strong>，每一步对应脚本中的一段代码，告诉你我们在做什么，以及为什么要这么做。</p>
+<hr />
+<h3>📋 你的任务清单 (To-Do List)</h3>
+<h4>✅ Task 1: 准备好“大脑”和“日记本” (环境与模型设置)</h4>
+<p>首先，你得告诉电脑我们要训练谁，以及训练过程记录在哪里。</p>
+<ul>
+<li><strong>脚本对应：</strong>
+    <code>bash
+    export CUDA_VISIBLE_DEVICES=...      # 指定用哪些显卡
+    export WANDB_DIR=...                 # 设置云端日志(Wandb)的项目名
+    MODEL_PATH=Qwen/Qwen2.5-14B-Instruct # 指定基础模型：Qwen2.5 14B</code></li>
+<li><strong>白话解释：</strong>
+    我们要用的“大脑”是 <strong>Qwen2.5-14B</strong>。
+    我们要把训练过程（比如模型变聪明了还是变笨了）记录在一个叫 <code>gsm8k-grpo...</code> 的项目里，方便以后查阅。</li>
+</ul>
+<h4>✅ Task 2: 算一下一次能“吃”多少数据 (Batch Size 计算)</h4>
+<p>这是脚本里看起来最乱的一段，其实就是为了不让显存爆炸，精打细算。</p>
+<ul>
+<li><strong>脚本对应：</strong>
+    <code>bash
+    nproc_per_gpu=58 # 32√ → 64× ... (这里是作者在试错，64会爆显存，58正好)
+    total_procs=$(( ... ))</code></li>
+<li><strong>白话解释：</strong>
+    这里作者在反复测试显卡的极限。
+    <code>32√</code> 表示设成32没问题，<code>64×</code> 表示设成64会报错。最后选定 <strong>58</strong> 作为单卡的吞吐量。这决定了模型一次学习多少道题。</li>
+</ul>
+<h4>✅ Task 3: 选定“教学大纲”和“教学方法” (数据与算法)</h4>
+<p>这是核心命令的开始。</p>
+<ul>
+<li><strong>脚本对应：</strong>
+    <code>bash
+    algorithm.adv_estimator=grpo             # 核心算法：GRPO
+    data.train_files=data/gsm8k/train.parquet # 教材：GSM8K (小学数学题)</code></li>
+<li><strong>白话解释：</strong><ul>
+<li><strong>教材</strong>：用 <code>GSM8K</code> 数据集，全是数学应用题。</li>
+<li><strong>教学法</strong>：用 <strong>GRPO</strong> (Group Relative Policy Optimization)。</li>
+<li><em>观点</em>：普通的强化学习（PPO）需要一个额外的“批评家模型”来打分，太占内存。<strong>GRPO</strong> 的核心观点是：<strong>“不用批评家，让模型自己生成一组答案，对比这组答案的好坏来学习”</strong>。这能大大节省显存。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 穷人的法拉利改装术 (LoRA 与 FSDP)</h4>
+<p>14B的模型很大，要在有限的显卡上训练，必须用省钱技巧。</p>
+<ul>
+<li><strong>脚本对应：</strong>
+    <code>bash
+    actor_rollout_ref.model.lora_rank=32      # 开启 LoRA
+    actor_rollout_ref.actor.fsdp_config...    # 开启 FSDP (全分片)
+    actor_rollout_ref.actor.fsdp_config.param_offload=True # 显存不够借用内存</code></li>
+<li><strong>白话解释：</strong><ul>
+<li><strong>LoRA</strong>：我们不修改模型所有的参数，只在旁边挂一个小外挂（Rank=32）进行训练。这样显存占用极小。</li>
+<li><strong>FSDP</strong>：把巨大的模型切碎，分散存到不同的显卡里，要用的时候再拼起来。</li>
+<li><strong>Offload</strong>：如果显卡存不下了，就把参数暂时扔到 CPU 内存里去。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 考试与快速阅卷 (vLLM Rollout)</h4>
+<p>这是强化学习最特殊的一步。模型需要先“做题”（生成答案），然后根据对错来更新自己。</p>
+<ul>
+<li><strong>脚本对应：</strong>
+    <code>bash
+    actor_rollout_ref.rollout.name=vllm       # 用 vLLM 引擎来生成
+    actor_rollout_ref.rollout.n=5             # 每道题生成 5 个答案
+    actor_rollout_ref.rollout.tensor_model_parallel_size=2 # 用2张卡跑推理</code></li>
+<li><strong>白话解释：</strong><ul>
+<li><strong>为什么要 vLLM？</strong>：训练过程中，模型需要不断地做题。普通的推理速度太慢了，<strong>vLLM</strong> 是一个超快的推理引擎。脚本观点：<strong>用 vLLM 配合训练，能大幅提升训练效率。</strong></li>
+<li><strong>为什么要 n=5？</strong>：配合上面的 <strong>GRPO</strong> 算法。对于同一道数学题，让模型生成 5 个不同的解法。如果其中 3 个对了，2 个错了，模型就会学习“那 3 个是对的，我要向它们靠拢”。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 6: 设定惩罚机制 (KL Loss)</h4>
+<p>防止模型为了做对数学题，说话变得语无伦次。</p>
+<ul>
+<li><strong>脚本对应：</strong>
+    <code>bash
+    actor_rollout_ref.actor.use_kl_loss=True
+    actor_rollout_ref.actor.kl_loss_coef=0.001</code></li>
+<li><strong>白话解释：</strong>
+    我们要模型学数学，但不能让它忘了怎么正常说话（即不要偏离原始模型太远）。<strong>KL Loss</strong> 就是一根绳子，如果模型改动太剧烈，就拽它一下。</li>
+</ul>
+<hr />
+<h3>总结：这脚本到底在讲啥观点？</h3>
+<p>如果你要把这个脚本提炼成几句核心观点（Takeaways），那就是：</p>
+<ol>
+<li><strong>GRPO 优于 PPO</strong>：对于数学推理任务，不需要训练一个巨大的 Value Model（批评家），只需要让模型自己生成多组答案（<code>n=5</code>）进行内部对比（Group Relative）即可，这样更省显存。</li>
+<li><strong>混合架构效率最高</strong>：训练时用 PyTorch FSDP（为了切分模型省显存），推理/生成答案时切换到 vLLM（为了极致的速度）。这种 <strong>Training + Inference Engine</strong> 混合的架构是目前最高效的 RLHF/RL 训练方式。</li>
+<li><strong>硬件压榨</strong>：脚本里大量的 <code>offload</code> 和 <code>checkpointing</code> 设置，以及手动微调的 batch size (<code>58</code>)，说明作者在极力压榨硬件性能，试图在有限的 H100 显卡上训练尽可能大的模型。</li>
+</ol>

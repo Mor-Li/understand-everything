@@ -1,0 +1,63 @@
+<h1>verl/utils/debug/performance.py</h1>
+<p>这份代码文件 <code>verl/utils/debug/performance.py</code> 其实是一个<strong>性能调试工具箱</strong>。它的主要作用是帮助开发者监控 <strong>显存（GPU Memory）</strong> 和 <strong>代码运行时间（Timing）</strong>。</p>
+<p>在训练大模型时，我们经常面临两个问题：“显存爆没爆？”和“这段代码跑得慢不慢？”。这个文件就是为了解决这两个问题而写的。</p>
+<p>我把它拆解成一个 <strong>“开发者的任务清单 (To-Do List)”</strong>，带你一步步看懂它是怎么工作的：</p>
+<hr />
+<h3>✅ Task 1: 我需要知道现在 GPU 显存用了多少</h3>
+<p><strong>对应代码：</strong> <code>_get_current_mem_info</code> 和 <code>log_gpu_memory_usage</code></p>
+<p>当你训练模型时，你需要实时查看显存水位。
+1.  <strong><code>_get_current_mem_info</code></strong>: 这是一个底层函数。
+    *   它会去询问 PyTorch 和 GPU 硬件：“现在分配了多少显存？保留了多少？总共有多少？”
+    *   <em>细节注意</em>：代码里特意提到了 <code>vllm</code> 的 sleep mode，说明这个工具考虑到了在使用 vLLM 推理框架时的特殊显存统计方式（直接读取硬件层面的 <code>mem_get_info</code> 而不仅仅是 PyTorch 的统计）。
+2.  <strong><code>log_gpu_memory_usage</code></strong>: 这是一个打印函数。
+    *   它调用上面的函数，把显存信息打印出来。
+    *   <em>防刷屏机制</em>：在多卡训练（Distributed）时，如果不加控制，8张卡会同时打印8行字。这个函数加了判断 <code>if (dist.get_rank() == rank)</code>，默认只让主卡（Rank 0）打印，保持日志干净。</p>
+<h3>✅ Task 2: 我想监控某个具体函数有没有“偷吃”显存</h3>
+<p><strong>对应代码：</strong> <code>class GPUMemoryLogger</code> (装饰器)</p>
+<p>有时候显存莫名其妙变高了，你想查出是哪个函数导致的。
+1.  这是一个 <strong>Python 装饰器 (Decorator)</strong>。
+2.  <strong>用法</strong>：你只需要在函数头上加一行 <code>@GPUMemoryLogger(role="actor")</code>。
+3.  <strong>原理</strong>：
+    *   <strong>Before</strong>: 在函数执行前，它先记录并打印一次显存。
+    *   <strong>Run</strong>: 执行原本的函数。
+    *   <strong>After</strong>: 函数执行完，它再打印一次显存。
+4.  <strong>目的</strong>：通过对比 Before 和 After 的显存变化，你就能一眼看出这个函数是否申请了大量显存且没有释放（Memory Leak）。</p>
+<h3>✅ Task 3: 我想打印带“身份证”的调试日志</h3>
+<p><strong>对应代码：</strong> <code>log_print</code></p>
+<p>普通的 <code>print("hello")</code> 在调试大项目时很乱，因为你不知道这句话是哪个文件、哪一行打印的。
+1.  这个函数利用 <code>inspect</code> 库，自动获取当前代码的 <strong>文件名、行号、函数名</strong>。
+2.  它还会加上 <strong>当前时间</strong>。
+3.  <strong>效果</strong>：打印出来的日志像这样 <code>[2024-05-20 10:00:00-train.py:105:main_loop]: hello</code>，方便你快速定位代码位置。</p>
+<h3>✅ Task 4: 我想给代码“掐表”，看它跑了多久</h3>
+<p><strong>对应代码：</strong> <code>_timer</code>, <code>simple_timer</code>, <code>marked_timer</code></p>
+<p>你需要优化性能，得先知道哪块慢。
+1.  <strong><code>simple_timer</code></strong>: 这是一个上下文管理器（Context Manager）。
+    *   <strong>用法</strong>：
+        <code>python
+        with simple_timer("模型前向传播", timing_dict):
+            model(input) # 这里的代码会被计时</code>
+    *   <strong>原理</strong>：它利用 <code>codetiming</code> 库记录 <code>with</code> 语句块内的运行时间，并把结果累加到 <code>timing_dict</code> 字典里。
+2.  <strong><code>marked_timer</code></strong>:
+    *   这通常用于配合 NVIDIA 的硬件分析工具（如 Nsight Systems）。理想情况下，它会打上 NVTX 标记，让这块代码在显卡分析图表中显示为特定颜色。
+    *   <em>现状</em>：在这份代码里，它目前只是简单调用了 <code>_timer</code>，功能和 <code>simple_timer</code> 一样，可能是一个预留接口，或者在特定环境下才生效。</p>
+<h3>✅ Task 5: 多卡训练时，我想算所有卡的平均耗时</h3>
+<p><strong>对应代码：</strong> <code>reduce_timing</code></p>
+<p>假设你有 8 张 GPU 卡在训练：
+*   卡 1 跑了 1.0 秒
+*   卡 2 跑了 1.2 秒
+*   ...
+你不能只看一张卡的时间，你需要看大家的平均值。</p>
+<ol>
+<li>这个函数接收每张卡记录的时间字典 <code>timing_raw</code>。</li>
+<li>它使用 <code>torch.distributed.all_reduce</code> 通信操作。</li>
+<li><strong>操作 (Op)</strong>：<code>ReduceOp.AVG</code> (求平均)。</li>
+<li><strong>结果</strong>：它把所有卡的时间汇总、求平均，然后返回一个统一的时间统计结果。</li>
+</ol>
+<hr />
+<h3>总结</h3>
+<p>这个文件就是 <strong>Verl</strong> 框架里的一个<strong>“体检仪”</strong>：
+1.  <strong>查显存</strong> (<code>_get_current_mem_info</code>, <code>GPUMemoryLogger</code>)
+2.  <strong>查日志</strong> (<code>log_print</code>)
+3.  <strong>查速度</strong> (<code>simple_timer</code>)
+4.  <strong>汇总报告</strong> (<code>reduce_timing</code>)</p>
+<p>它不参与模型的核心计算，但是为了让模型跑得更稳、更快，这些工具必不可少。</p>

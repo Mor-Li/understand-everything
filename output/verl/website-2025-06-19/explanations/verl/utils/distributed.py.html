@@ -1,0 +1,89 @@
+<h1>verl/utils/distributed.py</h1>
+<p>这段代码看起来很“劝退”，是因为它涉及到了<strong>分布式训练（Distributed Training）</strong>的底层设置。简单来说，就是<strong>如何让多张显卡（GPU）联合起来一起训练一个大模型</strong>。</p>
+<p>如果不写这段代码，显卡之间就是“各玩各的”，没法同步数据。</p>
+<p>为了让你听懂，我把理解这段代码拆解成一个 <strong>5步的 To-Do List</strong>，我们把“训练模型”想象成“一个团队一起做寒假作业”。</p>
+<h3>📋 学习任务 To-Do List</h3>
+<ol>
+<li><strong>Task 1：理解背景</strong> —— 为什么要搞个“群组”？</li>
+<li><strong>Task 2：建立连接</strong> —— <code>initialize_global_process_group</code> 是在干嘛？</li>
+<li><strong>Task 3：确认身份（核心）</strong> —— 搞懂 <code>RANK</code>, <code>LOCAL_RANK</code>, <code>WORLD_SIZE</code> 到底是谁。</li>
+<li><strong>Task 4：绑定硬件</strong> —— 软件怎么指挥硬件？</li>
+<li><strong>Task 5：散会走人</strong> —— <code>destroy_global_process_group</code> 的作用。</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 1：理解背景 —— 为什么要搞个“群组”？</h4>
+<p><strong>场景</strong>：你有一个超大的模型（比如 GPT），一张显卡装不下，或者算得太慢。你需要 8 张显卡甚至 100 张显卡一起算。
+<strong>问题</strong>：这 100 张显卡分布在不同的物理机器（服务器）上，它们怎么交流？怎么知道谁算完了？
+<strong>代码作用</strong>：这个文件的作用就是<strong>组建一个“微信群”</strong>，把所有显卡拉进群，让它们能互相发消息（同步梯度/参数）。</p>
+<h4>Task 2：建立连接 —— <code>initialize_global_process_group</code></h4>
+<p>看代码这一行：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">torch</span><span class="o">.</span><span class="n">distributed</span><span class="o">.</span><span class="n">init_process_group</span><span class="p">(</span><span class="n">get_nccl_backend</span><span class="p">(),</span> <span class="n">timeout</span><span class="o">=</span><span class="n">timedelta</span><span class="p">(</span><span class="n">seconds</span><span class="o">=</span><span class="n">timeout_second</span><span class="p">))</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：这就是“建群”或者“拨通电话会议”的操作。</li>
+<li><strong><code>get_nccl_backend()</code></strong>：这是通信方式。NVIDIA 的显卡之间通信通常用 <strong>NCCL</strong> 协议（你可以理解为它们专用的“语言”），速度最快。</li>
+<li><strong><code>timeout</code></strong>：超时时间。意思是，如果大家约好 10:00 开会，结果有人 10:00 还没上线，系统最多等多久？代码里默认设了 <code>36000</code> 秒，防止因为网络卡顿导致训练直接报错崩溃。</li>
+</ul>
+<h4>Task 3：确认身份（核心） —— 搞懂三个“环境变量”</h4>
+<p>这是代码里最让人晕的部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">local_rank</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s2">&quot;LOCAL_RANK&quot;</span><span class="p">])</span>
+<span class="n">rank</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s2">&quot;RANK&quot;</span><span class="p">])</span>
+<span class="n">world_size</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="p">[</span><span class="s2">&quot;WORLD_SIZE&quot;</span><span class="p">])</span>
+</code></pre></div>
+
+<p>这些变量通常不是你在代码里写的，而是启动命令（如 <code>torchrun</code>）自动塞进环境变量里的。</p>
+<p><strong>比喻：</strong>
+假设有一个大公司（整个训练任务），租了两栋楼（两台服务器），每栋楼里有 4 个工位（4 张显卡）。</p>
+<ol>
+<li><strong><code>WORLD_SIZE</code> (世界规模)</strong>：<ul>
+<li><strong>含义</strong>：这次任务总共有多少张显卡参与？</li>
+<li><strong>比喻</strong>：公司总共有 <strong>8</strong> 个人（2 栋楼 x 4 人）。</li>
+</ul>
+</li>
+<li><strong><code>RANK</code> (全局排名)</strong>：<ul>
+<li><strong>含义</strong>：你在整个任务中的唯一 ID 编号是多少？（0 到 7）。</li>
+<li><strong>比喻</strong>：你的<strong>工号</strong>。你是第 5 号员工。这个 ID 是全局唯一的，用来区分所有人。</li>
+</ul>
+</li>
+<li><strong><code>LOCAL_RANK</code> (本地排名)</strong>：<ul>
+<li><strong>含义</strong>：你在<strong>当前这台机器</strong>上的编号是多少？（0 到 3）。</li>
+<li><strong>比喻</strong>：你在<strong>这栋楼里的座位号</strong>。虽然你工号是 5，但你在第二栋楼里坐在 1 号座位。</li>
+</ul>
+</li>
+</ol>
+<p><strong>为什么需要 <code>LOCAL_RANK</code>？</strong>
+因为一台机器上通常有 8 张卡，编号是 GPU0, GPU1... GPU7。程序需要知道：“我是这台机器上的第几个进程，所以我应该去占用第几张显卡。”</p>
+<h4>Task 4：绑定硬件 —— 软件怎么指挥硬件？</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">distributed</span><span class="o">.</span><span class="n">is_initialized</span><span class="p">():</span>
+    <span class="n">get_torch_device</span><span class="p">()</span><span class="o">.</span><span class="n">set_device</span><span class="p">(</span><span class="n">local_rank</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>逻辑</strong>：既然我知道了我的 <code>local_rank</code>（座位号）是 2。</li>
+<li><strong>动作</strong>：<code>set_device(2)</code>。</li>
+<li><strong>人话</strong>：程序告诉操作系统：“我是 2 号进程，请把<strong>第 2 张物理显卡</strong>分配给我专用。”</li>
+<li>如果不做这一步，所有进程可能都会去抢第 0 张显卡，导致内存溢出。</li>
+</ul>
+<h4>Task 5：散会走人 —— <code>destroy_global_process_group</code></h4>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">destroy_global_process_group</span><span class="p">():</span>
+    <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">distributed</span><span class="o">.</span><span class="n">is_initialized</span><span class="p">():</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">distributed</span><span class="o">.</span><span class="n">destroy_process_group</span><span class="p">()</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>：训练结束，或者程序出错退出时调用。</li>
+<li><strong>含义</strong>：挂断电话，解散群聊。</li>
+<li><strong>作用</strong>：释放显卡之间的通信端口，清理内存垃圾，确保下次训练能干干净净地开始。</li>
+</ul>
+<hr />
+<h3>💡 总结</h3>
+<p>这个文件 <code>distributed.py</code> 其实就是一个<strong>开机仪式</strong>：</p>
+<ol>
+<li><strong>喊一句</strong>：“大家注意，我们要开始用 NCCL 协议开会了！”（<code>init_process_group</code>）</li>
+<li><strong>问自己</strong>：“我是谁？我在哪？咱们一共有多少人？”（读取 <code>RANK</code>, <code>LOCAL_RANK</code>, <code>WORLD_SIZE</code>）</li>
+<li><strong>占座</strong>：“既然我是本地第 0 号，那我就用第 0 张显卡。”（<code>set_device</code>）</li>
+<li><strong>收尾</strong>：“干完活了，解散。”（<code>destroy_process_group</code>）</li>
+</ol>
+<p>它不涉及具体的 AI 算法，只是为了让多张显卡能协同工作的基础设施代码。</p>

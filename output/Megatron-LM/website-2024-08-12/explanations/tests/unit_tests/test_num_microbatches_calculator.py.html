@@ -1,0 +1,156 @@
+<h1>tests/unit_tests/test_num_microbatches_calculator.py</h1>
+<p>这份代码确实比较晦涩，因为它是在测试深度学习框架（Megatron-LM）底层最核心的一个数学逻辑：<strong>如何切分数据</strong>。</p>
+<p>简单来说，这个文件是在<strong>测试一个计算器</strong>，这个计算器决定了“为了达到总的训练量（Global Batch Size），每个显卡每次需要搬运多少次小数据（Micro Batch）”。</p>
+<p>为了让你看懂，我制定了一个<strong>“五步走”的学习任务清单 (To-Do List)</strong>。只要跟着这个清单走，你就能理解这份代码在干什么。</p>
+<hr />
+<h3>📋 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1: 理解核心概念（搬砖的比喻）</strong></li>
+<li><strong>Task 2: 搞懂“固定模式”的计算逻辑 (Constant)</strong></li>
+<li><strong>Task 3: 搞懂“爬坡模式”的计算逻辑 (Ramp-up)</strong></li>
+<li><strong>Task 4: 看懂测试代码的“初始化”与“更新”</strong></li>
+<li><strong>Task 5: 模拟一遍 <code>test_ramp_up</code> (全流程模拟)</strong></li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>✅ Task 1: 理解核心概念（搬砖的比喻）</h4>
+<p>在看代码前，先搞懂三个变量的关系。假设我们要搬砖：</p>
+<ul>
+<li><strong>Global Batch Size (GBS)</strong>: <strong>总任务量</strong>。比如我们要一次性训练 <strong>32</strong> 块砖。</li>
+<li><strong>Micro Batch Size (MBS)</strong>: <strong>单次搬运能力</strong>。因为显存有限，一张显卡一次只能搬 <strong>8</strong> 块砖。</li>
+<li><strong>Data Parallel Size (DP)</strong>: <strong>工人数量</strong>。比如有 <strong>2</strong> 张显卡（两个工人）在并行干活。</li>
+</ul>
+<p><strong>关键问题：</strong> 为了凑够 32 块砖（GBS），这 2 个工人（DP），每人每次搬 8 块（MBS），需要搬几趟？</p>
+<p><strong>公式：</strong>
+$$ \text{搬运次数 (Micro Batches)} = \frac{\text{总任务量 (GBS)}}{\text{单次能力 (MBS)} \times \text{工人数量 (DP)}} $$</p>
+<p><strong>代入数值：</strong>
+$$ 2 = \frac{32}{8 \times 2} $$
+所以，<code>num_microbatches</code> 就是 <strong>2</strong>。</p>
+<blockquote>
+<p><strong>结论：</strong> 这个文件的核心目的，就是测试代码算出来的这个“2”，到底对不对。</p>
+</blockquote>
+<hr />
+<h4>✅ Task 2: 搞懂“固定模式”的计算逻辑 (Constant)</h4>
+<p>大多数时候，训练时的 GBS 是固定的。</p>
+<p>看代码中的 <code>test_init_num_microbatches_calculator</code> 函数：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">test_init_num_microbatches_calculator</span><span class="p">():</span>
+    <span class="c1"># 参数：rank=0, rampup=None(不爬坡), GBS=32, MBS=8, DP=2</span>
+    <span class="n">mb_calculator</span><span class="o">.</span><span class="n">init_num_microbatches_calculator</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+
+    <span class="c1"># 验证：根据公式 32 / (8*2) = 2</span>
+    <span class="k">assert</span> <span class="n">mb_calculator</span><span class="o">.</span><span class="n">get_num_microbatches</span><span class="p">()</span> <span class="o">==</span> <span class="mi">2</span> 
+    <span class="c1"># 验证：当前总任务量确实是 32</span>
+    <span class="k">assert</span> <span class="n">mb_calculator</span><span class="o">.</span><span class="n">get_current_global_batch_size</span><span class="p">()</span> <span class="o">==</span> <span class="mi">32</span>
+</code></pre></div>
+
+<p><strong>这一步在测什么？</strong>
+它在测试：如果我不搞花里胡哨的“爬坡”，计算器能不能算出正确的搬运次数？答案是能（2次）。</p>
+<hr />
+<h4>✅ Task 3: 搞懂“爬坡模式”的计算逻辑 (Ramp-up)</h4>
+<p>这是最难理解的部分。
+<strong>背景：</strong> 模型刚开始训练时很脆弱，直接上大批量（比如 GBS=32）容易练崩。所以需要 <strong>Ramp-up (爬坡)</strong>，也就是让 GBS 从小变大。</p>
+<p>比如配置是 <code>[16, 8, 96]</code>：
+*   <strong>Start</strong>: 从 GBS = 16 开始。
+*   <strong>Increment</strong>: 每次增加 8。
+*   <strong>Samples</strong>: 每训练过 96 个样本，就检查一下要不要增加。</p>
+<p>看代码中的 <code>test_update_num_microbatches</code>：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">test_update_num_microbatches</span><span class="p">():</span>
+    <span class="c1"># 配置：爬坡[16起步, 增量8, 间隔96], 目标GBS=32, MBS=4, DP=2</span>
+    <span class="n">reconfigure_num_microbatches_calculator</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="p">[</span><span class="mi">16</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">96</span><span class="p">],</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+
+    <span class="c1"># 阶段1：刚开始，GBS是起步价 16。</span>
+    <span class="c1"># 公式：16 / (4 * 2) = 2 次</span>
+    <span class="k">assert</span> <span class="n">mb_calculator</span><span class="o">.</span><span class="n">get_num_microbatches</span><span class="p">()</span> <span class="o">==</span> <span class="mi">2</span>
+
+    <span class="c1"># 阶段2：更新状态。假设已经训练了 48 个样本 (还没到96，但可能触发了某种逻辑，这里是模拟中途)</span>
+    <span class="c1"># 注意：这里的 update_num_microbatches(48) 是告诉计算器“我已经吃掉48个数据了”</span>
+    <span class="c1"># 如果内部逻辑判断需要增加 GBS，这里的 microbatches 就会变。</span>
+
+    <span class="c1"># 在这个具体的测试用例中，它测试的是当 GBS 增加后，搬运次数变成了 3。</span>
+    <span class="c1"># 也就是 GBS 变成了 24 (16+8)。 24 / (4*2) = 3。</span>
+    <span class="n">mb_calculator</span><span class="o">.</span><span class="n">update_num_microbatches</span><span class="p">(</span><span class="mi">48</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+    <span class="k">assert</span> <span class="n">mb_calculator</span><span class="o">.</span><span class="n">get_num_microbatches</span><span class="p">()</span> <span class="o">==</span> <span class="mi">3</span>
+</code></pre></div>
+
+<p><strong>这一步在测什么？</strong>
+它在测试：当训练进行到一半，需要增加总任务量（GBS）时，计算器能不能自动算出这就需要更多的搬运次数（Micro Batches）？</p>
+<hr />
+<h4>✅ Task 4: 看懂测试代码的“初始化”与“更新”</h4>
+<p>代码里有两个类 <code>TestConstantNumMicroBatchesCalculator</code> 和 <code>TestRampupBatchsizeNumMicroBatchesCalculator</code>。</p>
+<p>这只是把上面 Task 2 和 Task 3 的逻辑封装成了<strong>单元测试类</strong>。</p>
+<ul>
+<li><strong>Constant 类测试</strong>：验证 <code>self.mb_calculator.num_micro_batches == 2</code>（永远是2，不会变）。</li>
+<li><strong>Rampup 类测试</strong>：验证初始状态下，GBS 是 <code>start_global_batch_size</code> (16)，而不是最终的 32。所以 <code>num_micro_batches</code> 算出来是 1 (16 / (8*2) = 1)。</li>
+</ul>
+<hr />
+<h4>✅ Task 5: 模拟一遍 <code>test_ramp_up</code> (全流程模拟)</h4>
+<p>这是全文件最复杂的函数，它模拟了整个爬坡过程。只要看懂这个，你就通关了。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">test_ramp_up</span><span class="p">():</span>
+    <span class="c1"># 设定：</span>
+    <span class="c1"># 爬坡计划: [16起步, 每次加16, 每96个样本加一次]</span>
+    <span class="c1"># 最终目标 GBS: 32</span>
+    <span class="c1"># MBS=8, DP=2 (单次能力 8*2=16)</span>
+    <span class="n">reconfigure_num_microbatches_calculator</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="p">[</span><span class="mi">16</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">96</span><span class="p">],</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+
+    <span class="n">consumed_samples</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="c1"># 预期的训练进度表：</span>
+    <span class="c1"># 第1步: 0 + 16 (当前GBS) = 16</span>
+    <span class="c1"># 第2步: 16 + 16 = 32</span>
+    <span class="c1"># ... 到 96 的时候，满足了爬坡条件，GBS 应该变成 32</span>
+    <span class="n">expected_consumed_samples</span> <span class="o">=</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">48</span><span class="p">,</span> <span class="mi">64</span><span class="p">,</span> <span class="mi">80</span><span class="p">,</span> <span class="mi">96</span><span class="p">,</span> <span class="mi">128</span><span class="p">,</span> <span class="mi">160</span><span class="p">,</span> <span class="mi">192</span><span class="p">,</span> <span class="mi">224</span><span class="p">,</span> <span class="mi">256</span><span class="p">]</span>
+
+    <span class="k">while</span> <span class="n">consumed_samples</span> <span class="o">&lt;</span> <span class="mi">256</span><span class="p">:</span>
+        <span class="c1"># 1. 获取当前这一步的 GBS (一开始是16)</span>
+        <span class="n">current_gbs</span> <span class="o">=</span> <span class="n">mb_calculator</span><span class="o">.</span><span class="n">get_current_global_batch_size</span><span class="p">()</span>
+
+        <span class="c1"># 2. 累加已经训练过的样本数</span>
+        <span class="n">consumed_samples</span> <span class="o">+=</span> <span class="n">current_gbs</span>
+
+        <span class="c1"># 3. 验证累加结果是否符合预期表</span>
+        <span class="n">count</span> <span class="o">+=</span> <span class="mi">1</span>
+        <span class="k">assert</span> <span class="n">consumed_samples</span> <span class="o">==</span> <span class="n">expected_consumed_samples</span><span class="p">[</span><span class="n">count</span><span class="p">]</span>
+
+        <span class="c1"># 4. 关键点：告诉计算器“我又练了这么多数据，请更新你的状态”</span>
+        <span class="c1"># 如果达到了 96 个样本，计算器内部会自动把 GBS 从 16 提升到 32</span>
+        <span class="n">mb_calculator</span><span class="o">.</span><span class="n">update_num_microbatches</span><span class="p">(</span><span class="n">consumed_samples</span><span class="p">,</span> <span class="kc">True</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>推演过程：</strong></p>
+<ol>
+<li>
+<p><strong>前几轮 (0-96样本)</strong>:</p>
+<ul>
+<li>因为还没练够 96 个样本，GBS 维持在起步价 <strong>16</strong>。</li>
+<li>每次循环 <code>consumed_samples</code> 增加 16。</li>
+<li>列表检查：16, 32, 48, 64, 80, 96。一切正常。</li>
+</ul>
+</li>
+<li>
+<p><strong>转折点 (到达96样本)</strong>:</p>
+<ul>
+<li><code>update_num_microbatches(96)</code> 被调用。</li>
+<li>计算器发现：哎哟，练够96个了，触发爬坡逻辑！</li>
+<li>计算器把 GBS 从 16 加到 32 (因为增量是16)。但是不能超过最大值32，所以现在 GBS = 32。</li>
+</ul>
+</li>
+<li>
+<p><strong>后几轮 (96-256样本)</strong>:</p>
+<ul>
+<li>现在 <code>mb_calculator.get_current_global_batch_size()</code> 返回 <strong>32</strong> 了。</li>
+<li>下一次循环，<code>consumed_samples</code> 从 96 增加 32，变成 <strong>128</strong>。</li>
+<li>列表检查：96 -&gt; 128 -&gt; 160... 增幅变大了！</li>
+</ul>
+</li>
+</ol>
+<p><strong>这一步在测什么？</strong>
+它在验证：随着训练数据的累积，GBS 是否真的按照预定的计划（从16变成32）发生了变化。</p>
+<hr />
+<h3>💡 总结</h3>
+<p>这个文件其实就在干一件事：</p>
+<p><strong>确保 Megatron-Core 能够根据你的显卡数量（DP）、显存限制（MBS）和训练策略（是否爬坡），准确地计算出每一步需要切分成多少个小块（Micro Batches）来执行。</strong></p>
+<ul>
+<li>如果算多了，显存会爆。</li>
+<li>如果算少了，训练速度会变慢，或者达不到预期的 Batch Size 导致模型效果差。</li>
+<li>如果爬坡逻辑错了，模型一开始可能就会梯度爆炸。</li>
+</ul>
+<p>现在再回头看代码，是不是清晰多了？</p>

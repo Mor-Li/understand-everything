@@ -1,0 +1,92 @@
+<h1>tools/checkpoint/loader_mcore.py</h1>
+<p>这份代码文件 <code>loader_mcore.py</code> 的核心作用是：<strong>作为一个“搬运工”，读取 NVIDIA Megatron-Core (MCore) 格式的分布式模型 Checkpoint，将分散在不同 GPU 上的权重（Tensor Parallel）合并成完整的参数，并通过队列（Queue）发送给主进程（通常用于模型格式转换，比如转成 HuggingFace 格式）。</strong></p>
+<p>它通常不会单独运行，而是被其他转换脚本（如 <code>convert_checkpoint.py</code>）调用。</p>
+<p>为了让你更容易理解，我将这个脚本的执行流程拆解为一个 <strong>Task List (任务清单)</strong>，然后一步步给你讲解。</p>
+<hr />
+<h3>📋 Task List: 脚本执行流程清单</h3>
+<ol>
+<li><strong>环境准备 (Environment Setup):</strong> 设置路径，导入 Megatron 库。</li>
+<li><strong>伪造启动参数 (Mock Arguments):</strong> 假装自己是一个正在启动的训练任务，以便骗过 Megatron 的初始化检查。</li>
+<li><strong>加载元数据 (Load Metadata):</strong> 从 Checkpoint 中读取模型配置（层数、隐藏层大小等）。</li>
+<li><strong>构建空模型 (Build Model Structure):</strong> 在内存中初始化模型架构（此时是空的或随机权重的）。</li>
+<li><strong>加载分布式权重 (Load Checkpoint Weights):</strong> 将硬盘上的 Checkpoint 权重加载到刚才构建的模型架构中。</li>
+<li><strong>发送配置信息 (Send Config):</strong> 告诉主进程这个模型长什么样。</li>
+<li><strong>合并并发送 Embedding (Process Embeddings):</strong> 合并词向量层并发送。</li>
+<li><strong>循环处理每一层 (Process Transformer Layers):</strong><ul>
+<li>提取 Norm 层参数。</li>
+<li><strong>核心步骤：</strong> 遍历所有 Tensor Parallel (TP) 分片，提取 QKV、Dense、MLP 权重。</li>
+<li><strong>核心步骤：</strong> 将切分的权重拼合（Concat）成完整矩阵。</li>
+<li>发送该层数据。</li>
+</ul>
+</li>
+<li><strong>发送收尾层 (Process Final Layers):</strong> 发送 Final Norm 和 Output Layer。</li>
+<li><strong>完成 (Done):</strong> 发送结束信号。</li>
+</ol>
+<hr />
+<h3>🔍 逐步详解 (Step-by-Step Explanation)</h3>
+<h4>1. 环境准备 (Environment Setup)</h4>
+<ul>
+<li><strong>代码位置:</strong> <code>_load_checkpoint</code> 函数开头。</li>
+<li><strong>在做什么:</strong> 因为 Megatron 是一个第三方库，脚本需要把它的路径加入 <code>sys.path</code> 才能 import 里面的模块（如 <code>mpu</code>, <code>model_provider</code> 等）。如果找不到 Megatron，程序会报错并退出。</li>
+</ul>
+<h4>2. 伪造启动参数 (Mock Arguments)</h4>
+<ul>
+<li><strong>代码位置:</strong> <code>sys.argv = ['script.py', ...]</code> 那一大段。</li>
+<li><strong>为什么:</strong> Megatron 的代码设计是给训练用的，初始化时会强制检查很多命令行参数（比如 <code>--micro-batch-size</code>）。</li>
+<li><strong>怎么做:</strong> 这里手动修改了 <code>sys.argv</code>，填入了一堆 <code>--no-xxxx</code> 和默认值。特别是 <code>--use-cpu-initialization</code>，这是为了让模型在 CPU 上加载，而不是占用 GPU 显存（因为转换脚本通常在单机 CPU 上跑）。</li>
+</ul>
+<h4>3. 加载元数据 (Load Metadata)</h4>
+<ul>
+<li><strong>代码位置:</strong> <code>load_args_from_checkpoint(margs, ...)</code>。</li>
+<li><strong>在做什么:</strong> 读取 Checkpoint 文件夹里的 <code>config.json</code> 或参数文件。</li>
+<li><strong>目的:</strong> 知道模型有多少层 (<code>num_layers</code>)，隐藏层多大 (<code>hidden_size</code>)，用了什么精度 (<code>fp16/bf16</code>)，以及原来的并行度 (<code>tensor_model_parallel_size</code>)。</li>
+</ul>
+<h4>4. &amp; 5. 构建模型并加载权重 (Build &amp; Load)</h4>
+<ul>
+<li><strong>代码位置:</strong> <code>get_models</code> 函数内部。</li>
+<li><strong>核心逻辑:</strong><ul>
+<li>Megatron 的模型是切分存储的。比如 TP=2，意味着一个矩阵被切成了两半存在两个文件里。</li>
+<li>这个函数会<strong>模拟</strong>分布式环境。它通过循环 <code>for rank in range(count)</code>，依次假装自己是第 0 号卡、第 1 号卡...</li>
+<li><code>model_provider(...)</code>: 创建模型骨架。</li>
+<li><code>load_checkpoint(model_, ...)</code>: 把硬盘上的权重填入骨架。</li>
+<li>最后，<code>models</code> 列表里存放了所有分片的模型实例。</li>
+</ul>
+</li>
+</ul>
+<h4>6. 发送配置信息 (Send Config)</h4>
+<ul>
+<li><strong>代码位置:</strong> <code>md = types.SimpleNamespace()</code> 到 <code>queue.put(md)</code>。</li>
+<li><strong>在做什么:</strong> 把整理好的模型参数（元数据）打包成一个对象 <code>md</code>，通过 <code>queue</code> 发送出去。接收方（主进程）拿到这个包，就知道接下来要转换什么模型、怎么初始化 HuggingFace 的 Config 了。</li>
+</ul>
+<h4>7. 合并并发送 Embedding (Process Embeddings)</h4>
+<ul>
+<li><strong>代码位置:</strong> <code>message = { "word embeddings": torch.cat(...) }</code>。</li>
+<li><strong>关键点:</strong> <code>torch.cat(..., dim=0)</code>。</li>
+<li><strong>解释:</strong> 在 Megatron 中，词表（Vocab）通常是被切分的。比如 50000 个词，卡 0 存前 25000 个，卡 1 存后 25000 个。这里使用 <code>torch.cat</code> 把它们沿着第 0 维拼起来，还原成完整的 Embeddings 矩阵。</li>
+</ul>
+<h4>8. 循环处理每一层 (Process Transformer Layers)</h4>
+<p>这是最复杂也是最重要的部分。
+*   <strong>代码位置:</strong> <code>for layer_num in range(...)</code> 循环内。
+*   <strong>逻辑:</strong>
+    1.  <strong>Layer Norm:</strong> 不需要合并，因为每张卡上存的 Norm 参数是一样的（或者只有一份）。直接取 <code>models[0]</code> 的数据。
+    2.  <strong>QKV / Dense / MLP:</strong> 这些是线性层（Linear Layers），在 Megatron 中被切分了。
+        *   代码遍历 <code>models</code> (所有分片)。
+        *   <code>qkv_weight.append(...)</code>: 把每张卡的 QKV 权重拿出来放到列表里。
+        *   <code>torch.cat(qkv_weight, dim=0)</code> (或其他 dim): <strong>拼合操作</strong>。
+            *   如果是按列切分（Column Parallel），就按 <code>dim=0</code> 拼。
+            *   如果是按行切分（Row Parallel），就按 <code>dim=1</code> 拼。
+    3.  <strong>SwiGLU 特殊处理:</strong> 如果模型用了 SwiGLU 激活函数，权重切分方式比较特殊，代码里专门有一段 <code>if md.swiglu:</code> 来处理这种复杂的拼接。
+    4.  <strong>Queue Put:</strong> 拼好这一层的所有参数后，打包成字典 <code>message</code>，扔进队列。</p>
+<h4>9. 发送收尾层 (Process Final Layers)</h4>
+<ul>
+<li><strong>代码位置:</strong> <code>final_layernorm</code> 和 <code>output_layer</code> 部分。</li>
+<li><strong>在做什么:</strong> 处理 Transformer 最后的 LayerNorm 和输出层（LM Head）。输出层通常也需要像 Embedding 一样进行 <code>cat</code> 拼接。</li>
+</ul>
+<h4>10. 完成 (Done)</h4>
+<ul>
+<li><strong>代码位置:</strong> <code>queue.put("done")</code>。</li>
+<li><strong>在做什么:</strong> 告诉主进程：“我干完活了，所有权重都发过去了，你可以收工了。”</li>
+</ul>
+<h3>总结</h3>
+<p>这个脚本就像一个<strong>拼图大师</strong>。
+原来的模型像是一个被切碎的拼图，散落在不同的文件夹里（模拟不同的 GPU）。这个脚本负责把这些碎片一块块捡起来，按正确的顺序和边缘拼好，然后把拼好的完整图片递给外面的人。</p>

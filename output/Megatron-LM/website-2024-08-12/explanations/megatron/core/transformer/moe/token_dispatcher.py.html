@@ -1,0 +1,143 @@
+<h1>megatron/core/transformer/moe/token_dispatcher.py</h1>
+<p>这份代码确实比较硬核，因为它涉及到大模型分布式训练中最复杂的<strong>混合专家模型（MoE）</strong>的数据通信部分。</p>
+<p>为了让你看懂，我们可以把这个文件想象成一个<strong>“物流分拣中心”</strong>的操作手册。</p>
+<p><strong>核心任务</strong>：MoE模型里有很多“专家”（Experts，也就是很多个小神经网络）。每个Token（数据包裹）需要被送到指定的“专家”那里去处理，处理完后再送回原来的位置。</p>
+<p>这个文件就是负责<strong>“把Token送到对的GPU上”</strong>（Permutation/分发）以及<strong>“处理完把结果拿回来”</strong>（Unpermutation/还原）。</p>
+<p>下面是一个由浅入深的 <strong>Task Todo List</strong>，带你一步步拆解：</p>
+<hr />
+<h3>✅ Task 1: 理解基类 (MoETokenDispatcher) —— 定义接口</h3>
+<p><strong>目标</strong>：搞清楚这个系统只干两件事：<strong>“送出去”</strong>和<strong>“接回来”</strong>。</p>
+<p>代码中的 <code>class MoETokenDispatcher</code> 是一个抽象基类（类似大纲），它规定了所有分发器必须实现的两个方法：</p>
+<ol>
+<li><strong><code>token_permutation</code> (分发/排列)</strong>:<ul>
+<li><strong>输入</strong>: 原始Token，以及每个Token想去哪个专家的索引 (<code>indices</code>)。</li>
+<li><strong>工作</strong>: 把Token重新以此排序，甚至发送到别的GPU上，让同一个专家的Token聚在一起。</li>
+</ul>
+</li>
+<li><strong><code>token_unpermutation</code> (还原/归位)</strong>:<ul>
+<li><strong>输入</strong>: 专家处理完的结果 (<code>expert_output</code>)。</li>
+<li><strong>工作</strong>: 把这些打乱顺序的结果，按原来的顺序排回去，送回原来的GPU。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 2: 理解第一种实现 (MoEAllGatherTokenDispatcher) —— “全收集”模式</h3>
+<p><strong>目标</strong>：理解基于 <code>AllGather</code> 的分发逻辑。这通常用于专家并行度较低或者特定架构配置下。</p>
+<p><strong>核心逻辑</strong>：与其精准投递，不如<strong>把自己需要的东西从大家那里都抓取（Gather）过来</strong>。</p>
+<ul>
+<li>
+<p><strong>Step 2.1: 初始化 (<code>__init__</code>)</strong></p>
+<ul>
+<li>它记录了本地有哪些专家 (<code>local_expert_indices</code>)。</li>
+<li>它准备了一些掩码 (<code>mask</code>)，用来标记哪些Token是属于我本地专家的。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 2.2: 分发 (<code>token_permutation</code>)</strong></p>
+<ul>
+<li><strong>动作 1 (跨设备通信)</strong>: 调用 <code>gather</code>。虽然名字叫分发，但它实际上是从其他GPU那里<strong>收集</strong>所有Token的信息。</li>
+<li><strong>动作 2 (筛选)</strong>: 收集来了一大堆Token，但我只保留<strong>分配给我本地专家</strong>的那些 (<code>masked_select</code>)。</li>
+<li><strong>动作 3 (本地排序)</strong>: 把留下的Token按专家ID排序 (<code>argsort</code>)，这样本地专家1的Token在一起，专家2的在一起，方便计算。</li>
+<li><strong>结果</strong>: 此时，GPU上只有属于本地专家的Token，且排好序了。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 2.3: 还原 (<code>token_unpermutation</code>)</strong></p>
+<ul>
+<li><strong>动作</strong>: 专家算完了。现在要把结果还给原来的拥有者。</li>
+<li><strong>通信</strong>: 使用 <code>reduce_scatter</code>。这是一个逆向过程，把计算结果“撒”回给原来的GPU。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 理解第二种实现 (MoEAlltoAllTokenDispatcher) —— “全交换”模式 (重难点)</h3>
+<p><strong>目标</strong>：这是大规模MoE最常用的方式。效率更高，但逻辑更绕。</p>
+<p><strong>核心逻辑</strong>：<strong>点对点精准互换</strong>。我有给你的包裹，你有给我的包裹，我们同时交换（All-to-All）。</p>
+<ul>
+<li>
+<p><strong>Step 3.1: 预处理 (<code>preprocess</code>)</strong></p>
+<ul>
+<li><strong>统计</strong>: 先数一数（<code>bincount</code>），我有多少Token要给GPU 1，多少给GPU 2...</li>
+<li><strong>切分点 (<code>splits</code>)</strong>: 计算好数据的切割点，告诉通信函数：“前100个发给Rank 0，接下来的50个发给Rank 1...”。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.2: 分发 (<code>token_permutation</code>)</strong></p>
+<ul>
+<li><strong>本地重排</strong>: 先在自己家里把Token整理好，按目的地（目标专家所在的GPU）归类。</li>
+<li><strong>第一次通信 (TP AlltoAll)</strong>: 如果开了张量并行（Tensor Parallel），先处理TP维度的数据交换。</li>
+<li><strong>第二次通信 (EP AlltoAll)</strong>: <strong>这是关键</strong>。调用 <code>tensor_parallel.all_to_all</code>。<ul>
+<li>意思就是：所有GPU同时互发数据。我把你需要的Token发给你，你把我的发给我。</li>
+</ul>
+</li>
+<li><strong>再次重排</strong>: 收到数据后，虽然都在我这了，但可能顺序是乱的（比如来自GPU1的数据在前，GPU2在后）。我需要再排一次序，让属于“本地专家A”的数据紧挨着，属于“本地专家B”的紧挨着。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.3: 还原 (<code>token_unpermutation</code>)</strong></p>
+<ul>
+<li><strong>完全逆向操作</strong>:<ol>
+<li>先本地逆向重排。</li>
+<li>执行 <strong>All-to-All</strong> 通信（把处理完的数据发回原主）。</li>
+<li>收到数据后，再根据最开始记录的索引，把Token还原回句子原本的顺序（比如“我爱吃苹果”，不能变成“爱我果苹吃”）。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 总结与对比 (Cheat Sheet)</h3>
+<p>为了帮你理清思路，对比一下这两个类：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">特性</th>
+<th style="text-align: left;"><strong>AllGather Dispatcher</strong></th>
+<th style="text-align: left;"><strong>AlltoAll Dispatcher</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><strong>比喻</strong></td>
+<td style="text-align: left;"><strong>自助餐模式</strong>：大家把菜都端出来，我只拿我盘子里想吃的（属于我本地专家的）。</td>
+<td style="text-align: left;"><strong>快递模式</strong>：每个人打包好要寄给别人的包裹，统一交换，精准投递。</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>通信量</strong></td>
+<td style="text-align: left;">可能会有冗余传输（如果大部分Token都不属于我，我也可能得先看一眼）。</td>
+<td style="text-align: left;">高效，只传输必要的数据。</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>适用场景</strong></td>
+<td style="text-align: left;">这里的实现通常结合了序列并行(SP)，用于处理特定的拓扑结构。</td>
+<td style="text-align: left;"><strong>主流选择</strong>。大规模MoE训练的标准做法。</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong>代码复杂度</strong></td>
+<td style="text-align: left;">较低，主要是筛选（Masking）。</td>
+<td style="text-align: left;">较高，需要计算Splits，处理Padding（填充）和Capacity（容量限制）。</td>
+</tr>
+</tbody>
+</table>
+<h3>💡 重点代码段落翻译</h3>
+<p>如果你看到 <code>MoEAlltoAllTokenDispatcher</code> 里的这段：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Permutation 1: input to AlltoAll input</span>
+<span class="n">permutated_local_input_tokens</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">reversed_local_input_permutation_mapping</span> <span class="o">=</span> <span class="n">permute</span><span class="p">(</span>
+    <span class="n">hidden_states</span><span class="p">,</span>
+    <span class="n">indices</span><span class="p">,</span>
+    <span class="o">...</span>
+<span class="p">)</span>
+
+<span class="c1"># Perform expert parallel AlltoAll communication</span>
+<span class="n">global_input_tokens</span> <span class="o">=</span> <span class="n">tensor_parallel</span><span class="o">.</span><span class="n">all_to_all</span><span class="p">(</span>
+    <span class="n">parallel_state</span><span class="o">.</span><span class="n">get_expert_model_parallel_group</span><span class="p">(),</span>
+    <span class="n">permutated_local_input_tokens</span><span class="p">,</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">output_splits</span><span class="p">,</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">input_splits</span><span class="p">,</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p><strong>人话翻译</strong>：
+1.  <code>permute</code>: 在本地先把包裹按目的地分好堆。
+2.  <code>all_to_all</code>: 叫快递员来，把分好堆的包裹一次性发给其他所有GPU，同时接收其他GPU发给我的包裹。</p>
+<p><strong>总结</strong>：这个文件就是<strong>MoE模型的交通指挥系统</strong>。没有它，Token就不知道该去哪个GPU找哪个专家，算完也回不来。</p>

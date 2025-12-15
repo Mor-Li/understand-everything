@@ -1,0 +1,88 @@
+<h1>megatron/core/datasets/readme.md</h1>
+<p>这篇文章读起来确实比较晦涩，因为它描述的是 Megatron-LM（一个用于训练超大模型的框架）底层如何高效处理海量数据的<strong>技术规范</strong>。它不是给普通用户看的，而是给开发数据加载器的人看的。</p>
+<p>为了让你听懂，我把这个过程想象成<strong>“如何把一座图书馆的书（原始数据）变成喂给大模型吃的压缩饼干（训练样本）”</strong>。</p>
+<p>下面是一个学习任务清单（To-Do List），我们一步步来拆解：</p>
+<hr />
+<h3>Task 1：理解最底层的“地基” —— 数据的物理存储</h3>
+<p><strong>目标</strong>：搞懂 <code>IndexedDataset</code> 是个啥。</p>
+<ul>
+<li><strong>原文对应</strong>：<code>Data pre-processing</code> 和 <code>IndexedDataset</code> 部分。</li>
+<li><strong>通俗解释</strong>：<ul>
+<li>在大模型训练中，直接读取 <code>.txt</code> 或 <code>.json</code> 文件太慢了。</li>
+<li>Megatron 选择把数据转换成一种<strong>二进制格式</strong>，这就是 <code>IndexedDataset</code>。</li>
+<li>它由两个文件组成：<ol>
+<li><strong><code>.bin</code> 文件</strong>：这是<strong>肉</strong>。里面全是数字（Token IDs），把所有书的内容连在一起存进去。</li>
+<li><strong><code>.idx</code> 文件</strong>：这是<strong>骨架/目录</strong>。它告诉程序，“第5本书是从第1000个字节开始，到第2000个字节结束”。</li>
+</ol>
+</li>
+</ul>
+</li>
+<li><strong>结论</strong>：在做任何事之前，你的硬盘上必须先有这两个文件。</li>
+</ul>
+<h3>Task 2：理解“包工头” —— 数据的构建流程</h3>
+<p><strong>目标</strong>：搞懂 <code>Builder</code> 和 <code>Config</code> 的关系。</p>
+<ul>
+<li><strong>原文对应</strong>：<code>Data loading: construction</code> 部分。</li>
+<li><strong>通俗解释</strong>：<ul>
+<li>有了底层数据（Task 1），你不能直接拿手抓着喂给模型。你需要一个“工厂”来生产数据流。</li>
+<li><strong><code>BlendedMegatronDatasetConfig</code> (配置单)</strong>：这是图纸。它规定了“我们要用哪些数据？按什么比例混合？序列长度是多少？”</li>
+<li><strong><code>BlendedMegatronDatasetBuilder</code> (包工头)</strong>：这是执行者。它拿着配置单，去硬盘上读取 <code>IndexedDataset</code>，然后构建出最终的高级数据对象。</li>
+</ul>
+</li>
+<li><strong>结论</strong>：如果不使用统一的 <code>Builder</code>（包工头），程序就会卡死（hang），因为分布式训练要求所有显卡看到的构建过程是一致的。</li>
+</ul>
+<h3>Task 3：【核心难点】理解 GPTDataset 的“三层索引魔法”</h3>
+<p><strong>目标</strong>：搞懂 <code>GPTDataset</code> 是怎么把一堆长短不一的文章，变成整齐划一的训练样本的。</p>
+<ul>
+<li><strong>原文对应</strong>：<code>GPTDataset</code> implementation 部分。</li>
+<li><strong>背景</strong>：模型训练需要固定长度（比如 S=1024）。但原始文章有的长（1500字），有的短（300字）。怎么切？</li>
+<li><strong>步骤详解</strong>：<ol>
+<li><strong>第一层：文档索引 (<code>Do_idx</code>) —— 洗牌</strong><ul>
+<li>把所有文章的ID打乱。比如本来是[文章1, 文章2, 文章3...]，打乱成 [文章8, 文章5, 文章9...]。</li>
+</ul>
+</li>
+<li><strong>第二层：样本索引 (<code>Sa_idx</code>) —— 切割</strong><ul>
+<li>这是最复杂的。它是一个映射表，告诉程序：“第1个样本，取自文章8的开头到第1024字”；“第2个样本，取自文章8的剩余部分，拼上文章5的开头”。</li>
+<li><strong>目的</strong>：把长短不一的文章像香肠一样切片，拼成一个个长度严格为 1024 的样本。</li>
+</ul>
+</li>
+<li><strong>第三层：Shuffle索引 (<code>Sh_idx</code>) —— 再次打乱</strong><ul>
+<li>切好样本后，再把样本的顺序打乱一次，保证训练时的随机性。</li>
+</ul>
+</li>
+</ol>
+</li>
+<li><strong>结论</strong>：通过这三层映射，Megatron 实现了极高效率的随机读取，而不需要把真的数据搬来搬去，只需要存一堆数字索引。</li>
+</ul>
+<h3>Task 4：理解“混合果汁” —— BlendedDataset</h3>
+<p><strong>目标</strong>：搞懂怎么同时训练 Wikipedia 数据和 GitHub 代码数据。</p>
+<ul>
+<li><strong>原文对应</strong>：<code>BlendedDataset</code> implementation 部分。</li>
+<li><strong>通俗解释</strong>：<ul>
+<li>假设你有两个数据集：<code>GPTDataset_Wiki</code>（维基百科）和 <code>GPTDataset_Code</code>（代码）。</li>
+<li>你想让模型 50% 时间学维基，50% 时间学代码。</li>
+<li><strong><code>BlendedDataset</code></strong> 就是一个混合器。它也有两个索引：<ol>
+<li><strong>数据集索引 (<code>Da_idx</code>)</strong>：决定第K个样本从哪个数据集里拿（比如：[Wiki, Code, Code, Wiki...]）。</li>
+<li><strong>数据集内样本索引 (<code>Sa_idx</code>)</strong>：决定从那个数据集的第几个样本拿。</li>
+</ol>
+</li>
+</ul>
+</li>
+<li><strong>结论</strong>：这就是为什么叫 <code>Blended</code>（混合），它把多个单一来源的数据集按权重揉在一起。</li>
+</ul>
+<hr />
+<h3>总结回顾 (Summary)</h3>
+<p>如果你要用这个库，你脑子里的流程应该是这样的：</p>
+<ol>
+<li><strong>准备阶段</strong>：把原始文本处理成 <code>.bin</code> 和 <code>.idx</code> 文件 (<strong>IndexedDataset</strong>)。</li>
+<li><strong>配置阶段</strong>：写一个配置单 (<strong>Config</strong>)，说我要混合 Wiki 和 Code，比例 7:3。</li>
+<li><strong>启动阶段</strong>：程序启动 <strong>Builder</strong>。</li>
+<li><strong>内部逻辑</strong>：<ul>
+<li>Builder 创建两个 <strong>GPTDataset</strong>（一个Wiki，一个Code）。</li>
+<li>每个 GPTDataset 内部生成<strong>三层索引</strong>（文档-&gt;切片-&gt;打乱），把变长文章变成定长样本。</li>
+<li>Builder 再创建一个 <strong>BlendedDataset</strong>，根据权重指挥那两个 GPTDataset 吐数据。</li>
+</ul>
+</li>
+<li><strong>训练阶段</strong>：模型伸手要一个 Batch，BlendedDataset 就根据索引瞬间抓取数据给它。</li>
+</ol>
+<p>这篇文档主要就是在解释第 1 步的格式和第 4 步的数学逻辑。</p>

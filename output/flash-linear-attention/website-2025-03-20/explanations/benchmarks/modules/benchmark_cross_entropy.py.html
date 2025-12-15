@@ -1,0 +1,76 @@
+<h1>benchmarks/modules/benchmark_cross_entropy.py</h1>
+<p>这份代码其实就是一个<strong>“赛车比赛”的记分牌和说明书</strong>。</p>
+<p>它不是用来训练模型的，而是用来<strong>测试不同算法的速度（性能）</strong>。具体来说，它在测试“计算损失函数（Loss）”这一步，到底谁跑得快。</p>
+<p>为了让你看懂，我把这个任务拆解成一个 <strong>5步走的 To-Do List</strong>。我们一步步划掉这些任务，你就懂了。</p>
+<hr />
+<h3>✅ Task 1: 搞清楚我们在测什么？（比赛项目）</h3>
+<p><strong>核心概念：</strong> 这里的核心任务是 <strong>Cross Entropy Loss（交叉熵损失）</strong>。
+在训练大模型（LLM）时，模型输出最后一步通常是这样的：
+1.  <strong>算分（Linear层）：</strong> 把隐藏层向量映射到词表大小（比如 12万个词），算出每个词的得分（Logits）。
+2.  <strong>算错（Loss层）：</strong> 拿得分和真实标签（Target）对比，算出误差。</p>
+<p><strong>代码对应：</strong>
+文件名叫 <code>benchmark_cross_entropy.py</code>，意思就是“交叉熵性能测试”。</p>
+<hr />
+<h3>✅ Task 2: 搞清楚“赛车手”是谁？（三种算法）</h3>
+<p>代码里定义了 <code>provider</code>（提供者），这就是我们要对比的三位赛车手。它们做的事情一样，但做法不同：</p>
+<ol>
+<li><strong>赛车手 A (Naive - 朴素版):</strong><ul>
+<li><strong>代码：</strong> <code>criterion = nn.CrossEntropyLoss()</code> 加上 <code>F.linear(...)</code></li>
+<li><strong>逻辑：</strong> 这是 PyTorch 原生的标准做法。它老老实实地先算出巨大的得分矩阵，存到显存里，然后再算 Loss。</li>
+<li><strong>缺点：</strong> 慢，且极其占显存。</li>
+</ul>
+</li>
+<li><strong>赛车手 B (Fused - 融合版):</strong><ul>
+<li><strong>代码：</strong> <code>criterion = FusedCrossEntropyLoss()</code></li>
+<li><strong>逻辑：</strong> 这是一个优化过的算子。它在算 Loss 的时候做了一些底层优化（由 <code>fla</code> 库提供），比原生的快一点。</li>
+</ul>
+</li>
+<li><strong>赛车手 C (Fused Linear - 终极融合版):</strong><ul>
+<li><strong>代码：</strong> <code>criterion = FusedLinearCrossEntropyLoss()</code></li>
+<li><strong>逻辑：</strong> <strong>这是这篇代码的主角。</strong> 它把“算分”和“算错”这两步合并成一步了。</li>
+<li><strong>优点：</strong> 它不需要把那个巨大的得分矩阵写进显存里，而是在计算过程中直接流式处理。这在词表很大（代码里 <code>V=120000</code>）时，能极大节省显存并提升速度。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 3: 搞清楚比赛环境（数据规模）</h3>
+<p>我们要看看赛道有多长，负载有多重。</p>
+<p><strong>代码对应 <code>benchmark</code> 函数内部：</strong>
+*   <code>B = 4</code>: Batch size（这批有4个样本）。
+*   <code>H = 4096</code>: Hidden size（模型每一层的宽度，很宽）。
+*   <code>V = 120000</code>: Vocabulary size（词表大小，非常大，说明这是针对大语言模型的）。
+*   <code>x</code>: 输入的数据。
+*   <code>w, b</code>: 最后一层的权重和偏置。</p>
+<p><strong>关键点：</strong> <code>V</code> 很大。如果是普通做法，中间会产生一个 <code>Batch * T * 120000</code> 这么大的巨型矩阵，非常容易把显存撑爆。</p>
+<hr />
+<h3>✅ Task 4: 搞清楚比赛规则（测试指标）</h3>
+<p>比赛分两场：<strong>正向跑（Forward）</strong> 和 <strong>倒着跑（Backward）</strong>。</p>
+<p><strong>代码对应 <code>if provider == ...</code> 部分：</strong>
+*   <strong>Forward (前向传播):</strong> 仅仅计算出 Loss 值。
+    *   代码长这样：<code>criterion(...)</code>
+    *   对应 <code>naive</code>, <code>fused</code>, <code>fused_linear</code>。
+*   <strong>Backward (反向传播):</strong> 计算 Loss 之后，还要算出梯度（用于更新模型参数）。这通常是训练中最耗时的部分。
+    *   代码长这样：<code>criterion(...).backward()</code>
+    *   对应 <code>naive_bwd</code>, <code>fused_bwd</code>, <code>fused_linear_bwd</code>。</p>
+<p><strong>工具：</strong>
+代码用了 <code>triton.testing.do_bench</code>。你可以把它理解为一个<strong>极其精准的秒表</strong>，它会运行很多次，然后算出平均耗时（毫秒 ms）。</p>
+<hr />
+<h3>✅ Task 5: 搞清楚怎么看结果（图表配置）</h3>
+<p>代码最上面的 <code>@triton.testing.perf_report</code> 是用来画图的。</p>
+<ul>
+<li><strong>X轴 (<code>x_names=['T']</code>)</strong>: 代表序列长度（Sequence Length）。<ul>
+<li>代码里 <code>x_vals=[128 * 2 ** i ...]</code> 表示从 128 开始，每次翻倍，测 128, 256, 512... 一直到很长。</li>
+<li><strong>目的：</strong> 看看随着句子越来越长，这三个赛车手谁掉速最快，谁依然坚挺。</li>
+</ul>
+</li>
+<li><strong>Y轴 (<code>ylabel</code>)</strong>: 执行时间（毫秒）。越低越好。</li>
+<li><strong>线条 (<code>line_arg='provider'</code>)</strong>: 图上会画出 6 条线（3种算法 x 2种模式）。</li>
+</ul>
+<hr />
+<h3>总结：这段代码想告诉你什么？</h3>
+<p>这段代码是一个<strong>广告/证明</strong>。</p>
+<p>作者写了一个很牛的模块叫 <code>FusedLinearCrossEntropyLoss</code>（赛车手 C）。他写这段代码是为了证明：</p>
+<blockquote>
+<p>“看！当词表很大（V=120000）且序列变长（T变大）时，我的 <strong>Fused Linear</strong> 方法比 PyTorch 原生的方法（Naive）快得多，而且更省显存，尤其是在反向传播（Backward）的时候！”</p>
+</blockquote>
+<p>如果你运行这段代码，你会看到一张图，图中代表 <code>fused_linear</code> 的那条线应该在最下方（耗时最少）。</p>

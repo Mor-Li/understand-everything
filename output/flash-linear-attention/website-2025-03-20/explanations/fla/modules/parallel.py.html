@@ -1,0 +1,104 @@
+<h1>fla/modules/parallel.py</h1>
+<p>这份代码确实比较晦涩，因为它涉及到了 PyTorch 中比较前沿的 <strong>分布式张量（Distributed Tensor / DTensor）</strong> 概念。</p>
+<p>简单来说，这段代码是为了让普通的 PyTorch 模型能够“变身”成可以在多张显卡上并行运行的模型。</p>
+<p>为了让你听懂，我把理解这段代码的过程拆解成一个 <strong>“学习任务清单 (To-Do List)”</strong>。我们一步一步来打勾完成。</p>
+<hr />
+<h3>✅ Task 1：理解背景 —— 为什么要搞这一套？</h3>
+<ul>
+<li><strong>现状</strong>：你有一个大模型，单张显卡（GPU）显存放不下，或者跑得太慢。</li>
+<li><strong>目标</strong>：你想把模型拆开，放在多张显卡上一起跑（这叫<strong>张量并行 Tensor Parallelism</strong>）。</li>
+<li><strong>痛点</strong>：PyTorch 原生的 <code>nn.Parameter</code>（也就是模型的权重，比如 Linear 层的 $W$ 和 $b$）只认识单张卡。</li>
+<li><strong>解决方案</strong>：我们需要把这些普通的权重，转换成一种“超级权重”，叫做 <strong>DTensor</strong>。这种权重知道自己是被切分了（Shard）还是被复制了（Replicate），并且知道其他部分在哪张卡上。</li>
+</ul>
+<p><strong>结论</strong>：这个文件的作用就是<strong>把普通模型的权重转换成这种“超级权重”格式</strong>。</p>
+<hr />
+<h3>✅ Task 2：理解核心道具 —— DeviceMesh 和 DTensor</h3>
+<p>在看代码前，先懂两个名词：</p>
+<ol>
+<li><strong>DeviceMesh（设备网格）</strong>：<ul>
+<li>想象你是一个包工头，你手下有 8 个工人（8张 GPU）。</li>
+<li>DeviceMesh 就是工人的<strong>座位表</strong>。它定义了这 8 张卡是怎么排列的。</li>
+</ul>
+</li>
+<li><strong>DTensor（分布式张量）</strong>：<ul>
+<li>普通的 Tensor 都在一张卡上。</li>
+<li>DTensor 逻辑上是一个大矩阵，但实际上物理存储可能被切碎了存在不同卡上。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 3：逐行拆解代码 —— 这个类在干嘛？</h3>
+<p>现在我们来看代码 <code>PrepareModuleWeight</code> 这个类。</p>
+<h4>步骤 3.1：看类的定义</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">PrepareModuleWeight</span><span class="p">(</span><span class="n">ParallelStyle</span><span class="p">):</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：它继承自 <code>ParallelStyle</code>。你可以把它理解为一种“<strong>装修风格</strong>”。PyTorch 分布式库允许你定义不同的风格来改造模型（比如“按列切分风格”、“按行切分风格”）。这里定义的是“<strong>准备权重风格</strong>”。</li>
+</ul>
+<h4>步骤 3.2：看初始化 <code>__init__</code></h4>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">layouts</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Placement</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+    <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">layouts</span> <span class="o">=</span> <span class="n">layouts</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：装修前要拿图纸。<code>layouts</code> 就是图纸。</li>
+<li><strong>含义</strong>：它告诉程序，这个权重应该怎么摆放？是 <strong>Replicate</strong>（每张卡都复制一份完全一样的）？还是 <strong>Shard</strong>（把权重切开，每张卡拿一部分）？</li>
+</ul>
+<h4>步骤 3.3：看核心苦力 <code>_replicate_module_fn</code></h4>
+<p>这是最难懂的部分，我们细看：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">_replicate_module_fn</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">module</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span> <span class="n">device_mesh</span><span class="p">:</span> <span class="n">DeviceMesh</span><span class="p">):</span>
+    <span class="c1"># 遍历模型里的每一个参数（权重）</span>
+    <span class="k">for</span> <span class="n">p_name</span><span class="p">,</span> <span class="n">param</span> <span class="ow">in</span> <span class="n">module</span><span class="o">.</span><span class="n">named_parameters</span><span class="p">():</span>
+
+        <span class="c1"># 核心魔法发生在这里！</span>
+        <span class="n">replicated_param</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Parameter</span><span class="p">(</span>
+            <span class="n">DTensor</span><span class="o">.</span><span class="n">from_local</span><span class="p">(</span><span class="n">param</span><span class="p">,</span> <span class="n">device_mesh</span><span class="p">,</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">layouts</span><span class="p">],</span> <span class="n">run_check</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+        <span class="p">)</span>
+
+        <span class="c1"># 把旧的普通参数，替换成新的“超级参数”</span>
+        <span class="n">module</span><span class="o">.</span><span class="n">register_parameter</span><span class="p">(</span><span class="n">p_name</span><span class="p">,</span> <span class="n">replicated_param</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>通俗解释</strong>：<ol>
+<li>这个函数接收一个普通的层（比如一个 Linear 层）。</li>
+<li>它把里面的权重拿出来。</li>
+<li><code>DTensor.from_local(...)</code>：这句话的意思是，“我手里有一个本地的普通 Tensor，请根据我给的图纸（<code>layouts</code>）和座位表（<code>device_mesh</code>），把它包装成一个分布式的 <strong>DTensor</strong>”。</li>
+<li>最后，用这个新的 DTensor 替换掉原来的权重。</li>
+</ol>
+</li>
+</ul>
+<h4>步骤 3.4：看应用入口 <code>_apply</code></h4>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">_apply</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">module</span><span class="p">:</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">,</span> <span class="n">device_mesh</span><span class="p">:</span> <span class="n">DeviceMesh</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">:</span>
+    <span class="k">return</span> <span class="n">distribute_module</span><span class="p">(</span>
+        <span class="n">module</span><span class="p">,</span>
+        <span class="n">device_mesh</span><span class="p">,</span>
+        <span class="n">partition_fn</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_replicate_module_fn</span><span class="p">,</span> <span class="c1"># 告诉它用上面那个苦力函数来干活</span>
+        <span class="n">input_fn</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">output_fn</span><span class="o">=</span><span class="kc">None</span>
+    <span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：这是“装修队”的开工指令。</li>
+<li><code>distribute_module</code> 是 PyTorch 官方的一个函数，它会拿着你定义的 <code>_replicate_module_fn</code>（怎么处理权重），去改造你传入的 <code>module</code>。</li>
+<li>这里 <code>input_fn</code> 和 <code>output_fn</code> 都是 None，说明这个类<strong>只负责改造权重</strong>，不负责修改输入输出的数据流向。</li>
+</ul>
+<hr />
+<h3>✅ Task 4：总结 —— 串起来讲一遍</h3>
+<p><strong>这就好比你要组建一个合唱团（多卡并行）：</strong></p>
+<ol>
+<li><strong>原始状态</strong>：你手里只有一份普通的乐谱（普通 Tensor），只能给一个人唱。</li>
+<li><strong>目的</strong>：你想让合唱团里的每个人（GPU）都拿着乐谱，或者每个人拿乐谱的一部分。</li>
+<li><strong>这个代码的作用 (<code>PrepareModuleWeight</code>)</strong>：它是一个<strong>“乐谱分发员”</strong>。</li>
+<li><strong>流程</strong>：<ul>
+<li>你告诉分发员（初始化）：这种乐谱是要“人手一份复制”（Replicate）还是要“撕开分发”（Shard）。</li>
+<li>分发员执行任务（<code>_replicate_module_fn</code>）：走到每个合唱队员面前，把他们手里的普通纸张，换成标记了“这是属于合唱团乐谱”的特殊乐谱（DTensor）。</li>
+</ul>
+</li>
+</ol>
+<h3>为什么叫 <code>parallel.py</code>?</h3>
+<p>因为它是在为<strong>并行计算</strong>做准备。在真正开始切分矩阵做矩阵乘法之前，必须先保证所有的权重都已经转换成了 PyTorch 分布式系统能识别的 <code>DTensor</code> 格式。</p>
+<p><strong>一句话总结：这段代码定义了一个工具，用于将普通的 PyTorch 模型参数转换成支持分布式的 DTensor 参数，以便后续进行多显卡并行训练。</strong></p>

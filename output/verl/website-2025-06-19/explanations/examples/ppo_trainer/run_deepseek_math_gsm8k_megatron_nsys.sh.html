@@ -1,0 +1,93 @@
+<h1>examples/ppo_trainer/run_deepseek_math_gsm8k_megatron_nsys.sh</h1>
+<p>这份脚本确实看起来很复杂，因为它结合了<strong>强化学习（PPO）</strong>、<strong>大规模分布式训练（Megatron）</strong>以及<strong>底层性能分析（Nsys Profiling）</strong>这三个硬核领域。</p>
+<p>别担心，我们把这个脚本想象成<strong>“组织一场大型数学考试特训班”</strong>。我为你列了一个 <strong>Task To-Do List</strong>，带你一步步拆解它的逻辑。</p>
+<hr />
+<h3>📋 任务清单：从零读懂这个训练脚本</h3>
+<h4>✅ Task 1: 搞清楚我们要干什么？（宏观目标）</h4>
+<ul>
+<li><strong>目标</strong>：我们要通过“强化学习（PPO）”的方法，训练一个叫 <code>DeepSeek-7B</code> 的大模型，让它更擅长做小学数学题（GSM8K 数据集）。</li>
+<li><strong>方法</strong>：不仅是让它背题（SFT），而是让它自己做题，做对了给奖励，做错了受惩罚（RLHF/PPO）。</li>
+<li><strong>硬件环境</strong>：这可不是单卡能跑的，脚本里配置的是 <strong>2台机器，每台8张 H20 GPU，共16张卡</strong>。</li>
+</ul>
+<h4>✅ Task 2: 准备“教材”和“环境”</h4>
+<p>脚本的前半部分是在做准备工作。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 环境变量设置，为了避免 vllm 的 bug 和优化 Megatron 的通信</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">VLLM_ATTENTION_BACKEND</span><span class="o">=</span>XFORMERS
+<span class="nb">export</span><span class="w"> </span><span class="nv">CUDA_DEVICE_MAX_CONNECTIONS</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>
+
+<span class="c1"># 指定教材路径（GSM8K 数学题集）</span>
+<span class="nv">gsm8k_train_path</span><span class="o">=</span><span class="nv">$HOME</span>/data/gsm8k/train.parquet
+...
+<span class="nv">train_files</span><span class="o">=</span><span class="si">${</span><span class="nv">train_files</span><span class="k">:-</span><span class="s2">&quot;</span><span class="nv">$gsm8k_train_path</span><span class="s2">&quot;</span><span class="si">}</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：告诉电脑数据在哪里，并设置一些底层加速开关。</li>
+</ul>
+<h4>✅ Task 3: 组建“特训团队” (PPO 的核心角色)</h4>
+<p>PPO 训练不像普通训练那么简单，它需要四个“分身”互相配合。脚本中 <code>python3 -m verl.trainer.main_ppo ...</code> 后面的一大串参数，其实是在配置这四个角色：</p>
+<ol>
+<li><strong>Actor (学生)</strong>：负责做题。</li>
+<li><strong>Ref (旧学生/参照系)</strong>：负责对比，防止新学生学歪了（忘掉原来的知识）。</li>
+<li><strong>Critic (老师)</strong>：负责打分，预判学生这道题能不能做对。</li>
+<li><strong>Rollout (刷题机器)</strong>：负责快速生成大量的题目答案供训练使用。</li>
+</ol>
+<p><strong>脚本中的对应配置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 指定模型底座是 deepseek-llm-7b-chat</span>
+actor_rollout_ref.model.path<span class="o">=</span>deepseek-ai/deepseek-llm-7b-chat<span class="w"> </span>
+
+<span class="c1"># 刷题机器（Rollout）使用 vllm 引擎加速推理</span>
+actor_rollout_ref.rollout.name<span class="o">=</span>vllm
+</code></pre></div>
+
+<h4>✅ Task 4: 分配工作 (Megatron 分布式并行)</h4>
+<p>因为模型很大（7B），而且我们要同时跑上面那4个角色，显存根本不够。所以需要把模型“切开”放在不同的 GPU 上。这就是脚本文件名里 <strong>Megatron</strong> 的含义。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 流水线并行 (Pipeline Parallel) = 2</span>
+<span class="c1"># 张量并行 (Tensor Parallel) = 2</span>
+actor_rollout_ref.actor.megatron.pipeline_model_parallel_size<span class="o">=</span><span class="m">2</span>
+actor_rollout_ref.actor.megatron.tensor_model_parallel_size<span class="o">=</span><span class="m">2</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：这就好比把这本厚书撕成几份，分给不同的 GPU 去读。<code>size=2</code> 意味着把模型切成2份。</li>
+</ul>
+<h4>✅ Task 5: 安装“监控摄像头” (Nsys Profiling)</h4>
+<p>这是这个脚本最特殊的地方（文件名里带有 <code>nsys</code>）。
+通常我们只关心训练快不快，但这个脚本是用来<strong>调试性能</strong>的。它想看清楚 GPU 每一毫秒在干嘛。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 配置监控参数</span>
+<span class="nv">PROFILE_STEPS</span><span class="o">=</span><span class="s2">&quot;[1,2,5]&quot;</span><span class="w"> </span><span class="c1"># 只监控第1、2、5步，因为监控很耗资源</span>
+<span class="nv">PROFILE_RANKS_ALL</span><span class="o">=</span>False<span class="w"> </span><span class="c1"># 不监控所有显卡，只挑几张代表</span>
+
+<span class="c1"># 指定哪些显卡（Rank）被监控</span>
+actor_rollout_ref.actor.profiler.ranks<span class="o">=[</span><span class="m">0</span>,1,8,9<span class="o">]</span>
+...
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：它指定了在特定的训练步数，去记录特定几张显卡（比如第0, 1, 8, 9号卡）的详细运行轨迹。这通常是开发人员用来<strong>查瓶颈</strong>（比如为什么训练卡顿）用的。</li>
+</ul>
+<h4>✅ Task 6: 设定训练规则 (超参数)</h4>
+<p>最后就是具体的训练细节了。</p>
+<div class="codehilite"><pre><span></span><code>data.train_batch_size<span class="o">=</span><span class="m">256</span><span class="w">      </span><span class="c1"># 一次学256道题</span>
+trainer.nnodes<span class="o">=</span><span class="m">2</span><span class="w">               </span><span class="c1"># 用2台机器</span>
+trainer.n_gpus_per_node<span class="o">=</span><span class="m">8</span><span class="w">      </span><span class="c1"># 每台8张卡</span>
+trainer.total_training_steps<span class="o">=</span><span class="m">6</span><span class="w"> </span><span class="c1"># 总共只训练6步！</span>
+</code></pre></div>
+
+<ul>
+<li><strong>注意</strong>：这里 <code>total_training_steps=6</code> 非常短。说明这个脚本<strong>不是为了真的把模型练好</strong>，而是为了<strong>跑通流程并收集性能数据</strong>（配合 Task 5 的监控）。</li>
+</ul>
+<hr />
+<h3>💡 总结：这个脚本到底是干嘛的？</h3>
+<p>如果你运行这个脚本，它的流程是：</p>
+<ol>
+<li><strong>启动</strong>：在 2 台机器共 16 张 GPU 上启动一个 PPO 训练任务。</li>
+<li><strong>加载</strong>：加载 DeepSeek-7B 模型，并用 Megatron 技术把它切分到各张显卡上。</li>
+<li><strong>运行</strong>：开始做 GSM8K 数学题。</li>
+<li><strong>监控</strong>：在跑第 1、2、5 步的时候，开启 Nsight Systems (Nsys) 深度监控，记录显卡的每一个动作。</li>
+<li><strong>结束</strong>：跑完 6 步就立刻停下来。</li>
+</ol>
+<p><strong>一句话人话解释</strong>：</p>
+<blockquote>
+<p>这是一个<strong>性能测试脚本</strong>，目的是在 16 张卡上运行 DeepSeek-7B 的 PPO 训练，并用专业工具（Nsys）录制前几步的运行情况，用来分析系统哪里跑得慢，而不是为了真的训练出模型。</p>
+</blockquote>

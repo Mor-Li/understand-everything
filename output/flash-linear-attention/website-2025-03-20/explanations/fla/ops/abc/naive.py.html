@@ -1,0 +1,111 @@
+<h1>fla/ops/abc/naive.py</h1>
+<p>这份代码确实比较晦涩，因为它实现的是一种比较前沿的<strong>线性注意力机制（Linear Attention）</strong>变体，通常被称为 <strong>ABC (Attention with Bounded-memory Control)</strong>。</p>
+<p>简单来说，它的核心思想是：<strong>把标准的 Attention 拆解成两个循环（RNN）过程，引入了“Slot（槽位）”的概念来增加记忆容量。</strong></p>
+<p>为了让你能够看懂，我为你设计了一个 <strong>“学习任务清单 (To-Do List)”</strong>。请按照这个顺序，一步步解锁代码中的逻辑。</p>
+<hr />
+<h3>✅ Task 0: 搞懂核心输入 (角色介绍)</h3>
+<p>在深入逻辑之前，先看清舞台上的演员。
+*   <strong><code>q, k, v</code></strong>: 老朋友，Query, Key, Value。
+*   <strong><code>s</code> (Slots/Scores)</strong>: 这是这个算法的主角。形状通常是 <code>[..., n_slots]</code>。你可以把它理解为<strong>“记忆槽位的权重”</strong>。普通的线性 Attention 只有一个记忆状态，而这里有 $M$ 个槽位（slots），<code>s</code> 决定了当前时刻要把信息存入哪个槽位。
+*   <strong><code>g</code> (Gate)</strong>: 遗忘门。决定了过去的记忆要保留多少（类似 LSTM 的 forget gate）。</p>
+<hr />
+<h3>✅ Task 1: 攻克 <code>naive_recurrent_abc</code> - 第一阶段 (Key Memory)</h3>
+<p>这个函数是 <strong>RNN 形式</strong> 的实现（时间复杂度 $O(N)$）。它被分成了两个 <code>for</code> 循环。我们先看第一个循环。</p>
+<p><strong>目标</strong>：计算出每个时刻，Query 应该关注哪些 Slot。</p>
+<ol>
+<li>
+<p><strong>初始化</strong>：</p>
+<ul>
+<li>代码：<code>hk = torch.zeros(...)</code></li>
+<li>解释：<code>hk</code> 是一个隐状态（Hidden State），用于存储<strong>Key 的历史信息</strong>。它的形状包含 <code>M</code> (slots)。</li>
+</ul>
+</li>
+<li>
+<p><strong>循环逻辑 (Time Step $t$)</strong>：</p>
+<ul>
+<li><strong>遗忘 (Decay)</strong>：<code>hk = hk * g_i</code>。历史记忆衰减一点。</li>
+<li><strong>写入 (Write)</strong>：<code>... + k_i * v_i</code> (注意这里的 <code>v_i</code> 其实传入的是 <code>s</code>，代码里写 <code>v_i = s[:, :, i]</code>)。<ul>
+<li><strong>核心逻辑</strong>：将当前的 Key (<code>k</code>) 乘以当前的 Slot 权重 (<code>s</code>)，存入记忆 <code>hk</code> 中。</li>
+</ul>
+</li>
+<li><strong>读取 (Read)</strong>：<code>ok = q_i * hk</code>。<ul>
+<li><strong>核心逻辑</strong>：用当前的 Query (<code>q</code>) 去查询记忆 <code>hk</code>，得到初步的匹配分数。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>归一化</strong>：</p>
+<ul>
+<li>代码：<code>qv = ok.softmax(-1)</code></li>
+<li>解释：把读取出来的分数做 Softmax。这得到的是一个<strong>概率分布</strong>，表示“对于当前时刻，每个 Slot 有多重要”。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 2: 攻克 <code>naive_recurrent_abc</code> - 第二阶段 (Value Memory)</h3>
+<p>现在我们有了 <code>qv</code>（Slot 的重要性概率），进入第二个 <code>for</code> 循环。</p>
+<p><strong>目标</strong>：根据 Slot 的重要性，从历史 Value 中提取最终输出。</p>
+<ol>
+<li>
+<p><strong>初始化</strong>：</p>
+<ul>
+<li>代码：<code>hv = torch.zeros(...)</code></li>
+<li>解释：<code>hv</code> 是另一个隐状态，用于存储 <strong>Value 的历史信息</strong>。</li>
+</ul>
+</li>
+<li>
+<p><strong>循环逻辑 (Time Step $t$)</strong>：</p>
+<ul>
+<li><strong>准备</strong>：这次的 Query 变成了上一阶段算出来的 <code>qv</code>。Key 变成了 <code>s</code>。Value 是真的 <code>v</code>。</li>
+<li><strong>遗忘</strong>：<code>hv = hv * g_i</code>。</li>
+<li><strong>写入</strong>：<code>... + k_i * v_i</code> (即 <code>s * v</code>)。<ul>
+<li><strong>核心逻辑</strong>：把当前的 Value (<code>v</code>) 按照 Slot 权重 (<code>s</code>) 存入记忆 <code>hv</code> 中。</li>
+</ul>
+</li>
+<li><strong>读取</strong>：<code>ov = q_i * hv</code> (即 <code>qv * hv</code>)。<ul>
+<li><strong>核心逻辑</strong>：根据刚才算出来的 Slot 概率 (<code>qv</code>)，加权提取历史记忆中的 Value。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<p><strong>总结 Task 1 &amp; 2</strong>：
+ABC 机制就是：先用 $Q$ 和 $K$ 算出一个“怎么分配 Slot”的概率，再用这个概率去聚合 $V$。</p>
+<hr />
+<h3>✅ Task 3: 攻克 <code>naive_cumsum_abc</code> (数学作弊版)</h3>
+<p>如果觉得循环太绕，看这个函数。这是<strong>并行版</strong>实现，逻辑完全一样，但用数学公式一次性算完。</p>
+<ol>
+<li>
+<p><strong>理解 <code>cumsum</code> (累加)</strong>：</p>
+<ul>
+<li>代码中的 <code>cumsum</code> 对应循环里的“累积”过程。因为没有复杂的门控（Gate），或者门控很简单，所以可以用前缀和（Prefix Sum）来代替循环。</li>
+</ul>
+</li>
+<li>
+<p><strong>看透公式</strong>：</p>
+<ul>
+<li>代码：<code>K = (s * k).cumsum(2) / z</code></li>
+<li>解释：这对应 Task 1 的记忆积累。它是 $(s \times k)$ 的加权平均。</li>
+<li>代码：<code>p = (q * K).softmax(-1)</code></li>
+<li>解释：这对应 Task 1 的读取和 Softmax。算出 Slot 的概率 $p$。</li>
+<li>代码：<code>o = p * V</code></li>
+<li>解释：这对应 Task 2。用概率 $p$ 去加权平均 Value 的累积量 $V$。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>📝 最终复盘 (这一步一步讲了什么观点？)</h3>
+<p>如果把这个文件翻译成人类语言，它在表达以下观点：</p>
+<ol>
+<li><strong>标准的 Attention 太慢了</strong>：标准 Attention 需要 $Q$ 和 $K$ 两两计算，复杂度是 $O(N^2)$。</li>
+<li><strong>RNN/线性 Attention 省内存</strong>：通过维护一个固定大小的状态 ($hk, hv$)，我们可以把复杂度降到 $O(N)$。</li>
+<li><strong>单纯的线性 Attention 效果不好</strong>：因为状态太小，记不住复杂信息。</li>
+<li><strong>ABC 的解决方案</strong>：引入 <strong>多头/多槽位 (Multi-Slot)</strong> 机制。<ul>
+<li><strong>Step 1</strong>: 用 $Q$ 和 $K$ 动态决定当前时刻要把注意力放在哪个“槽位”上。</li>
+<li><strong>Step 2</strong>: 从选定的“槽位”里把 $V$ 拿出来。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话总结代码功能：</strong>
+这是一个<strong>双重 RNN 系统</strong>。第一个 RNN 负责计算“你应该关注哪个记忆槽”，第二个 RNN 负责“从那个记忆槽里提取值”。</p>

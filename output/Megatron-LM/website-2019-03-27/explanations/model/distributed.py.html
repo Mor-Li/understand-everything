@@ -1,0 +1,97 @@
+<h1>model/distributed.py</h1>
+<p>这份代码确实看起来有点“硬核”，因为它是一个<strong>手写的、早期的分布式数据并行（Distributed Data Parallel, DDP）封装</strong>。现代 PyTorch 通常直接用官方的 <code>torch.nn.parallel.DistributedDataParallel</code>，而这份代码像是 NVIDIA 为了特定项目（如 Megatron-LM 早期版本）自己造的轮子。</p>
+<p>不用担心，我们把它拆解成一个 <strong>“任务清单 (To-Do List)”</strong>，把你想象成这个代码的“总指挥”，我们需要一步步完成多显卡训练的协调工作。</p>
+<hr />
+<h3>任务清单：如何让多个 GPU 协同训练同一个模型？</h3>
+<p>这个类的核心目标是：<strong>让多个 GPU (显卡) 每一轮训练后，都能算出完全一样的梯度，从而同步更新模型。</strong></p>
+<h4>✅ Task 1: 确保起跑线一致 (初始化阶段)</h4>
+<p><strong>代码位置：</strong> <code>__init__</code> 方法中的 <code>dist.broadcast(p, 0)</code> 循环。</p>
+<ul>
+<li><strong>场景：</strong> 假设你有 8 张显卡（Rank 0 到 Rank 7）。刚开始训练时，每张卡都会随机初始化自己的模型参数。如果卡 1 的参数是 A，卡 2 的参数是 B，那还怎么协同训练？</li>
+<li><strong>你的任务：</strong> 强制所有显卡都听 Rank 0 (主卡) 的。</li>
+<li><strong>代码解读：</strong>
+    <code>python
+    for p in self.module.parameters():
+        if torch.is_tensor(p):
+            dist.broadcast(p, 0) # 把 Rank 0 的参数复制给所有人</code>
+    <strong>观点：</strong> 训练开始前，必须保证所有显卡的模型参数一模一样。</li>
+</ul>
+<h4>✅ Task 2: 准备开跑 (前向传播)</h4>
+<p><strong>代码位置：</strong> <code>forward</code> 方法。</p>
+<ul>
+<li><strong>场景：</strong> 数据来了，每张卡拿到了不同的数据切片（比如卡 1 拿前 10 条数据，卡 2 拿后 10 条）。</li>
+<li><strong>你的任务：</strong> 正常跑模型，但要立个 Flag，标记“这轮跑完我们需要同步数据哦”。</li>
+<li><strong>代码解读：</strong>
+    <code>python
+    def forward(self, *inputs, **kwargs):
+        self.needs_reduction = True # 立 Flag：一会需要做梯度归约(同步)
+        return self.module(*inputs, **kwargs) # 正常跑模型</code></li>
+</ul>
+<h4>✅ Task 3: 核心魔法 —— 梯度同步 (All-Reduce)</h4>
+<p><strong>代码位置：</strong> <code>__init__</code> 内部定义的 <code>def allreduce_params(...)</code> 函数。这是整个文件最难也最核心的部分。</p>
+<ul>
+<li><strong>场景：</strong> 每张卡跑完了，算出了自己的梯度（Gradients）。卡 1 觉得参数该 +1，卡 2 觉得参数该 -0.5。如果不沟通，大家各改各的，模型就分裂了。</li>
+<li><strong>你的任务：</strong> 把所有卡的梯度加起来，算个平均值，然后把这个平均梯度塞回给每张卡。这样大家更新的方向就一致了。</li>
+</ul>
+<p>我们将这个大任务拆解为几个<strong>子步骤</strong>：</p>
+<ul>
+<li>
+<p><strong>Step 3.1: 分类打包 (Bucketing)</strong></p>
+<ul>
+<li><strong>逻辑：</strong> 显卡通信很贵。如果模型有 1000 个参数变量，发 1000 次快递太慢了。代码里把参数按类型（比如 float32 和 float16）分到不同的桶（<code>buckets</code>）里。</li>
+<li><strong>代码片段：</strong> <code>buckets[tp].append(param)</code></li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.2: 压扁打包 (Flattening)</strong></p>
+<ul>
+<li><strong>逻辑：</strong> 把桶里的一堆小梯度张量，拼成一个超长的、连续的一维大张量（Big Tensor）。这样一次通信就能发完。</li>
+<li><strong>代码片段：</strong> <code>coalesced = _flatten_dense_tensors(grads)</code></li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.3: 全局求和 (All-Reduce)</strong></p>
+<ul>
+<li><strong>逻辑：</strong> 这是分布式训练的灵魂。调用 <code>dist.all_reduce</code>，所有显卡把手里的“大张量”拿出来，对应位置相加。</li>
+<li><strong>结果：</strong> 此时，每张卡手里的 <code>coalesced</code> 变量都变成了“所有卡梯度的总和”。</li>
+<li><strong>代码片段：</strong> <code>dist.all_reduce(coalesced)</code></li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.4: 取平均 (Averaging)</strong></p>
+<ul>
+<li><strong>逻辑：</strong> 总和太大了，我们要的是平均梯度。除以显卡数量（World Size）。</li>
+<li><strong>代码片段：</strong> <code>coalesced /= dist.get_world_size()</code></li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.5: 拆包还原 (Unflattening)</strong></p>
+<ul>
+<li><strong>逻辑：</strong> 现在手里是一个处理好的大张量，需要把它切开，填回到模型原本的每一个参数变量（<code>param.grad</code>）里去。</li>
+<li><strong>代码片段：</strong>
+    <code>python
+    for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
+        buf.copy_(synced) # 把同步好的平均梯度写回去</code></li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 自动触发机制 (Hooks - 注释掉的部分)</h4>
+<p><strong>代码位置：</strong> <code>__init__</code> 尾部的 <code>register_hook</code>（被注释了）。</p>
+<ul>
+<li><strong>观点：</strong> 这里的代码被注释掉了，说明作者可能想<strong>手动控制</strong>什么时候同步梯度，而不是像官方 DDP 那样在反向传播（Backward）时自动触发。</li>
+<li><strong>逻辑：</strong> 这里的 <code>allreduce_params</code> 函数被保存到了 <code>self.allreduce_params</code>。这意味着在外部训练循环（Training Loop）的代码里，必须显式地调用 <code>model.allreduce_params()</code>，否则梯度不会同步，模型就练废了。</li>
+</ul>
+<h4>✅ Task 5: 存取档案 (State Dict)</h4>
+<p><strong>代码位置：</strong> <code>state_dict</code> 和 <code>load_state_dict</code>。</p>
+<ul>
+<li><strong>观点：</strong> 这个类只是个“外壳”。当你想保存模型权重时，你不想保存这个外壳，而是想保存里面真正的 <code>self.module</code>。</li>
+<li><strong>代码解读：</strong> 所以这两个方法直接透传，去调用内部 <code>self.module</code> 的保存/加载方法。</li>
+</ul>
+<hr />
+<h3>总结：这篇文章到底在讲啥？</h3>
+<p><strong>一句话总结：</strong>
+这是一个<strong>手动挡</strong>的分布式训练包装器。它负责在多张显卡之间<strong>统一初始参数</strong>，并在每次训练迭代后，将所有显卡计算出的<strong>梯度进行打包、求和、取平均</strong>，确保所有显卡用同样的梯度更新模型。</p>
+<p><strong>相比官方 PyTorch DDP 的区别：</strong>
+*   <strong>显式控制：</strong> 它把同步梯度的逻辑封装在 <code>allreduce_params</code> 里供外部调用，而不是完全自动挂载在反向传播中（虽然它尝试写了 hook，但看起来主要逻辑是依赖手动调用）。
+*   <strong>性能优化：</strong> 它手动做了 Flatten（压扁）操作，这是为了减少显卡间通信的次数（通信优化）。</p>
+<p>希望这个 List 能帮你把代码逻辑串起来！</p>

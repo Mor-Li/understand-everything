@@ -1,0 +1,103 @@
+<h1>docs/workers/fsdp_workers.rst</h1>
+<p>这份文档主要是介绍在 <strong>verl</strong> 这个框架中，如何使用 <strong>PyTorch FSDP (Fully Sharded Data Parallel)</strong> 作为后端来进行大规模模型训练（主要是 RLHF，即基于人类反馈的强化学习）。</p>
+<p>简单来说，它讲的是<strong>如何组织和管理多个 GPU 协同工作</strong>，一边让模型“生成文本”（Rollout），一边让模型“学习更新”（Train）。</p>
+<p>为了让你看懂，我把文档里的技术细节拆解成一个 <strong>“开发/理解任务清单 (ToDo List)”</strong>。我们可以假设你是一个新入职的工程师，需要理解并运行这套系统，以下是你需要一步步完成的任务：</p>
+<hr />
+<h3>任务清单：理解 PyTorch FSDP Backend</h3>
+<h4>✅ Task 1: 搞清楚“为什么选它” (Pros &amp; Cons)</h4>
+<p>在开始看代码前，先明白这个方案的定位。
+*   <strong>背景知识</strong>：训练大模型通常需要把模型切碎放在不同 GPU 上。FSDP 是 PyTorch 自带的一种切分方式。vLLM 是一个生成文本特别快的库。
+*   <strong>核心痛点</strong>：通常训练（FSDP）和推理（vLLM）是两套代码。这个文档说：<strong>我们要把它们结合起来</strong>。
+*   <strong>优点 (Pros)</strong>：
+    *   <strong>兼容性好</strong>：只要写个简单的权重加载器 (<code>dtensor_weight_loader</code>)，大部分 HuggingFace 模型都能直接用。
+    *   <strong>逻辑简单</strong>：前向传播（算结果）和后向传播（算梯度）很好组织。
+*   <strong>缺点 (Cons)</strong>：
+    *   <strong>太大的模型带不动</strong>：比如 Llama 70B 或 405B，扩展性不如 Megatron-LM。
+    *   <strong>切换开销大</strong>：因为要一边用 FSDP 训练，一边用 vLLM 生成，中间需要倒腾权重（Resharding），这步比较慢。
+*   <strong>结论</strong>：<strong>搞算法研究、做原型开发</strong>，选这个后端最合适。</p>
+<h4>✅ Task 2: 理解核心角色“Actor/Rollout Worker”</h4>
+<p>这是文档里最重要的部分 <code>ActorRolloutRefWorker</code>。在 RLHF 中，Actor 是要被训练的模型（比如 ChatGPT 的雏形）。</p>
+<ul>
+<li>
+<p><strong>Step 2.1: 初始化 (init_model)</strong></p>
+<ul>
+<li><strong>要做的事</strong>：同时启动两个引擎。<ol>
+<li><strong>FSDP 引擎</strong>：用来训练（<code>DataParallelPPOActor</code>）。</li>
+<li><strong>vLLM 引擎</strong>：用来快速生成文本（<code>vLLMRollout</code>）。</li>
+</ol>
+</li>
+<li><strong>关键组件</strong>：<code>FSDPVLLMShardingManager</code>。这相当于一个“搬运工”，负责把 FSDP 训练好的权重，转换格式搬运给 vLLM 去用。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 2.2: 生成数据 (generate_sequences)</strong></p>
+<ul>
+<li><strong>场景</strong>：给模型一个提示词（Prompt），让它写回复。</li>
+<li><strong>流程</strong>：<ol>
+<li>调用 vLLM 快速写出回复。</li>
+<li>调用 FSDP 重新计算这些回复的概率（Log Prob），为后面的数学计算做准备。</li>
+</ol>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 2.3: 更新模型 (update_actor)</strong></p>
+<ul>
+<li><strong>场景</strong>：根据反馈（奖励），教模型学好。</li>
+<li><strong>流程</strong>：使用 PPO 算法和熵损失（Entropy Loss）来更新 Actor 的权重。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 理解陪练角色“Reference Model”</h4>
+<ul>
+<li><strong>背景</strong>：在 RLHF 中，我们需要一个“原始模型”作为参考，防止新模型练偏了（Forgeting）。</li>
+<li><strong>Step 3.1: 计算参考概率 (compute_ref_log_prob)</strong><ul>
+<li><strong>要做的事</strong>：它不需要训练，只需要把刚才生成的文本再算一遍概率。</li>
+<li><strong>实现</strong>：它复用了 Actor 的计算逻辑，但不包含优化器（Optimizer），因为它不更新参数。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 理解裁判角色“Critic &amp; Reward”</h4>
+<p>这两个也是模型，但作用不同。</p>
+<ul>
+<li><strong>Critic (评论家)</strong>：<ul>
+<li><strong>作用</strong>：预判当前状态好不好（Value Function）。</li>
+<li><strong>Step 4.1: 计算价值 (compute_values)</strong>：给当前生成的内容打个分。</li>
+<li><strong>Step 4.2: 更新自己 (update_critic)</strong>：Critic 也许要训练，让自己打分更准。</li>
+</ul>
+</li>
+<li><strong>Reward (奖励模型)</strong>：<ul>
+<li><strong>作用</strong>：给最终结果打分。</li>
+<li><strong>Step 4.3: 计算分数 (compute_rm_score)</strong>：通常是一个冻结的模型，只负责打分，不训练。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 了解目前的限制 (HybridShard)</h4>
+<ul>
+<li><strong>文档最后提到</strong>：目前不支持 FSDP 的 <code>HybridShard</code> 策略（一种混合切分策略，适合超大规模集群）。</li>
+<li><strong>要做的事</strong>：如果你将来要支持这个，你需要构建 2D 设备网格（Device Mesh），这属于高级优化，暂时不用管。</li>
+</ul>
+<hr />
+<h3>总结：整个工作流是怎样的？</h3>
+<p>如果把这个文档翻译成一段程序的运行逻辑，它是这样的：</p>
+<ol>
+<li><strong>启动 (Init)</strong>：加载模型，准备好 FSDP（用于学习）和 vLLM（用于生成）。建立“搬运工”准备同步权重。</li>
+<li><strong>生成 (Rollout)</strong>：<ul>
+<li>Actor 用 vLLM 写作业（生成文本）。</li>
+<li>Actor 用 FSDP 检查自己写作业时的信心（计算 Log Prob）。</li>
+<li>Reference Model 检查如果是它写，信心是多少（计算 Ref Log Prob）。</li>
+</ul>
+</li>
+<li><strong>打分 (Evaluation)</strong>：<ul>
+<li>Reward Model 给作业打分。</li>
+<li>Critic Model 预估这个作业值多少分。</li>
+</ul>
+</li>
+<li><strong>学习 (Training)</strong>：<ul>
+<li>Actor 根据分数，用 FSDP 更新自己的大脑（权重）。</li>
+<li>Critic 根据分数和预估的差距，更新自己的大脑。</li>
+</ul>
+</li>
+<li><strong>循环</strong>：回到第 2 步，用更新后的大脑继续写作业。</li>
+</ol>
+<p>这篇文档就是在讲在这个循环中，每个步骤对应的 Python 函数叫什么，以及它是怎么利用 FSDP 和 vLLM 这两个工具的。</p>

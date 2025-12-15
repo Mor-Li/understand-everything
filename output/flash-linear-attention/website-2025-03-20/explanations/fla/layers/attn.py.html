@@ -1,0 +1,109 @@
+<h1>fla/layers/attn.py</h1>
+<p>这份代码确实写得非常“工程化”，因为它不是用来演示原理的教学代码，而是为了<strong>极致性能</strong>（使用了 Flash Attention）和<strong>显存优化</strong>（使用了 KV Cache 和 GQA/MQA）而写的实战代码。</p>
+<p>简单来说，这是一个<strong>高效的 Transformer 自注意力（Self-Attention）层</strong>。</p>
+<p>为了让你读懂，我把这个 <code>forward</code> 函数（数据流向）拆解成一个 <strong>“流水线工人的任务清单 (Todo List)”</strong>。我们假装自己是数据，正在通过这个层。</p>
+<h3>📋 任务清单 (Task Todo List)</h3>
+<ol>
+<li><strong>【准备原材料】切分与投影 (Projections)</strong>：把输入的隐向量变成 Q, K, V。</li>
+<li><strong>【贴标签】位置编码 (RoPE)</strong>：给数据打上位置标记，让模型知道谁在谁前面。</li>
+<li><strong>【查阅历史】KV Cache 管理</strong>：如果是生成模式，把以前算过的 K 和 V 拿出来，别重算。</li>
+<li><strong>【去气泡】去除 Padding (Upad/Unpad)</strong>：(这是 Flash Attention 特有的) 把数据里无用的占位符（0）去掉，压缩成一长串，为了算得更快。</li>
+<li><strong>【核心加工】Flash Attention 计算</strong>：用最快的速度计算注意力机制。</li>
+<li><strong>【还原包装】输出投影</strong>：把压缩的数据还原回原来的形状，并输出。</li>
+</ol>
+<hr />
+<h3>逐步讲解 (Step-by-Step)</h3>
+<h4>1. 【准备原材料】切分与投影 (Projections)</h4>
+<p><strong>代码位置：</strong> <code>forward</code> 函数开头
+<strong>原理：</strong> 输入的数据 <code>hidden_states</code> 形状通常是 <code>[batch, 长度, 维度]</code>。我们需要把它变成 Query (查询), Key (钥匙), Value (值)。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 把输入经过三个全连接层(Linear)，变成 q, k, v</span>
+<span class="c1"># rearrange 是把维度拆开，分出多头 (num_heads)</span>
+<span class="n">q</span> <span class="o">=</span> <span class="n">rearrange</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">q_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">),</span> <span class="s1">&#39;... (h d) -&gt; ... h d&#39;</span><span class="p">,</span> <span class="n">d</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span><span class="p">)</span>
+<span class="n">k</span> <span class="o">=</span> <span class="n">rearrange</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">k_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">),</span> <span class="s1">&#39;... (h d) -&gt; ... h d&#39;</span><span class="p">,</span> <span class="n">d</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span><span class="p">)</span>
+<span class="n">v</span> <span class="o">=</span> <span class="n">rearrange</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">v_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">),</span> <span class="s1">&#39;... (h d) -&gt; ... h d&#39;</span><span class="p">,</span> <span class="n">d</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>注意点</strong>：这里支持 <strong>GQA (Grouped Query Attention)</strong>，也就是 K 和 V 的头数可能比 Q 少（为了省显存），代码里通过 <code>num_kv_heads</code> 控制。</li>
+</ul>
+<h4>2. 【贴标签】位置编码 (RoPE)</h4>
+<p><strong>代码位置：</strong> <code>self.rotary(...)</code>
+<strong>原理：</strong> Transformer 本身不知道词的顺序（“我爱你”和“你爱我”对它来说是一样的）。<strong>RoPE (Rotary Positional Embedding)</strong> 是一种数学技巧，通过旋转向量给 Q 和 K 加上位置信息。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 计算当前的位置偏移量 seqlen_offset（特别是推理时，要接着上次的位置算）</span>
+<span class="k">if</span> <span class="n">past_key_values</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="c1"># ...计算 offset 逻辑...</span>
+
+<span class="c1"># 给 Q 和 K 加上旋转位置编码</span>
+<span class="n">q</span><span class="p">,</span> <span class="n">k</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">rotary</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">seqlen_offset</span><span class="o">=</span><span class="n">seqlen_offset</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<h4>3. 【查阅历史】KV Cache 管理</h4>
+<p><strong>代码位置：</strong> <code>if past_key_values is not None:</code>
+<strong>原理：</strong> 在类似 ChatGPT 这种<strong>生成文字</strong>的过程中，你每生成一个新词，不需要把前面几千个词的 K 和 V 重新算一遍。我们把旧的 K, V 存起来（Cache），这次只算新词，然后拼接到 Cache 后面。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">past_key_values</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="c1"># 1. 把当前算出的新 k, v 存入 cache</span>
+    <span class="n">k_cached</span><span class="p">,</span> <span class="n">v_cached</span> <span class="o">=</span> <span class="n">past_key_values</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="o">...</span><span class="p">)[</span><span class="s1">&#39;attn_state&#39;</span><span class="p">]</span>
+
+    <span class="c1"># 2. 如果 cache 里本来就有东西（说明不是第一个词），就用拼接后的完整 k, v 替换掉当前的</span>
+    <span class="k">if</span> <span class="n">cache_has_content</span><span class="p">:</span>
+        <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="o">=</span> <span class="n">k_cached</span><span class="p">,</span> <span class="n">v_cached</span>
+        <span class="c1"># ... 形状调整 ...</span>
+</code></pre></div>
+
+<h4>4. 【去气泡】去除 Padding (Upad/Unpad) —— <strong>最难懂的部分</strong></h4>
+<p><strong>代码位置：</strong> <code>self._upad_input(...)</code> 和 <code>flash_attn_varlen_func</code>
+<strong>原理：</strong> 这是一个工程优化。
+假设一个 Batch 里有两句话：
+1. <code>[A, B, C]</code> (长度3)
+2. <code>[D, E]</code> (长度2)</p>
+<p>为了拼成一个矩阵，通常会补零（Padding）：
+1. <code>[A, B, C]</code>
+2. <code>[D, E, 0]</code></p>
+<p><strong>Flash Attention</strong> 觉得算这个 <code>0</code> 浪费时间。所以代码会把这个 Batch <strong>压扁</strong>成一维数组：<code>[A, B, C, D, E]</code>，并记录一个索引 <code>cu_seqlens</code> (Cumulative Sequence Lengths) 告诉它：<code>0~3</code>是第一句，<code>3~5</code>是第二句。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">attention_mask</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="c1"># 如果有 mask，说明有 padding。</span>
+    <span class="c1"># _upad_input 函数负责把 padding 去掉，把有效数据压扁，并计算索引</span>
+    <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">indices_q</span><span class="p">,</span> <span class="n">cu_seq_lens</span><span class="p">,</span> <span class="n">max_seq_lens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_upad_input</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">attention_mask</span><span class="p">,</span> <span class="n">q_len</span><span class="p">)</span>
+
+    <span class="c1"># 调用 &quot;变长 (varlen)&quot; 版本的 Flash Attention</span>
+    <span class="n">o</span> <span class="o">=</span> <span class="n">flash_attn_varlen_func</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># 算完后再 pad_input 还原回带 0 的矩形形状</span>
+    <span class="n">o</span> <span class="o">=</span> <span class="n">pad_input</span><span class="p">(</span><span class="n">o</span><span class="p">,</span> <span class="n">indices_q</span><span class="p">,</span> <span class="n">batch_size</span><span class="p">,</span> <span class="n">q_len</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>如果看不懂 <code>_upad_input</code></strong>：没关系，你只要知道它的作用是 <strong>“为了算得更快，把原本整齐的方队里的空位剔除，排成一条紧凑的长龙，算完再排回方队”</strong>。</li>
+</ul>
+<h4>5. 【核心加工】Flash Attention 计算</h4>
+<p><strong>代码位置：</strong> <code>flash_attn_func</code> 或 <code>flash_attn_varlen_func</code>
+<strong>原理：</strong> 这是整个文件的核心。它替代了传统的公式 $Attention(Q, K, V) = Softmax(\frac{QK^T}{\sqrt{d}})V$。
+Flash Attention 是一种底层 CUDA 优化算法，计算结果数学上是一样的，但速度快得多，显存占用极少。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 核心计算：输入 Q, K, V，输出 O (Output)</span>
+<span class="c1"># causal=True 表示这是个语言模型，只能看前面的词，不能看后面的词</span>
+<span class="n">o</span> <span class="o">=</span> <span class="n">flash_attn_varlen_func</span><span class="p">(</span>
+    <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span>
+    <span class="n">cu_seqlens_q</span><span class="o">=</span><span class="n">cu_seqlens_q</span><span class="p">,</span> <span class="c1"># 告诉它每一句话从哪开始到哪结束</span>
+    <span class="o">...</span>
+    <span class="n">causal</span><span class="o">=</span><span class="kc">True</span> 
+<span class="p">)</span>
+</code></pre></div>
+
+<h4>6. 【还原包装】输出投影</h4>
+<p><strong>代码位置：</strong> <code>forward</code> 结尾
+<strong>原理：</strong> 注意力算完了，把多头的结果拼回去，再过一层线性层，准备传给网络的下一层。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 把多头维度合并回来</span>
+<span class="n">o</span> <span class="o">=</span> <span class="n">o</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">batch_size</span><span class="p">,</span> <span class="n">q_len</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+<span class="c1"># 最后一层线性投影</span>
+<span class="n">o</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">o_proj</span><span class="p">(</span><span class="n">o</span><span class="p">)</span>
+
+<span class="k">return</span> <span class="n">o</span><span class="p">,</span> <span class="n">attentions</span><span class="p">,</span> <span class="n">past_key_values</span>
+</code></pre></div>
+
+<hr />
+<h3>总结</h3>
+<p>你之所以觉得难懂，是因为它混合了 <strong>算法逻辑</strong> (Transformer) 和 <strong>工程优化</strong> (Flash Attention + KV Cache)。</p>
+<p><strong>你可以这样简单理解这个文件：</strong></p>
+<blockquote>
+<p>这是一个<strong>为了跑得极快</strong>而特制的插座。它接收输入，先把没用的填充（Padding）拆掉，利用 GPU 的底层加速（Flash Attention）算出结果，顺便把记忆（KV Cache）存好，最后把结果重新组装好交给你。</p>
+</blockquote>

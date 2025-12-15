@@ -1,0 +1,133 @@
+<h1>megatron/core/pipeline_parallel/schedules.py</h1>
+<p>这份代码 <code>megatron/core/pipeline_parallel/schedules.py</code> 是 Megatron-Core 中<strong>最核心的调度逻辑</strong>。</p>
+<p>简单来说，它的作用就是充当<strong>流水线并行（Pipeline Parallelism）的“指挥官”</strong>。在一个庞大的模型被切分到多个 GPU 上时（比如 GPU 1 算第 1-10 层，GPU 2 算第 11-20 层），这个文件负责告诉每个 GPU 在每一时刻该做什么：是计算前向传播（Forward）？是计算反向传播（Backward）？还是给隔壁 GPU 发送数据？</p>
+<p>为了让你看懂，我把这个文件要做的事情拆解成一个 <strong>GPU 的待办事项清单 (To-Do List)</strong>，并按逻辑顺序列出来。</p>
+<hr />
+<h3>核心观点：流水线并行的“三部曲”</h3>
+<p>这个文件主要实现了一种叫做 <strong>1F1B (One-Forward-One-Backward)</strong> 的调度策略。为了节省显存并保持 GPU 忙碌，它把一大批数据切分成很多个小份（Micro-batches），然后按以下三个阶段处理：</p>
+<ol>
+<li><strong>热身阶段 (Warmup):</strong> 先连续做几次前向计算，填满流水线。</li>
+<li><strong>稳定阶段 (Steady State / 1F1B):</strong> 做一次前向，紧接着做一次反向。进一个，出一个，保持平衡。</li>
+<li><strong>冷却阶段 (Cooldown):</strong> 流水线不再进新数据了，把剩下的反向传播做完。</li>
+</ol>
+<hr />
+<h3>这里的代码逻辑 To-Do List</h3>
+<p>假设你就是其中一块 GPU（比如 GPU Rank 1），以下是代码 <code>forward_backward_pipelining_without_interleaving</code> 函数指挥你执行的详细步骤：</p>
+<h4>✅ 任务一：准备工作 (Setup)</h4>
+<ol>
+<li><strong>确定身份</strong>：<ul>
+<li>我是流水线的第几站？（<code>parallel_state.get_pipeline_model_parallel_rank()</code>）</li>
+<li>我是第一站（只发不收）、中间站（既收又发）还是最后一站（只收不发，且要算 Loss）？</li>
+</ul>
+</li>
+<li><strong>确定形状</strong>：<ul>
+<li>我要接收的 Tensor 长什么样？我要发送的 Tensor 长什么样？（<code>get_tensor_shapes</code>）</li>
+</ul>
+</li>
+<li><strong>关闭梯度同步</strong>：<ul>
+<li>因为我们把一大批数据切碎了算，所以在所有 Micro-batch 算完之前，先别急着在这个 GPU 内部做 DDP（数据并行）的梯度同步。（<code>disable_grad_sync()</code>）</li>
+</ul>
+</li>
+</ol>
+<h4>✅ 任务二：热身阶段 (Warmup Phase)</h4>
+<p><em>代码位置：<code>forward_backward_pipelining_without_interleaving</code> 中的第一个 <code>for</code> 循环</em></p>
+<ul>
+<li><strong>目标</strong>：先把流水线填满，让后面的 GPU 有活干。</li>
+<li><strong>To-Do</strong>:<ol>
+<li><strong>接收数据</strong>：从上一个 GPU（Rank 0）接收 <code>input_tensor</code>。（如果是第一站则直接读数据）。</li>
+<li><strong>前向计算 (<code>forward_step</code>)</strong>：<ul>
+<li>调用 <code>model(input_tensor)</code>。</li>
+<li>如果是最后一站，计算 Loss。</li>
+</ul>
+</li>
+<li><strong>发送数据</strong>：把计算结果 <code>output_tensor</code> 发给下一个 GPU（Rank 2）。</li>
+<li><strong>保存现场</strong>：把 <code>input_tensor</code> 和 <code>output_tensor</code> 存进一个列表里，因为等会儿反向传播要用（这很占显存）。</li>
+<li><strong>重复</strong>：重复上述步骤 <code>num_warmup_microbatches</code> 次。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ 任务三：稳定阶段 (1F1B Steady State)</h4>
+<p><em>代码位置：<code>forward_backward_pipelining_without_interleaving</code> 中的第二个 <code>for</code> 循环</em></p>
+<ul>
+<li><strong>目标</strong>：这是最高效的阶段。为了不让显存爆炸，算完一个前向（占用显存），立马算一个反向（释放显存）。</li>
+<li><strong>To-Do</strong>:<ol>
+<li><strong>前向部分 (1F)</strong>:<ul>
+<li>接收下一个 Micro-batch 的输入。</li>
+<li>执行 <code>forward_step</code>。</li>
+<li><strong>关键点</strong>：如果不需要留着做反向（比如推理模式），或者为了节省显存，这里会调用 <code>deallocate_output_tensor</code> 把发出去的 Tensor 数据清空，只留个壳。</li>
+</ul>
+</li>
+<li><strong>通信交换</strong>:<ul>
+<li>把刚才的前向结果发给后一个 GPU。</li>
+<li><strong>同时</strong>，从后一个 GPU 接收之前 Micro-batch 的梯度（<code>output_tensor_grad</code>）。</li>
+<li><em>代码函数：<code>send_forward_recv_backward</code></em></li>
+</ul>
+</li>
+<li><strong>反向部分 (1B)</strong>:<ul>
+<li>从缓存列表里取出很久以前存的 <code>input_tensor</code> 和 <code>output_tensor</code>。</li>
+<li>执行 <code>backward_step</code>：根据收到的梯度，算出当前层的梯度，以及要传给上一个 GPU 的梯度。</li>
+</ul>
+</li>
+<li><strong>发送梯度</strong>:<ul>
+<li>把算出来的输入梯度发给上一个 GPU。</li>
+<li><em>代码函数：<code>send_backward_recv_forward</code></em>（发走梯度的同时，顺便接收下一次的前向输入，形成循环）。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>✅ 任务四：冷却阶段 (Cooldown Phase)</h4>
+<p><em>代码位置：<code>forward_backward_pipelining_without_interleaving</code> 中的最后部分</em></p>
+<ul>
+<li><strong>目标</strong>：前向计算都做完了，现在要把流水线里剩下的反向传播全部收尾。</li>
+<li><strong>To-Do</strong>:<ol>
+<li><strong>接收梯度</strong>：从后一个 GPU 拿梯度。</li>
+<li><strong>反向计算 (<code>backward_step</code>)</strong>：算出梯度。</li>
+<li><strong>发送梯度</strong>：把梯度扔给上一个 GPU。</li>
+<li><strong>重复</strong>：直到所有 Micro-batch 都处理完。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ 任务五：收尾工作 (Finalize)</h4>
+<ol>
+<li><strong>梯度同步</strong>：<ul>
+<li>所有小批次都算完了，现在开启 <code>enable_grad_sync()</code>。</li>
+<li>把这一大批数据累积的梯度，在数据并行组（Data Parallel Group）之间做 All-Reduce 同步。</li>
+</ul>
+</li>
+<li><strong>处理 Embedding</strong>：<ul>
+<li>如果是特定的模型结构，可能需要专门处理一下 Embedding 层的梯度（<code>finish_embedding_wgrad_compute</code>）。</li>
+</ul>
+</li>
+<li><strong>返回结果</strong>：<ul>
+<li>返回 Loss 信息，供打印日志。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>进阶：什么是 "Interleaving" (交错式)？</h3>
+<p><em>对应函数：<code>forward_backward_pipelining_with_interleaving</code></em></p>
+<p>你可能会看到代码里还有个巨复杂的 <code>with_interleaving</code> 函数。</p>
+<ul>
+<li><strong>普通模式 (Without Interleaving)</strong>: GPU 1 负责第 1-10 层，GPU 2 负责 11-20 层。</li>
+<li><strong>交错模式 (With Interleaving)</strong>: 为了减少“气泡”（GPU 等待的时间），我们把模型切得更碎。<ul>
+<li>GPU 1 负责：第 1-2 层 <strong>和</strong> 第 9-10 层 (Virtual Rank 0 &amp; 2)。</li>
+<li>GPU 2 负责：第 3-4 层 <strong>和</strong> 第 11-12 层 (Virtual Rank 1 &amp; 3)。</li>
+<li><strong>代码差异</strong>：逻辑变得更复杂，因为同一个 GPU 要在不同的“虚拟层级”之间反复横跳。代码里会有 <code>get_model_chunk_id</code> 来计算当前是算哪一块模型。</li>
+</ul>
+</li>
+</ul>
+<h3>总结代码中的关键函数</h3>
+<ol>
+<li><strong><code>get_forward_backward_func</code></strong>: 调度中心。根据配置决定是用“普通流水线”、“交错流水线”还是“单卡跑”。</li>
+<li><strong><code>forward_step</code></strong>: 真正干活的。调用 <code>model()</code>，如果是最后一站就算 Loss。</li>
+<li><strong><code>backward_step</code></strong>: 真正干活的。调用 <code>torch.autograd.backward()</code> 算梯度。</li>
+<li><strong><code>deallocate_output_tensor</code> / <code>custom_backward</code></strong>: <strong>这是个黑魔法优化</strong>。<ul>
+<li>PyTorch 默认会保留前向的 Output 用于反向。</li>
+<li>但在这里，Output 发给下一个 GPU 后，当前 GPU 就不需要它的数值了（只需要它的图结构）。</li>
+<li>这个函数把 Output 的数据内存清空（设为 1），防止显存浪费。反向传播时再用 C++ 引擎的 trick 绕过检查。</li>
+</ul>
+</li>
+</ol>
+<h3>一句话总结</h3>
+<p>这个文件就是一张<strong>极其精密的列车时刻表</strong>，它指挥着数据在多个 GPU 之间像接力棒一样传递，确保在训练超大模型时，每个 GPU 都在干活，且显存不会被撑爆。</p>

@@ -1,0 +1,122 @@
+<h1>megatron/core/models/bert/pooler.py</h1>
+<p>这段代码看起来很复杂，是因为它把<strong>简单的数学逻辑</strong>包裹在了<strong>复杂的并行计算（Megatron）外壳</strong>里。</p>
+<p>为了让你彻底看懂，我们把这个过程拆解成一个 <strong>“学习任务清单 (To-Do List)”</strong>。我们不直接读代码，而是先完成这 4 个任务，每完成一个，你就懂了一部分代码。</p>
+<hr />
+<h3>📋 学习任务清单</h3>
+<ol>
+<li><strong>Task 1：理解业务背景（什么是 Pooler？）</strong></li>
+<li><strong>Task 2：理解数据形状（输入长什么样？）</strong></li>
+<li><strong>Task 3：理解并行难点（为什么要 Gather？）</strong></li>
+<li><strong>Task 4：理解核心计算（提取 -&gt; 线性变换 -&gt; 激活）</strong></li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>✅ Task 1：理解业务背景（什么是 Pooler？）</h4>
+<p><strong>观点：</strong> BERT 模型处理完一句话后，每个字都会对应一个向量。但是，如果我们要做“整句分类”（比如判断这句话是褒义还是贬义），我们不需要每个字的向量，我们只需要<strong>一个代表整句话的向量</strong>。</p>
+<ul>
+<li><strong>BERT 的惯例：</strong> 句子的第一个 token（通常是 <code>[CLS]</code> 标记）被训练用来代表整句话的含义。</li>
+<li><strong>Pooler 的作用：</strong> 就是把这<strong>第一个 token</strong> 拿出来，再稍微加工一下（过一个全连接层），作为整句话的最终特征。</li>
+</ul>
+<blockquote>
+<p><strong>对应代码类名：</strong> <code>class Pooler(MegatronModule)</code> —— 就是干这个事的模块。</p>
+</blockquote>
+<hr />
+<h4>✅ Task 2：理解数据形状（输入长什么样？）</h4>
+<p><strong>观点：</strong> 在深度学习代码里，看不懂代码通常是因为不知道数据的“形状”（Dimensions）。</p>
+<ul>
+<li><strong>输入 (<code>hidden_states</code>)：</strong> 这是一个三维张量（Tensor）。<ul>
+<li>形状是：<code>[Sequence Length, Batch Size, Hidden Size]</code></li>
+<li>简称：<code>[s, b, h]</code></li>
+<li><strong>解释：</strong><ul>
+<li><code>s</code>：句子长度（比如 512 个字）。</li>
+<li><code>b</code>：一批有多少句话（比如一次处理 8 句话）。</li>
+<li><code>h</code>：每个字用多少维的向量表示（比如 1024 维）。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<p><strong>对应代码注释：</strong> <code>hidden_states: [s, b, h]</code></p>
+</blockquote>
+<hr />
+<h4>✅ Task 3：理解并行难点（为什么要 Gather？）</h4>
+<p><strong>观点：</strong> 这是这段代码里最难懂的部分，也是 Megatron 这个库的核心。</p>
+<ul>
+<li><strong>场景：</strong> 假设模型特别大，或者句子特别长，一张显卡（GPU）放不下。Megatron 会使用 <strong>“序列并行 (Sequence Parallel)”</strong>。</li>
+<li><strong>发生了什么：</strong><ul>
+<li>原本 <code>s=512</code> 的句子，被切分到了多张显卡上。</li>
+<li>显卡 A 拿着第 1-256 个字。</li>
+<li>显卡 B 拿着第 257-512 个字。</li>
+</ul>
+</li>
+<li><strong>问题：</strong> <code>Pooler</code> 需要拿第 0 个字（第一个 token）。如果你是显卡 B，你手里根本没有第 0 个字，你的数据是从 257 开始的。</li>
+<li><strong>解决办法 (Gather)：</strong> 在做提取之前，所有显卡必须“互通有无”，把切碎的句子重新拼成完整的句子。</li>
+</ul>
+<blockquote>
+<p><strong>对应代码段：</strong>
+<code>python
+if self.sequence_parallel:
+    hidden_states = tensor_parallel.gather_from_sequence_parallel_region(...)</code>
+<strong>人话翻译：</strong> “如果开启了序列并行，大家先把各自手里的片段拼凑起来，还原成完整的数据。”</p>
+</blockquote>
+<hr />
+<h4>✅ Task 4：理解核心计算（提取 -&gt; 线性变换 -&gt; 激活）</h4>
+<p><strong>观点：</strong> 数据准备好之后，剩下的就是标准的 PyTorch 操作了。</p>
+<ul>
+<li><strong>步骤 1：提取 (Slice)</strong><ul>
+<li>我们要拿第 <code>sequence_index</code> 个字（默认是 0，即第一个字）。</li>
+<li>操作：从 <code>[s, b, h]</code> 中切出 <code>[b, h]</code>。</li>
+</ul>
+</li>
+<li><strong>步骤 2：线性变换 (Linear)</strong><ul>
+<li>把提取出来的向量乘一个矩阵（权重）。这就是为了增加一点非线性能力，让特征更适合分类。</li>
+</ul>
+</li>
+<li><strong>步骤 3：激活 (Tanh)</strong><ul>
+<li>BERT 的 Pooler 层规定最后要过一个 <code>Tanh</code> 激活函数，把数值压缩到 -1 到 1 之间。</li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<p><strong>对应代码段：</strong>
+<code>python
+pooled = hidden_states[sequence_index, :, :]  # 步骤1：只取第0行
+pooled = self.dense(pooled)                   # 步骤2：过全连接层
+pooled = torch.tanh(pooled)                   # 步骤3：过Tanh</code></p>
+</blockquote>
+<hr />
+<h3>📝 总结回顾（带入代码）</h3>
+<p>现在我们把代码连起来看一遍，你应该就能看懂了：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">Pooler</span><span class="p">(</span><span class="n">MegatronModule</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+        <span class="c1"># 初始化一个全连接层 (Linear Layer)，大小是 hidden_size x hidden_size</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dense</span> <span class="o">=</span> <span class="n">get_linear_layer</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+        <span class="c1"># 记录一下是否开启了“序列并行”</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">sequence_parallel</span> <span class="o">=</span> <span class="n">sequence_parallel</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span> <span class="n">sequence_index</span><span class="o">=</span><span class="mi">0</span><span class="p">):</span>
+        <span class="c1"># 输入 hidden_states 形状是 [句子长度, 批次大小, 隐藏层维度]</span>
+
+        <span class="c1"># 【Task 3】如果是序列并行，数据是碎的，先把它拼完整</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">sequence_parallel</span><span class="p">:</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">tensor_parallel</span><span class="o">.</span><span class="n">gather_from_sequence_parallel_region</span><span class="p">(</span>
+                <span class="n">hidden_states</span><span class="p">,</span> <span class="n">tensor_parallel_output_grad</span><span class="o">=</span><span class="kc">False</span>
+            <span class="p">)</span>
+
+        <span class="c1"># 【Task 4.1】只取第 sequence_index (通常是0) 个 token 的向量</span>
+        <span class="c1"># 此时形状变成了 [批次大小, 隐藏层维度]</span>
+        <span class="n">pooled</span> <span class="o">=</span> <span class="n">hidden_states</span><span class="p">[</span><span class="n">sequence_index</span><span class="p">,</span> <span class="p">:,</span> <span class="p">:]</span>
+
+        <span class="c1"># 【Task 4.2】过全连接层</span>
+        <span class="n">pooled</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dense</span><span class="p">(</span><span class="n">pooled</span><span class="p">)</span>
+
+        <span class="c1"># 【Task 4.3】过 Tanh 激活函数</span>
+        <span class="n">pooled</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tanh</span><span class="p">(</span><span class="n">pooled</span><span class="p">)</span>
+
+        <span class="c1"># 返回最终代表整句话的向量</span>
+        <span class="k">return</span> <span class="n">pooled</span>
+</code></pre></div>
+
+<p><strong>一句话总结：</strong>
+这个文件定义了一个 BERT 的 Pooler 层，它的核心工作是<strong>取出句首 Token 的向量并做一次线性变换</strong>，但为了支持超大模型训练，它额外加了一步<strong>“把分散在不同显卡上的句子片段拼起来”</strong>的操作。</p>

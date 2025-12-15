@@ -1,0 +1,99 @@
+<h1>tools/retro/sft/sft_retro.py</h1>
+<p>这份代码文件 <code>sft_retro.py</code> 的核心目的是：<strong>使用 Megatron-LM 框架，对 RETRO 模型（一种带有检索能力的 GPT 模型）进行有监督微调（SFT, Supervised Fine-Tuning）。</strong></p>
+<p>简单来说，就是教一个本来已经读过很多书的模型，如何根据额外检索到的信息来回答特定的问题（QA任务）。</p>
+<p>为了让你更容易理解，我们可以把这个脚本看作是一个<strong>项目经理</strong>，他手里有一份<strong>任务清单（To-Do List）</strong>，需要一步步执行才能完成训练。</p>
+<p>下面是这份 To-Do List，以及每一步在代码中对应的内容和解释：</p>
+<hr />
+<h3>📋 训练任务 To-Do List</h3>
+<ol>
+<li><strong>[配置阶段]</strong> 设定训练规则：我们要练什么任务？练几轮？参数怎么设？</li>
+<li><strong>[准备食材]</strong> 准备数据：从哪里读问题和答案？如果是 RETRO 模型，检索到的“邻居”（参考资料）在哪里？</li>
+<li><strong>[加工处理]</strong> 制作批次（Batch）：把文本变成数字，并决定哪些部分需要模型“背诵”（计算 Loss），哪些只是“提示”（Context）。</li>
+<li><strong>[模型运行]</strong> 前向传播（Forward）：把处理好的数据喂给模型，让它预测下一个字。</li>
+<li><strong>[评估结果]</strong> 计算损失（Loss）：看模型答得对不对，算出分数。</li>
+<li><strong>[启动引擎]</strong> 开始循环：把上面的一切交给 Megatron 的主引擎去跑。</li>
+</ol>
+<hr />
+<h3>🔍 逐步详细解读</h3>
+<h4>1. [配置阶段] 设定训练规则</h4>
+<p><strong>代码对应函数：</strong> <code>get_tasks_args(parser)</code></p>
+<ul>
+<li><strong>他在做什么：</strong>
+    这就好比在训练开始前填写一张“报名表”。这个函数定义了很多命令行参数。</li>
+<li><strong>关键点：</strong><ul>
+<li><code>--task</code>: 任务名称。</li>
+<li><code>--epochs</code>: 练多少轮。</li>
+<li><code>--answer-loss-only</code>: <strong>这是 SFT 的核心</strong>。意思是“只计算答案部分的损失”。比如输入是“中国首都在哪？北京”，模型只需要学会输出“北京”，而不需要学会输出“中国首都在哪”。</li>
+<li><code>--add_retriever</code>: 是否开启检索功能（RETRO 模型的特色）。如果开启，还需要指定数据库路径 (<code>database_path</code>) 等。</li>
+</ul>
+</li>
+</ul>
+<h4>2. [准备食材] 准备数据</h4>
+<p><strong>代码对应函数：</strong> <code>train_valid_test_datasets_provider(...)</code></p>
+<ul>
+<li><strong>他在做什么：</strong>
+    负责去硬盘里读取数据文件（通常是 JSON 格式的问答对），并将数据切分成训练集、验证集和测试集。</li>
+<li><strong>关键点：</strong><ul>
+<li>代码里区分了两种数据集加载器：<ul>
+<li><code>RetroJsonQADataset</code>: 如果开启了检索 (<code>args.retro_add_retriever</code>)，用这个。它不仅加载问答，还会加载检索到的“邻居”文本（参考资料）。</li>
+<li><code>JsonQADataset</code>: 普通的问答数据加载。</li>
+</ul>
+</li>
+<li>它使用了 <code>BlendedMegatronDatasetBuilder</code> 来混合和构建这些数据。</li>
+</ul>
+</li>
+</ul>
+<h4>3. [加工处理] 制作批次（Batch）</h4>
+<p><strong>代码对应函数：</strong> <code>get_batch(data_iterator)</code></p>
+<ul>
+<li><strong>他在做什么：</strong>
+    这是流水线上的“打包工”。它从数据集中拿出一组数据，整理成模型能吃进去的 Tensor（张量/矩阵）。</li>
+<li><strong>关键点（非常重要）：</strong><ul>
+<li><strong>Masking（掩码）</strong>: 代码里有 <code>loss_mask</code>。<ul>
+<li>如果是 <code>args.answer_loss_only</code>，它会将“问题/上下文”部分的 mask 设为 0。这意味着模型读问题时产生的误差<strong>不计入成绩</strong>，模型只在生成答案时被考核。</li>
+</ul>
+</li>
+<li><strong>Retrieval Data</strong>: 如果是 RETRO 模型，它会额外打包 <code>neighbor_tokens</code>（检索到的相关文档片段），这些将作为模型的额外知识来源。</li>
+</ul>
+</li>
+</ul>
+<h4>4. [模型运行] 前向传播</h4>
+<p><strong>代码对应函数：</strong> <code>forward_step(data_iterator, model)</code></p>
+<ul>
+<li><strong>他在做什么：</strong>
+    这是“考试”过程。把打包好的数据喂给神经网络。</li>
+<li><strong>关键点：</strong><ul>
+<li>它会调用 <code>get_batch</code> 拿到数据。</li>
+<li><strong>分支逻辑</strong>：<ul>
+<li>如果 <code>args.retro_add_retriever</code> 为真：调用模型时会传入 <code>retriever_input_ids</code>（检索内容）。模型会一边看问题，一边查阅检索内容来生成答案。</li>
+<li>否则：就按普通的 GPT 方式运行。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>5. [评估结果] 计算损失</h4>
+<p><strong>代码对应函数：</strong> <code>loss_func(loss_mask, output_tensor)</code></p>
+<ul>
+<li><strong>他在做什么：</strong>
+    这是“阅卷老师”。</li>
+<li><strong>关键点：</strong><ul>
+<li>它计算模型输出和真实答案之间的差距。</li>
+<li>它会用到第 3 步生成的 <code>loss_mask</code>。被 Mask 掉的部分（比如问题部分）不会产生 Loss。</li>
+</ul>
+</li>
+</ul>
+<h4>6. [启动引擎] 开始循环</h4>
+<p><strong>代码对应部分：</strong> <code>if __name__ == "__main__":</code></p>
+<ul>
+<li><strong>他在做什么：</strong>
+    这是整个程序的启动按钮。</li>
+<li><strong>关键点：</strong><ul>
+<li><code>pretrain(...)</code>: 虽然名字叫 <code>pretrain</code>（预训练），但在 Megatron 框架里，这是通用的训练入口。</li>
+<li>它把上面定义好的 <code>train_valid_test_datasets_provider</code>（数据）、<code>model_provider</code>（模型结构）、<code>forward_step</code>（怎么跑一步）全部传进去，Megatron 就会接管剩下的事情（分布式训练、梯度下降、保存模型等）。</li>
+<li><code>ModelType.retro_decoder</code>: 告诉框架我们用的是 RETRO 结构的解码器模型。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个脚本就是一个<strong>“配置器”</strong>和<strong>“数据胶水”</strong>。它利用 Megatron 强大的底层能力，专门为了 <strong>“带检索功能的问答微调 (RETRO SFT)”</strong> 这一任务，组装了特定的数据读取方式、Loss 计算方式和参数配置。</p>

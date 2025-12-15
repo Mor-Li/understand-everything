@@ -1,0 +1,89 @@
+<h1>verl/trainer/main_eval.py</h1>
+<p>没问题，这段代码其实就是一个<strong>“自动阅卷机”</strong>。</p>
+<p>它的核心任务是：拿着大模型做好的“试卷”（生成的数据），对着“标准答案”（Ground Truth），算一下模型到底考了多少分。</p>
+<p>为了让你更容易理解，我把这个脚本的工作流程拆解成一个 <strong>To-Do List（任务清单）</strong>，我们可以假装自己就是这段代码，一步步去执行任务。</p>
+<hr />
+<h3>📋 任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>[准备阶段] 获取配置和试卷</strong>：弄清楚数据在哪，把文件拿过来。</li>
+<li><strong>[读取阶段] 打开试卷表格</strong>：把数据文件打开，分门别类整理好（题目、模型写的答案、标准答案）。</li>
+<li><strong>[阅卷循环] 开始逐题批改</strong>：<ul>
+<li>看看这道题是哪个科目的（比如是数学题），找对应的“阅卷老师”（评分规则）。</li>
+<li>看看模型这道题写了几个答案（通常模型会尝试回答多次）。</li>
+<li>把模型的每个答案和标准答案比对，打分。</li>
+<li><strong>关键判断</strong>：只要这几次尝试里，有<strong>一次</strong>是对的，这道题就算做对了。</li>
+</ul>
+</li>
+<li><strong>[总结阶段] 计算及格率</strong>：统计一共做对了多少题，算出最终的得分率（Pass Rate）。</li>
+</ol>
+<hr />
+<h3>🔍 逐步代码详解</h3>
+<p>现在我们对照上面的清单，看看代码具体是怎么做的：</p>
+<h4>任务 1 &amp; 2：准备与读取</h4>
+<p>代码一开始做的是搬运和整理数据的工作。</p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@hydra</span><span class="o">.</span><span class="n">main</span><span class="p">(</span><span class="n">config_path</span><span class="o">=</span><span class="s1">&#39;config&#39;</span><span class="p">,</span> <span class="n">config_name</span><span class="o">=</span><span class="s1">&#39;evaluation&#39;</span><span class="p">,</span> <span class="n">version_base</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">(</span><span class="n">config</span><span class="p">):</span>
+    <span class="c1"># 1. 如果文件在远程服务器(HDFS)上，先把它下载到本地</span>
+    <span class="n">local_path</span> <span class="o">=</span> <span class="n">copy_local_path_from_hdfs</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">path</span><span class="p">)</span>
+
+    <span class="c1"># 2. 读取这个 parquet 文件（你可以把它想象成一个高级的 Excel 表格）</span>
+    <span class="n">dataset</span> <span class="o">=</span> <span class="n">pd</span><span class="o">.</span><span class="n">read_parquet</span><span class="p">(</span><span class="n">local_path</span><span class="p">)</span>
+
+    <span class="c1"># 3. 把表格里的列拆出来，方便后面用</span>
+    <span class="n">prompts</span> <span class="o">=</span> <span class="n">dataset</span><span class="p">[</span><span class="n">config</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">prompt_key</span><span class="p">]</span>          <span class="c1"># 题目</span>
+    <span class="n">responses</span> <span class="o">=</span> <span class="n">dataset</span><span class="p">[</span><span class="n">config</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">response_key</span><span class="p">]</span>      <span class="c1"># 模型生成的答案列表 (注意：这里每道题可能有一组答案)</span>
+    <span class="n">data_sources</span> <span class="o">=</span> <span class="n">dataset</span><span class="p">[</span><span class="n">config</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">data_source_key</span><span class="p">]</span><span class="c1"># 数据来源 (比如是 &#39;lighteval/MATH&#39;)</span>
+    <span class="n">reward_model_data</span> <span class="o">=</span> <span class="n">dataset</span><span class="p">[</span><span class="n">config</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">reward_model_key</span><span class="p">]</span> <span class="c1"># 里面包含标准答案 (Ground Truth)</span>
+</code></pre></div>
+
+<h4>任务 3：阅卷循环 (核心逻辑)</h4>
+<p>这是代码最主要的部分，它开始一道题一道题地“改卷子”。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="n">passes</span> <span class="o">=</span> <span class="mi">0</span>          <span class="c1"># 记录做对的题目数量</span>
+    <span class="n">total</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">dataset</span><span class="p">)</span> <span class="c1"># 总题数</span>
+
+    <span class="c1"># 开始遍历每一道题</span>
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">total</span><span class="p">):</span>
+        <span class="n">response_lst</span> <span class="o">=</span> <span class="n">responses</span><span class="p">[</span><span class="n">i</span><span class="p">]</span>     <span class="c1"># 取出第 i 题模型写的一组答案 (比如模型尝试了5次)</span>
+        <span class="n">data_source</span> <span class="o">=</span> <span class="n">data_sources</span><span class="p">[</span><span class="n">i</span><span class="p">]</span>   <span class="c1"># 取出第 i 题的科目</span>
+        <span class="n">reward_data</span> <span class="o">=</span> <span class="n">reward_model_data</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> 
+        <span class="n">ground_truth</span> <span class="o">=</span> <span class="n">reward_data</span><span class="p">[</span><span class="s1">&#39;ground_truth&#39;</span><span class="p">]</span> <span class="c1"># 取出第 i 题的标准答案</span>
+
+        <span class="c1"># --- 子任务：挑选阅卷老师 ---</span>
+        <span class="c1"># 根据科目选择评分函数。如果是 MATH 数据集，就用 math.compute_score</span>
+        <span class="n">reward_fn</span> <span class="o">=</span> <span class="n">select_reward_fn</span><span class="p">(</span><span class="n">data_source</span><span class="p">)</span> 
+
+        <span class="c1"># --- 子任务：打分 ---</span>
+        <span class="n">score_lst</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">response_lst</span><span class="p">:</span>
+            <span class="c1"># 用评分函数对比“模型答案(r)”和“标准答案(ground_truth)”</span>
+            <span class="c1"># 如果对就是 1，不对就是 0</span>
+            <span class="n">score</span> <span class="o">=</span> <span class="n">reward_fn</span><span class="p">(</span><span class="n">r</span><span class="p">,</span> <span class="n">ground_truth</span><span class="p">)</span>
+            <span class="n">score_lst</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">score</span><span class="p">)</span>
+
+        <span class="c1"># --- 子任务：关键判断 ---</span>
+        <span class="c1"># np.max 取最大值。</span>
+        <span class="c1"># 意思就是：假设模型对这道题回答了 5 次，只要有 1 次对了(得1分)，最大值就是 1。</span>
+        <span class="n">max_score</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">max</span><span class="p">(</span><span class="n">score_lst</span><span class="p">)</span>
+
+        <span class="c1"># 如果最大值是 1，说明这道题算“通过”</span>
+        <span class="k">if</span> <span class="n">max_score</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="n">passes</span> <span class="o">+=</span> <span class="mi">1</span>
+</code></pre></div>
+
+<h4>任务 4：总结阶段</h4>
+<p>最后打印出成绩。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># 计算通过率： 做对的题数 / 总题数</span>
+    <span class="c1"># print里的 pass@5 意思是：假设每道题给了模型 5 次尝试机会，它的通过率是多少。</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s1">&#39;pass@5: </span><span class="si">{</span><span class="n">passes</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">total</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">)</span>
+</code></pre></div>
+
+<hr />
+<h3>💡 总结文中的核心观点</h3>
+<p>这段代码虽然短，但它展示了大模型评估中一个非常重要的指标：<strong>Pass@k (这里是 k=5)</strong>。</p>
+<ol>
+<li><strong>容错性评估</strong>：作者认为，在评估模型（特别是做数学题）时，给模型多次机会（比如生成 5 个不同的解题过程），只要其中有一个是对的，就证明模型有能力解决这个问题。</li>
+<li><strong>基于规则的验证</strong>：它没有用另一个 AI 去给答案打分，而是用了 <code>verl.utils.reward_score</code> 里的数学规则（<code>math.compute_score</code>）来硬性比对答案。这通常比用 AI 打分更准确、更客观。</li>
+<li><strong>离线评估 (Offline Eval)</strong>：这个脚本不负责训练，也不负责生成，它只负责<strong>事后算账</strong>。输入是已经生成好的文件，输出是一个分数。</li>
+</ol>
+<p><strong>简单一句话概括：</strong>
+这就好比老师改卷子，但是允许学生每道题写 5 个解法，只要其中有一个解法算出正确答案，这道题就给满分。这个脚本就是那个负责最后算总分的老师。</p>

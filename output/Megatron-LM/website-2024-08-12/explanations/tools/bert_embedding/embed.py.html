@@ -1,0 +1,87 @@
+<h1>tools/bert_embedding/embed.py</h1>
+<p>这份代码文件 <code>tools/bert_embedding/embed.py</code> 的核心作用非常简单：<strong>利用 BERT 模型，把文本（句子）转换成向量（Embedding），并支持大规模数据的并行处理和存储。</strong></p>
+<p>你可以把它想象成一个<strong>“翻译工厂”</strong>：
+*   <strong>原料</strong>：一堆文本（句子）。
+*   <strong>机器</strong>：BERT 模型。
+*   <strong>产品</strong>：数学向量（计算机能理解的数字列表）。
+*   <strong>物流</strong>：把这些向量打包存到硬盘上。</p>
+<p>为了让你更容易理解，我把你当作在这个工厂里的“工长”，列一份你的 <strong>任务清单 (To-Do List)</strong>，然后一步步解释代码是如何完成这些任务的。</p>
+<hr />
+<h3>📋 任务清单 (Task To-Do List)</h3>
+<ol>
+<li><strong>准备原料（数据预处理）</strong>：把长短不一的句子整理成整齐的方块，方便机器吞吐。</li>
+<li><strong>调试机器（模型初始化）</strong>：把 BERT 模型加载进内存，并预热一下机器。</li>
+<li><strong>流水线生产（核心推理）</strong>：把整理好的数据喂给模型，算出向量，并把结果从显卡（GPU）搬运回内存（CPU）。</li>
+<li><strong>大规模物流（分块存储）</strong>：如果数据太多，就切分成小块，分配给不同的工位（GPU）并行处理，最后存入硬盘。</li>
+</ol>
+<hr />
+<h3>🧐 逐步讲解 (Step-by-Step Analysis)</h3>
+<h4>任务 1：准备原料 (数据预处理)</h4>
+<p><strong>代码对应：</strong> <code>collate_batch</code> 函数 和 <code>TextDataset</code> 类</p>
+<ul>
+<li><strong>问题</strong>：BERT 模型（机器）要求每次输入的形状必须是整齐的矩形。但是，人类的句子有的长（"今天天气真好，我想去公园..."），有的短（"你好"）。</li>
+<li><strong>解决方案 (<code>collate_batch</code>)</strong>：<ul>
+<li>这个函数会查看这一批次（Batch）里最长的句子有多长。</li>
+<li>然后，它给所有短句子后面<strong>补零（Padding）</strong>，直到大家都一样长。</li>
+<li>就像打包快递，如果箱子太大东西太小，就塞泡沫填充物，保证箱子是满的。</li>
+</ul>
+</li>
+<li><strong><code>TextDataset</code></strong>：这只是一个简单的包装，把普通的文本列表变成 PyTorch 能识别的数据集格式。</li>
+</ul>
+<h4>任务 2：调试机器 (模型初始化)</h4>
+<p><strong>代码对应：</strong> <code>BertEmbedder</code> 类中的 <code>__init__</code> 方法</p>
+<ul>
+<li><strong>加载模型</strong>：代码里 <code>setup_model_and_optimizer</code> 负责把 BERT 模型加载进来。它支持两种模式：<ul>
+<li><code>megatron</code>：NVIDIA 自家的 Megatron-LM 格式。</li>
+<li><code>huggingface</code>：开源社区通用的 HuggingFace 格式。</li>
+</ul>
+</li>
+<li><strong>预热 (Warmup)</strong>：<ul>
+<li>代码里有一段很有趣的逻辑：<code>if warmup:</code>。</li>
+<li>它会先拿几句无意义的英文诗（"great fleas have lesser fleas..."）喂给模型跑几遍。</li>
+<li><strong>为什么？</strong> 深度学习框架（如 PyTorch JIT）第一次运行时通常需要编译优化，速度会慢。预热就是为了让机器进入“最佳状态”，避免第一批正式数据处理得太慢。</li>
+</ul>
+</li>
+</ul>
+<h4>任务 3：流水线生产 (核心推理)</h4>
+<p><strong>代码对应：</strong> <code>embed_data_loader</code> 函数</p>
+<p>这是整个工厂最核心的生产环节：
+1.  <strong>检查环境</strong>：代码首先检查 <code>TP=1, PP=1</code>。这意味着这个脚本不搞复杂的模型切分，每个 GPU 上都是一个完整的 BERT，大家各算各的数据（数据并行）。
+2.  <strong>开启评估模式</strong>：<code>model.eval()</code>。告诉模型：“现在是考试时间，只做题（推理），不要学习（不更新参数，即不训练）”。
+3.  <strong>循环生产</strong>：
+    *   <code>forward_step</code>：把数据喂进去，算出向量。
+    *   <code>detach().cpu().numpy()</code>：算出来的结果通常在 GPU（显存）上。这一步把它“切断”计算图，并搬运到 CPU（内存）里，转换成 NumPy 数组，方便后续处理。
+4.  <strong>拼接</strong>：最后把这一批算出来的所有向量拼在一起返回。</p>
+<h4>任务 4：大规模物流 (分块存储)</h4>
+<p><strong>代码对应：</strong> <code>DiskDataParallelBertEmbedder</code> 类</p>
+<p>如果你的文本数据有几百 GB，内存根本装不下，怎么办？
+*   <strong>分块 (<code>block_size</code>)</strong>：这个类把巨大的数据集切分成很多个 <code>block</code>（块）。
+*   <strong>分工 (<code>get_blocks_by_rank</code>)</strong>：
+    *   如果你有 8 张 GPU 卡，这个函数会分配任务。比如：GPU 0 处理第 1-10 块，GPU 1 处理第 11-20 块...
+    *   <code>missing_embedding_blocks</code>：它甚至很聪明，会检查硬盘上哪些块已经算好了，只计算那些“缺失”的块（断点续传）。
+*   <strong>存盘 (<code>h5py</code>)</strong>：
+    *   算好一个块，就立刻用 <code>h5py</code> 存成 <code>.h5</code> 文件。这种格式读写速度快，适合存这种大矩阵。
+*   <strong>同步 (<code>barrier</code>)</strong>：
+    *   <code>torch.distributed.barrier()</code> 就像一个红绿灯。它让跑得快的 GPU 等一等跑得慢的，保证大家步调一致，或者在开始下一步之前确保文件目录已经建好了。</p>
+<hr />
+<h3>📝 总结：这个文件讲了啥？</h3>
+<p>这个文件定义了两个主要的工具人（Class）：</p>
+<ol>
+<li>
+<p><strong><code>BertEmbedder</code> (内存版工长)</strong>：</p>
+<ul>
+<li>负责管理 BERT 模型。</li>
+<li>给你一段字，它直接给你返回内存里的向量。</li>
+<li>适合小规模数据或者在线实时处理。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>DiskDataParallelBertEmbedder</code> (硬盘版工长)</strong>：</p>
+<ul>
+<li>它是 <code>BertEmbedder</code> 的上级。</li>
+<li>它负责处理<strong>海量数据</strong>。</li>
+<li>它指挥多个 GPU 并行工作，把数据切块，算完一块存一块到硬盘上，确保不撑爆内存。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话概括：这是一个用于大规模并行生成 BERT 文本向量，并将其安全保存到硬盘的工具脚本。</strong></p>

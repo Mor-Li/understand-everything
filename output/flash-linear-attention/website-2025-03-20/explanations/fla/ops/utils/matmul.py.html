@@ -1,0 +1,106 @@
+<h1>fla/ops/utils/matmul.py</h1>
+<p>完全理解。Triton 的代码对于初学者来说确实像天书，因为它混合了<strong>高层逻辑（Python）</strong>和<strong>底层显存操作（C/CUDA 概念）</strong>。</p>
+<p>为了让你看懂这份代码，我们把它想象成一个<strong>“学习任务清单”（To-Do List）</strong>。我们不一行行读，而是按<strong>逻辑模块</strong>去拆解。</p>
+<p>这份代码的核心功能只有一个：<strong>用 GPU 高效地计算矩阵乘法 $C = A \times B$</strong>，顺便支持加法和激活函数。</p>
+<p>下面是你的学习清单：</p>
+<hr />
+<h3>✅ Task 1: 搞懂“外壳” —— Python 入口函数</h3>
+<p><strong>目标</strong>：理解我们平时怎么调用这个功能。
+<strong>位置</strong>：代码底部的 <code>def matmul(...)</code> (第 183 行) 和 <code>def addmm(...)</code> (第 216 行)。</p>
+<p>这部分是写给 Python 程序员看的“接待员”。
+1.  <strong>检查形状</strong>：它检查输入 $A$ 和 $B$ 的维度对不对（比如 $A$ 的最后一维必须等于 $B$ 的第一维）。
+2.  <strong>统一格式</strong>：如果输入是 2D 矩阵，为了方便计算，它强行把它看作 3D（Batch大小为1）。
+3.  <strong>分配显存</strong>：<code>c = a.new_empty(B, M, N)</code>，提前为结果矩阵 $C$ 挖好坑。
+4.  <strong>计算 Grid（网格）</strong>：
+    *   这是 GPU 编程的核心。GPU 不会一次性算完整个大矩阵，而是把大矩阵切成无数个小方块（Block）。
+    *   <code>grid</code> 函数决定了要把大矩阵切成多少块分给 GPU 的不同计算单元去算。
+5.  <strong>发射核函数</strong>：<code>matmul_kernel[grid](...)</code> 这一行就是按下发射按钮，把任务交给 GPU 去跑。</p>
+<hr />
+<h3>✅ Task 2: 搞懂“核心” —— Kernel 的任务分配</h3>
+<p><strong>目标</strong>：理解 GPU 里的每一个“小工人”（Program）负责干什么。
+<strong>位置</strong>：<code>def matmul_kernel(...)</code> (第 48 行) 的开头部分。</p>
+<p>当 GPU 开始跑的时候，会有成百上千个“小工人”（Thread Block / Program）同时启动。
+1.  <strong>我是谁？（PID）</strong>：
+    *   <code>i_b, i_m, i_n = tl.program_id(0), ...</code>
+    *   每个小工人都拿着一个身份证号。比如 <code>(0, 2, 5)</code> 表示：“我负责处理第 0 个 Batch，第 2 行块，第 5 列块的数据”。
+2.  <strong>我要算哪一块数据？</strong>：
+    *   代码里有 <code>BM</code>, <code>BN</code>。这表示每个小工人只负责算 $C$ 矩阵中大小为 $BM \times BN$ 的一小块区域。
+    *   <code>tl.swizzle2d</code>：这是一行魔法代码，用来打乱任务分配顺序，为了利用 L2 缓存提高速度（你可以暂时忽略它，理解为优化手段）。</p>
+<hr />
+<h3>✅ Task 3: 搞懂“寻址” —— 指针定位</h3>
+<p><strong>目标</strong>：理解如何从显存的茫茫大海中找到数据。
+<strong>位置</strong>：<code>matmul_kernel</code> 中间部分 (第 94-105 行)。</p>
+<p>这是最难懂的部分，全是数学计算。
+1.  <strong>指针（Pointer）</strong>：在 GPU 里，数据是一长串连续的数字。我们需要计算出 $A$ 矩阵和 $B$ 矩阵的起始位置。
+2.  <strong>Stride（步长）</strong>：
+    *   <code>stride_am</code>：在 $A$ 矩阵里，往下一行需要跳过多少个内存地址？
+    *   <code>stride_ak</code>：在 $A$ 矩阵里，往右一列需要跳过多少个内存地址？
+3.  <strong>定位</strong>：
+    *   <code>p_a</code>：计算出当前这个小工人要读取的 $A$ 矩阵分块的起始地址。
+    *   <code>p_b</code>：计算出 $B$ 矩阵分块的起始地址。</p>
+<hr />
+<h3>✅ Task 4: 搞懂“计算” —— 循环与累加</h3>
+<p><strong>目标</strong>：理解矩阵乘法 $A \times B$ 到底是怎么算出来的。
+<strong>位置</strong>：<code>for k in range(0, tl.cdiv(K, BK)):</code> (第 108-119 行)。</p>
+<p>矩阵乘法是“行乘以列”。但在 GPU 里，我们采用<strong>分块累加</strong>的方式。
+1.  <strong>切香肠</strong>：
+    *   假设 $A$ 和 $B$ 的公共维度 $K$ 很长。我们不能一次读完。
+    *   我们把 $K$ 切成很多段，每段长度 <code>BK</code>。
+2.  <strong>循环加载 (Load)</strong>：
+    *   <code>tl.load(p_a, ...)</code>：从显存搬运一小块 $A$ 到芯片上。
+    *   <code>tl.load(p_b, ...)</code>：从显存搬运一小块 $B$ 到芯片上。
+    *   <code>mask</code>：防止读出界（比如矩阵边缘）。
+3.  <strong>点积 (Dot Product)</strong>：
+    *   <code>tl.dot(b_a, b_b, ...)</code>：这是计算的核心。计算这一小块的乘积。
+4.  <strong>累加 (Accumulate)</strong>：
+    *   <code>b_acc += ...</code>：把这次算出来的结果加到之前的总和里。
+5.  <strong>移动指针</strong>：
+    *   <code>p_a += BK * stride_ak</code>：指针向右移动，准备读下一段 $K$。</p>
+<hr />
+<h3>✅ Task 5: 搞懂“后处理” —— 激活与融合</h3>
+<p><strong>目标</strong>：理解 Triton 相比 PyTorch 默认算子的优势（算完乘法顺便把激活函数做了）。
+<strong>位置</strong>：循环结束后 (第 121-155 行)。</p>
+<p>当循环结束，<code>b_acc</code> 里存的就是矩阵乘法的结果了。但还没完：
+1.  <strong>激活函数 (Activation)</strong>：
+    *   代码里判断 <code>if ACTIVATION == "leaky_relu": ...</code>。
+    *   这意味着数据还在寄存器（最快的内存）里时，顺手就把 ReLU 或 Sigmoid 做了。这比“存回显存 -&gt; 再读出来做 ReLU -&gt; 再存回去”要快得多。
+2.  <strong>Addmm (矩阵加法)</strong>：
+    *   <code>if HAS_INPUT:</code>：如果用户传入了 <code>input</code> 矩阵（通常是 Bias 偏置或者残差连接）。
+    *   它会把 <code>input</code> 读进来，乘以 <code>beta</code>，加上刚才算出的结果（乘以 <code>alpha</code>）。
+    *   这就是 <code>addmm</code>：$C = \beta \cdot \text{input} + \alpha \cdot (A \times B)$。</p>
+<hr />
+<h3>✅ Task 6: 搞懂“写回” —— 存盘</h3>
+<p><strong>目标</strong>：把计算结果放回显存，让 Python 能拿到。
+<strong>位置</strong>：最后几行 (第 158-160 行)。</p>
+<ol>
+<li><strong>计算写入位置</strong>：根据 <code>i_b</code>, <code>i_m</code>, <code>i_n</code> 算出结果矩阵 $C$ 的内存地址 <code>p_c</code>。</li>
+<li><strong>存储 (Store)</strong>：<ul>
+<li><code>tl.store(p_c, b_c, mask=mask)</code>：把手里算好的 <code>b_c</code> 写回到显存里。</li>
+<li><code>mask</code> 同样是为了防止写出界。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 7: 搞懂“自动调优” —— Autotune</h3>
+<p><strong>目标</strong>：理解代码最上面的装饰器。
+<strong>位置</strong>：<code>@triton.autotune</code> (第 25-46 行)。</p>
+<p>你可能看到很多 <code>triton.Config</code>。
+*   <strong>问题</strong>：每次处理的块大小（<code>BM</code>, <code>BN</code>, <code>BK</code>）设为多少最快？是 $128 \times 128$ 还是 $64 \times 64$？
+*   <strong>答案</strong>：不知道，试一下才知道。
+*   <strong>Autotune</strong>：这个装饰器告诉 Triton：“当你第一次运行这个代码时，把列表里的这些配置都跑一遍，看哪个最快，以后就用那个最快的配置。”</p>
+<hr />
+<h3>总结：整个文件的故事线</h3>
+<ol>
+<li><strong>Python</strong> 收到矩阵 $A$ 和 $B$。</li>
+<li><strong>Python</strong> 决定把结果矩阵 $C$ 切成很多 $128 \times 128$（举例）的小方块。</li>
+<li><strong>GPU</strong> 启动很多小线程，每个线程认领一个小方块。</li>
+<li><strong>Triton Kernel</strong> (每个线程内部)：<ul>
+<li>算出 $A$ 和 $B$ 对应的起始位置。</li>
+<li>沿着 $K$ 维度，切片读取 $A$ 和 $B$，做乘法，累加。</li>
+<li>乘法算完后，顺手做个 ReLU，顺手加上 Bias。</li>
+<li>把最终结果写回显存。</li>
+</ul>
+</li>
+<li><strong>Python</strong> 拿到结果 $C$。</li>
+</ol>
+<p>希望这个 List 能帮你理清思路！你可以先只看 <code>matmul</code> 函数，再看 <code>matmul_kernel</code> 的循环部分，其他的细节（如 stride 计算）可以慢慢消化。</p>

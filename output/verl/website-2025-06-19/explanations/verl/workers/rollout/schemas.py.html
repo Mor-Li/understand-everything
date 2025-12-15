@@ -1,0 +1,110 @@
+<h1>verl/workers/rollout/schemas.py</h1>
+<p>这份代码确实比较硬核，因为它涉及到 <strong>大模型强化学习（RLHF）</strong> 中最核心的数据流转部分。</p>
+<p>简单来说，这个文件定义了一个 <strong>“超级数据包”</strong>，用来在训练过程中全程追踪一条对话的状态。你可以把它想象成餐厅里的 <strong>“点菜单”</strong>，从客人点菜（Prompt），到厨师做菜（模型生成），再到上菜（结果），最后到客人打分（Reward），所有的信息都记在这张单子上。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“学习任务清单 (To-Do List)”</strong>，我们一步步来通关。</p>
+<hr />
+<h3>🟢 Task 1：理解背景概念 (Context)</h3>
+<p><strong>目标</strong>：知道“Rollout”和“Schema”是干嘛的。</p>
+<ol>
+<li><strong>Rollout (采样/推演)</strong>：在强化学习中，我们需要让模型先“试着说几句话”，然后给这些话打分。这个“模型试着说话”的过程就叫 Rollout。</li>
+<li><strong>Schema (数据结构)</strong>：这个文件定义了“数据长什么样”。</li>
+<li><strong>核心逻辑</strong>：代码里的 <code>AsyncRolloutRequest</code> 类，就是那个“超级数据包”。它不仅仅存文本，还存了对应的 Token ID、掩码（Mask）以及奖励分数。</li>
+</ol>
+<hr />
+<h3>🟢 Task 2：看懂基础积木 (Basic Blocks)</h3>
+<p><strong>目标</strong>：理解代码开头定义的几个简单的小类。</p>
+<ul>
+<li><strong><code>FinishReasonTypeEnum</code> (枚举)</strong>：模型为什么停下了？<ul>
+<li><code>length</code>: 话太长，被截断了。</li>
+<li><code>stop</code>: 模型自己说完了（遇到了结束符）。</li>
+<li><code>tool_calls</code>: 模型想调用工具（比如想搜素引擎），所以暂停了。</li>
+</ul>
+</li>
+<li><strong><code>Message</code> (模型)</strong>：标准的对话格式。<ul>
+<li>包含 <code>role</code> (用户/助手), <code>content</code> (内容), <code>tool_calls</code> (工具调用信息)。</li>
+</ul>
+</li>
+<li><strong><code>AsyncRolloutRequestStateEnum</code> (状态)</strong>：这张“单子”现在走到哪一步了？<ul>
+<li><code>PENDING</code> (排队中) -&gt; <code>RUNNING</code> (生成中) -&gt; <code>COMPLETED</code> (搞定)。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🟢 Task 3：拆解核心对象 <code>AsyncRolloutRequest</code> (The Core)</h3>
+<p><strong>目标</strong>：理解这个超级大类里存了哪些关键数据。</p>
+<p>这个类 <code>AsyncRolloutRequest</code> 是一切的核心。请重点关注以下几个属性，它们是训练大模型的“燃料”：</p>
+<ol>
+<li><strong>ID类数据</strong>：<ul>
+<li><code>input_ids</code>: 所有的对话内容转成的数字列表（Token IDs）。</li>
+<li><code>prompt_ids</code> vs <code>response_ids</code>: 提问部分的 ID 和 回答部分的 ID。</li>
+</ul>
+</li>
+<li><strong>Mask类数据 (非常重要)</strong>：<ul>
+<li><code>attention_mask</code>: 告诉模型哪些字是真实的，哪些是填充的空白（Padding）。</li>
+<li><strong><code>loss_mask</code> (核心)</strong>：<strong>这是重点！</strong> 训练时，我们只关心模型回答得好不好，不关心用户提问（因为提问是固定的）。所以，提问部分的 <code>loss_mask</code> 是 0（不计算损失），回答部分是 1（计算损失）。</li>
+</ul>
+</li>
+<li><strong>其他</strong>：<ul>
+<li><code>reward_scores</code>: 最后给这段对话打的分数（用于奖励模型）。</li>
+<li><code>tools_...</code>: 如果涉及到工具调用，相关的参数存在这。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🟢 Task 4：理解初始化过程 <code>initialize_request</code></h3>
+<p><strong>目标</strong>：看懂数据包是怎么被创建出来的。</p>
+<p>当你把一个用户的提问（Prompt）丢进来时，这个函数会自动执行（<code>@model_validator</code>）：</p>
+<ol>
+<li><strong>应用模板 (Chat Template)</strong>：把 <code>[{"role": "user", "content": "你好"}]</code> 这种格式，变成模型能读懂的字符串（比如 <code>&lt;|user|&gt;你好&lt;|end|&gt;&lt;|assistant|&gt;</code>）。</li>
+<li><strong>Tokenization</strong>：把字符串变成数字 <code>[101, 234, 999...]</code>。</li>
+<li><strong>设置初始 Mask</strong>：<ul>
+<li>因为现在只有提问，还没有回答。</li>
+<li>所以 <code>loss_mask</code> 全是 <strong>0</strong>（目前还没东西需要模型负责）。</li>
+</ul>
+</li>
+<li><strong>埋点 (Generation Prompt)</strong>：它会特意记下 <code>&lt;|assistant|&gt;</code> 这种“提示符”的位置，告诉模型“该你说话了”。</li>
+</ol>
+<hr />
+<h3>🟢 Task 5：理解动态更新 (Dynamic Updates)</h3>
+<p><strong>目标</strong>：看懂对话过程中，数据包是怎么变长的。</p>
+<p>强化学习的对话往往是多轮的，或者是带工具调用的（Agent）。</p>
+<ul>
+<li><strong><code>_update_input_ids</code></strong>: 这是一个底层工具函数。每当有新内容加进来，它负责把新的 Token ID 拼接到尾部，并同步延长 mask 和 position_ids。</li>
+<li><strong><code>add_assistant_message</code></strong>: 模型生成了一句话。<ul>
+<li>把这句话拼接到 <code>input_ids</code> 后面。</li>
+<li><strong>关键点</strong>：把这段新内容的 <code>loss_mask</code> 设为 <strong>True (1)</strong>。意味着：这段话是模型说的，它要对这段话负责（计算梯度/学习）。</li>
+</ul>
+</li>
+<li><strong><code>add_tool_response_messages</code></strong>: 工具返回了结果（比如搜索到了天气）。<ul>
+<li>把工具结果拼接到 <code>input_ids</code> 后面。</li>
+<li><strong>关键点</strong>：工具结果的 <code>loss_mask</code> 通常设为 <strong>False (0)</strong>。因为工具结果是客观事实，不是模型生成的，不需要模型去“学习”如何生成天气数据。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🟢 Task 6：理解收尾工作 <code>finalize</code></h3>
+<p><strong>目标</strong>：看懂生成结束后，如何打包数据去训练。</p>
+<p>当对话彻底结束（模型说完了，或者达到最大长度），调用这个函数：</p>
+<ol>
+<li><strong>完整性检查</strong>：对比一下推理时的 Token 和训练时的 Token 是否一致，防止出 Bug。</li>
+<li><strong>切割 Prompt 和 Response</strong>：<ul>
+<li>把 <code>input_ids</code> 一刀两断。</li>
+<li>前半截是 <code>prompt_ids</code>（题面）。</li>
+<li>后半截是 <code>response_ids</code>（答案）。</li>
+<li>后续的 PPO 算法（强化学习算法）需要分开这两个部分来计算优势函数（Advantage）。</li>
+</ul>
+</li>
+<li><strong>截断 (Truncate)</strong>：<ul>
+<li>如果模型啰里啰嗦超出了 <code>max_model_len</code>（比如 32k token），这里会强制砍掉多余的部分，防止显存爆炸。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结 (Summary)</h3>
+<p><strong>这个文件的核心观点是：</strong></p>
+<p>在 LLM 的强化学习（RLHF）中，我们需要一个<strong>动态的、精确的</strong>容器（<code>AsyncRolloutRequest</code>）。</p>
+<ol>
+<li>它不仅仅存文本，而是存 <strong>Token IDs</strong> 和 <strong>Masks</strong>。</li>
+<li>它区分 <strong>“谁说的”</strong>：用户的提问和工具的返回不计算 Loss（Mask=0），只有模型生成的回复计算 Loss（Mask=1）。</li>
+<li>它支持 <strong>“接龙”</strong>：随着对话进行（模型回复 -&gt; 调用工具 -&gt; 工具返回 -&gt; 模型再回复），这个容器会不断往后追加数据，直到对话结束，打包送去计算奖励和更新参数。</li>
+</ol>

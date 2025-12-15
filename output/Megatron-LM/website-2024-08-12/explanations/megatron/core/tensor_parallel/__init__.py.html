@@ -1,0 +1,48 @@
+<h1>megatron/core/tensor_parallel/<strong>init</strong>.py</h1>
+<p>这段代码看起来很吓人，但其实它只是一个<strong>目录（Menu）</strong>。</p>
+<p>这个文件是 <code>megatron/core/tensor_parallel/__init__.py</code>。在 Python 中，<code>__init__.py</code> 的作用通常是把分散在不同子文件里的功能“汇聚”起来，方便外部一次性调用。</p>
+<p><strong>你可以把它想象成一个“造大模型（LLM）的工具箱清单”。</strong></p>
+<p>为了帮你理解这个工具箱里都有啥，我们不需要读代码，而是要理解<strong>“张量并行（Tensor Parallelism, TP）”</strong>都在干什么。</p>
+<p>我为你列了一个 <strong>“从零搭建张量并行系统” 的学习任务清单 (To-Do List)</strong>。跟着这个清单走，你就能看懂这个文件里的每一个模块是干嘛的了。</p>
+<hr />
+<h3>🚀 任务清单：理解 Megatron 张量并行 (Tensor Parallel)</h3>
+<h4>✅ 任务一：理解核心难题 —— “显卡装不下怎么办？”</h4>
+<p>假设你有一个巨大的矩阵乘法要做（大模型的本质就是无数个矩阵乘法），但是这个矩阵太大了，一张显卡（GPU）存不下。
+*   <strong>解决方案</strong>：把大矩阵切成小块，分给多张显卡一起算。
+*   <strong>对应代码模块</strong>：<code>layers.py</code>
+    *   <strong><code>ColumnParallelLinear</code> (列并行)</strong>：把大矩阵竖着切一刀，分给不同 GPU。
+    *   <strong><code>RowParallelLinear</code> (行并行)</strong>：把大矩阵横着切一刀，分给不同 GPU。
+    *   <strong><code>VocabParallelEmbedding</code></strong>：词表（Vocabulary）太大（比如几万个词），也切开，每张卡只存一部分词的向量。</p>
+<h4>✅ 任务二：理解通信 —— “切开了怎么拼回去？”</h4>
+<p>既然矩阵被切开了，每张显卡只算了一部分结果。如果下一层需要完整的输入，或者需要把结果加起来，显卡之间就必须“打电话”交换数据。
+*   <strong>对应代码模块</strong>：<code>mappings.py</code> (这是最重要的通信胶水)
+    *   <strong><code>copy_to_tensor_model_parallel_region</code></strong>：把一份数据复制给所有 GPU（大家起点一致）。
+    *   <strong><code>gather_from_tensor_model_parallel_region</code></strong>：大家各自拿着手里的一小块拼图，聚合成一张完整的大图。
+    *   <strong><code>reduce_from_tensor_model_parallel_region</code></strong>：大家算出各自的结果，然后<strong>相加</strong>（All-Reduce），得到最终总和。
+    *   <strong><code>scatter_to...</code></strong>：把完整的数据拆散，分发给不同的 GPU。</p>
+<h4>✅ 任务三：处理开头和结尾 —— “输入和输出怎么搞？”</h4>
+<p>模型训练不仅是中间的层，还有最开始的数据输入和最后的算分（Loss）。
+*   <strong>对应代码模块</strong>：<code>data.py</code> 和 <code>cross_entropy.py</code>
+    *   <strong><code>broadcast_data</code></strong>：训练开始时，确保所有 GPU 拿到的“任务指令”（比如配置信息）是一样的。
+    *   <strong><code>vocab_parallel_cross_entropy</code></strong>：算 Loss 的时候，因为词表是切开的（任务一里说的），所以计算交叉熵（Cross Entropy）也得配合着切片的方式来算，不能直接用 PyTorch 自带的。</p>
+<h4>✅ 任务四：保持同步 —— “随机数不能乱”</h4>
+<p>训练模型需要随机性（比如 Dropout 丢弃神经元，或者初始化参数）。但在并行训练中，有些随机数必须大家一样（比如参数初始化），有些必须大家不一样（比如 Dropout）。
+*   <strong>对应代码模块</strong>：<code>random.py</code>
+    *   <strong><code>checkpoint</code></strong>：为了省显存，中间结果不存，反向传播时重算一遍（显存换时间）。
+    *   <strong><code>get_cuda_rng_tracker</code> / <code>model_parallel_cuda_manual_seed</code></strong>：这是<strong>随机数生成器的控制器</strong>。它确保当你需要大家随机数一致时，它就一致；需要不同时，它就不同。否则模型训练会因为不同步而发散。</p>
+<h4>✅ 任务五：进阶优化 —— “序列并行 (Sequence Parallelism)”</h4>
+<p>这是 Megatron 后期引入的高级优化。不仅仅切分模型参数，连输入的句子长度（Sequence Length）也切分，进一步节省显存。
+*   <strong>对应代码模块</strong>：<code>mappings.py</code> 和 <code>utils.py</code>
+    *   <strong><code>scatter_to_sequence_parallel_region</code></strong>：把长句子切断分给不同 GPU。
+    *   <strong><code>reduce_scatter_to_sequence_parallel_region</code></strong>：一边做加法聚合，一边顺手把结果切分好（通信优化）。
+    *   <strong><code>gather_from_sequence_parallel_region_to_moe</code></strong>：这是给 MoE（混合专家模型）用的特供版通信。</p>
+<hr />
+<h3>📝 总结：这个文件到底在讲啥？</h3>
+<p>如果你现在回过头看这个文件，可以把它们归类为三句话：</p>
+<ol>
+<li><strong>Layers (<code>layers.py</code>)</strong>：给我<strong>切</strong>！(把模型切成行或列)。</li>
+<li><strong>Mappings (<code>mappings.py</code>)</strong>：给我<strong>传</strong>！(在 GPU 之间同步切片后的数据)。</li>
+<li><strong>Utils/Random/Cross_entropy</strong>：给我<strong>稳</strong>！(处理切片后的随机数、Loss 计算和辅助工具)。</li>
+</ol>
+<p><strong>你的学习路径建议：</strong>
+先别管 <code>mappings</code> 里的复杂通信细节。先去理解 <code>ColumnParallelLinear</code> 是怎么把一个矩阵 $A \times B$ 变成 $A \times B_1$ 和 $A \times B_2$ 的，这是 Megatron 的灵魂。</p>

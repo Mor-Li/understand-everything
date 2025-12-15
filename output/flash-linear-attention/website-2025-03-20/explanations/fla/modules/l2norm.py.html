@@ -1,0 +1,132 @@
+<h1>fla/modules/l2norm.py</h1>
+<p>没问题，这份代码是用 <strong>Triton</strong> 编写的 <strong>L2 Normalization (L2 归一化)</strong> 算子。Triton 是一种用于编写高效 GPU 代码的语言（比 CUDA 简单，但比 PyTorch 原生操作更底层）。</p>
+<p>这份代码的核心目的是：<strong>手动实现一个跑在 GPU 上的 L2 归一化层，包含前向传播（Forward）和反向传播（Backward），以追求比 PyTorch 原生实现更快的速度。</strong></p>
+<p>为了让你看懂，我把这个过程拆解成一个 <strong>“任务清单 (To-Do List)”</strong>，我们一项一项来勾选。</p>
+<hr />
+<h3>✅ Task 0: 搞懂我们在算什么 (数学原理)</h3>
+<p>在看代码前，先复习一下 L2 Norm 是啥。假设你有一行向量 $x$，我们要把它变成单位向量 $y$。</p>
+<ul>
+<li><strong>公式</strong>：$y = \frac{x}{ |x|_2 } = \frac{x}{\sqrt{\sum x^2 + \epsilon}}$</li>
+<li><strong>简单说</strong>：把向量里的每个数，除以这个向量的“长度”（平方和开根号）。</li>
+</ul>
+<hr />
+<h3>✅ Task 1: 编写前向传播内核 (Forward Kernel)</h3>
+<p><strong>目标</strong>：告诉 GPU 的每一个线程块（Block），怎么处理一行数据。</p>
+<p>对应代码：<code>def l2norm_fwd_kernel(...)</code></p>
+<ol>
+<li><strong>分配任务</strong>：<ul>
+<li><code>row = tl.program_id(0)</code>：Triton 自动并行。这里的意思是：当前这个程序实例负责处理第 <code>row</code> 行的数据。</li>
+</ul>
+</li>
+<li><strong>定位内存</strong>：<ul>
+<li><code>X += row * stride_x_row</code>：把指针移动到这一行的开头。</li>
+</ul>
+</li>
+<li><strong>加载数据</strong>：<ul>
+<li><code>cols = tl.arange(0, BLOCK_N)</code>：生成列的索引（0, 1, 2...）。</li>
+<li><code>x = tl.load(...)</code>：把这一行数据从显存读到寄存器。</li>
+</ul>
+</li>
+<li><strong>核心计算 (三步走)</strong>：<ul>
+<li><strong>第一步 (求平方和)</strong>：<code>var = tl.sum(xbar * xbar, axis=0)</code>。这就是 $\sum x^2$。</li>
+<li><strong>第二步 (求分母)</strong>：<code>rstd = 1 / tl.sqrt(var + eps)</code>。这里算的是“倒数标准差”（Reciprocal Standard Deviation），也就是 $\frac{1}{\sqrt{\sum x^2}}$。</li>
+<li><strong>第三步 (归一化)</strong>：<code>y = x * rstd</code>。也就是 $x \times \frac{1}{|x|}$。</li>
+</ul>
+</li>
+<li><strong>保存结果</strong>：<ul>
+<li><code>tl.store(Y + cols, y, mask=mask)</code>：把算好的 $y$ 写回显存。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 2: 编写反向传播内核 (Backward Kernel)</h3>
+<p><strong>目标</strong>：神经网络训练需要算梯度。已知输出的梯度 <code>DY</code>，求输入的梯度 <code>DX</code>。</p>
+<p>对应代码：<code>def l2norm_bwd_kernel(...)</code></p>
+<p><em>这是最难的一步，涉及到矩阵求导。</em></p>
+<ol>
+<li><strong>准备工作</strong>：<ul>
+<li>和前向传播一样，找到当前负责的行，加载输入 <code>X</code> 和上游传下来的梯度 <code>DY</code>。</li>
+</ul>
+</li>
+<li><strong>重算统计量</strong>：<ul>
+<li>注意代码里又算了一遍 <code>var</code> 和 <code>rstd</code>。为什么？为了省显存，前向传播时没存这些中间变量，反向传播时这就得重新算一遍（这叫 Recomputation/Rematerialization）。</li>
+</ul>
+</li>
+<li><strong>计算梯度 (数学公式)</strong>：<ul>
+<li>代码核心句：
+    <code>python
+    dx = dy * rstd - tl.sum(dy * x) * (1 / (var+eps)) * rstd * x</code></li>
+<li><strong>人话解释</strong>：L2 Norm 的导数比较复杂，它由两部分组成：<ol>
+<li>直接缩放部分：<code>dy * rstd</code></li>
+<li>相互影响部分（减去投影）：后面那一长串。</li>
+</ol>
+</li>
+<li>这一步算出了最终需要的 <code>dx</code>。</li>
+</ul>
+</li>
+<li><strong>保存结果</strong>：<ul>
+<li><code>tl.store(DX + cols, dx, mask=mask)</code>。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 3: 编写 Python 包装器 (Wrappers)</h3>
+<p><strong>目标</strong>：Triton 内核需要很细致的参数（比如指针步长、Block大小），普通用户不会传这些。我们需要写个 Python 函数来准备这些数据。</p>
+<p>对应代码：<code>def l2norm_fwd(...)</code> 和 <code>def l2norm_bwd(...)</code></p>
+<ol>
+<li><strong>处理形状 (Shape)</strong>：<ul>
+<li><code>x = x.reshape(-1, x.shape[-1])</code>：不管输入是几维（比如 Batch x Sequence x Hidden），统统压扁成 2D 矩阵（行数 x 特征维度）。因为内核是按行处理的。</li>
+</ul>
+</li>
+<li><strong>内存连续化</strong>：<ul>
+<li><code>if x.stride(-1) != 1: x = x.contiguous()</code>：Triton 处理连续内存最快，如果数据在内存里是乱的，先理顺。</li>
+</ul>
+</li>
+<li><strong>计算 Block Size</strong>：<ul>
+<li><code>BLOCK_N = triton.next_power_of_2(N)</code>：GPU 喜欢 2 的幂次方（比如 1024, 2048）。这里计算每行需要多少个线程来处理。</li>
+</ul>
+</li>
+<li><strong>启动内核</strong>：<ul>
+<li><code>l2norm_fwd_kernel[(M,)](...)</code>：像调用函数一样启动 GPU 内核。<code>(M,)</code> 表示启动 M 个线程块（每行一个）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 4: 接入 PyTorch 自动微分 (Autograd Function)</h3>
+<p><strong>目标</strong>：把上面写好的 Forward 和 Backward 包装成一个 PyTorch 能识别的“算子”，这样你用 <code>loss.backward()</code> 时它能自动调用。</p>
+<p>对应代码：<code>class L2NormFunction(torch.autograd.Function)</code></p>
+<ol>
+<li><strong>Forward 静态方法</strong>：<ul>
+<li>接收输入 <code>x</code>。</li>
+<li>调用 <code>l2norm_fwd</code> 算出 <code>y</code>。</li>
+<li><code>ctx.save_for_backward(x)</code>：<strong>关键</strong>！把输入 <code>x</code> 存起来，因为反向传播算梯度时需要用到原始输入。</li>
+<li>返回 <code>y</code>。</li>
+</ul>
+</li>
+<li><strong>Backward 静态方法</strong>：<ul>
+<li>接收梯度 <code>dy</code>。</li>
+<li><code>x, = ctx.saved_tensors</code>：把刚才存的 <code>x</code> 取出来。</li>
+<li>调用 <code>l2norm_bwd</code> 算出 <code>dx</code>。</li>
+<li>返回 <code>dx</code>。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 5: 提供用户接口 (User API)</h3>
+<p><strong>目标</strong>：给用户一个简单的函数名调用。</p>
+<p>对应代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">l2_norm</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+    <span class="k">return</span> <span class="n">L2NormFunction</span><span class="o">.</span><span class="n">apply</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p>用户只需要调用 <code>l2_norm(x)</code>，剩下的复杂过程（Triton 内核、显存管理、反向传播）全部自动完成。</p>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>这个文件的逻辑流是：</p>
+<ol>
+<li><strong>最底层</strong>：写了两个 <strong>Triton Kernel</strong>（一个算结果，一个算梯度），直接操作 GPU 指针，速度极快。</li>
+<li><strong>中间层</strong>：写了 <strong>Python Wrapper</strong>，负责整理数据格式，计算 GPU 线程块大小，发射核函数。</li>
+<li><strong>最上层</strong>：写了 <strong>Autograd Function</strong>，骗过 PyTorch，让 PyTorch 以为这是一个普通的层，从而无缝融入神经网络训练中。</li>
+</ol>
+<p><strong>为什么要写这个？</strong>
+通常是因为 PyTorch 自带的 <code>torch.nn.functional.normalize</code> 在处理某些特定维度或大模型训练时不够快，或者为了节省显存（这里用了 Recompute 技术，反向传播不存中间结果，而是重算），作者自己手搓了一个高性能版本。</p>

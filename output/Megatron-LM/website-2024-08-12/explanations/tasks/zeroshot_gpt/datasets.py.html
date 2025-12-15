@@ -1,0 +1,86 @@
+<h1>tasks/zeroshot_gpt/datasets.py</h1>
+<p>这份代码确实比较底层，涉及到了<strong>数据预处理</strong>、<strong>滑动窗口切分</strong>以及<strong>掩码（Mask）生成</strong>，如果对NLP（自然语言处理）的数据流不熟悉，确实很难懂。</p>
+<p>别担心，我们把它拆解成一个 <strong>“学习任务清单” (Todo List)</strong>。我们不一行行读代码，而是通过解决一个个具体的问题，来理解它的逻辑。</p>
+<p>这是为你准备的学习路径：</p>
+<h3>任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 0: 搞清楚这文件是干嘛的？（宏观视角）</strong></li>
+<li><strong>Task 1: 理解“总调度员” (<code>build_dataset</code>)</strong></li>
+<li><strong>Task 2: 搞定“长文本阅读理解” (<code>_LMDataset</code> / WikiText103)</strong> —— <em>这是最难懂的部分</em></li>
+<li><strong>Task 3: 搞定“猜最后一个词” (<code>_LambadaDataset</code>)</strong></li>
+<li><strong>Task 4: 理解数据是怎么喂给模型的 (<code>__getitem__</code>)</strong></li>
+</ol>
+<hr />
+<h3>详细讲解</h3>
+<h4>Task 0: 搞清楚这文件是干嘛的？</h4>
+<p><strong>目标：</strong> 这不是用来“训练”模型的，而是用来做 <strong>Zero-shot Evaluation（零样本评估）</strong> 的。
+<strong>通俗解释：</strong> 就像是给已经训练好的 AI 安排一场考试。
+*   <strong>LAMBADA 考试：</strong> 给一段话，让 AI 猜最后一个词是什么。
+*   <strong>WikiText103 考试：</strong> 给一篇长文章，看 AI 能不能通顺地读下来（计算困惑度 PPL）。</p>
+<p>这个文件的作用就是：<strong>把原始的文本文件，转换成 AI 考试能看懂的试卷格式。</strong></p>
+<hr />
+<h4>Task 1: 理解“总调度员” (<code>build_dataset</code>)</h4>
+<p><strong>代码位置：</strong> <code>def build_dataset(task):</code>
+<strong>观点：</strong> 这是一个简单的分流器（Factory Pattern）。</p>
+<ul>
+<li><strong>逻辑：</strong><ul>
+<li>如果你想考 <code>LAMBADA</code>，我就调用 <code>_build_lambada_dataset()</code>。</li>
+<li>如果你想考 <code>WIKITEXT103</code>，我就调用 <code>_build_wikitext103_dataset()</code>。</li>
+<li>其他的考试科目还没开发好，如果乱填就报错。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>Task 2: 搞定“长文本阅读理解” (<code>_LMDataset</code>)</h4>
+<p><strong>代码位置：</strong> <code>class _LMDataset</code> 和 <code>_build_wikitext103_dataset</code>
+<strong>难点：</strong> 这里的数学计算（滑动窗口）比较绕。</p>
+<p><strong>核心观点：</strong>
+模型一次只能读有限长度的内容（比如 <code>seq_len</code> = 1024 个字）。但是 WikiText 是一篇很长的文章，几百万字。怎么办？</p>
+<p><strong>Todo 步骤：</strong>
+1.  <strong>连成一条龙：</strong> 把所有文章首尾相连，变成一个超级长的 Token 列表 (<code>self.tokens</code>)。
+2.  <strong>切片（Sliding Window）：</strong> 我们要像切香肠一样，把它切成一段一段喂给模型。
+3.  <strong>重叠（Overlapping）：</strong>
+    *   为了评估更准确，切片之间通常会有重叠。
+    *   比如：第一段读 0-1024 字，第二段读 512-1536 字。
+    *   代码里的 <code>overalapping_eval</code> 就是控制滑动的步长。
+4.  <strong>计算切多少刀：</strong> <code>__init__</code> 里的数学公式就是在算：这么长的文章，按照这个步长切，一共能切出多少个样本 (<code>total_sequences</code>)。</p>
+<hr />
+<h4>Task 3: 搞定“猜最后一个词” (<code>_LambadaDataset</code>)</h4>
+<p><strong>代码位置：</strong> <code>class _LambadaDataset</code>
+<strong>观点：</strong> 这个任务很简单，就是“完形填空”。</p>
+<p><strong>Todo 步骤：</strong>
+1.  <strong>读取数据：</strong> 打开文件，每一行是一个 JSON。
+2.  <strong>拆分答案 (<code>get_tokens</code>)：</strong>
+    *   原文："The dog is chasing the cat"
+    *   代码逻辑：把最后一个词 "cat" 单独切出来作为<strong>答案 (Labels)</strong>，前面的 "The dog is chasing the" 作为<strong>题目 (Tokens)</strong>。
+    *   <code>strict</code> 参数决定了切分时要不要严格处理空格。
+3.  <strong>拼接：</strong> 在 <code>__getitem__</code> 里，它把题目和答案拼回去，变成一整句话给模型，但通过“掩码”告诉模型：前面的只是提示，你只需要预测最后这个词。</p>
+<hr />
+<h4>Task 4: 理解数据是怎么喂给模型的 (<code>__getitem__</code>)</h4>
+<p><strong>代码位置：</strong> 两个类的 <code>__getitem__</code> 方法
+<strong>观点：</strong> 这是最关键的一步。模型不仅需要<strong>文字（Text）</strong>，还需要<strong>掩码（Pad Mask）</strong>。</p>
+<p><strong>关键概念解释：</strong>
+*   <strong>Pad Mask (填充掩码)：</strong> 告诉模型“这一位要不要算分”。
+    *   <code>1</code> = 这位是考题，算分（计算 Loss）。
+    *   <code>0</code> = 这位是填充的废话，或者已经考过了，不算分。</p>
+<p><strong>场景 A：WikiText (<code>_LMDataset</code>) 的处理逻辑</strong>
+*   <strong>切数据：</strong> 根据索引 <code>idx</code>，从长文本里切出一段 <code>tokens</code>。
+*   <strong>填充 (Padding)：</strong> 如果这段文字不够长（比如最后一段只剩 50 个字，但模型要求输入 1024），就在后面补一堆占位符 (<code>pad_idx</code>)。
+*   <strong>设置 Mask：</strong>
+    *   如果是填充的空位，Mask 设为 0（不用算分）。
+    *   <strong>重叠处理（难点）：</strong> 如果这一段和上一段有重叠，重叠的部分在上一段已经算过分了，所以这一段开头重叠部分的 Mask 也要设为 0。</p>
+<p><strong>场景 B：LAMBADA (<code>_LambadaDataset</code>) 的处理逻辑</strong>
+*   <strong>拼接：</strong> [题目] + [答案]
+*   <strong>设置 Mask：</strong>
+    *   题目部分的 Mask 全部设为 <code>0</code> （因为题目是已知的，不需要模型预测）。
+    *   只有最后那几个代表“答案”的 Token，Mask 设为 <code>1</code>。
+    *   <strong>目的：</strong> 强迫模型只关注预测最后一个词准不准。</p>
+<h3>总结 (Summary)</h3>
+<p>把这个文件看作一个<strong>试卷印刷厂</strong>：</p>
+<ol>
+<li><strong><code>build_dataset</code></strong> 是厂长，决定印哪种卷子。</li>
+<li><strong><code>_LMDataset</code></strong> 负责印<strong>阅读理解卷子</strong>：把一整本书切成一页一页，还要处理页码重叠，告诉老师（模型）每一页哪些字要批改。</li>
+<li><strong><code>_LambadaDataset</code></strong> 负责印<strong>填空题卷子</strong>：把句子拆开，告诉老师（模型）前面是题干不用改，只批改最后一个空的填词对不对。</li>
+<li><strong><code>__getitem__</code></strong> 是流水线工人：把文字转成数字 ID，算出哪些地方要打分 (<code>pad_mask</code>)，打包送给模型。</li>
+</ol>
+<p>现在回头再看代码，关注 <code>pad_mask</code> 在两个类里不同的赋值方式，你应该就能看懂了。</p>

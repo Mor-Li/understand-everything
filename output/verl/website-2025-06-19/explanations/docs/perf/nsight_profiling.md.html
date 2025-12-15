@@ -1,0 +1,63 @@
+<h1>docs/perf/nsight_profiling.md</h1>
+<p>这篇文档主要讲的是：<strong>如何使用 NVIDIA Nsight Systems 这个工具来分析 <code>verl</code> 训练过程中的性能瓶颈。</strong></p>
+<p>简单来说，如果你觉得训练太慢，或者显卡利用率不高，就需要用这个功能来“体检”一下，看看时间都花哪儿了。</p>
+<p>为了让你更容易理解，我把它拆解成一个 <strong>“性能分析任务清单 (To-Do List)”</strong>，你只需要按顺序执行这几步即可。</p>
+<hr />
+<h3>📋 任务清单：一步步开启性能分析</h3>
+<h4>✅ 第一步：准备工作 (Prerequisites)</h4>
+<p><strong>目标</strong>：确保你的环境里有能用的分析工具。
+*   <strong>动作</strong>：检查你的 Docker 环境或系统里是否安装了 NVIDIA Nsight Systems。
+*   <strong>注意</strong>：文档提到版本很重要，最好参考 <code>docker/Dockerfile.vllm.sglang.megatron</code> 里使用的版本，否则可能跑不起来。</p>
+<h4>✅ 第二步：决定“什么时候”分析 (Global Control)</h4>
+<p><strong>目标</strong>：你不可能从头到尾一直录制（文件会巨大），你需要指定录制哪几步。
+*   <strong>修改文件</strong>：<code>ppo_trainer.yaml</code> (或者其他 trainer 配置文件)。
+*   <strong>设置参数</strong>：找到 <code>trainer</code> 部分。
+    *   设置 <strong><code>profile_steps</code></strong>：
+        *   比如写 <code>[1, 2, 5]</code>：意思是只在第1步、第2步、第5步训练时开启录制。
+        *   写 <code>null</code>：意思是<strong>关闭</strong>分析功能（平时不用时就设这个）。
+    *   <strong>Controller/Worker Options</strong>：通常保持默认即可。文档解释了 <code>worker_nsight_options</code> 里固定使用了 <code>cudaProfilerApi</code>，意思是“通过代码指令来控制开始和结束”，不要手动改它。</p>
+<h4>✅ 第三步：决定“谁”需要被分析 (Worker Profiling)</h4>
+<p><strong>目标</strong>：<code>verl</code> 有很多角色（Actor生成数据, Critic打分, Ref参考模型等），你需要决定监控哪些角色的 GPU。
+*   <strong>修改文件</strong>：同上，在配置文件的各个角色部分（如 <code>actor_rollout_ref</code>, <code>critic</code>）。
+*   <strong>设置参数 <code>profiler</code></strong>：
+    *   <strong><code>ranks</code></strong>: 指定具体哪几张卡（进程ID）。比如 <code>[0, 1]</code> 表示只分析第0号和第1号进程。
+    *   <strong><code>all_ranks</code></strong>:
+        *   <code>True</code>: 所有卡都分析（文件会很多，慎用）。
+        *   <code>False</code>: 只分析上面 <code>ranks</code> 指定的卡（推荐）。</p>
+<h4>✅ 第四步：决定“怎么”存数据 (Discrete Mode)</h4>
+<p><strong>目标</strong>：决定生成的数据文件是“大而全”还是“小而散”。
+*   <strong>设置参数 <code>discrete</code></strong>：
+    *   <strong><code>False</code> (推荐新手)</strong>：<strong>连续模式</strong>。在一个训练步骤（Step）内，所有操作都录制在<strong>同一个文件</strong>里。你会得到一个完整的 timeline，看这一步整体发生了什么。
+    *   <strong><code>True</code></strong>：<strong>离散模式</strong>。在一个训练步骤内，不同的动作（比如 Actor 生成、Critic 计算）会被切分成<strong>独立的小文件</strong>。适合极度深度的调试。</p>
+<h4>✅ 第五步：运行训练并获取“体检报告”</h4>
+<p><strong>目标</strong>：拿到 <code>.nsys-rep</code> 文件，并在电脑上打开分析。
+*   <strong>动作</strong>：启动你的训练任务。
+*   <strong>找文件</strong>：
+    *   去训练节点的这个目录找：<strong><code>/tmp/ray/session_latest/logs/nsight/</code></strong>。
+    *   这是 Ray 框架的默认日志目录，改不了，只能去那儿找。
+*   <strong>文件名格式</strong>：通常是 <code>worker_process_&lt;PID&gt;.&lt;step&gt;.nsys-rep</code>。
+*   <strong>查看</strong>：把文件下载到本地，用 NVIDIA Nsight Systems 桌面版软件打开。你可以看到 CUDA 核函数执行时间、显存操作、CPU/GPU 同步情况等。</p>
+<hr />
+<h3>💡 举个栗子 (配置总结)</h3>
+<p>如果你想<strong>只分析第 1、2、5 步</strong>，且<strong>只看 Actor 和 Critic 的前两张卡</strong>，且<strong>希望每个 Step 生成一个完整文件</strong>，配置应该长这样：</p>
+<div class="codehilite"><pre><span></span><code><span class="nt">trainer</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">profile_steps</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">1</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">2</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">5</span><span class="p p-Indicator">]</span><span class="w">  </span><span class="c1"># 👈 关键点1：指定分析哪几步</span>
+
+<span class="c1"># 角色1配置</span>
+<span class="nt">actor_rollout_ref</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">actor</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">profiler</span><span class="p">:</span>
+<span class="w">            </span><span class="nt">discrete</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">False</span><span class="w">   </span><span class="c1"># 👈 关键点3：False表示合并成一个文件</span>
+<span class="w">            </span><span class="nt">all_ranks</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">False</span><span class="w">  </span><span class="c1"># 👈 关键点2：不分析所有卡</span>
+<span class="w">            </span><span class="nt">ranks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">1</span><span class="p p-Indicator">]</span><span class="w">     </span><span class="c1"># 👈 关键点2：只看前两张</span>
+
+<span class="c1"># 角色2配置</span>
+<span class="nt">critic</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">profiler</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">discrete</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">False</span>
+<span class="w">        </span><span class="nt">all_ranks</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">False</span>
+<span class="w">        </span><span class="nt">ranks</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">0</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">1</span><span class="p p-Indicator">]</span>
+</code></pre></div>
+
+<h3>总结</h3>
+<p>这篇文档就是教你怎么改 <code>yaml</code> 配置文件来开启“录像”功能，以便你找出代码哪里跑得慢。核心就改三个地方：<strong>哪几步(steps)</strong>、<strong>哪几张卡(ranks)</strong>、<strong>怎么存(discrete)</strong>。</p>

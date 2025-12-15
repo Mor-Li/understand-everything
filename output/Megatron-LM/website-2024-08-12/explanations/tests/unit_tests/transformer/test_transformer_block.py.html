@@ -1,0 +1,111 @@
+<h1>tests/unit_tests/transformer/test_transformer_block.py</h1>
+<p>这份代码确实比较硬核，它是 <strong>NVIDIA Megatron-LM</strong> 项目的一部分。Megatron-LM 是目前训练超大规模 AI 模型（比如 GPT-3, GPT-4 级别）最主流的基础库之一。</p>
+<p>这份文件的本质是 <strong>单元测试（Unit Test）</strong>。它的目的不是“训练一个模型”，而是“检查模型的一个零件（TransformerBlock）是否是坏的”。</p>
+<p>为了让你看懂，我制定了一个 <strong>6步走的“学习任务清单” (Todo List)</strong>。我们把这个文件拆解开，就像拆解一个乐高积木的质检流程一样。</p>
+<hr />
+<h3>📋 学习任务清单 (Task To-Do List)</h3>
+<ol>
+<li><strong>Task 01: 搞清楚“我们在测什么？” (环境搭建)</strong></li>
+<li><strong>Task 02: 检查“积木”搭得对不对？ (构造函数测试)</strong></li>
+<li><strong>Task 03: 跑通“普通模式” (基础前向传播)</strong></li>
+<li><strong>Task 04: 跑通“省显存模式 A” (全量重计算)</strong></li>
+<li><strong>Task 05: 跑通“省显存模式 B” (选择性重计算)</strong></li>
+<li><strong>Task 06: 总结核心观点</strong></li>
+</ol>
+<hr />
+<h3>🟢 Task 01: 搞清楚“我们在测什么？” (环境搭建)</h3>
+<p><strong>对应代码：</strong> <code>setup_method</code> 和 <code>teardown_method</code></p>
+<ul>
+<li><strong>这是啥？</strong>
+    这是测试前的准备工作（Setup）和测试后的打扫工作（Teardown）。</li>
+<li><strong>代码在干嘛？</strong><ul>
+<li><code>Utils.initialize_model_parallel(1,1)</code>: 假装启动了一个并行训练环境（虽然这里设为1，意味着单卡，但为了兼容 Megatron 的逻辑）。</li>
+<li><code>TransformerConfig(...)</code>: 定义了这个“零件”的规格。<ul>
+<li><code>num_layers=2</code>: 这个模块里有2层 Transformer 层。</li>
+<li><code>hidden_size=12</code>: 神经元隐层大小是 12（为了测试设得很小，真实模型通常是几千）。</li>
+</ul>
+</li>
+<li><code>TransformerBlock(...)</code>: <strong>主角登场</strong>。根据上面的规格，实例化了一个 <code>TransformerBlock</code> 对象。</li>
+</ul>
+</li>
+<li><strong>观点：</strong>
+    在测试任何功能前，必须先建立一个标准的、可控的实验环境。</li>
+</ul>
+<h3>🟢 Task 02: 检查“积木”搭得对不对？ (构造函数测试)</h3>
+<p><strong>对应代码：</strong> <code>test_constructor</code></p>
+<ul>
+<li><strong>这是啥？</strong>
+    这是在检查：我下单买了个 2 层的楼房，你交房的时候是不是真的是 2 层？</li>
+<li><strong>代码在干嘛？</strong><ul>
+<li><code>assert isinstance(...)</code>: 确认造出来的对象确实是 TransformerBlock 类型。</li>
+<li><code>num_weights == 3792</code>: 数一下里面的参数（权重）总数。如果代码改动导致参数变多了或变少了，这里会报错，提醒开发者出问题了。</li>
+<li><code>assert len(...layers) == 2</code>: 确认里面确实包含了 2 个 Layer。</li>
+<li><code>assert layer_0.layer_number == 1</code>: 确认第0层的编号是1（这是为了多卡训练时的层数对齐）。</li>
+</ul>
+</li>
+<li><strong>观点：</strong>
+    在让机器跑起来之前，先静态检查结构参数是否符合预期。</li>
+</ul>
+<h3>🟢 Task 03: 跑通“普通模式” (基础前向传播)</h3>
+<p><strong>对应代码：</strong> <code>test_gpu_forward</code></p>
+<ul>
+<li><strong>这是啥？</strong>
+    这是最核心的测试。把数据扔进去，看能不能吐出结果，且不报错。</li>
+<li><strong>代码在干嘛？</strong><ul>
+<li><strong>造假数据</strong>：<ul>
+<li><code>hidden_states</code>: 输入数据。形状是 <code>[32, 2, 12]</code> (序列长度32，Batch大小2，维度12)。</li>
+<li><code>attention_mask</code>: 注意力掩码，告诉模型关注哪些词。</li>
+</ul>
+</li>
+<li><strong>放入 GPU</strong>：<code>.cuda()</code> 把模型和数据都搬到显卡上。</li>
+<li><strong>运行</strong>：<code>parallel_transformer_block(...)</code> 这就是执行了一次“前向传播”（推理）。</li>
+<li><strong>检查结果</strong>：<code>assert hidden_states.shape...</code> 检查输出的数据形状是不是和输入一样。Transformer 的特点通常是输入输出形状保持不变。</li>
+</ul>
+</li>
+<li><strong>观点：</strong>
+    验证模型在 GPU 上的基础数据通路是畅通的。</li>
+</ul>
+<h3>🟢 Task 04: 跑通“省显存模式 A” (全量重计算)</h3>
+<p><strong>对应代码：</strong> <code>test_gpu_forward_full_checkpoint</code></p>
+<ul>
+<li><strong>这是啥？</strong>
+    大模型训练非常吃显存。有一种技术叫 <strong>Activation Checkpointing (重计算)</strong>。<ul>
+<li><em>原理：</em> 为了省显存，中间结果我不存了，反向传播需要的时候我再算一遍。虽然慢点，但能塞进更大的模型。</li>
+<li>这里的 <code>full</code> 意味着“最极致的省显存模式”。</li>
+</ul>
+</li>
+<li><strong>代码在干嘛？</strong><ul>
+<li><code>config.recompute_granularity = 'full'</code>: 打开全量重计算开关。</li>
+<li><code>TransformerBlock(...)</code>: 带着这个省显存的配置，重新造一个 Block。</li>
+<li><strong>运行</strong>：再次扔进假数据跑一遍。</li>
+</ul>
+</li>
+<li><strong>观点：</strong>
+    验证当你开启“用时间换空间”的优化策略时，模型依然能正常工作，不会崩。</li>
+</ul>
+<h3>🟢 Task 05: 跑通“省显存模式 B” (选择性重计算)</h3>
+<p><strong>对应代码：</strong> <code>test_gpu_forward_selective_checkpoint</code></p>
+<ul>
+<li><strong>这是啥？</strong>
+    这是另一种折中的省显存技术。<ul>
+<li><em>原理：</em> <code>full</code> 模式太慢了。<code>selective</code> (选择性) 模式是只重计算那些特别占显存的操作（比如 Attention 里的矩阵乘法），其他保留。性价比更高。</li>
+</ul>
+</li>
+<li><strong>代码在干嘛？</strong><ul>
+<li><code>config.recompute_granularity = 'selective'</code>: 打开选择性重计算开关。</li>
+<li><code>assert ...checkpoint_core_attention</code>: 确认核心注意力部分被标记为需要 Checkpoint。</li>
+<li><strong>运行</strong>：再次扔进假数据跑一遍。</li>
+</ul>
+</li>
+<li><strong>观点：</strong>
+    验证 Megatron 里的高级显存优化功能（Selective Checkpointing）是可用的。</li>
+</ul>
+<hr />
+<h3>🟢 Task 06: 总结核心观点</h3>
+<p>读完这个文件，我们可以得出以下结论：</p>
+<ol>
+<li><strong>TransformerBlock 是一个容器</strong>：它把多个 <code>TransformerLayer</code> 包装在一起，并且支持配置不同的层数和隐藏层大小。</li>
+<li><strong>输入输出守恒</strong>：无论内部怎么折腾，TransformerBlock 的输入形状 <code>[Seq, Batch, Hidden]</code> 和输出形状应该是一致的。</li>
+<li><strong>支持多种优化策略</strong>：这个模块不仅能普通运行，还内置了两种显存优化策略（Full 和 Selective Checkpointing），测试保证了这些开关打开后，代码逻辑依然是通的。</li>
+</ol>
+<p><strong>简单说：这个文件就是为了证明 NVIDIA 的这个 Transformer 模块，在普通跑、省显存跑、极度省显存跑这三种情况下，都能正常干活，不出 Bug。</strong></p>

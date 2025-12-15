@@ -1,0 +1,119 @@
+<h1>fla/ops/delta_rule/chunk.py</h1>
+<p>这份代码确实非常硬核，因为它涉及到<strong>线性注意力机制（Linear Attention）</strong>的高效实现，特别是针对<strong>Delta Rule</strong>（一种类似梯度下降的记忆更新规则）的<strong>分块（Chunkwise）并行加速</strong>。</p>
+<p>简单来说，这个文件的目的是：<strong>让模型在处理长序列时，既能像RNN一样节省显存（推理快），又能像Transformer一样并行训练（训练快）。</strong></p>
+<p>为了让你听懂，我把这个过程想象成<strong>“整理一本巨大的流水账日记”</strong>。</p>
+<hr />
+<h3>核心概念：什么是 Delta Rule？</h3>
+<p>普通的线性注意力是“把新知识直接加到脑子里”。
+<strong>Delta Rule</strong> 是“<strong>只把新知识和旧知识的差异（Delta）加到脑子里</strong>”。这有点像我们在做优化时的梯度下降，只不过是在更新“记忆状态”。</p>
+<hr />
+<h3>Task List: 你的执行清单</h3>
+<p>如果把运行这段代码看作一个项目，以下是按顺序执行的 <strong>Todo List</strong>：</p>
+<ol>
+<li><strong>[准备工作] 数据清洗与分块</strong><ul>
+<li>把输入的长序列切成一小块一小块（Chunking），比如每块长度 64。</li>
+<li>对数据做标准化（L2 Norm），防止数值爆炸。</li>
+</ul>
+</li>
+<li><strong>[块内预处理] 压缩更新信息 (WY Representation)</strong><ul>
+<li><strong>核心难点</strong>：在一个小块内部，本来是串行的（第1步影响第2步...）。我们需要用数学技巧把这些串行操作转化成矩阵乘法形式（即 $W$ 和 $u$ 矩阵）。</li>
+<li>目的：为了能在 GPU 上并行计算块内的变化。</li>
+</ul>
+</li>
+<li><strong>[块间传递] 更新记忆状态 (State Passing)</strong><ul>
+<li>计算这一块的结尾会产生什么样的“记忆”（State $h$）。</li>
+<li>把这个记忆传递给下一块作为初始状态。</li>
+</ul>
+</li>
+<li><strong>[最终计算] 生成输出 (Output Generation)</strong><ul>
+<li>结合当前的查询（Query）、当前的键值（Key/Value）以及刚才算出来的记忆（State），计算最终的输出 $O$。</li>
+</ul>
+</li>
+<li><strong>[反向传播] 算梯度 (Backward Pass)</strong><ul>
+<li>如果是在训练，还需要倒着走一遍，算出各个参数的梯度。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>逐步代码解读（对应上面的 List）</h3>
+<p>现在我们对照代码内容，一步步看它是怎么实现的。</p>
+<h4>1. 入口函数：<code>chunk_delta_rule</code></h4>
+<p>这是给用户调用的最外层函数。
+*   <strong>功能</strong>：检查数据类型，处理变长序列（<code>cu_seqlens</code>），并调用核心的 <code>ChunkDeltaRuleFunction</code>。
+*   <strong>Todo 对应</strong>：[准备工作]。它确保输入是合法的 BFloat16 格式，并处理 Batch 维度。</p>
+<h4>2. 核心前向传播：<code>chunk_delta_rule_fwd</code></h4>
+<p>这是最关键的逻辑部分，位于 <code>ChunkDeltaRuleFunction.forward</code> 内部。</p>
+<p><strong>Step 1: 分块与索引准备</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">T</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="k">if</span> <span class="n">head_first</span> <span class="k">else</span> <span class="n">q</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+<span class="n">BT</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">chunk_size</span><span class="p">,</span> <span class="nb">max</span><span class="p">(</span><span class="n">triton</span><span class="o">.</span><span class="n">next_power_of_2</span><span class="p">(</span><span class="n">T</span><span class="p">),</span> <span class="mi">16</span><span class="p">))</span>
+<span class="c1"># ... indices = prepare_chunk_indices(...)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：这里计算了块的大小 <code>BT</code>（通常是 64），并准备了索引。就像把一本 1000 页的书分成 16 个章节，每个章节单独处理。</li>
+</ul>
+<p><strong>Step 2: 块内预处理 (WY Representation)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">w</span><span class="p">,</span> <span class="n">u</span><span class="p">,</span> <span class="n">A</span> <span class="o">=</span> <span class="n">fwd_prepare_wy_repr</span><span class="p">(</span>
+    <span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="o">=</span><span class="n">v</span><span class="p">,</span> <span class="n">beta</span><span class="o">=</span><span class="n">beta</span><span class="p">,</span> <span class="o">...</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>对应 Todo</strong>：[块内预处理]。</li>
+<li><strong>通俗解释</strong>：这是最魔法的一步。<ul>
+<li>在 Delta Rule 里，记忆更新公式是 $h_t = h_{t-1} + \beta (v_t - k_t h_{t-1}) k_t^T$。</li>
+<li>这一步相互依赖，很难并行。</li>
+<li><code>fwd_prepare_wy_repr</code> 这个函数把这一连串更新转化成了两个矩阵 $W$ 和 $u$。有了它们，我们就不需要用 <code>for</code> 循环一步步算，而是可以用矩阵乘法直接算出这一块对记忆的总影响。</li>
+<li><code>beta</code> 在这里控制“更新率”，即我们要保留多少新信息，遗忘多少旧信息。</li>
+</ul>
+</li>
+</ul>
+<p><strong>Step 3: 块间状态传递</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">h</span><span class="p">,</span> <span class="n">v_new</span><span class="p">,</span> <span class="n">final_state</span> <span class="o">=</span> <span class="n">chunk_gated_delta_rule_fwd_h</span><span class="p">(</span>
+    <span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span> <span class="n">w</span><span class="o">=</span><span class="n">w</span><span class="p">,</span> <span class="n">u</span><span class="o">=</span><span class="n">u</span><span class="p">,</span> <span class="o">...</span> <span class="n">initial_state</span><span class="o">=</span><span class="n">initial_state</span> <span class="o">...</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>对应 Todo</strong>：[块间传递]。</li>
+<li><strong>通俗解释</strong>：<ul>
+<li>利用上一步算好的 $W$ 和 $u$，快速算出每一个 Chunk 结束时的记忆状态 $h$。</li>
+<li>这个 $h$ 会被传给下一个 Chunk。</li>
+<li>这就好比：我看完了第一章，脑子里有个概念（State），带着这个概念去看第二章。</li>
+</ul>
+</li>
+</ul>
+<p><strong>Step 4: 计算最终输出</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">o</span> <span class="o">=</span> <span class="n">chunk_fwd_o</span><span class="p">(</span>
+    <span class="n">q</span><span class="o">=</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="o">=</span><span class="n">v_new</span><span class="p">,</span> <span class="n">h</span><span class="o">=</span><span class="n">h</span><span class="p">,</span> <span class="o">...</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>对应 Todo</strong>：[最终计算]。</li>
+<li><strong>通俗解释</strong>：<ul>
+<li>现在我们有了每一时刻的 Query ($q$)，Key ($k$)，以及刚才算出来的当前时刻的记忆 ($h$)。</li>
+<li>输出 $o \approx q \cdot h$（简化版）。</li>
+<li>这一步把所有信息整合成模型最终吐出来的向量。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 反向传播：<code>chunk_delta_rule_bwd</code></h4>
+<ul>
+<li><strong>对应 Todo</strong>：[反向传播]。</li>
+<li><strong>解释</strong>：这是为了训练用的。它接收输出的梯度 <code>do</code>，然后倒着推算出 <code>dq</code>, <code>dk</code>, <code>dv</code>, <code>dbeta</code>。</li>
+<li>代码里有很多 <code>recompute</code>（重计算），这是为了节省显存，宁愿多算一遍前向过程也不把中间巨大的矩阵存下来。</li>
+</ul>
+<h3>总结文中的核心观点</h3>
+<p>这段代码实际上是在表达一个工程上的观点：</p>
+<ol>
+<li><strong>Delta Rule 很好，但很难算</strong>：因为它每一步都依赖上一步（强递归），GPU 不喜欢这种串行计算。</li>
+<li><strong>数学变换救命 (WY Repr)</strong>：通过数学推导，我们可以把这种串行的递归，在局部（Chunk）内转化为并行的矩阵运算。</li>
+<li><strong>混合策略</strong>：<ul>
+<li><strong>Chunk 内部</strong>：用并行计算（空间换时间，利用 WY 矩阵）。</li>
+<li><strong>Chunk 之间</strong>：用串行递归（传递 Hidden State）。</li>
+<li><strong>结果</strong>：既享受了 RNN 的线性复杂度（处理长文不卡），又享受了 Transformer 的并行训练速度。</li>
+</ul>
+</li>
+</ol>
+<p><strong>简单一句话：</strong> 这是一个利用<strong>分块并行</strong>和<strong>矩阵分解技巧</strong>，极速实现<strong>Delta Rule 线性注意力</strong>的加速器。</p>

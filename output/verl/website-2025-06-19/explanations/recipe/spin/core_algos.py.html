@@ -1,0 +1,72 @@
+<h1>recipe/spin/core_algos.py</h1>
+<p>这份代码文件 <code>core_algos.py</code> 其实是一个<strong>大模型训练工具箱</strong>，专门用于<strong>Online DPO</strong>（在线直接偏好优化）或者 <strong>SPIN</strong>（Self-Play Fine-Tuning，自我博弈微调）这类算法。</p>
+<p>简单来说，它的核心任务是：<strong>让模型自己生成答案，自己（或通过奖励模型）评判哪个好，然后通过对比学习来优化自己。</strong></p>
+<p>为了让你听懂，我把这个文件的功能拆解成一个<strong>“教学生（模型）做题的 4 步 To-Do List”</strong>。</p>
+<hr />
+<h3>📋 训练任务 To-Do List</h3>
+<h4>任务 1：检查学生对自己答案的“确信度”</h4>
+<ul>
+<li><strong>对应代码：</strong> <code>get_batch_logps</code></li>
+<li><strong>场景：</strong> 模型生成了一句话，比如“巴黎是法国的首都”。</li>
+<li><strong>通俗解释：</strong><ul>
+<li>我们需要知道模型生成这句话时，每个字的概率是多少（Log Probability）。</li>
+<li>如果概率很高，说明模型很确信；如果概率很低，说明模型也是瞎蒙的。</li>
+<li><strong>代码做了啥：</strong> 输入模型的输出（logits）和答案（labels），算出一个数值，代表模型对这句话的“信心分数”。它还会聪明地忽略掉那些填充字符（padding，即 <code>-100</code> 的部分）。</li>
+</ul>
+</li>
+</ul>
+<h4>任务 2：评判哪一个答案是“赢家”</h4>
+<ul>
+<li><strong>对应代码：</strong> <code>compute_onlinedpo_pref</code></li>
+<li><strong>场景：</strong> 针对同一个问题，模型生成了两个回答（Response A 和 Response B）。我们需要决定谁好谁坏。</li>
+<li><strong>通俗解释：</strong><ul>
+<li>这就像一场擂台赛。我们给每个回答打分（<code>token_level_rewards</code>）。</li>
+<li><strong>代码做了啥：</strong><ol>
+<li>把两个回答的分数加总。</li>
+<li>比较分数：如果 A 分高，A 就是“赢家”（Chosen），B 是“输家”（Rejected）。</li>
+<li>生成一个“赢家名单”（Mask），告诉后面的程序：“第1组里A赢了，第2组里B赢了...”。</li>
+</ol>
+</li>
+<li><em>注意：</em> 这个函数处理的是成对的数据（Pairwise），所以它要求输入必须是偶数行。</li>
+</ul>
+</li>
+</ul>
+<h4>任务 3：根据输赢，惩罚或奖励学生（计算 Loss）</h4>
+<ul>
+<li><strong>对应代码：</strong> <code>compute_online_dpo_loss</code></li>
+<li><strong>场景：</strong> 现在我们知道哪个答案好了，我们需要调整模型的大脑参数。</li>
+<li><strong>通俗解释：</strong><ul>
+<li>这是 DPO（Direct Preference Optimization）的核心公式。</li>
+<li><strong>目标：</strong> 让模型以后生成“赢家”答案的概率变大，生成“输家”答案的概率变小。</li>
+<li><strong>代码做了啥：</strong><ol>
+<li>计算 <code>logits</code>：比较模型对“赢家”和“输家”的信心差值。</li>
+<li>引入 <code>reference_model</code>（参考模型）：防止模型为了讨好打分器而彻底乱说，它不能偏离原本的基础模型太远。</li>
+<li>计算 <code>loss</code>：如果模型给“输家”的信心比“赢家”还高，Loss 就会很大（狠狠惩罚）；反之 Loss 就小。</li>
+<li>支持不同的惩罚风格：<code>sigmoid</code>（标准DPO）或 <code>ipo</code>（另一种变体）。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<h4>任务 4：控制教学的“严厉程度”防止学歪（KL 控制）</h4>
+<ul>
+<li><strong>对应代码：</strong> <code>AdaptiveKLController</code> 和 <code>FixedKLController</code></li>
+<li><strong>场景：</strong> 在强化学习中，如果模型为了拿高分变化太快，容易“走火入魔”（比如输出乱码但碰巧得分高）。我们需要限制它变化的步子。</li>
+<li><strong>通俗解释：</strong><ul>
+<li>这就是一个“缰绳”。</li>
+<li><strong>FixedKLController（固定缰绳）：</strong> 无论怎样，都保持一个固定的约束力度。</li>
+<li><strong>AdaptiveKLController（自适应缰绳）：</strong> 比较智能。如果模型现在的差异（KL散度）和目标差异比起来太小了，说明步子太小，就松一点缰绳；如果差异太大了，说明步子太大，就勒紧缰绳。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这代码是怎么串起来工作的？</h3>
+<p>想象一个循环流程，这个文件提供了流程里的<strong>核心零件</strong>：</p>
+<ol>
+<li><strong>模型做题</strong>：模型针对问题生成两个答案。</li>
+<li><strong>算信心（Task 1）</strong>：用 <code>get_batch_logps</code> 算出模型对这俩答案的信心。</li>
+<li><strong>定胜负（Task 2）</strong>：用 <code>compute_onlinedpo_pref</code> 结合奖励分，算出哪个答案是赢家。</li>
+<li><strong>算惩罚（Task 3）</strong>：用 <code>compute_online_dpo_loss</code> 计算损失函数，告诉模型：“你要多学赢家，少学输家”。</li>
+<li><strong>调力度（Task 4）</strong>：用 <code>KLController</code> 确保模型在学习过程中不要飞得太远，保持稳定。</li>
+</ol>
+<p>这就是这个文件的全部含义：<strong>它是大模型自我进化训练中的“裁判”和“教导主任”。</strong></p>

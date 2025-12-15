@@ -1,0 +1,105 @@
+<h1>megatron/core/tensor_parallel/layers.py</h1>
+<p>这份代码确实非常硬核，它是 <strong>Megatron-LM</strong>（目前最主流的大模型训练框架）的核心组件。简单来说，这个文件定义了<strong>如何把一个巨大的神经网络层（Linear Layer）切成小块，放在不同的 GPU 上并行计算</strong>。</p>
+<p>如果没有分布式训练背景，看这个就像看天书。为了让你读懂，我制定了一个 <strong>“学习任务清单 (Todo List)”</strong>，我们将代码拆解成 5 个循序渐进的任务，带你一步步攻克它。</p>
+<hr />
+<h3>📝 任务清单：一步步读懂 Tensor Parallel (张量并行)</h3>
+<h4>✅ Task 1: 理解核心概念 —— 为什么要切？怎么切？</h4>
+<p>在看代码前，你得先懂这里的数学原理。大模型本质上就是无数个巨大的矩阵乘法 $Y = X \times W$。
+当 $W$（权重矩阵）太大，显存放不下时，我们需要把它切开。</p>
+<ul>
+<li><strong>列并行 (Column Parallel):</strong> 把矩阵 $W$ 竖着切。<ul>
+<li>每个 GPU 算出一部分结果 $Y_{part}$。</li>
+<li>最后把结果拼起来。</li>
+</ul>
+</li>
+<li><strong>行并行 (Row Parallel):</strong> 把矩阵 $W$ 横着切。<ul>
+<li>为了配合计算，输入 $X$ 也得切。</li>
+<li>每个 GPU 算出部分结果，最后必须把所有 GPU 的结果<strong>相加 (All-Reduce)</strong> 才能得到最终的 $Y$。</li>
+</ul>
+</li>
+</ul>
+<p><strong>对应代码：</strong>
+*   <code>ColumnParallelLinear</code> 类
+*   <code>RowParallelLinear</code> 类</p>
+<hr />
+<h4>✅ Task 2: 阅读基础组件 —— 怎么初始化切分后的权重？</h4>
+<p>既然要切分，初始化参数时就不能像普通 PyTorch 那样直接生成大矩阵，否则内存会爆。</p>
+<p><strong>你需要关注的函数：</strong>
+1.  <strong><code>_initialize_affine_weight_gpu</code></strong>:
+    *   <strong>功能</strong>：在 GPU 上初始化权重。
+    *   <strong>核心逻辑</strong>：设置随机数种子 (Seed)。为了保证模型一致性，有些部分所有 GPU 必须生成一样的随机数，而有些部分（切分后的权重）每个 GPU 必须生成不一样的。这里用 <code>get_cuda_rng_tracker</code> 来控制随机性。</p>
+<ol>
+<li><strong><code>_initialize_affine_weight_cpu</code></strong>:<ul>
+<li><strong>功能</strong>：在 CPU 上生成一个完整的“主权重”，然后根据当前 GPU 的编号（rank），只切下来属于自己的那一块 (<code>weight_list[rank]</code>) 拷贝到 GPU 上。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 3: 攻克核心难点 —— 自定义的前向与反向传播</h4>
+<p>这是文件中最难懂的部分。为什么不直接用 <code>torch.nn.Linear</code>？因为普通的 Linear 不知道怎么处理多卡之间的通信（同步数据）。</p>
+<p><strong>你需要关注的类：</strong>
+<strong><code>LinearWithGradAccumulationAndAsyncCommunication</code></strong> (名字超长，意思是：带梯度累加和异步通信的线性层)</p>
+<ul>
+<li><strong>它的作用</strong>：这是一个自定义的 <code>torch.autograd.Function</code>。它手动定义了 <code>forward</code>（前向）和 <code>backward</code>（反向）。</li>
+<li><strong>Forward (前向)</strong>:<ul>
+<li>计算 $X \times W$。</li>
+<li><strong>关键点</strong>：如果开启了 <code>sequence_parallel</code>（序列并行），它会先把分散在各卡上的输入 $X$ 收集起来 (<code>all_gather</code>) 变成完整的 $X$，再做乘法。</li>
+</ul>
+</li>
+<li><strong>Backward (反向)</strong>:<ul>
+<li>计算梯度的同时，负责 GPU 之间的通信。</li>
+<li><strong>异步通信 (Async Communication)</strong>：代码里有很多 <code>async_op=True</code>。这是为了<strong>速度</strong>。它试图一边算梯度（计算密集），一边在 GPU 之间传输数据（IO 密集），把时间重叠起来，掩盖通信延迟。</li>
+<li><strong>All-Reduce</strong>: 这里的 <code>torch.distributed.all_reduce</code> 就是在做“行并行”最后的求和操作，或者同步梯度。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 4: 组装层级 —— 列并行与行并行层</h4>
+<p>现在我们看这两个最常用的类，它们是 Transformer 结构（如 MLP 和 Attention）的积木。</p>
+<p><strong>1. <code>ColumnParallelLinear</code> (列并行层)</strong>
+*   <strong>场景</strong>：通常用于 MLP 的第一层（放大维度）或 Attention 的 QKV 投影。
+*   <strong>初始化 (<code>__init__</code>)</strong>:
+    *   <code>output_size_per_partition = divide(output_size, world_size)</code>：看到没？它把输出维度除以了 GPU 数量，说明每张卡只存一部分权重。
+*   <strong>前向 (<code>forward</code>)</strong>:
+    *   <code>copy_to_tensor_model_parallel_region(input_)</code>：把输入复制一份给所有卡（保证大家输入一样）。
+    *   调用 <code>linear_with_...</code> 做乘法。
+    *   <code>gather_from_tensor_model_parallel_region</code>：如果需要，把各卡算出的半截结果拼成完整结果。</p>
+<p><strong>2. <code>RowParallelLinear</code> (行并行层)</strong>
+*   <strong>场景</strong>：通常用于 MLP 的第二层（缩小维度）或 Attention 的输出投影。
+*   <strong>初始化 (<code>__init__</code>)</strong>:
+    *   <code>input_size_per_partition = divide(input_size, world_size)</code>：它把输入维度除以了 GPU 数量。
+*   <strong>前向 (<code>forward</code>)</strong>:
+    *   <code>scatter_to_tensor_model_parallel_region(input_)</code>：把输入切开，每张卡只拿一部分输入。
+    *   做乘法。
+    *   <code>reduce_from_tensor_model_parallel_region</code>：<strong>最关键的一步</strong>。各卡算出结果后，必须进行 <code>All-Reduce</code>（相加），才能得到正确的数学结果。</p>
+<hr />
+<h4>✅ Task 5: 特殊层 —— 词表并行 (Embedding)</h4>
+<p><strong><code>VocabParallelEmbedding</code></strong></p>
+<ul>
+<li><strong>问题</strong>：大模型的词表很大（比如 10万+），Embedding 层如果不切分，显存占用极大。</li>
+<li><strong>做法</strong>：<ul>
+<li>假设词表有 100 个词，两张卡。</li>
+<li>GPU 0 负责存词 ID 0-49 的向量。</li>
+<li>GPU 1 负责存词 ID 50-99 的向量。</li>
+</ul>
+</li>
+<li><strong>Forward 逻辑</strong>：<ul>
+<li>输入进来了，比如 ID 是 60。</li>
+<li>GPU 0 发现 60 不在自己范围内，输出全 0。</li>
+<li>GPU 1 发现 60 在自己这里，查出向量。</li>
+<li>最后大家把结果 <code>All-Reduce</code>（相加），0 + 向量 = 向量。这就拿到了结果。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结：这个文件到底在讲啥？</h3>
+<p>如果你要把这个文件的一句话总结写在备忘录上：</p>
+<blockquote>
+<p><strong>这是一个工具箱，它通过重写 PyTorch 的 Linear 层，实现了将矩阵乘法切分到多张 GPU 上运行的功能，并手动管理了前向时的 <code>All-Gather</code>（聚合）和反向时的 <code>All-Reduce</code>（求和）通信，以此来训练放不进单张显卡的超大模型。</strong></p>
+</blockquote>
+<h3>建议阅读顺序</h3>
+<ol>
+<li>先看 <strong><code>ColumnParallelLinear</code></strong> 的 <code>forward</code> 函数，配合 <code>__init__</code> 理解它是怎么切权重的。</li>
+<li>再看 <strong><code>RowParallelLinear</code></strong>，对比两者的不同（一个切输出，一个切输入；一个最后 Gather，一个最后 Reduce）。</li>
+<li>最后看 <strong><code>LinearWithGradAccumulation...</code></strong>，这是底层的脏活累活（优化速度用的）。</li>
+</ol>

@@ -1,0 +1,100 @@
+<h1>fla/ops/rwkv6/chunk_naive.py</h1>
+<p>这份代码实现的是 <strong>RWKV-6 模型的核心计算逻辑</strong>，使用的是一种叫 <strong>Chunk（切块）</strong> 的计算模式。</p>
+<p>RWKV 的核心思想是：既像 Transformer 一样可以并行训练，又像 RNN 一样推理时占用显存极低。为了在训练和推理之间取得平衡，通常会把长序列切成小块（Chunk）。块内并行计算（像 Transformer），块间串行传递记忆（像 RNN）。</p>
+<p>别被代码吓到了，我们把它拆解成 <strong>5 个待办事项（Todo List）</strong>，一步步来看：</p>
+<hr />
+<h3>📋 学习任务清单 (Todo List)</h3>
+<ol>
+<li><strong>Task 1: 理解数据准备 (切蛋糕)</strong> —— 把长序列切成小块。</li>
+<li><strong>Task 2: 理解核心机制 (遗忘曲线)</strong> —— 变量 <code>w</code> 是做什么的？</li>
+<li><strong>Task 3: 块间循环 (Inter-Chunk)</strong> —— 处理“历史记忆”的传递（RNN 模式）。</li>
+<li><strong>Task 4: 块内计算 (Intra-Chunk)</strong> —— 处理“当前上下文”的关联（Attention 模式）。</li>
+<li><strong>Task 5: 合并输出</strong> —— 把两部分结果加起来。</li>
+</ol>
+<hr />
+<h3>🚀 详细步骤讲解</h3>
+<h4>Task 1: 理解数据准备 (切蛋糕)</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 把 b(batch), h(head), len(总长度), d(维度)</span>
+<span class="c1"># 变成 b, h, n(块的数量), c(块的大小), d</span>
+<span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">w</span> <span class="o">=</span> <span class="nb">map</span><span class="p">(</span><span class="k">lambda</span> <span class="n">x</span><span class="p">:</span> <span class="n">rearrange</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="s1">&#39;b h (n c) d -&gt; b h n c d&#39;</span><span class="p">,</span> <span class="o">...</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+想象你有一本 1000 页的书（长序列）。
+*   <strong>如果不切块</strong>：一口气读完，脑子（显存）会爆。
+*   <strong>切块 (Chunking)</strong>：把书分成 10 章（<code>n</code>），每章 100 页（<code>c</code>）。
+*   这一步就是把数据整形，方便我们一章一章地处理，同时在章的内部又能并行看这 100 页。</p>
+<hr />
+<h4>Task 2: 理解核心机制 (遗忘曲线)</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">w_cumsum</span> <span class="o">=</span> <span class="n">w</span><span class="o">.</span><span class="n">cumsum</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">)</span> <span class="c1"># 在时间维度累加</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+RWKV 的全称里 R (Receptance) W (Weight) K (Key) V (Value)。这里的 <code>w</code> 非常关键，它代表 <strong>“衰减”</strong> 或 <strong>“遗忘”</strong>。
+*   RWKV 认为，越久远的信息，对当前的影响越小。
+*   <code>w</code> 通常是负数（在 log 空间）。
+*   <code>cumsum</code> (累加) 是为了计算任意两个时刻之间的总衰减量。比如时刻 5 到时刻 8 的衰减，就是 <code>w[5] + w[6] + w[7]</code>。后面代码里的 <code>.exp()</code> 就是把它变成衰减比例（0.9, 0.8...）。</p>
+<hr />
+<h4>Task 3: 块间循环 (Inter-Chunk / Global State)</h4>
+<p><strong>这是最像 RNN 的部分：处理“上一章”传给“这一章”的记忆。</strong></p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 准备当前块要传给下一块的信息</span>
+<span class="n">kw</span> <span class="o">=</span> <span class="n">k</span> <span class="o">*</span> <span class="p">(</span><span class="n">w_cumsum</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="p">:]</span> <span class="o">-</span> <span class="n">w_cumsum</span><span class="p">)</span><span class="o">.</span><span class="n">exp</span><span class="p">()</span>
+<span class="n">wkv</span> <span class="o">=</span> <span class="n">kw</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">2</span><span class="p">)</span> <span class="o">@</span> <span class="n">v</span>
+
+<span class="c1"># 2. 循环累积记忆</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_chunk</span> <span class="o">-</span> <span class="mi">1</span><span class="p">):</span>
+    <span class="c1"># 下一块的记忆 = (当前块记忆 * 衰减) + 当前块新产生的信息</span>
+    <span class="n">wkv_new</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="o">+</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">wkv_new</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span> <span class="o">*</span> <span class="o">...</span><span class="p">)</span> <span class="o">+</span> <span class="n">wkv</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span>
+
+<span class="c1"># 3. 计算历史记忆对当前输出的影响</span>
+<span class="n">o_inter</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">einsum</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">wkv_new</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+*   <strong>目标</strong>：计算之前的章节（Chunk 0 到 Chunk i-1）对当前章节（Chunk i）的影响。
+*   <code>wkv</code>：这是把 Key 和 Value 压缩成一个状态（State），就像 RNN 的 hidden state。
+*   <code>for</code> 循环：这就是串行部分。读完第一章，把记忆压缩，乘以衰减系数（忘掉一点），传给第二章；读完第二章，融合新记忆，再传给第三章。
+*   <code>o_inter</code>：Inter 意为“之间”。这就是 <strong>历史记忆对当前的贡献</strong>。</p>
+<hr />
+<h4>Task 4: 块内计算 (Intra-Chunk / Local Attention)</h4>
+<p><strong>这是最像 Transformer Attention 的部分：处理“当前章”内部的关联。</strong></p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这一大段 nested loop</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">chunk_size</span><span class="p">):</span>
+    <span class="c1"># 计算当前 token 和块内之前 token 的注意力</span>
+    <span class="n">attn</span> <span class="o">=</span> <span class="p">(</span><span class="n">q</span><span class="p">[</span><span class="o">...</span><span class="p">]</span> <span class="o">*</span> <span class="n">k</span> <span class="o">*</span> <span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+    <span class="c1"># Mask 操作：不能看后面的词 (Causal Mask)</span>
+    <span class="n">mask</span> <span class="o">=</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">chunk_size</span><span class="p">)</span> <span class="o">&lt;</span> <span class="n">i</span><span class="p">)</span><span class="o">...</span>
+    <span class="c1"># ...</span>
+    <span class="c1"># 加上 u (Bonus)</span>
+    <span class="n">intra_intra_o</span> <span class="o">=</span> <span class="p">(</span><span class="n">q</span><span class="p">[</span><span class="o">...</span><span class="p">]</span> <span class="o">*</span> <span class="n">u</span> <span class="o">*</span> <span class="n">k</span><span class="p">[</span><span class="o">...</span><span class="p">])</span> <span class="o">...</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+*   <strong>目标</strong>：计算当前章节内部，第 10 页的内容和第 1 页到第 9 页的关系。因为它们在同一个 Chunk 里，所以还没被压缩成 RNN 状态，我们可以精细地计算。
+*   <strong>Mask</strong>：因为是生成模型，看第 5 个词的时候不能偷看第 6 个词，所以要把后面的 Mask 掉。
+*   <strong>变量 <code>u</code></strong>：这是 RWKV 的特色。<code>u</code> 代表 <strong>“特殊的当前时刻奖励”</strong>。RWKV 认为当前的 Key 对当前的 Query 有一个特殊的、不随时间衰减的加成。
+*   <code>o_intra</code>：Intra 意为“内部”。这就是 <strong>当前块内部上下文的贡献</strong>。</p>
+<blockquote>
+<p><em>注：这个代码里的 <code>naive</code> 实现是用 <code>for</code> 循环写的，效率很低，仅仅是为了演示算法逻辑。在实际加速版本（CUDA Kernel）里，这部分是用并行算法算的。</em></p>
+</blockquote>
+<hr />
+<h4>Task 5: 合并输出</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">o</span> <span class="o">=</span> <span class="n">o_inter</span> <span class="o">+</span> <span class="n">o_intra</span>
+<span class="k">return</span> <span class="n">rearrange</span><span class="p">(</span><span class="n">o</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+*   <strong>总输出 = 历史记忆的贡献 (Inter) + 当前局部上下文的贡献 (Intra)</strong>。
+*   最后把切开的块（n, c）重新拼回原来的长序列（L）。</p>
+<hr />
+<h3>总结</h3>
+<p>这段代码其实就在做一件事：</p>
+<p><strong>计算 RWKV-6 的注意力输出，但是为了省显存和处理长文本，它把计算分成了两部分：</strong>
+1.  <strong>远距离的过去</strong>：压缩成状态 (<code>wkv_new</code>) 传递过来（代码里的 <code>o_inter</code>）。
+2.  <strong>近距离的现在</strong>：在小窗口内直接算注意力（代码里的 <code>o_intra</code>）。</p>
+<p>希望这个 List 能帮你读懂这个逻辑！</p>

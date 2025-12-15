@@ -1,0 +1,123 @@
+<h1>fla/layers/gated_deltanet.py</h1>
+<p>这个代码文件实现了一个名为 <code>GatedDeltaNet</code> 的神经网络层。这是一种<strong>线性注意力（Linear Attention）</strong>或者说<strong>状态空间模型（SSM）</strong>的变体，旨在改进 Mamba2 模型。</p>
+<p>简单来说，它的核心思想是：<strong>不用像 Transformer 那样计算昂贵的 $N^2$ 全注意力矩阵，而是维护一个“记忆状态”（State），读入一个词，更新一下记忆，再输出一个词。</strong></p>
+<p>为了让你读懂它，我把理解这份代码拆解成 <strong>6 个 Task</strong> 的 Todo List，我们一步步来通关。</p>
+<hr />
+<h3>✅ Task 1: 宏观定位 —— 这玩意儿是干嘛的？</h3>
+<p><strong>目标</strong>：理解输入和输出。</p>
+<ul>
+<li><strong>输入 (<code>hidden_states</code>)</strong>：形状通常是 <code>[Batch, Length, Hidden_Size]</code>。比如你输入一句话 "我爱吃苹果"，经过 Embedding 层后就是这个张量。</li>
+<li><strong>输出 (<code>o</code>)</strong>：形状和输入一样。经过这一层处理后的特征，包含了上下文信息。</li>
+<li><strong>核心机制</strong>：它结合了“卷积”（看局部）和“循环/递归”（看全局历史），特别是用了一种叫 <strong>Delta Rule</strong> 的数学规则来更新记忆。</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 拆解零件 —— <code>__init__</code> 里都有啥？</h3>
+<p><strong>目标</strong>：看懂构造函数里定义的变量，它们是后续计算的原材料。</p>
+<p>代码里定义了一堆 <code>nn.Linear</code> 和参数，我们可以把它们分为三组：</p>
+<ol>
+<li>
+<p><strong>数据变换组 (Q, K, V)</strong>：</p>
+<ul>
+<li><code>self.q_proj</code>, <code>self.k_proj</code>: 类似于 Attention 里的 Query 和 Key。</li>
+<li><code>self.v_proj</code>: Value（实际承载内容的信息）。<strong>注意</strong>：代码里 <code>expand_v=2</code>，说明 V 的维度比 Q/K 大，这是为了容纳更多信息。</li>
+</ul>
+</li>
+<li>
+<p><strong>控制信号组 (Gate &amp; Beta &amp; Decay)</strong>：</p>
+<ul>
+<li><code>self.g_proj</code>: 输出门控（Output Gate），决定最后输出多少信息。</li>
+<li><code>self.b_proj</code>: 生成 $\beta$ 参数，这是 Delta Rule 的关键，决定“更新力度”。</li>
+<li><code>self.a_proj</code>, <code>self.A_log</code>, <code>self.dt_bias</code>: 这些是用来计算<strong>遗忘/衰减率</strong>的。类似于 LSTM 里的遗忘门，决定旧记忆保留多久。</li>
+</ul>
+</li>
+<li>
+<p><strong>局部特征提取组 (Short Conv)</strong>：</p>
+<ul>
+<li><code>self.q_conv1d</code>, <code>self.k_conv1d</code>, <code>self.v_conv1d</code>: 短卷积层。在做复杂的记忆更新前，先看看当前词周围这几个词（Local Context）。代码注释里警告说 <em>“ShortConvolution is crucial... do not turn it off”</em>，说明这一步对性能很重要。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 3: 前向传播第一步 —— 局部处理 (<code>forward</code> 前半段)</h3>
+<p><strong>目标</strong>：看懂 <code>forward</code> 函数开始部分，直到 <code>rearrange</code> 之前。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 伪代码逻辑</span>
+<span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_short_conv</span><span class="p">:</span>
+    <span class="c1"># 1. 先把输入 X 投影成 q, k, v</span>
+    <span class="c1"># 2. 然后过一个短卷积 (ShortConvolution)</span>
+    <span class="n">q</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">q_conv1d</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">q_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">))</span>
+    <span class="n">k</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">k_conv1d</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">k_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">))</span>
+    <span class="n">v</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">v_conv1d</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">v_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">))</span>
+</code></pre></div>
+
+<p><strong>解读</strong>：
+这里并没有直接开始做全局注意力，而是先用卷积“扫”一遍。比如处理“苹果”这个词时，卷积会让它稍微看到前面的“爱吃”，提取局部特征。</p>
+<hr />
+<h3>✅ Task 4: 计算核心控制信号 (Beta &amp; G)</h3>
+<p><strong>目标</strong>：看懂 <code>q, k</code> 之后那几行计算 <code>beta</code> 和 <code>g</code> 的代码。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 调整维度</span>
+<span class="n">q</span><span class="p">,</span> <span class="n">k</span> <span class="o">=</span> <span class="o">...</span> <span class="c1"># 变成 [batch, seq, head, dim]</span>
+<span class="n">v</span> <span class="o">=</span> <span class="o">...</span>
+
+<span class="c1"># 计算 Beta：控制记忆更新的“步长”或“力度”</span>
+<span class="n">beta</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">b_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span><span class="o">.</span><span class="n">sigmoid</span><span class="p">()</span>
+
+<span class="c1"># 计算 g (Decay/Forgetting)：控制记忆衰减</span>
+<span class="c1"># 它是基于 A_log 和 a_proj 计算出来的，经过 softplus 和 exp 处理</span>
+<span class="n">g</span> <span class="o">=</span> <span class="o">-</span><span class="bp">self</span><span class="o">.</span><span class="n">A_log</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">.</span><span class="n">exp</span><span class="p">()</span> <span class="o">*</span> <span class="n">F</span><span class="o">.</span><span class="n">softplus</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">a_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span><span class="o">.</span><span class="n">float</span><span class="p">()</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">dt_bias</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解读</strong>：
+*   <strong>$\beta$ (Beta)</strong>：你可以把它理解为“写入门”。如果 $\beta$ 很大，说明当前这个词很重要，要大力写入记忆；如果很小，就忽略。
+*   <strong>$g$ (Decay)</strong>：这代表随时间流逝，旧的记忆（KV Cache）要衰减多少。</p>
+<hr />
+<h3>✅ Task 5: 核心引擎 —— Delta Rule 更新记忆</h3>
+<p><strong>目标</strong>：理解 <code>chunk_gated_delta_rule</code> 或 <code>fused_recurrent_...</code> 是在干嘛。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">mode</span> <span class="o">==</span> <span class="s1">&#39;chunk&#39;</span><span class="p">:</span>
+    <span class="n">o</span><span class="p">,</span> <span class="n">recurrent_state</span> <span class="o">=</span> <span class="n">chunk_gated_delta_rule</span><span class="p">(</span>
+        <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">g</span><span class="p">,</span> <span class="n">beta</span><span class="p">,</span> <span class="o">...</span>
+    <span class="p">)</span>
+</code></pre></div>
+
+<p><strong>这是全篇最难懂的地方，也是核心。</strong>
+虽然代码调用的是外部函数，但逻辑如下：</p>
+<p>传统的 Attention 是 $QK^T \times V$。
+<strong>Delta Rule</strong> 的逻辑更像是一个循环神经网络（RNN）：
+1.  我们有一个记忆状态 $S_{t-1}$。
+2.  新来了一个数据 $k_t, v_t$。
+3.  我们用 $q_t$ 去查询记忆，发现现在的记忆和预期的有误差（Delta）。
+4.  我们用 $\beta$ 和这个误差来更新记忆状态 $S_t$。
+5.  同时，$g$ 负责让旧的 $S$ 慢慢变淡。</p>
+<p><strong>代码里的 <code>chunk</code> 模式</strong>：
+是为了加速训练。它把长序列切成小块（Chunk），块内用 Attention 算，块间用 RNN 传导。这是一种常见的线性 Attention 加速技巧（FlashAttention 的变体思路）。</p>
+<hr />
+<h3>✅ Task 6: 收尾工作 —— 门控与输出 (<code>forward</code> 后半段)</h3>
+<p><strong>目标</strong>：生成最终结果。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 门控机制 (Gating)</span>
+<span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_gate</span><span class="p">:</span>
+    <span class="c1"># 算一个 gate 信号</span>
+    <span class="n">gate</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">g_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+    <span class="c1"># 用 Norm 层把刚才算出来的 o 和 gate 融合</span>
+    <span class="n">o</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">o_norm</span><span class="p">(</span><span class="n">o</span><span class="p">,</span> <span class="n">gate</span><span class="p">)</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="n">o</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">o_norm</span><span class="p">(</span><span class="n">o</span><span class="p">)</span>
+
+<span class="c1"># 2. 最后的线性投影</span>
+<span class="n">o</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">o_proj</span><span class="p">(</span><span class="n">o</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解读</strong>：
+*   <strong>Gating</strong>：类似于 GLU（Gated Linear Unit）。刚才算出来的 <code>o</code> 是包含历史信息的特征，现在用一个 <code>gate</code> 再次筛选一遍，决定哪些信息流向下一层。
+*   <strong>RMSNorm</strong>：归一化，保证数值稳定。
+*   <strong>Output Proj</strong>：把维度变回 <code>hidden_size</code>，方便传给神经网络的下一层。</p>
+<hr />
+<h3>总结清单 (Takeaway List)</h3>
+<p>如果你要向别人介绍这个文件，你可以按这个顺序讲：</p>
+<ol>
+<li><strong>身份</strong>：这是一个类似 Mamba 的层，用来处理序列数据，替代 Transformer 的 Attention 层。</li>
+<li><strong>预处理</strong>：先通过 Linear 和 <strong>Short Conv</strong> 提取局部特征 (Q, K, V)。</li>
+<li><strong>参数计算</strong>：计算更新力度 $\beta$ 和遗忘速率 $g$。</li>
+<li><strong>核心计算</strong>：调用 <strong>Gated Delta Rule</strong> 算子。这是一种高效的记忆更新算法，把 $O(N^2)$ 的复杂度降到了线性 $O(N)$。</li>
+<li><strong>输出</strong>：经过门控 (Gate) 和归一化 (Norm)，输出最终结果。</li>
+</ol>
+<p><strong>一句话总结代码逻辑：</strong>
+<strong>"先看局部 (Conv)，再算遗忘率 (g) 和更新率 (beta)，然后用 Delta 规则更新全局记忆 (State)，最后筛选输出 (Gate)。"</strong></p>

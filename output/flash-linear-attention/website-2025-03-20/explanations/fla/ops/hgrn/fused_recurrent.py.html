@@ -1,0 +1,125 @@
+<h1>fla/ops/hgrn/fused_recurrent.py</h1>
+<p>这份代码看起来很吓人，因为它不是普通的Python代码，而是用 <strong>Triton</strong> 编写的 <strong>GPU底层加速代码</strong>。</p>
+<p>简单来说，这个文件实现了一个<strong>极速版的循环神经网络（RNN）单元</strong>，具体来说是 HGRN（Hierarchical Gated Recurrent Network）的核心计算部分。</p>
+<p>为了让你听懂，我们把阅读这份代码想象成开发一个<strong>“记忆流水线”</strong>的工程。我给你列一个 <strong>Task To-Do List</strong>，我们一步步把这个工程拆解开。</p>
+<hr />
+<h3>核心任务清单 (To-Do List)</h3>
+<p>我们要完成的任务是：<strong>在显卡(GPU)上高效地算出 HGRN 的公式。</strong></p>
+<ol>
+<li><strong>[理论准备]</strong> 搞懂我们要算的数学公式是什么（其实很简单）。</li>
+<li><strong>[正向传播]</strong> 写一个由前往后的循环，算出每一步的输出（Forward Kernel）。</li>
+<li><strong>[反向传播]</strong> 写一个由后往前的循环，算出梯度以便训练（Backward Kernel）。</li>
+<li><strong>[包装接口]</strong> 把上面两个复杂的内核包装成 PyTorch 能直接调用的函数（Function &amp; API）。</li>
+</ol>
+<hr />
+<h3>Step 1: 理论准备（我们要算啥？）</h3>
+<p>在看代码前，你必须知道它在算这行公式：</p>
+<p>$$ h_t = h_{t-1} \cdot \exp(g_t) + x_t $$</p>
+<ul>
+<li><strong>$h_t$ (Current State)</strong>: 当前时刻的记忆。</li>
+<li><strong>$h_{t-1}$ (Previous State)</strong>: 上一时刻的记忆。</li>
+<li><strong>$g_t$ (Gate/Decay)</strong>: 遗忘门。$\exp(g_t)$ 决定了我们要保留多少旧记忆（通常是 0~1 之间）。</li>
+<li><strong>$x_t$ (Input)</strong>: 当前时刻的新输入。</li>
+</ul>
+<p><strong>人话翻译</strong>：今天的记忆 = (昨天的记忆 × 遗忘比例) + 今天新学的东西。</p>
+<hr />
+<h3>Step 2: 正向传播 (Forward Kernel)</h3>
+<p>对应代码中的：<code>def fused_recurrent_hgrn_fwd_kernel(...)</code></p>
+<p>这是最核心的部分。因为 GPU 擅长并行，但 RNN 是串行的（必须先算昨天才能算今天），所以这里用了 Triton 来手写这个循环以达到极致速度。</p>
+<ul>
+<li>
+<p><strong>任务 2.1：定位数据</strong></p>
+<ul>
+<li>代码：<code>i_d</code>, <code>i_n</code> 获取当前的维度和批次索引。</li>
+<li>代码：<code>bos</code>, <code>eos</code> (Begin/End of Sequence)。处理<strong>变长序列</strong>（比如有的句子长，有的短），找到当前句子从哪开始，到哪结束。</li>
+</ul>
+</li>
+<li>
+<p><strong>任务 2.2：加载初始状态</strong></p>
+<ul>
+<li>代码：<code>if USE_INITIAL_STATE: ...</code></li>
+<li>逻辑：如果这并不是句子的开头（或者有预设的初始记忆 $h_0$），先把之前的记忆加载进来赋值给 <code>b_h</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>任务 2.3：核心时间循环 (The Loop)</strong></p>
+<ul>
+<li>代码：<code>for _ in range(0, T):</code></li>
+<li>这是整个文件的灵魂。它在时间轴上一步步走：<ol>
+<li><code>b_x = tl.load(...)</code>: 读取这一时刻的输入 $x$。</li>
+<li><code>b_g = tl.load(...)</code>: 读取这一时刻的门控 $g$。</li>
+<li><strong>核心公式</strong>：<code>b_h = tl.exp(b_g) * b_h + b_x</code> (完全对应 Step 1 的公式)。</li>
+<li><code>tl.store(p_o, ...)</code>: 把计算结果存入输出 $o$。</li>
+<li>指针移动 (<code>p_x += D</code>...)，准备处理下一时刻。</li>
+</ol>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>任务 2.4：保存最终状态</strong></p>
+<ul>
+<li>代码：<code>if STORE_FINAL_STATE: ...</code></li>
+<li>逻辑：跑完整个句子后，把最后时刻的记忆 $h_t$ 存下来，可能下一个句子要接着用。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Step 3: 反向传播 (Backward Kernel)</h3>
+<p>对应代码中的：<code>def fused_recurrent_hgrn_bwd_kernel(...)</code></p>
+<p>神经网络需要训练，就必须求导。正向是从过去走向未来，反向传播必须<strong>从未来走向过去</strong>。</p>
+<ul>
+<li>
+<p><strong>任务 3.1：准备工作</strong></p>
+<ul>
+<li>逻辑与正向类似，但指针要指向句子的<strong>末尾</strong>。</li>
+</ul>
+</li>
+<li>
+<p><strong>任务 3.2：反向时间循环</strong></p>
+<ul>
+<li>代码：<code>for i in range(T - 1, -1, -1):</code> (倒着循环)</li>
+<li>这里在做<strong>链式法则（Chain Rule）</strong>求导。</li>
+<li>逻辑：<ol>
+<li>读取当前时刻的梯度 <code>b_do</code> 和门控 <code>b_g</code>。</li>
+<li><code>b_dh = b_dh + b_do</code>: 累加梯度。</li>
+<li><code>b_dx = b_dh</code>: 算出输入的梯度 $dx$。</li>
+<li><code>b_dh = b_dh * tl.exp(b_g)</code>: 算出传给上一时刻的梯度（要把遗忘门乘回去）。</li>
+<li><code>b_dg = ...</code>: 算出门控的梯度。</li>
+<li><code>tl.store(...)</code>: 保存算出来的梯度 $dx$ 和 $dg$。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Step 4: 包装接口 (PyTorch Wrapper)</h3>
+<p>光有 Triton 内核，PyTorch 是不认识的。这部分代码负责把上面的内核变成 PyTorch 的一个层。</p>
+<ul>
+<li>
+<p><strong>任务 4.1：Python 函数包装</strong></p>
+<ul>
+<li>代码：<code>def fused_recurrent_hgrn_fwd(...)</code></li>
+<li>作用：计算 Grid 大小（怎么分配 GPU 线程块），然后启动 Step 2 的 Triton 内核。</li>
+</ul>
+</li>
+<li>
+<p><strong>任务 4.2：Autograd 桥接</strong></p>
+<ul>
+<li>代码：<code>class FusedRecurrentHGRNFunction(torch.autograd.Function)</code></li>
+<li>作用：告诉 PyTorch，“当你遇到这个操作时，向前跑用 <code>forward</code> 函数，求导时用 <code>backward</code> 函数”。这里把 Step 2 和 Step 3 串起来了。</li>
+</ul>
+</li>
+<li>
+<p><strong>任务 4.3：用户接口</strong></p>
+<ul>
+<li>代码：<code>def fused_recurrent_hgrn(...)</code></li>
+<li>作用：这是给最终用户（也就是你）调用的函数。它处理参数文档，支持 <code>cu_seqlens</code>（处理变长序列的一种格式），并调用上面的 Function。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底在干嘛？</h3>
+<p><strong>一句话总结：</strong>
+它在用一种<strong>极度优化</strong>的方式，在 GPU 上计算公式 <strong>$h_t = h_{t-1} e^{g_t} + x_t$</strong> 及其反向传播梯度。</p>
+<p><strong>为什么要写这么复杂？</strong>
+如果你直接用 PyTorch 写 <code>for</code> 循环算这个公式，速度会非常慢（因为 Python 的 <code>for</code> 循环慢，且 GPU 不喜欢串行操作）。这份代码用 Triton 将整个循环“融合（Fused）”成一个 GPU 核心操作，速度可能比原生 PyTorch 快几十倍，且显存占用更低。</p>

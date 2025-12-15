@@ -1,0 +1,58 @@
+<h1>verl/utils/reward_score/prime_math/<strong>init</strong>.py</h1>
+<p>这份代码其实就是一个<strong>“不仅懂数学，还很严格的自动阅卷老师”</strong>。</p>
+<p>它的核心任务只有一件事：<strong>判断模型生成的数学答案（Given Answer）和标准答案（Ground Truth）是否一致。</strong></p>
+<p>为了让你看懂，我把它拆解成一个<strong>阅卷流程的 Todo List</strong>。每一步对应代码里的一个主要逻辑。</p>
+<hr />
+<h3>阅卷老师的 Todo List (任务清单)</h3>
+<h4>1. 第一步：从草稿纸里找到答案 (Extract Answer)</h4>
+<p>模型输出的一大段话里可能包含推理步骤。阅卷老师得先找到最终结果在哪里。
+*   <strong>代码对应：</strong> <code>match_answer(response)</code> 和 <code>_last_boxed_only_string</code>
+*   <strong>具体做法：</strong>
+    *   看看有没有被框起来的内容（比如 LaTeX 里的 <code>\boxed{123}</code>）。
+    *   看看有没有关键词，比如 "Answer is..." 或 "The answer is..."。
+    *   如果没有明确标记，就尝试提取最后一句包含数字的话。</p>
+<h4>2. 第二步：把字写工整 (Normalize / Clean up)</h4>
+<p>学生写的格式五花八门，标准答案可能写的是 "1,000 meters"，学生写的是 "1000 m"。在比较之前，必须把它们变成统一的“标准格式”。
+*   <strong>代码对应：</strong> <code>_normalize(expr)</code>
+*   <strong>具体做法：</strong>
+    *   <strong>去单位：</strong> 把 "cm", "kg", "degrees", "miles" 等单位统统删掉（只比数值）。
+    *   <strong>统一写法：</strong> 把 "million" 变成 <code>*10^6</code>，把 LaTeX 的分数 <code>\tfrac</code> 变成 <code>\frac</code>。
+    *   <strong>去格式符号：</strong> 去掉美元符号 <code>$</code>，百分号 <code>%</code>，逗号 <code>,</code> (比如 1,000 变 1000)。
+    *   <strong>处理带分数：</strong> 把 "7 3/4" 这种写法变成 "7+3/4"，方便后续计算。</p>
+<h4>3. 第三步：一眼定生死 (Exact String Match)</h4>
+<p>如果清洗完的字符串一模一样，那就直接给分，不用算了。
+*   <strong>代码对应：</strong> <code>grade_answer</code> 里的 <code>if ground_truth_normalized == given_normalized:</code>
+*   <strong>例子：</strong> 标准答案是 "42"，学生清洗后也是 "42"，通过。</p>
+<h4>4. 第四步：动用数学工具验证 (SymPy Evaluation)</h4>
+<p>这是最核心的一步。如果字符串不一样（比如答案是 "1/2"，学生写 "0.5"），老师需要拿计算器算一下它们是不是相等的。
+*   <strong>代码对应：</strong> <code>are_equal_under_sympy</code>, <code>_sympy_parse</code>
+*   <strong>核心逻辑：</strong>
+    *   它利用 Python 的数学库 <code>sympy</code>。
+    *   逻辑是：<strong><code>标准答案 - 学生答案 = 0</code> 吗？</strong>
+    *   它会尝试化简这个差值。如果化简结果是 0，说明两者在数学上相等。
+    *   <strong>例子：</strong> <code>sqrt(4)</code> 和 <code>2</code>，字符串不同，但相减为0，算对。</p>
+<h4>5. 第五步：特殊情况处理 (Edge Cases Check)</h4>
+<p>有些情况不能乱用计算器，必须严格匹配。
+*   <strong>代码对应：</strong> <code>grade_answer</code> 里的逻辑分支
+*   <strong>具体做法：</strong>
+    *   <strong>如果是整数：</strong> 如果标准答案是整数，通常要求学生也写成整数形式（视具体配置而定），防止浮点误差。
+    *   <strong>如果是分数：</strong> 代码里写了 <code>if _is_frac(...)</code>，如果双方都是分数，可能要求必须约分或者形式严格一致（代码注释提到 fractions aren't reduced 时不给分）。
+    *   <strong>如果是元组/集合：</strong> 比如答案是 <code>(1, 2)</code>，要拆开来一个个比对。</p>
+<h4>6. 第六步：安全检查 (Safety &amp; Timeout)</h4>
+<p>防止模型输出一些恶意的代码或者极其复杂的表达式把阅卷程序搞死机。
+*   <strong>代码对应：</strong> <code>should_allow_eval</code>, <code>timeout_limit</code>
+*   <strong>具体做法：</strong>
+    *   如果你写的表达式里有太多未知的字母（超过2个），不予计算，直接判错。
+    *   如果计算时间超过 10 秒（<code>@timeout_limit(seconds=10)</code>），直接放弃，判错。</p>
+<h4>7. 最后一步：出总分 (Compute Score)</h4>
+<p>这是整个文件的总入口。
+*   <strong>代码对应：</strong> <code>compute_score(model_output, ground_truth)</code>
+*   <strong>流程：</strong>
+    1.  调用 <strong>第一步</strong> 提取答案。
+    2.  调用 <strong>第三、四步</strong> (<code>grade_answer</code>) 进行比对。
+    3.  如果 <code>grade_answer</code> 搞不定，还会尝试用备用的 <code>math_equal</code> 函数（处理涉及 $\pi$ 的近似值等情况）再试一次。
+    4.  返回结果：<code>True</code> (对) 或 <code>False</code> (错)。</p>
+<hr />
+<h3>总结</h3>
+<p>这个脚本就是一个<strong>智能数学判题器</strong>。
+它不光看你写的字是不是和答案一样（字符串匹配），还会试图理解你写的数学表达式等于多少（SymPy 计算），同时为了防止死机或误判，加了一堆清洗规则和安全限制。</p>

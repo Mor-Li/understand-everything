@@ -1,0 +1,67 @@
+<h1>docs/workers/sglang_worker.rst</h1>
+<p>这份文档其实是一篇<strong>技术操作指南</strong>。它的核心目的是告诉那些使用 <code>verl</code>（一个强化学习训练框架）的用户：<strong>如何把底层的推理引擎从默认的 vLLM 换成 SGLang。</strong></p>
+<p>简单来说，就是在训练大模型（比如让模型做数学题）的过程中，模型需要不断地“生成”答案（Rollout），SGLang 就是负责“生成”这一步的工具，它比传统的工具更快、更省显存。</p>
+<p>为了让你更容易理解，我把文档内容拆解成了一个<strong>“4步走”的 Todo List</strong>，并逐一解释每一步在干什么。</p>
+<hr />
+<h3>📋 任务清单 (Task Todo List)</h3>
+<ol>
+<li><strong>[准备阶段]</strong> 搞懂背景并安装环境 (Introduction &amp; Installation)</li>
+<li><strong>[新手村]</strong> 在单台机器上跑通一个简单的训练 (Single Machine PPO)</li>
+<li><strong>[进阶知识]</strong> 理解并解决一个特定的报错配置 (About Memory Check)</li>
+<li><strong>[打怪升级]</strong> 在多台机器上进行大规模训练 (Multi-Machine Training)</li>
+</ol>
+<hr />
+<h3>🟢 第一步：准备阶段 (Introduction &amp; Installation)</h3>
+<p><strong>文档观点：</strong>
+SGLang 是一个很厉害的推理引擎（xAI 的 Grok 模型都在用）。现在 <code>verl</code> 框架已经完美支持它了。你想用它，只需要改一行配置代码。</p>
+<p><strong>你需要做的 Task：</strong>
+1.  <strong>安装软件</strong>：在终端运行文档给出的命令。
+    <code>bash
+    pip install -e ".[sglang]"</code>
+2.  <strong>检查版本</strong>：文档特意强调了环境版本，你需要确认你的电脑环境符合以下要求，否则跑不起来：
+    *   PyTorch 版本需 2.6.0+
+    *   CUDA 版本需 12.4
+    *   其他依赖包（flashinfer, sgl-kernel）也要对齐。</p>
+<hr />
+<h3>🔵 第二步：新手村 - 单机训练 (Single Machine)</h3>
+<p><strong>文档观点：</strong>
+我们先拿一个小模型（Qwen2-7B）和一个数学数据集（gsm8k）来练手，证明 SGLang 可以在单台机器的 4 张显卡上正常工作。</p>
+<p><strong>你需要做的 Task：</strong>
+1.  <strong>准备数据</strong>：运行预处理脚本 <code>examples/data_preprocess/gsm8k.py</code>。
+2.  <strong>运行训练</strong>：运行文档中那个很长的 <code>python3 -m verl.trainer.main_ppo ...</code> 命令。
+3.  <strong>关键修改</strong>：注意命令里有一行核心代码，这就是切换引擎的关键：
+    <code>bash
+    actor_rollout_ref.rollout.name=sglang</code>
+    (这句话的意思是：告诉程序，“生成”阶段请使用 SGLang)。</p>
+<hr />
+<h3>🟡 第三步：进阶知识 - 理解“显存检查” (Why export SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK?)</h3>
+<p><strong>文档观点：</strong>
+你会发现在运行命令前，文档让你加了一个环境变量：
+<code>export SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK=True</code>
+(翻译：强制关闭 SGLang 的显存不平衡检查)。</p>
+<p><strong>为什么要这么做？（这是文中解释最晦涩的部分，我给你翻译成人话）：</strong></p>
+<ul>
+<li><strong>正常情况</strong>：SGLang 启动时会检查所有显卡的剩余显存。如果卡A剩 20G，卡B剩 10G，SGLang 就会报错（Panic），因为它觉得显存不平衡会导致后续崩溃。</li>
+<li><strong>Verl 的情况</strong>：<code>verl</code> 使用 Ray 来管理任务。Ray 启动不同的显卡进程（Worker）是有<strong>时间差</strong>的。<ul>
+<li>显卡A 可能先启动了，加载了一些东西，显存变少了。</li>
+<li>显卡B 还没启动完，显存还是空的。</li>
+</ul>
+</li>
+<li><strong>冲突点</strong>：这时候 SGLang 去检查，发现显存差异巨大，就会报错停止。</li>
+<li><strong>解决方案</strong>：所以我们要设置这个变量，告诉 SGLang：“<strong>别管显存差异，直接闭眼启动，这是正常的。</strong>”</li>
+</ul>
+<hr />
+<h3>🔴 第四步：打怪升级 - 多机训练 (Multi-Machine)</h3>
+<p><strong>文档观点：</strong>
+如果你有两台机器（比如 node0 和 node1），想把它们连起来一起训练更大的模型（比如 Llama-3 8B），SGLang 也能支持。</p>
+<p><strong>你需要做的 Task：</strong>
+1.  <strong>组建集群 (Ray Cluster)</strong>：
+    *   在 <strong>主节点 (node0)</strong> 上运行 <code>ray start --head</code>，建立指挥部。
+    *   在 <strong>从节点 (node1)</strong> 上运行 <code>ray start --address='主节点IP'</code>，加入指挥部。
+    *   运行 <code>ray status</code> 确认两台机器都连上了（比如看到 Total GPU = 16）。
+2.  <strong>运行分布式训练</strong>：
+    *   运行文档最后提供的那个脚本。
+    *   注意参数变化：<code>trainer.nnodes=2</code> (表示用2个节点)。</p>
+<hr />
+<h3>总结</h3>
+<p>这篇文档其实就是告诉你：<strong>“想在 verl 里用 SGLang 吗？装好包，加个环境变量跳过显存检查，然后改个配置名就行了。单机和多机都能跑。”</strong></p>

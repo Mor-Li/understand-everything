@@ -1,0 +1,132 @@
+<h1>fla/ops/gsa/fused_recurrent.py</h1>
+<p>这份代码确实比较晦涩，因为它实现的是 <strong>GSA (Gated Slot Attention)</strong> 算法，并且为了极致的性能，使用了 <strong>Triton</strong> 进行底层加速，还涉及了 <strong>Fused Recurrent（融合循环）</strong> 的操作。</p>
+<p>简单来说，这是一个<strong>线性注意力机制（Linear Attention）的变体</strong>。不同于标准 Transformer 的 $O(N^2)$ 复杂度，它是 $O(N)$ 的，并且通过类似 RNN（循环神经网络）的方式一步步处理序列。</p>
+<p>为了让你听懂，我把这个复杂的数学过程拆解成一个 <strong>“处理流水线” (Todo List)</strong>。你可以把这个模型想象成一个正在阅读文章的<strong>“记忆机器”</strong>。</p>
+<hr />
+<h3>核心任务清单 (Task Todo List)</h3>
+<p>我们将整个代码逻辑拆解为 7 个步骤。</p>
+<h4>✅ Task 1: 准备原材料 (理解输入变量)</h4>
+<p>在代码的开头，你会看到 <code>q, k, v, s, g</code>。
+*   <strong>Q, K, V</strong>: 老朋友了，Query, Key, Value。
+*   <strong>S (Slots)</strong>: 这是 GSA 特有的。你可以把它理解为<strong>“插槽”</strong>或者<strong>“中间记忆单元”</strong>。它是一个连接 K 和 V 的桥梁。
+*   <strong>G (Gate)</strong>: <strong>遗忘门</strong>。它决定了机器每一部要“记住”多少旧信息，又要“忘掉”多少。<code>torch.exp(b_g)</code> 说明它是一个衰减系数（0~1之间）。</p>
+<h4>✅ Task 2: 建立第一本笔记 (Key-Slot Memory, $H_k$)</h4>
+<p>GSA 的核心思想是维护两个“隐状态”（Hidden States，即记忆）。
+*   <strong>第一个记忆 ($H_k$)</strong>：记录 <strong>Key</strong> 和 <strong>Slot</strong> 之间的关系。
+*   <strong>代码对应</strong>：在 <code>fused_recurrent_gsa_inference_kernel</code> 里的 <code>b_hk</code> 计算部分，或者 <code>fwd</code> 函数里的第一次 kernel 调用。
+*   <strong>动作</strong>：
+    1.  拿到当前的输入 $k$ 和 $s$。
+    2.  把它们乘起来存入记忆。
+    3.  同时用 $g$ (Gate) 衰减旧的记忆。
+    *   公式感性理解：<code>当前记忆 = 旧记忆 * 衰减 + (Key * Slot)</code></p>
+<h4>✅ Task 3: 查询第一本笔记 (生成 Attention Score)</h4>
+<ul>
+<li><strong>动作</strong>：现在有了 $H_k$（Key-Slot 记忆），我们用 <strong>Query ($q$)</strong> 去查这本笔记。</li>
+<li><strong>目的</strong>：看看当前的 $q$ 对哪些 Slot 感兴趣。</li>
+<li><strong>代码对应</strong>：<code>b_ok += tl.sum(b_hk * b_q...)</code>。</li>
+<li><strong>结果</strong>：得到一个中间分数 <code>ok</code> (Attention Score)。</li>
+</ul>
+<h4>✅ Task 4: 归一化 (Softmax)</h4>
+<ul>
+<li><strong>动作</strong>：对刚才查到的分数 <code>ok</code> 做一次 Softmax。</li>
+<li><strong>目的</strong>：把分数变成概率分布。这在代码里叫 <code>qv</code> (Query-Value attention probabilities)。</li>
+<li><strong>代码对应</strong>：<code>b_qv = tl.softmax(b_ok)</code>。</li>
+</ul>
+<h4>✅ Task 5: 建立第二本笔记 (Slot-Value Memory, $H_v$)</h4>
+<ul>
+<li><strong>第二个记忆 ($H_v$)</strong>：记录 <strong>Slot</strong> 和 <strong>Value</strong> 之间的关系。</li>
+<li><strong>代码对应</strong>：<code>fused_recurrent_gsa_inference_kernel</code> 的下半部分，或者 <code>fwd</code> 函数里的第二次 kernel 调用。</li>
+<li><strong>动作</strong>：<ol>
+<li>拿到当前的 $s$ (Slot) 和 $v$ (Value)。</li>
+<li>把它们乘起来存入第二本笔记。</li>
+<li>同样用 $g$ 进行衰减。</li>
+<li>公式感性理解：<code>当前记忆 = 旧记忆 * 衰减 + (Slot * Value)</code></li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 6: 生成最终输出 (Output)</h4>
+<ul>
+<li><strong>动作</strong>：用 Task 4 算出来的概率 <code>qv</code>，去读取 Task 5 建立的第二本笔记 $H_v$。</li>
+<li><strong>代码对应</strong>：<code>b_ov = tl.sum(b_hv * b_qv...)</code>。</li>
+<li><strong>结果</strong>：得到最终的输出 $O$。</li>
+</ul>
+<h4>✅ Task 7: 融合加速 (Fused Kernel)</h4>
+<ul>
+<li><strong>核心逻辑</strong>：如果用 PyTorch 原生写循环（For loop），GPU 会非常慢。</li>
+<li><strong>代码做法</strong>：<ul>
+<li><code>fused_recurrent_gsa_inference_kernel</code>: 这是一个 <strong>Triton Kernel</strong>。它把上面 Task 2 到 Task 6 的所有步骤，在一个 GPU 核函数里一口气做完，不需要反复读写显存。</li>
+<li><code>fused_recurrent_gsa_fwd</code>: 这是训练用的前向传播。有趣的是，它把过程拆成了两次调用 <code>fused_recurrent_fwd_kernel</code>：<ol>
+<li>第一次算出 $H_k$ 和 Attention Score。</li>
+<li>第二次算出 $H_v$ 和最终 Output。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>代码段落详解 (中英对照)</h3>
+<p>现在我们带着上面的理解再看代码片段：</p>
+<h4>1. 推理核心 (<code>fused_recurrent_gsa_inference_kernel</code>)</h4>
+<p>这是一个专门用于<strong>生成（Inference）</strong>的函数，因为它是一个时间步一个时间步算的。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># ... 省略部分代码</span>
+    <span class="c1"># --- Task 2: 更新 Hk 记忆 ---</span>
+    <span class="c1"># 读取旧的 hk</span>
+    <span class="n">b_hk</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_hk0</span><span class="p">,</span> <span class="n">mask</span><span class="o">=</span><span class="n">mask_hk</span><span class="p">,</span> <span class="n">other</span><span class="o">=</span><span class="mf">0.</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+    <span class="c1"># 读取 q, k</span>
+    <span class="n">b_q</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">q</span> <span class="o">+</span> <span class="n">i_bh</span> <span class="o">*</span> <span class="n">K</span> <span class="o">+</span> <span class="n">o_k</span><span class="p">,</span> <span class="n">mask</span><span class="o">=</span><span class="n">mask_k</span><span class="p">,</span> <span class="n">other</span><span class="o">=</span><span class="mf">0.</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span> <span class="o">*</span> <span class="n">scale</span>
+    <span class="n">b_k</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">k</span> <span class="o">+</span> <span class="n">i_bg</span> <span class="o">*</span> <span class="n">K</span> <span class="o">+</span> <span class="n">o_k</span><span class="p">,</span> <span class="n">mask</span><span class="o">=</span><span class="n">mask_k</span><span class="p">,</span> <span class="n">other</span><span class="o">=</span><span class="mf">0.</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+
+    <span class="c1"># 核心公式：H_k = H_k * g + k * s</span>
+    <span class="c1"># 注意：这里 b_s 是 slot，b_g 是 gate</span>
+    <span class="n">b_hk</span> <span class="o">=</span> <span class="n">b_hk</span> <span class="o">*</span> <span class="n">b_g</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">+</span> <span class="n">b_k</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]</span> <span class="o">*</span> <span class="n">b_s</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span>
+
+    <span class="c1"># --- Task 3: 算分 ---</span>
+    <span class="c1"># Score = Sum(H_k * q)</span>
+    <span class="n">b_ok</span> <span class="o">+=</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">b_hk</span> <span class="o">*</span> <span class="n">b_q</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:],</span> <span class="n">axis</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+
+    <span class="c1"># ... 存储更新后的 hk ...</span>
+
+    <span class="c1"># --- Task 4: Softmax ---</span>
+    <span class="n">b_qv</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="n">b_ok</span><span class="p">)</span>
+
+    <span class="c1"># --- Task 5: 更新 Hv 记忆 ---</span>
+    <span class="c1"># ... 读取旧的 hv ...</span>
+    <span class="c1"># 核心公式：H_v = H_v * g + s * v</span>
+    <span class="n">b_hv</span> <span class="o">=</span> <span class="n">b_hv</span> <span class="o">*</span> <span class="n">b_g</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]</span> <span class="o">+</span> <span class="n">b_s</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]</span> <span class="o">*</span> <span class="n">b_v</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span>
+
+    <span class="c1"># --- Task 6: 算输出 ---</span>
+    <span class="c1"># Output = Sum(H_v * Score)</span>
+    <span class="n">b_ov</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">b_hv</span> <span class="o">*</span> <span class="n">b_qv</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:],</span> <span class="n">axis</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+</code></pre></div>
+
+<h4>2. 训练前向 (<code>fused_recurrent_gsa_fwd</code>)</h4>
+<p>训练时因为所有数据都已知，可以并行得更厉害。这里作者复用了通用的 <code>fused_recurrent_fwd_kernel</code>，但是调用了<strong>两次</strong>。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># === 第一阶段：处理 Key 和 Slot ===</span>
+    <span class="c1"># 这里的 o=ok (输出分数), h=hk (Key记忆)</span>
+    <span class="c1"># 输入是 q, k, v=s (注意这里把 s 当作 value 传进去了)</span>
+    <span class="n">fused_recurrent_fwd_kernel</span><span class="p">[</span><span class="n">grid</span><span class="p">](</span>
+        <span class="n">q</span><span class="o">=</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="o">=</span><span class="n">s</span><span class="p">,</span>  <span class="c1"># &lt;-- 这里的 v 实际上传入的是 s</span>
+        <span class="c1"># ...</span>
+        <span class="n">o</span><span class="o">=</span><span class="n">ok</span><span class="p">,</span> <span class="n">h0</span><span class="o">=</span><span class="n">hk0</span><span class="p">,</span> <span class="n">ht</span><span class="o">=</span><span class="n">hkt</span><span class="p">,</span>
+        <span class="c1"># ...</span>
+    <span class="p">)</span>
+
+    <span class="c1"># 中间做一次 Softmax</span>
+    <span class="n">qv</span> <span class="o">=</span> <span class="n">ok</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float</span><span class="p">)</span>
+
+    <span class="c1"># === 第二阶段：处理 Slot 和 Value ===</span>
+    <span class="c1"># 这里的 q=qv (刚才算出的概率), k=s (把 s 当作 key), v=v</span>
+    <span class="c1"># 这里的 h=hv (Value记忆)</span>
+    <span class="n">fused_recurrent_fwd_kernel</span><span class="p">[</span><span class="n">grid</span><span class="p">](</span>
+        <span class="n">q</span><span class="o">=</span><span class="n">qv</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="n">s</span><span class="p">,</span> <span class="n">v</span><span class="o">=</span><span class="n">v</span><span class="p">,</span> <span class="c1"># &lt;-- 这里的 k 实际上传入的是 s</span>
+        <span class="c1"># ...</span>
+        <span class="n">o</span><span class="o">=</span><span class="n">ov</span><span class="p">,</span> <span class="n">h0</span><span class="o">=</span><span class="n">hv0</span><span class="p">,</span> <span class="n">ht</span><span class="o">=</span><span class="n">hvt</span><span class="p">,</span>
+        <span class="c1"># ...</span>
+    <span class="p">)</span>
+</code></pre></div>
+
+<h3>总结</h3>
+<p>这篇代码实际上是在实现一个<strong>双重循环网络</strong>：
+1.  第一层循环：输入 $K, S$，维护状态 $H_k$，产出“注意力分数”。
+2.  第二层循环：输入 $S, V$，维护状态 $H_v$，结合“注意力分数”产出最终结果。</p>
+<p>之所以叫 <code>fused</code>，是因为它用 Triton 把这些矩阵乘法、状态更新、门控衰减全部融合在了一个核函数里，避免了显存的反复读写，从而极大地提高了速度。</p>

@@ -1,0 +1,77 @@
+<h1>verl/utils/reward_score/sandbox_fusion/utils.py</h1>
+<p>这份代码的核心功能是一个<strong>“远程代码判题器”</strong>（Code Grader）。</p>
+<p>简单来说，它的作用是：<strong>把AI写的代码，连同测试题目（输入/输出），发送到一个安全的沙盒环境中运行，然后检查代码对不对。</strong></p>
+<p>为了让你听懂，我把这个文件的逻辑拆解成一个<strong>“监考老师的任务清单 (To-Do List)”</strong>。想象你自己就是这个程序，你要完成以下步骤才能批改完一份试卷。</p>
+<hr />
+<h3>任务清单 (To-Do List)</h3>
+<h4>第一步：准备“打电话”的工具 (通信基础)</h4>
+<p><strong>对应函数：</strong> <code>call_sandbox_api</code>
+*   <strong>背景：</strong> 你的电脑不能直接运行不安全的代码，必须送到远程服务器（沙盒）去跑。
+*   <strong>任务：</strong>
+    1.  把代码（Code）、输入数据（Stdin）、编程语言（Language）打包成一个数据包。
+    2.  <strong>发送请求：</strong> 尝试把包发给远程服务器。
+    3.  <strong>重试机制 (Retry Logic)：</strong> 如果网络不好（比如服务器报 504 超时），不要马上放弃。
+        *   先等 1 秒，再试一次。
+        *   还不行？等 2 秒，再试。
+        *   最多试 3 次（<code>MAX_RETRIES</code>）。
+    4.  <strong>结果：</strong> 要么拿到服务器返回的运行结果（JSON），要么报错说“打不通”。</p>
+<h4>第二步：给代码“穿外套” (代码预处理)</h4>
+<p><strong>对应函数：</strong> <code>_process_single_case</code> 中的 <code>wrapper_code</code> 部分
+*   <strong>背景：</strong> AI 写代码通常只写一个函数，比如 <code>def solution(a, b): return a+b</code>。但是沙盒环境通常是运行一个完整的脚本，需要读取输入并打印输出。
+*   <strong>任务：</strong> 如果是 Python 代码，你需要在 AI 的代码外面套一层“壳”：
+    1.  <strong>引入库：</strong> 自动加上 <code>import json</code>, <code>import math</code> 等常用库，防止 AI 忘了写。
+    2.  <strong>处理输入：</strong> 写一段代码从系统标准输入（<code>sys.stdin</code>）读取测试数据。
+    3.  <strong>调用函数：</strong> 找到 AI 写的那个函数（或者 <code>Solution</code> 类），把数据传进去。
+    4.  <strong>处理输出：</strong> 把函数的返回值转换成 JSON 格式打印出来（<code>print</code>），这样沙盒才能捕获到答案。</p>
+<h4>第三步：批改“单道”题目 (单例判题)</h4>
+<p><strong>对应函数：</strong> <code>_process_single_case</code>
+*   <strong>背景：</strong> 一次考试有很多道题（Test Cases）。这里只负责批改其中一道。
+*   <strong>任务：</strong>
+    1.  <strong>抢资源 (Semaphore)：</strong> 如果并发太高，先排队，拿到令牌（信号量）再执行。
+    2.  <strong>调用第一步的工具：</strong> 把包装好的代码发给沙盒运行。
+    3.  <strong>分析成绩：</strong> 拿到沙盒的返回结果后，进行判断：
+        *   <strong>编译错误 (Compile Error)：</strong> 代码语法不对，直接给 -4 分。
+        *   <strong>超时 (Timeout)：</strong> 跑太久了，给 -3 分。
+        *   <strong>运行报错 (Runtime Error)：</strong> 比如除以零、数组越界，给 -2 分。
+        *   <strong>系统错误 (API Error)：</strong> 沙盒坏了，给 -1 分。
+        *   <strong>运行成功 (Success)：</strong> 拿出沙盒跑出来的结果，跟“标准答案”对比。
+            *   一样 -&gt; <strong>True (通过)</strong>
+            *   不一样 -&gt; <strong>False (答案错误)</strong></p>
+<h4>第四步：组织“全场考试” (并发管理)</h4>
+<p><strong>对应函数：</strong> <code>check_correctness</code> (这是主入口)
+*   <strong>背景：</strong> 给了一段代码和 10 组测试输入/输出。不能一道一道测，太慢了。
+*   <strong>任务：</strong>
+    1.  <strong>检查试卷：</strong> 确认输入和输出的数量是不是对等的。
+    2.  <strong>招聘阅卷组 (ThreadPoolExecutor)：</strong> 开启多线程（默认最多 32 个线程或 CPU 核心数的 5 倍）。
+    3.  <strong>并发分发：</strong> 把每一组输入/输出都丢给<strong>第三步</strong>去处理，让它们同时跑。
+    4.  <strong>收集结果：</strong> 等所有题目都改完，把结果存到一个列表里 <code>results</code>。</p>
+<h4>第五步：处理“没必要考了”的情况 (错误剪枝)</h4>
+<p><strong>对应函数：</strong> <code>check_correctness</code> 的后半部分
+*   <strong>观点：</strong> 如果第一道题就<strong>编译报错</strong>（语法错误），那剩下的题肯定也都跑不起来，测了也是浪费时间。
+*   <strong>任务：</strong>
+    1.  检查结果列表。
+    2.  一旦发现有 <strong>-4 (编译错误)</strong>。
+    3.  把这个错误之后的所有题目状态全部强行改成 <strong>-4</strong>，并在元数据里标记为 <code>compile_error_skipped</code>（因编译错误跳过）。</p>
+<hr />
+<h3>总结：这个文件到底输出了什么？</h3>
+<p>当你调用 <code>check_correctness</code> 时，它会返回两个列表：</p>
+<ol>
+<li>
+<p><strong><code>results</code> (分数条):</strong></p>
+<ul>
+<li><code>True</code>: 答案正确。</li>
+<li><code>False</code>: 答案错误。</li>
+<li><code>-1</code>: 沙盒挂了。</li>
+<li><code>-2</code>: 代码运行报错 (Runtime Error)。</li>
+<li><code>-3</code>: 代码超时 (Timeout)。</li>
+<li><code>-4</code>: 代码写错了，编译不过 (Compile Error)。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>metadata_list</code> (详细报告):</strong></p>
+<ul>
+<li>包含了每一道题的具体运行时间、报错信息、标准输出内容等，用于调试。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话总结：</strong> 这是一个<strong>带有多线程并发、自动重试、Python代码自动封装功能的远程判题客户端</strong>。</p>

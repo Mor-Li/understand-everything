@@ -1,0 +1,106 @@
+<h1>tests/unit_tests/dist_checkpointing/models/common.py</h1>
+<p>这份代码其实是一个<strong>测试工具箱</strong>。它不是用来训练模型的，而是用来<strong>验证“模型存档（Checkpoint）”功能是否正常</strong>的。</p>
+<p>特别是在大规模分布式训练（Megatron-LM）中，模型被切分成很多块（Sharded）分布在不同的显卡上。保存和读取这些切片非常复杂。</p>
+<p>为了让你听懂，我们可以把这个文件想象成一个<strong>“质检员的任务清单（To-Do List）”</strong>。质检员需要完成以下几个任务，来确保存档系统是可靠的。</p>
+<hr />
+<h3>任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>任务一：基础功能测试</strong> —— 存进去再读出来，只要不报错就行。</li>
+<li><strong>任务二：变形能力测试 (核心)</strong> —— 用 2 张卡存的模型，能不能用 4 张卡读出来？（并行度重配置）。</li>
+<li><strong>任务三：数据一致性测试</strong> —— 确保存进去的数据和读出来的数据是一模一样的，没有“丢包”。</li>
+<li><strong>任务四：特殊情况测试</strong> —— 当词表（Vocab）大小因为并行切分发生变化时，还能不能正常读取？</li>
+</ol>
+<hr />
+<h3>逐步讲解 (Step-by-Step)</h3>
+<p>下面我按照上面的任务清单，带你一步步看代码中的函数在干什么。</p>
+<h4>1. 任务一：基础功能测试</h4>
+<p><strong>对应函数：</strong> <code>common_test_simple_sharded_state_dict_save_load</code></p>
+<p>这个任务最简单，就是“走一遍流程”。</p>
+<ul>
+<li><strong>Step 1 (环境准备):</strong> 模拟一个分布式环境（比如 2 张卡做张量并行，4 张卡做流水线并行）。</li>
+<li><strong>Step 2 (初始化):</strong> 创建一个 GPT 模型。</li>
+<li><strong>Step 3 (保存):</strong> 把这个模型的状态（<code>sharded_state_dict</code>）保存到临时文件夹里。</li>
+<li><strong>Step 4 (读取):</strong> 销毁旧模型，创建一个新模型，然后从刚才的文件夹里读取存档。</li>
+<li><strong>Step 5 (检查):</strong> 只要读取过程没有抛出严重的“缺少参数”错误（除了 <code>_extra_state</code> 这种允许忽略的元数据），就算通过。</li>
+</ul>
+<blockquote>
+<p><strong>观点：</strong> 最基本的“存”和“取”必须是通的。</p>
+</blockquote>
+<h4>2. 任务二：变形能力测试 (最重要)</h4>
+<p><strong>对应函数：</strong> <code>common_test_parallel_reconfiguration_e2e</code></p>
+<p>这是分布式训练中最难的一步。比如你一开始穷，只有 8 张卡训练；后来有钱了，想扩充到 16 张卡继续训练。模型存档必须支持这种“变形”。</p>
+<ul>
+<li><strong>Step 1 (存档 A):</strong><ul>
+<li>设置起始的并行策略（<code>src_tp_pp</code>，比如 TP=1）。</li>
+<li>创建模型 A，保存为 <strong>Checkpoint A</strong>。</li>
+<li>同时在内存里留一份 A 的普通数据备份。</li>
+</ul>
+</li>
+<li><strong>Step 2 (变形读取并另存为 B):</strong><ul>
+<li>销毁环境，重新设置为目标的并行策略（<code>dest_tp_pp</code>，比如 TP=2）。</li>
+<li>创建模型 B（此时模型结构已经变了，被切得更细了）。</li>
+<li><strong>关键点：</strong> 让模型 B 去读取 <strong>Checkpoint A</strong>。系统必须自动处理切片的合并或拆分。</li>
+<li>读取成功后，把模型 B 保存为 <strong>Checkpoint B</strong>。</li>
+</ul>
+</li>
+<li><strong>Step 3 (终极比对):</strong><ul>
+<li>现在我们有两个存档：A（旧并行度）和 B（新并行度）。</li>
+<li>使用 <code>load_plain_tensors</code> 把 A 和 B 都加载成普通的、不切片的张量。</li>
+<li><strong>断言 (Assert):</strong> 比较 A 和 B 的每一个数字。如果 <code>diffs</code>（差异）为空，说明数据在“变形”过程中完全没有损坏。</li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<p><strong>观点：</strong> 分布式存档系统必须具备“弹性”，无论显卡数量怎么变，模型里的数学数值不能变。</p>
+</blockquote>
+<h4>3. 任务三：状态字典对比测试</h4>
+<p><strong>对应函数：</strong> <code>common_test_state_dict_comparison</code></p>
+<p>这个任务是为了防止“假阳性”——别把两个完全不一样的模型误判成一样的。</p>
+<ul>
+<li><strong>Step 1:</strong> 初始化模型 A，保存。</li>
+<li><strong>Step 2:</strong> 初始化模型 B，保存。</li>
+<li><strong>Step 3:</strong> <ul>
+<li>加载 A，再加载一次 A (命名为 A_dup)。对比它们，必须完全一样（自己等于自己）。</li>
+<li>加载 B。对比 A 和 B。</li>
+</ul>
+</li>
+<li><strong>Step 4:</strong> <ul>
+<li><strong>检查键 (Keys):</strong> A 和 B 的层数、名字应该是一样的（架构相同）。</li>
+<li><strong>检查值 (Values):</strong> A 和 B 里面的权重数值应该<strong>不一样</strong>（因为是随机初始化的）。</li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<p><strong>观点：</strong> 验证测试工具本身的逻辑是对的：相同的必须相同，不同的必须不同。</p>
+</blockquote>
+<h4>4. 任务四：词表填充变更测试</h4>
+<p><strong>对应函数：</strong> <code>common_test_vocab_size_padding_change</code></p>
+<p>这是一个边缘情况（Edge Case）。在张量并行（TP）中，为了计算效率，词表大小（Vocab Size）通常需要被显卡数量整除。如果不能整除，代码会自动补 0 (Padding)。</p>
+<ul>
+<li><strong>场景:</strong><ul>
+<li>1 张卡时，词表大小是 100。</li>
+<li>2 张卡时，为了整除，词表可能被强制补全到了 102。</li>
+<li>这时候存档里的权重形状变了，直接读会报错。</li>
+</ul>
+</li>
+<li><strong>Step 1:</strong> 计算填充后的词表大小，创建模型 A 并保存。</li>
+<li><strong>Step 2:</strong> 改变并行度（导致填充大小变化），创建模型 B，尝试读取 A。</li>
+<li><strong>Step 3 (智能比对):</strong><ul>
+<li>把 A 和 B 的存档都读出来。</li>
+<li><strong>关键点：</strong> 只对比前 <code>vocab_size_base</code>（原始大小，比如 100）个数据。</li>
+<li>忽略后面补全的那些 0 或随机填充值。</li>
+<li>如果有效数据部分一致，就算通过。</li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<p><strong>观点：</strong> 分布式训练中的“填充数据”不应该影响模型核心参数的迁移。</p>
+</blockquote>
+<hr />
+<h3>总结</h3>
+<p>这个文件其实就是给 Megatron-LM 的存档系统做<strong>全身体检</strong>的：
+1.  能不能存取？
+2.  换了显卡数量能不能存取？
+3.  数据有没有坏？
+4.  特殊填充有没有处理好？</p>
+<p>只要这些函数运行不报错，开发者就可以放心地说：“我们的 Checkpoint 系统是稳健的。”</p>

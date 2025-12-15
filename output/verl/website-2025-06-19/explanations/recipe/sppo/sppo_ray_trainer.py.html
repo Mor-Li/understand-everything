@@ -1,0 +1,158 @@
+<h1>recipe/sppo/sppo_ray_trainer.py</h1>
+<p>这份代码实现了一个基于 <strong>Ray</strong>（分布式计算框架）的 <strong>SPPO (Self-Play Preference Optimization)</strong> 训练器。</p>
+<p>简单来说，这是一个“总指挥”（Trainer），它负责协调一堆“工人”（Worker，比如负责生成的模型、负责打分的模型）来训练一个大模型，让它生成的回答更符合人类偏好。</p>
+<p>为了让你听懂，我把这个复杂的训练过程比作<strong>“为了考试而复习”</strong>的过程。</p>
+<h3>1. 核心逻辑 To-Do List (任务清单)</h3>
+<p>想象你是一个班主任（Trainer），你要训练一个学生（Actor Model）写出满分作文。你的任务流程如下：</p>
+<ol>
+<li>
+<p><strong>准备阶段 (Setup)</strong>:</p>
+<ul>
+<li>[ ] 准备好题目（加载数据集）。</li>
+<li>[ ] 叫醒所有老师和学生（初始化 Ray Workers：生成模型、打分模型、参考模型）。</li>
+<li>[ ] 设定好评分标准（Reward Function）。</li>
+</ul>
+</li>
+<li>
+<p><strong>练习阶段 (Rollout / Generation)</strong>:</p>
+<ul>
+<li>[ ] <strong>发卷子</strong>：给学生（Actor）一批作文题目（Prompts）。</li>
+<li>[ ] <strong>学生答题</strong>：学生针对每个题目写出几个不同的回答（Generate Sequences）。</li>
+</ul>
+</li>
+<li>
+<p><strong>批改阶段 (Evaluation / Reward)</strong>:</p>
+<ul>
+<li>[ ] <strong>老师打分</strong>：把学生的作文交给阅卷老师（Reward Model），老师给出分数（Reward）。</li>
+<li>[ ] <strong>查重</strong>：看看学生现在的写法和以前的写法（Reference Policy）差别大不大，防止学生为了高分“走火入魔”写乱七八糟的东西（计算 KL 散度，作为惩罚项）。</li>
+</ul>
+</li>
+<li>
+<p><strong>反思阶段 (Advantage Calculation - SPPO的核心)</strong>:</p>
+<ul>
+<li>[ ] <strong>横向比较</strong>：SPPO 的核心在于，不需要一个专门预测分数的“预言家”（Critic Model）。它直接拿学生针对<strong>同一个题目写出的好几个回答</strong>进行内部比较。</li>
+<li>[ ] <strong>计算优势</strong>：如果某篇作文的分数比这批作文的“平均水平”（SoftMean）高，那这就是个好方向（Advantage 是正的）；反之就是坏方向。</li>
+</ul>
+</li>
+<li>
+<p><strong>学习阶段 (Update)</strong>:</p>
+<ul>
+<li>[ ] <strong>修正大脑</strong>：根据“反思”的结果，调整学生的大脑神经（Update Actor），让他下次更倾向于写高分的那种作文。</li>
+</ul>
+</li>
+<li>
+<p><strong>循环</strong>：回到第2步，直到学会为止。</p>
+</li>
+</ol>
+<hr />
+<h3>2. 逐步代码解读</h3>
+<p>现在我们对照着代码，一步步看它是怎么实现上面的 To-Do List 的。</p>
+<h4>第一部分：工具函数（SPPO 的数学核心）</h4>
+<p>代码最上面有两个函数，这是 SPPO 算法的灵魂：</p>
+<ul>
+<li><code>softmean(x, beta)</code>:<ul>
+<li><strong>讲人话</strong>：计算一种“平滑的平均值”。普通的平均值是所有数加起来除以 N，但在 SPPO 里，分数高的项权重会更大一点。</li>
+</ul>
+</li>
+<li><code>compute_advantage(data, beta)</code>:<ul>
+<li><strong>讲人话</strong>：计算这篇作文到底有多好。</li>
+<li><strong>代码逻辑</strong>：<code>rewards - s_mean</code>。即：<strong>当前作文的分数 - 这组作文的平均分</strong>。</li>
+<li><strong>观点</strong>：如果你的分数高于平均分，说明你这次做得好，模型要奖励这种写法。</li>
+</ul>
+</li>
+</ul>
+<h4>第二部分：类的初始化 (<code>__init__</code>)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">RaySPPOTrainer</span><span class="p">(</span><span class="n">RayPPOTrainer</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+        <span class="c1"># ... 初始化各种配置 ...</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">use_critic</span> <span class="o">=</span> <span class="kc">False</span>  <span class="c1"># &lt;--- 重点！</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：SPPO 与传统 PPO 最大的区别就在这里。传统 PPO 需要一个 Critic 模型（价值网络）来预测分数，而 SPPO 不需要。它直接设为 <code>False</code>，省了一个模型，训练更快、显存占用更少。</li>
+</ul>
+<h4>第三部分：训练主循环 (<code>fit</code> 函数)</h4>
+<p>这是最长的那段代码，我们拆解来看：</p>
+<p><strong>1. 准备与循环</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 加载存档</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">_load_checkpoint</span><span class="p">()</span>
+<span class="c1"># 开始循环 epoch</span>
+<span class="k">for</span> <span class="n">epoch</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">trainer</span><span class="o">.</span><span class="n">total_epochs</span><span class="p">):</span>
+    <span class="k">for</span> <span class="n">batch_dict</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">train_dataloader</span><span class="p">:</span>
+        <span class="c1"># ...</span>
+</code></pre></div>
+
+<p><strong>2. 任务：学生答题 (Rollout)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 让 Actor (生成模型) 根据题目生成回答</span>
+<span class="n">gen_batch_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">actor_rollout_wg</span><span class="o">.</span><span class="n">generate_sequences</span><span class="p">(</span><span class="n">gen_batch</span><span class="p">)</span>
+
+<span class="c1"># ... 省略中间的数据处理 ...</span>
+
+<span class="c1"># 这一步很重要：SPPO 通常需要对同一个问题生成 N 个回答来做对比</span>
+<span class="n">batch</span> <span class="o">=</span> <span class="n">batch</span><span class="o">.</span><span class="n">repeat</span><span class="p">(</span><span class="n">repeat_times</span><span class="o">=...</span><span class="p">,</span> <span class="n">interleave</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：这里调用了远程的 Worker 去做生成。</li>
+</ul>
+<p><strong>3. 任务：老师打分 (Reward)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 调用 Reward Model (RM) 打分</span>
+<span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_rm</span><span class="p">:</span>
+    <span class="n">reward_tensor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">rm_wg</span><span class="o">.</span><span class="n">compute_rm_score</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
+
+<span class="c1"># 或者使用自定义的规则打分函数</span>
+<span class="n">reward_tensor</span><span class="p">,</span> <span class="n">reward_extra_infos_dict</span> <span class="o">=</span> <span class="n">compute_reward</span><span class="p">(</span><span class="n">batch</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">reward_fn</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>4. 任务：计算概率 (Log Prob)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 计算当前模型生成这些文字的概率</span>
+<span class="n">old_log_prob</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">actor_rollout_wg</span><span class="o">.</span><span class="n">compute_log_prob</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
+
+<span class="c1"># 计算参考模型(Reference Model)生成这些文字的概率 (用于防止跑偏)</span>
+<span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_reference_policy</span><span class="p">:</span>
+    <span class="n">ref_log_prob</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">ref_policy_wg</span><span class="o">.</span><span class="n">compute_ref_log_prob</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>5. 任务：反思与计算优势 (Advantage) —— 代码最核心部分</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">with</span> <span class="n">simple_timer</span><span class="p">(</span><span class="s2">&quot;adv&quot;</span><span class="p">,</span> <span class="n">timing_raw</span><span class="p">):</span>
+    <span class="c1"># 获取分数</span>
+    <span class="n">batch</span><span class="o">.</span><span class="n">batch</span><span class="p">[</span><span class="s2">&quot;token_level_scores&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">reward_tensor</span>
+
+    <span class="c1"># ... (省略部分代码) ...</span>
+
+    <span class="c1"># SPPO 的核心：计算 Advantage</span>
+    <span class="n">beta</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">algorithm</span><span class="o">.</span><span class="n">sppo_eta</span>
+    <span class="c1"># 调用最上面定义的函数，用 (分数 - SoftMean) 作为优势</span>
+    <span class="n">batch</span> <span class="o">=</span> <span class="n">compute_advantage</span><span class="p">(</span><span class="n">batch</span><span class="p">,</span> <span class="n">beta</span><span class="o">=</span><span class="n">beta</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：这里没有调用 Critic 模型计算 Value，而是直接用统计学方法（SoftMean）算出了优势。这是 SPPO 算法生效的地方。</li>
+</ul>
+<p><strong>6. 任务：修正大脑 (Update)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 更新 Actor 模型</span>
+<span class="k">with</span> <span class="n">simple_timer</span><span class="p">(</span><span class="s2">&quot;update_actor&quot;</span><span class="p">,</span> <span class="n">timing_raw</span><span class="p">):</span>
+    <span class="n">actor_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">actor_rollout_wg</span><span class="o">.</span><span class="n">update_actor</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：根据算出来的 Advantage，进行反向传播，更新模型参数。</li>
+</ul>
+<p><strong>7. 任务：保存与验证</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 打印生成的例子看看效果</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">_dump_generations</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="c1"># 验证集测试</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">_validate</span><span class="p">()</span>
+<span class="c1"># 保存模型</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">_save_checkpoint</span><span class="p">()</span>
+</code></pre></div>
+
+<h3>总结：这篇文章讲了什么观点？</h3>
+<p>这个文件实现的是 <strong>SPPO</strong> 算法。它的核心观点是：</p>
+<ol>
+<li><strong>去繁就简</strong>：传统的 RLHF (PPO) 需要四个模型（Actor, Critic, Ref, Reward）。SPPO 认为 <strong>Critic（价值网络）是不需要的</strong>。</li>
+<li><strong>自我博弈 (Self-Play)</strong>：通过让模型自己对自己生成的一组回答进行比较（计算 SoftMean），就能知道哪个回答更好。</li>
+<li><strong>计算效率</strong>：因为少了一个 Critic 模型，显存占用更低，训练流程更简单，但效果依然很好。</li>
+</ol>
+<p><strong>你只需要记住这个流程：</strong>
+生成多个回答 -&gt; 老师打分 -&gt; 算出哪个回答比平均分高 -&gt; 鼓励模型多写高分回答。</p>

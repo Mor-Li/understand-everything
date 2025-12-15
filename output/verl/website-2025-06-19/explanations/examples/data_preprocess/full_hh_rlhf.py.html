@@ -1,0 +1,69 @@
+<h1>examples/data_preprocess/full_hh_rlhf.py</h1>
+<p>这份代码其实是一个<strong>“数据备菜员”</strong>。</p>
+<p>在训练一个像 ChatGPT 这样的大模型（特别是 RLHF，即“人类反馈强化学习”阶段）时，我们需要把原始食材（原始数据集）切成三种不同的形状，分别喂给三个不同的训练阶段。</p>
+<p>这个脚本就是用来做这件事的。它下载一个叫 <code>Dahoas/full-hh-rlhf</code> 的公开数据集，然后把它转换成 <strong>SFT</strong>、<strong>RM</strong> 和 <strong>RL</strong> 三种格式。</p>
+<p>我为你列了一个 <strong>Task TODO List</strong>，带你一步步看懂它是怎么工作的：</p>
+<h3>📝 任务清单 (Task List)</h3>
+<ol>
+<li><strong>准备阶段</strong>：下载原始数据集（全是“对话”数据）。</li>
+<li><strong>任务一 (SFT)</strong>：制作“照着学”的数据。把所有对话拆开，让模型学会怎么说话。</li>
+<li><strong>任务二 (RM)</strong>：制作“打分裁判”的数据。把好回答和坏回答放在一起，让模型学会分辨好坏。</li>
+<li><strong>任务三 (RL)</strong>：制作“正式考试”的数据。只保留题目（Prompt），把格式整理好，准备让模型自己生成答案并接受打分。</li>
+<li><strong>收尾</strong>：把处理好的数据存成文件（Parquet格式）。</li>
+</ol>
+<hr />
+<h3>🔍 逐步详细讲解</h3>
+<h4>0. 原始数据是什么？</h4>
+<p>代码里用的是 <code>Dahoas/full-hh-rlhf</code>。它的每一条数据长这样：
+*   <strong>Prompt</strong>: 用户问的问题。
+*   <strong>Chosen</strong>: 人类认为较好的回答。
+*   <strong>Rejected</strong>: 人类认为较差的回答。</p>
+<h4>1. 任务一：生成 SFT 数据 (<code>generate_sft_dataset</code>)</h4>
+<p><strong>目标</strong>：SFT (Supervised Fine-Tuning) 是为了让模型学会基本的对话能力。</p>
+<ul>
+<li><strong>代码逻辑</strong>：<ul>
+<li>它遍历了所有数据。</li>
+<li><strong>关键点</strong>：它非常“贪心”，把“好回答”和“坏回答”都拿来用了（代码注释写了：<code>Both chosen and rejected is used to train SFT</code>）。</li>
+<li>它把数据拆成了两行：<ol>
+<li><code>Prompt</code> + <code>Chosen</code> (作为标准答案)</li>
+<li><code>Prompt</code> + <code>Rejected</code> (也作为标准答案)</li>
+</ol>
+</li>
+</ul>
+</li>
+<li><strong>结果</strong>：数据量变为了原来的两倍。虽然混入了坏回答，但这一步通常是为了让模型先学会“把句子写通顺”。</li>
+<li><strong>输出格式</strong>：两列 -&gt; <code>prompt</code>, <code>response</code>。</li>
+</ul>
+<h4>2. 任务二：生成 RM 数据 (<code>generate_rm_dataset</code>)</h4>
+<p><strong>目标</strong>：RM (Reward Model) 是奖励模型，它像一个老师，需要学会给作业打分。</p>
+<ul>
+<li><strong>代码逻辑</strong>：<ul>
+<li><strong>切分数据</strong>：它把原始数据切了一刀。前 75% 用来训练（Train），后 25% 用来测试（Test/Validation）。这是为了防止老师“死记硬背”，要测试它是否真的懂好坏。</li>
+<li><strong>保留对比</strong>：它没有拆散数据，而是保留了“三元组”结构：<code>Prompt</code>（题目）+ <code>Chosen</code>（好答案）+ <code>Rejected</code>（坏答案）。</li>
+<li>这样训练时，模型会学习：<strong>“对于这个题目，Chosen 的得分 必须高于 Rejected 的得分”</strong>。</li>
+</ul>
+</li>
+<li><strong>输出格式</strong>：三列 -&gt; <code>prompt</code>, <code>chosen</code>, <code>rejected</code>。</li>
+</ul>
+<h4>3. 任务三：生成 RL 数据 (<code>generate_rl_dataset</code>)</h4>
+<p><strong>目标</strong>：RL (Reinforcement Learning) 是最后一步 PPO 训练。模型要根据题目自己写答案，然后拿高分。</p>
+<ul>
+<li><strong>代码逻辑</strong>：<ul>
+<li>这里它只关心 <strong>Prompt</strong>（题目）。因为在 RL 阶段，答案是模型自己生成的，不需要原始数据的答案。</li>
+<li><strong>格式大变身</strong>：这段代码写得很复杂（<code>make_map_fn</code>），其实是为了把数据包装成 <code>verl</code> 这个训练框架（字节跳动的框架）能读懂的 JSON 格式。</li>
+<li>它把数据包装成了类似聊天记录的格式：<code>[{"role": "user", "content": prompt}]</code>。</li>
+<li>它把原始答案藏在了 <code>reward_model</code> -&gt; <code>ground_truth</code> 里，仅供参考，不直接参与训练。</li>
+</ul>
+</li>
+<li><strong>输出格式</strong>：复杂的嵌套字典结构，包含 <code>prompt</code>, <code>ability</code>, <code>reward_model</code> 等字段。</li>
+</ul>
+<h4>4. 主程序入口 (<code>if __name__ == "__main__":</code>)</h4>
+<p>这是脚本的开关。
+*   你可以通过命令行参数 <code>--split</code> 来告诉它你想做哪一步菜。
+*   比如运行 <code>python full_hh_rlhf.py --split sft</code>，它就只执行任务一。
+*   最后它会把处理好的数据保存到 <code>local_dir</code>（本地文件夹），如果配置了 <code>hdfs_dir</code>，还会上传到云端存储。</p>
+<h3>总结</h3>
+<p>这个脚本就是把同一块肉（原始数据）：
+1.  <strong>切碎</strong>（SFT）：不管好坏，做成肉末，让模型学会怎么吃。
+2.  <strong>成对摆放</strong>（RM）：好肉坏肉放一起，让模型学会挑食。
+3.  <strong>精美摆盘</strong>（RL）：只给盘子（Prompt），让模型自己产出肉，并符合特定框架的餐仪标准。</p>

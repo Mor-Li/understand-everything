@@ -1,0 +1,109 @@
+<h1>examples/ray/tutorial.ipynb</h1>
+<p>这份教程确实涉及了很多分布式计算的概念，如果之前没有接触过 <strong>Ray</strong>（一个分布式计算框架）或者 <strong>Megatron-LM</strong>（大模型训练框架），看不懂是非常正常的。</p>
+<p>简单来说，这份文档是在教你：<strong>如何使用 VeRL 封装好的工具，轻松地指挥多张显卡（GPU）协同工作，去跑大模型或者进行并行计算。</strong></p>
+<p>我为你整理了一个 <strong>5步学习 Task List</strong>，我们把复杂的代码拆解成简单的逻辑：</p>
+<hr />
+<h3>📝 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1：理解 Ray 的基本功（单兵作战）</strong><ul>
+<li><em>目标：</em> 搞懂“主进程”和“远程Worker”的区别。</li>
+</ul>
+</li>
+<li><strong>Task 2：组建你的显卡小队（WorkerGroup）</strong><ul>
+<li><em>目标：</em> 学会如何一次性管理多个 Worker，而不是一个一个管。</li>
+</ul>
+</li>
+<li><strong>Task 3：学会资源复用（Resource Sharing）</strong><ul>
+<li><em>目标：</em> 搞懂如何让不同的队伍共用同一批显卡。</li>
+</ul>
+</li>
+<li><strong>Task 4：简化指挥指令（Decorators &amp; Dispatch）</strong><ul>
+<li><em>目标：</em> 学会用“装饰器”让复杂的分布式代码写起来像单机代码一样简单。</li>
+</ul>
+</li>
+<li><strong>Task 5：实战演练（Megatron 集成）</strong><ul>
+<li><em>目标：</em> 真正跑一个被切分的大模型层（Tensor Parallel），看看它是怎么运作的。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>✅ Task 1: 理解 Ray 的基本功（单兵作战）</h4>
+<p><em>对应文档 Chapter 1</em></p>
+<ul>
+<li><strong>场景</strong>：你现在是包工头（主进程），你需要雇佣一个工人（Worker）去旁边房间算数。</li>
+<li><strong>核心概念</strong>：<ul>
+<li><code>@ray.remote</code>：把一个普通的 Python 类变成一个可以在别的机器/进程上跑的“远程角色”。</li>
+<li><code>.remote()</code>：命令工人开始干活。注意，这个命令发出去后，包工头<strong>不等待</strong>结果，直接往下走（异步）。</li>
+<li><code>ray.get()</code>：包工头说：“停，我要拿到刚才那个活儿的结果”，这时候才会阻塞等待。</li>
+</ul>
+</li>
+<li><strong>代码看点</strong>：<ul>
+<li><code>Accumulator</code> 类就是一个简单的计数器。</li>
+<li><code>accumulator.add.remote(10)</code> 是异步调用。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 组建你的显卡小队（WorkerGroup）</h4>
+<p><em>对应文档 Chapter 2 (前半部分)</em></p>
+<ul>
+<li><strong>场景</strong>：现在工程大了，你需要雇佣 4 个工人，每人配一台 GPU。如果你一个个去 <code>remote()</code> 太累了，你需要一个“包工队”。</li>
+<li><strong>核心概念</strong>：<ul>
+<li><code>RayResourcePool</code>：<strong>资源池</strong>。相当于你圈定了“我要用这 4 张显卡”。</li>
+<li><code>RayWorkerGroup</code>：<strong>工作组</strong>。这是 VeRL 的核心封装。它把这 4 张卡和你要跑的代码（<code>GPUAccumulator</code>）绑定在一起。</li>
+</ul>
+</li>
+<li><strong>操作逻辑</strong>：<ul>
+<li>当你调用 <code>worker_group.execute_all_sync('add', x=[1,1,1,1])</code> 时，系统会自动把列表里的 4 个 <code>1</code> 分别发给 4 个工人。</li>
+<li>每个工人在自己的 GPU 上把数字加起来，然后一起把结果返回给你。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 学会资源复用（Resource Sharing）</h4>
+<p><em>对应文档 Chapter 2 (后半部分)</em></p>
+<ul>
+<li><strong>场景</strong>：显卡很贵，不够用。你有两个任务，任务 A 需要用前 4 张卡，任务 B 需要用全部 8 张卡。</li>
+<li><strong>核心概念</strong>：<ul>
+<li><strong>资源池合并</strong>：<code>merge_resource_pool</code>。</li>
+<li>教程里展示了：<ol>
+<li><code>pool</code> (占了 GPU 0-3)</li>
+<li><code>pool_1</code> (占了 GPU 4-7)</li>
+<li><code>pool_merge</code> (占了 GPU 0-7)</li>
+</ol>
+</li>
+<li><strong>关键点</strong>：不同的 <code>WorkerGroup</code> 可以绑定到重叠的资源池上。这意味着你可以灵活定义“谁在什么时候用哪些卡”。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 简化指挥指令（Decorators &amp; Dispatch）</h4>
+<p><em>对应文档 Chapter 3</em></p>
+<ul>
+<li><strong>痛点</strong>：在 Task 2 里，我们用 <code>execute_all_sync</code> 还要手动传一个列表 <code>[1,1,1,1]</code>，太麻烦了。如果我有 100 张卡，难道写 100 个 1 吗？</li>
+<li><strong>解决方案</strong>：使用装饰器 <code>@register</code>。</li>
+<li><strong>核心玩法</strong>：<ul>
+<li><code>@register(Dispatch.ONE_TO_ALL)</code>：<strong>广播模式</strong>。你只传一个 <code>10</code>，系统自动帮你在所有 Worker 上都执行 <code>add(10)</code>。</li>
+<li><strong>自定义分发 (Custom Dispatch)</strong>：教程里的 <code>two_to_all_dispatch_fn</code> 展示了更高级的玩法。比如你输入两个数据，系统自动把它们交替分发给所有 Worker。</li>
+<li><code>Execute.RANK_ZERO</code>：只让第 0 号工人干活，其他人看着。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 实战演练（Megatron 集成）</h4>
+<p><em>对应文档 Chapter 4</em></p>
+<ul>
+<li><strong>场景</strong>：我们要搞大模型（LLM）了。大模型太大，一张卡放不下，需要把模型切开（Tensor Parallel, TP）。</li>
+<li><strong>核心概念</strong>：<ul>
+<li><code>MegatronRayWorkerGroup</code>：这是 VeRL 最厉害的地方。它在 Ray 的基础上集成了 Megatron。</li>
+<li><strong>切分模型</strong>：代码中 <code>tensor_model_parallel_size=4</code>，意思是把一个巨大的神经网络层（MLP Layer）竖着切成 4 份，分别放在 4 张显卡上。</li>
+<li><code>Dispatch.MEGATRON_COMPUTE</code>：这是一个特殊的指令。当你输入数据 <code>x</code> 时，它会自动处理数据的切分和通信，让这 4 张卡协同计算出结果。</li>
+</ul>
+</li>
+<li><strong>结果</strong>：<ul>
+<li>你看最后的 <code>layer_worker_group.run_layer([x])</code>，虽然底层是 4 张卡在复杂的通信计算，但对于你（写代码的人）来说，就像调用一个普通的函数一样简单。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这篇教程的核心目的就是推销 <strong>VeRL 的 Ray 封装库</strong>。它想告诉你：</p>
+<blockquote>
+<p>“别直接手写原始的 Ray 代码了，太累。用我们的 <code>WorkerGroup</code> 和 <code>@register</code> 装饰器吧，管理显卡、分发数据、跑大模型切片，都像写单机代码一样简单！”</p>
+</blockquote>

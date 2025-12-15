@@ -1,0 +1,112 @@
+<h1>tools/retro/text_generation/retro_text_generation.py</h1>
+<p>这份代码是 <strong>NVIDIA Megatron</strong> 框架下，专门用于 <strong>RETRO (Retrieval-Enhanced Transformer)</strong> 模型的<strong>文本生成（Inference/推理）</strong>脚本。</p>
+<p>简单来说，它的作用是：<strong>读取一个包含问题的文件，利用外部检索到的知识（Neighbors），让模型生成回答，并保存到文件。</strong></p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“任务清单 (Todo List)”</strong>，按照程序运行的逻辑顺序，一步步给你讲解。</p>
+<hr />
+<h3>📋 任务清单 (Task Todo List)</h3>
+<ol>
+<li><strong>【初始化】设定参数与环境</strong> (配置这一轮生成要怎么跑)</li>
+<li><strong>【模型构建】搭建 GPT 模型骨架</strong> (把空壳子搭起来)</li>
+<li><strong>【加载权重】读取训练好的模型</strong> (把脑子装进去)</li>
+<li><strong>【数据准备】读取输入文件</strong> (拿题库)</li>
+<li><strong>【核心循环】处理检索数据 (Neighbors)</strong> (RETRO 的核心：找帮手)</li>
+<li><strong>【核心循环】拼装提示词 (Prompt)</strong> (把问题和帮手的信息通过模板组合)</li>
+<li><strong>【核心循环】执行生成</strong> (模型开始写答案)</li>
+<li><strong>【收尾】保存结果</strong> (把答案写进文件)</li>
+</ol>
+<hr />
+<h3>🧐 详细步骤讲解</h3>
+<h4>1. 【初始化】设定参数与环境</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>main()</code> 函数开头 和 <code>add_text_generate_args</code> 函数。</li>
+<li><strong>在做什么</strong>:<ul>
+<li>程序启动时，首先调用 <code>initialize_megatron</code>。</li>
+<li>它会去读取你命令行输入的参数。比如：<ul>
+<li><code>--temperature</code>: 生成的随机程度。</li>
+<li><code>--sample-input-file</code>: 输入的问题文件在哪里。</li>
+<li><code>--use-retrieved-neighbours</code>: 是否使用检索增强（RETRO 的关键开关）。</li>
+<li><code>--out-seq-length</code>: 答案最长写多少字。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>2. 【模型构建】搭建 GPT 模型骨架</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>model_provider</code> 函数。</li>
+<li><strong>在做什么</strong>:<ul>
+<li>这就是一个“蓝图”。它告诉 Megatron：“给我造一个 GPT 模型”。</li>
+<li>注意代码里的 <code>megatron.legacy.model.GPTModel</code>，说明它是基于旧版架构构建的 GPT，并且专门为了 RETRO 做了适配。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 【加载权重】读取训练好的模型</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>main()</code> 函数中的 <code>load_checkpoint</code>。</li>
+<li><strong>在做什么</strong>:<ul>
+<li>第2步只是搭了个架子，这里是从硬盘加载 <code>.pt</code> 文件（Checkpoint），恢复模型训练好的参数。没有这一步，模型就是个随机输出的傻瓜。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 【数据准备】读取输入文件</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>generate_samples_conditional</code> 函数中的 <code>preprocess</code>。</li>
+<li><strong>在做什么</strong>:<ul>
+<li><strong>Rank 0 (主进程)</strong> 负责读取 <code>args.sample_input_file</code>。</li>
+<li>它不仅读取你的“问题”（Query），还会读取与问题相关的“检索邻居”（Neighbours）。</li>
+<li><em>背景知识</em>：RETRO 模型生成时，不仅看你的问题，还会看数据库里搜出来的相似文档。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 【核心循环】处理检索数据 (Neighbors)</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>pad_neighbours_for_query_only</code> 函数。</li>
+<li><strong>在做什么</strong>:<ul>
+<li>检索回来的文本长度不一，模型无法直接吃。</li>
+<li>这个函数负责把检索到的文本（Neighbours）：<ol>
+<li><strong>截断/填充 (Pad)</strong>：太长的切掉，太短的补零，统一长度。</li>
+<li><strong>筛选 (Top-K)</strong>：只取最相关的前几个（<code>args.retro_num_neighbors</code>）。</li>
+</ol>
+</li>
+<li>最后变成一个整齐的数组 <code>neighbours_array</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>6. 【核心循环】拼装提示词 (Prompt)</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>reformat_prompt</code> 或 <code>reformat_prompt_short</code>。</li>
+<li><strong>在做什么</strong>:<ul>
+<li>这是 <strong>Prompt Engineering</strong> 的过程。</li>
+<li>模型不能直接吃“问题”+“检索文”，需要把它们拼成一句通顺的话。</li>
+<li>比如拼成：<code>"参考信息：[检索文1]... 问题：[用户问题] 回答："</code>。</li>
+<li><code>tokenizer.detokenize</code> 会把处理好的 Token 变回文字，方便后续处理。</li>
+</ul>
+</li>
+</ul>
+<h4>7. 【核心循环】执行生成</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>retro_generate_and_post_process</code> (来自 <code>retro_api</code> 库)。</li>
+<li><strong>在做什么</strong>:<ul>
+<li>这是真正“动脑子”的时候。</li>
+<li>输入：拼装好的 Prompt + 处理好的 Neighbours 数组。</li>
+<li>输出：模型生成的文本。</li>
+<li>这里涉及到了分布式同步：<code>torch.distributed</code>，只有 Rank 0 负责分发任务，其他 GPU 配合计算。</li>
+</ul>
+</li>
+</ul>
+<h4>8. 【收尾】保存结果</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>generate_and_write_samples_conditional</code> 和 <code>yield datum</code> 部分。</li>
+<li><strong>在做什么</strong>:<ul>
+<li>模型生成出来的东西可能包含一些乱码或结束符（如 <code>&lt;|endoftext|&gt;</code>）。</li>
+<li>代码里的 <code>datum.replace("\n", " ")</code> 负责把换行符去掉，让格式更整齐。</li>
+<li>最后把清洗干净的答案写入到输出文件 (<code>.out</code>) 中。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个脚本就是一个 <strong>“带外挂的 GPT 生成器”</strong>。
+*   <strong>普通 GPT</strong>: 问题 -&gt; 模型 -&gt; 答案
+*   <strong>这个脚本 (RETRO)</strong>: 问题 -&gt; <strong>找帮手(检索)</strong> -&gt; <strong>整理帮手资料(Padding)</strong> -&gt; <strong>拼在一起(Reformat)</strong> -&gt; 模型 -&gt; 答案</p>
+<p>你看的时候重点关注 <code>generate_samples_conditional</code> 这个函数，它是整个流水线的总指挥。</p>

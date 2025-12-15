@@ -1,0 +1,70 @@
+<h1>verl/models/llama/megatron/checkpoint_utils/llama_loader.py</h1>
+<p>这份代码的核心功能可以概括为：<strong>“搬运工”</strong>。</p>
+<p>它的任务是将一个完整的、标准的 Llama 模型权重（state_dict），<strong>拆解、切分</strong>，然后<strong>精准地填入</strong>到 Megatron-LM 这种复杂的分布式（并行）训练框架的各个 GPU 显存中。</p>
+<p>因为 Megatron 训练时，模型是被“大卸八块”分布在几十甚至上百张卡上的（有的卡只存前几层，有的卡只存矩阵的一部分），所以不能直接加载，必须边切边装。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>Task List（任务清单）</strong>，模拟这个脚本执行时的心路历程：</p>
+<hr />
+<h3>📋 任务清单：从单机权重到分布式模型</h3>
+<h4>Task 1: “我是谁？我在哪？” (环境初始化)</h4>
+<p><strong>代码位置：</strong> <code>load_state_dict_to_megatron_llama</code> 函数开头部分。
+*   <strong>目标：</strong> 确定当前运行这个脚本的 GPU 处于分布式集群的什么位置。
+*   <strong>动作：</strong>
+    *   获取 <code>dp_rank</code> (数据并行排名)：我是第几组复读机？
+    *   获取 <code>pp_rank</code> (流水线并行排名)：我负责模型的第几阶段（比如前10层还是后10层）？
+    *   获取 <code>tp_rank</code> (张量并行排名)：我负责矩阵切分的哪一块（左半边还是右半边）？
+*   <strong>人话解释：</strong> 在大家一起干活前，先确认自己的工号，防止搬错砖。</p>
+<h4>Task 2: “准备切割工具” (定义辅助函数)</h4>
+<p><strong>代码位置：</strong> 定义 <code>_fetch_tensor</code>, <code>_fetch_tp_shard_tensor</code> 等内部函数。
+*   <strong>目标：</strong> 针对不同类型的权重，制造不同的“铲子”。
+*   <strong>工具列表：</strong>
+    1.  <strong><code>_fetch_tensor</code> (普通铲子):</strong> 用于不切分的参数（如 LayerNorm），直接复制。
+    2.  <strong><code>_fetch_tp_shard_tensor</code> (切块铲子):</strong> 用于普通的线性层（如 <code>o_proj</code>, <code>down_proj</code>）。把大矩阵切成小块，只取当前 GPU 负责的那一块。
+    3.  <strong><code>_fetch_tp_shard_tensor_gate_up</code> (合并再切铲子):</strong> Llama 的 MLP 层很特殊，有 Gate 和 Up 两个投影。这里把它们拼起来再切分，为了符合 Megatron 的格式。
+    4.  <strong><code>_fetch_tp_shard_tensor_qkv</code> (三合一切铲子):</strong> 最复杂的工具。把 Q、K、V 三个矩阵拼在一起，按照“注意力头”重新排列并切分。这是因为 Megatron 喜欢把 QKV 放在一起算。</p>
+<h4>Task 3: “绘制施工图纸” (计算层映射)</h4>
+<p><strong>代码位置：</strong> <code>_megatron_calc_layer_map</code> 函数。
+*   <strong>目标：</strong> 搞清楚整个大模型的每一层（比如第 0 层到第 31 层）具体归哪个 GPU 管。
+*   <strong>动作：</strong> 生成一个字典 <code>layer_map</code>。
+    *   例如：<code>layer_map[5] = (rank_0, virtual_rank_0, local_layer_2)</code>
+    *   意思是：全局第 5 层，实际上在 Rank 0 这个 GPU 上，是它本地存储的第 2 层。
+*   <strong>人话解释：</strong> 这是一个导航地图，防止把第 10 层的权重装到第 20 层的架子上。</p>
+<h4>Task 4: “铺设地基” (加载 Embedding)</h4>
+<p><strong>代码位置：</strong> <code># Embeddings</code> 注释下方。
+*   <strong>目标：</strong> 加载词向量表 (<code>embed_tokens</code>)。
+*   <strong>动作：</strong>
+    *   判断：如果你是流水线的第一级 (<code>pp_rank == 0</code>)，你才需要干这个活。
+    *   使用“切块铲子” (<code>_fetch_tp_shard_tensor_vocab</code>) 把巨大的词表按词汇量切分加载。</p>
+<h4>Task 5: “盖楼” (循环加载 Transformer 层)</h4>
+<p><strong>代码位置：</strong> <code># Transformer layers</code> 注释下方的大循环。
+*   <strong>目标：</strong> 一层一层地把核心权重装进去。
+*   <strong>流程：</strong>
+    1.  <strong>查地图：</strong> 拿到当前循环的层号（比如 layer #5），看它是不是归我管 (<code>dst_pp_rank == pp_rank</code>)。如果不归我管，我就跳过，让别的 GPU 去装。
+    2.  <strong>装 LayerNorm：</strong> 输入层的归一化参数。
+    3.  <strong>装 Attention (QKV)：</strong> 使用“三合一切铲子”，把原始权重里的 Q、K、V 读出来，拼好，切好，塞进去。
+    4.  <strong>装 Attention Output：</strong> 使用“切块铲子”装 <code>o_proj</code>。
+    5.  <strong>装 MLP (Gate/Up/Down)：</strong>
+        *   先用“合并再切铲子”处理 <code>gate_proj</code> 和 <code>up_proj</code>。
+        *   再用“切块铲子”处理 <code>down_proj</code>。
+*   <strong>人话解释：</strong> 这是最累的环节。每个 GPU 拿着清单核对：“这层归我吗？归我。好，把 QKV 拿来切了装上，把 MLP 拿来切了装上。”</p>
+<h4>Task 6: “封顶” (加载 Final Norm 和 Head)</h4>
+<p><strong>代码位置：</strong> <code># Final Layernorm</code> 和 <code># lm_head</code> 注释下方。
+*   <strong>目标：</strong> 加载最后的归一化层和输出层。
+*   <strong>动作：</strong>
+    *   判断：只有流水线的最后一级 (<code>pp_rank + 1 == pp_size</code>) 才负责封顶。
+    *   装 <code>norm.weight</code>。
+    *   装 <code>lm_head</code> (输出层)。这里有个小逻辑：如果是 Value Model (用于 RLHF 的评论员模型)，可能要把 <code>reward_head</code> 当作 <code>lm_head</code> 加载。</p>
+<h4>Task 7: “收工” (清理与同步)</h4>
+<p><strong>代码位置：</strong> 最后几行。
+*   <strong>动作：</strong>
+    *   <code>dist.barrier()</code>: 等所有人（所有 GPU）都装完了，再一起往下走。
+    *   <code>empty_cache()</code>: 清理一下刚才搬运过程中产生的垃圾（显存碎片）。
+    *   打印耗时。</p>
+<hr />
+<h3>总结一下这段代码在干嘛</h3>
+<p><strong>简单来说：</strong>
+你手里有一本很厚的书（原始 Llama 权重），你要把它撕下来贴到一面巨大的墙上（Megatron 模型）。但这面墙被划分给了 8 个人（8 个 GPU），每个人只负责墙的一小块区域。</p>
+<p>这段代码就是指挥官：
+1.  告诉每个人负责哪块区域。
+2.  给每个人发剪刀和胶水（Helper Functions）。
+3.  把书一页页撕下来，如果是文字（LayerNorm）直接贴；如果是图片（矩阵），就剪开（Tensor Parallel），分给对应的人贴上去。
+4.  最后确认大家都贴好了，才算完工。</p>

@@ -1,0 +1,140 @@
+<h1>tests/functional_tests/test_scripts/gpt3/pretrain_gpt3_distributed_test.sh</h1>
+<p>这份脚本确实看起来很复杂，因为它不仅仅是用来“训练模型”的，它是一个<strong>自动化测试脚本</strong>（CI/CD pipeline的一部分）。它的目的是在不同的配置下（比如是否用FP8，是否用Transformer Engine，是否用Megatron-Core等）运行GPT-3的预训练，并验证结果是否正确。</p>
+<p>你可以把它想象成一个<strong>“全自动试飞员”</strong>。它上飞机前要检查仪表，根据天气（环境变量）调整飞行模式，飞一圈，然后把黑匣子数据拿出来对比标准数据，看看飞得对不对。</p>
+<p>我为你整理了一个 <strong>“试飞员的任务清单 (To-Do List)”</strong>，按照脚本执行的顺序一步步拆解：</p>
+<hr />
+<h3>📋 脚本执行任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>[准备阶段] 收取并解析任务指令</strong><ul>
+<li>读取外部传入的参数（比如 <code>KEY=VALUE</code>），把它们变成脚本里的环境变量。</li>
+</ul>
+</li>
+<li><strong>[准备阶段] 设定默认参数与硬件环境</strong><ul>
+<li>如果没指定Batch Size或文件路径，就用默认值。</li>
+<li>确定有多少个GPU，网络地址是多少。</li>
+</ul>
+</li>
+<li><strong>[配置阶段] 制定“飞行模式” (关键逻辑)</strong><ul>
+<li>根据开关决定：是用旧版代码还是新版Megatron-Core？是用FP16还是FP8？是否允许随机性？</li>
+<li>根据这些决定，拼接出不同的环境变量和启动参数。</li>
+</ul>
+</li>
+<li><strong>[构建阶段] 组装启动命令 (torchrun)</strong><ul>
+<li>写出一个超级长的 <code>torchrun</code> 命令，里面包含了模型大小（层数、隐藏层维度）、并行策略（TP/PP）、数据路径等。</li>
+</ul>
+</li>
+<li><strong>[特殊分支] 断点续训测试 (Checkpoint Resume Test)</strong><ul>
+<li><em>如果开启了此模式</em>：不仅仅是跑一次，而是要模拟“跑一半挂了 -&gt; 读取存档 -&gt; 继续跑”的过程，验证存档功能是否正常。</li>
+</ul>
+</li>
+<li><strong>[执行阶段] 点火发射</strong><ul>
+<li>打印最终命令，保存到文件，并真正执行它 (<code>eval</code>)。</li>
+</ul>
+</li>
+<li><strong>[验收阶段] 数据分析与合规检查</strong><ul>
+<li>从 TensorBoard 日志中提取 Loss（损失值）等数据。</li>
+<li>运行 <code>pytest</code>：把这次跑出来的数据和“标准答案（Golden Values）”做对比。如果误差太大，测试失败。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🧐 逐步详细解读</h3>
+<p>下面我按照上面的清单，带你一段一段看代码：</p>
+<h4>1. 收取并解析任务指令</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">for</span><span class="w"> </span>ARGUMENT<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$@</span><span class="s2">&quot;</span>
+<span class="k">do</span>
+<span class="w">   </span><span class="nv">KEY</span><span class="o">=</span><span class="k">$(</span><span class="nb">echo</span><span class="w"> </span><span class="nv">$ARGUMENT</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>cut<span class="w"> </span>-f1<span class="w"> </span>-d<span class="o">=</span><span class="k">)</span>
+<span class="w">   </span>...
+<span class="w">   </span><span class="nb">export</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$KEY</span><span class="s2">&quot;</span><span class="o">=</span><span class="s2">&quot;</span><span class="nv">$VALUE</span><span class="s2">&quot;</span>
+<span class="k">done</span>
+</code></pre></div>
+
+<ul>
+<li><strong>白话解释</strong>：这就像试飞员接过任务书。你在运行脚本时输入的 <code>MBS=4 GBS=32</code> 等参数，在这里被拆解并设置为环境变量，供后面使用。</li>
+</ul>
+<h4>2. 设定默认参数与硬件环境</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span><span class="w"> </span><span class="o">[[</span><span class="w"> </span>-z<span class="w"> </span><span class="nv">$MBS</span><span class="w"> </span><span class="o">]]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span><span class="w"> </span><span class="nv">MBS</span><span class="o">=</span><span class="m">4</span><span class="p">;</span><span class="w"> </span><span class="k">fi</span>
+...
+<span class="nv">GPUS_PER_NODE</span><span class="o">=</span><span class="m">8</span>
+<span class="nv">MASTER_ADDR</span><span class="o">=</span>localhost
+...
+</code></pre></div>
+
+<ul>
+<li><strong>白话解释</strong>：如果任务书没写Micro Batch Size ($MBS)，默认设为4。这里假定是在单机8卡（<code>GPUS_PER_NODE=8</code>）的环境下运行测试。</li>
+</ul>
+<h4>3. 制定“飞行模式” (配置开关)</h4>
+<p>这是最让人眼花缭乱的部分，全是 <code>if</code>。
+*   <strong>确定性 (Deterministic)</strong>: <code>if [[ $ALLOW_NONDETERMINISTIC -eq 1 ]];</code>。测试通常需要结果可复现，所以默认会强制关闭随机性算法。
+*   <strong>新旧核心 (Core vs Legacy)</strong>: <code>if [[ $USE_CORE -eq 1 ]];</code>。Megatron正在从旧架构迁移到Megatron-Core，这里决定用哪套代码。
+*   <strong>精度 (FP8/BF16/FP16)</strong>: <code>if [[ $USE_FP8 -eq 1 ]];</code>。如果开启FP8，就要加一堆FP8专用的参数。如果是Transformer Engine (<code>USE_TE</code>)，通常强制用 <code>bf16</code>。
+*   <strong>存档测试准备</strong>: <code>if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]];</code>。如果是为了测存档功能，训练步数 (<code>MAX_STEPS</code>) 会被强制缩短（比如只跑100步），因为我们不需要训练完，只要测能不能存取就行。</p>
+<h4>4. 组装启动命令 (Build Command)</h4>
+<p>代码中定义了一个函数 <code>build_torch_run_cmd()</code>。</p>
+<div class="codehilite"><pre><span></span><code><span class="nv">torch_run_cmd</span><span class="o">=</span><span class="s2">&quot;</span><span class="nv">$run_cmd</span><span class="s2"> \</span>
+<span class="s2">       pretrain_gpt.py \</span>
+<span class="s2">       --num-layers 12 \</span>
+<span class="s2">       --hidden-size 512 \</span>
+<span class="s2">       ...&quot;</span>
+</code></pre></div>
+
+<ul>
+<li><strong>白话解释</strong>：这是在造“核弹”。<ul>
+<li><code>pretrain_gpt.py</code>: 这是真正干活的训练代码。</li>
+<li><code>--num-layers 12 --hidden-size 512</code>: 这里硬编码了一个很小的模型（GPT-3 345M参数量），因为这只是功能测试，没必要跑几千亿参数的大模型，太费钱费时。</li>
+<li><code>--tensor-model-parallel-size $TP_SIZE</code>: 设置模型并行度。</li>
+<li><code>${ADDITIONAL_PARAMS}</code>: 把第3步里根据各种开关攒出来的额外参数塞进去。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 特殊分支：断点续训 (Resume Test)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span><span class="w"> </span><span class="o">[[</span><span class="w"> </span><span class="nv">$CHECKPOINT_RESUME_TEST</span><span class="w"> </span>-eq<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="o">]]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">  </span>...
+<span class="w">  </span><span class="nv">command</span><span class="o">=</span><span class="s2">&quot;</span><span class="nv">$command</span><span class="s2">; rm -rf ...; echo 50 &gt; ...; </span><span class="nv">$torch_run_cmd</span><span class="s2">&quot;</span>
+<span class="k">fi</span>
+</code></pre></div>
+
+<ul>
+<li><strong>白话解释</strong>：如果这是个“断点续训测试”，逻辑会变得很变态：<ol>
+<li>先生成运行命令。</li>
+<li><strong>修改命令</strong>：先跑一段 -&gt; 删掉第100步的存档（模拟丢失） -&gt; 手动把记录改回第50步 -&gt; 再次运行命令（触发Resume）。</li>
+<li>它的目的是验证：模型能不能成功从第50步的存档加载，并继续训练。</li>
+</ol>
+</li>
+</ul>
+<h4>6. 正式执行</h4>
+<div class="codehilite"><pre><span></span><code><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$command</span><span class="s2">&quot;</span><span class="w"> </span>&gt;<span class="w"> </span><span class="nv">$SCRIPTS_DIR</span>/pretrain_gpt3_distributed_command.sh
+<span class="nb">eval</span><span class="w"> </span><span class="nv">$command</span>
+</code></pre></div>
+
+<ul>
+<li><strong>白话解释</strong>：把刚才拼凑了几百个字符的超长命令打印出来（方便你Debug），然后用 <code>eval</code> 执行它。这时候GPU开始转动，风扇开始呼啸。</li>
+</ul>
+<h4>7. 验收阶段 (Validation)</h4>
+<div class="codehilite"><pre><span></span><code><span class="nv">PYTHONPATH</span><span class="o">=</span><span class="nv">$PWD</span><span class="w"> </span>python3<span class="w"> </span>.../get_test_results_from_tensorboard_logs.py<span class="w"> </span>...
+<span class="k">if</span><span class="w"> </span><span class="o">[[</span><span class="w"> </span><span class="nv">$SKIP_PYTEST</span><span class="w"> </span>!<span class="o">=</span><span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="o">]]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">    </span>pytest<span class="w"> </span>...
+<span class="k">fi</span>
+</code></pre></div>
+
+<ul>
+<li><strong>白话解释</strong>：<ul>
+<li>训练完了，生成了一堆日志。</li>
+<li>用一个Python脚本去读日志，把Loss曲线拿出来。</li>
+<li><strong>关键一步</strong>：运行 <code>pytest</code>。<ul>
+<li>如果是普通测试：对比 <code>test_ci_pipeline.py</code> 里的“黄金数据”（比如：第10步Loss应该是8.5）。如果跑出来是10.0，测试<strong>Fail</strong>。</li>
+<li>如果是FP8测试：对比FP8的基准数据。</li>
+<li>如果是续训测试：对比第一次跑和第二次续跑的曲线是否吻合。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个脚本就是一个<strong>大管家</strong>。你告诉它：“嘿，帮我测一下Megatron在8卡上跑FP16行不行”。
+它就会：
+1.  配置好环境变量。
+2.  拼好命令。
+3.  跑一个小模型。
+4.  拿着放大镜看结果对不对。
+5.  最后告诉你：Pass 还是 Fail。</p>

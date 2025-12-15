@@ -1,0 +1,137 @@
+<h1>fla/layers/hgrn2.py</h1>
+<p>这个代码文件实现了一个名为 <strong>HGRN2 (Hiearchical Gated Recurrent Network 2)</strong> 的神经网络层。简单来说，它是一种<strong>线性注意力（Linear Attention）</strong>或者说<strong>现代 RNN</strong> 的变体。它的目标是用比传统 Transformer（标准 Attention）更低的计算成本（显存占用更少、推理更快），来实现类似的效果。</p>
+<p>之所以你看不懂，是因为它混合了 RNN 的逻辑（循环状态）、卷积（局部特征）和 Transformer 的多头结构。</p>
+<p>为了让你听懂，我把这个代码的执行流程拆解成一个 <strong>“流水线加工任务清单” (Task To-Do List)</strong>。我们可以把输入的数据想象成传送带上的原料，经过这一层层的加工，最后变成成品。</p>
+<hr />
+<h3>📋 HGRN2 加工流水线 Task List</h3>
+<ol>
+<li><strong>【准备原料】输入投影 (Projections)</strong>：把原始数据拆分成三个不同的控制信号 (Q, F, I)。</li>
+<li><strong>【局部预处理】短卷积 (Short Convolution)</strong>：先看看“周围”的信息，提取局部特征。</li>
+<li><strong>【质检与控制】门控计算 (Gating Logic)</strong>：决定哪些信息该“记住”，哪些该“遗忘”。</li>
+<li><strong>【核心加工】状态更新与混合 (Core Recurrence/GLA)</strong>：把当前信息融入到历史记忆中（这是最核心的一步）。</li>
+<li><strong>【状态保存】缓存管理 (Cache Management)</strong>：如果是生成模式，把记忆存下来供下一步使用。</li>
+<li><strong>【成品包装】输出归一化与投影 (Output Norm &amp; Projection)</strong>：整理形状，输出最终结果。</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 1: 【准备原料】输入投影 (Projections)</h4>
+<p><strong>代码位置：</strong> <code>__init__</code> 中的定义 和 <code>forward</code> 的开头。</p>
+<p><strong>解释：</strong>
+输入的 <code>hidden_states</code> (比如一句话的特征) 不能直接用，需要转换成三个特定的信号：
+*   <strong>Q (Query/Gate)</strong>: 可以理解为“查询”或者“输出门”，决定当前时刻要输出多少信息。
+*   <strong>F (Forget)</strong>: <strong>遗忘门</strong>。这是 HGRN2 的核心，决定了我们要保留多少之前的记忆。
+*   <strong>I (Input)</strong>: <strong>输入内容</strong>。这是实际承载文本语义信息的向量（类似于 Attention 里的 V）。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 定义</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">q_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">forget_dim</span><span class="p">,</span> <span class="n">bias</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">f_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">forget_dim</span><span class="p">,</span> <span class="n">bias</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">i_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_dim</span><span class="p">,</span> <span class="n">bias</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+
+<span class="c1"># 使用</span>
+<span class="n">q</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">q_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+<span class="n">f</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">f_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+<span class="n">i</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">i_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+</code></pre></div>
+
+<blockquote>
+<p><strong>注意点</strong>：这里 <code>f</code> (遗忘门) 的维度通常比 <code>i</code> (内容) 大（<code>expand_ratio</code>），这是 HGRN2 的特色“状态扩展”，为了记得更细致。</p>
+</blockquote>
+<hr />
+<h4>Task 2: 【局部预处理】短卷积 (Short Convolution)</h4>
+<p><strong>代码位置：</strong> <code>if self.use_short_conv:</code> 代码块。</p>
+<p><strong>解释：</strong>
+RNN/线性注意力有时候太关注“全局”或者“过去”，容易忽略“当前这个词旁边紧挨着的词”。
+这里用一个很短的<strong>一维卷积 (Conv1d)</strong>（窗口大小通常是 4），在进入核心计算前，先让 Q、F、I 看看它们左右邻居的信息。这能增强模型的局部捕捉能力。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_short_conv</span><span class="p">:</span>
+    <span class="c1"># ... 处理缓存 ...</span>
+    <span class="n">q</span><span class="p">,</span> <span class="n">conv_state_q</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">q_conv1d</span><span class="p">(</span><span class="n">x</span><span class="o">=</span><span class="n">q</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span> <span class="c1"># 加上了局部信息</span>
+    <span class="n">f</span><span class="p">,</span> <span class="n">conv_state_f</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">f_conv1d</span><span class="p">(</span><span class="n">x</span><span class="o">=</span><span class="n">f</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+    <span class="n">i</span><span class="p">,</span> <span class="n">conv_state_i</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">i_conv1d</span><span class="p">(</span><span class="n">x</span><span class="o">=</span><span class="n">i</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<hr />
+<h4>Task 3: 【质检与控制】门控计算 (Gating Logic)</h4>
+<p><strong>代码位置：</strong> <code>forward</code> 中间部分，处理 <code>q</code>, <code>f</code>, <code>lower_bound</code>。</p>
+<p><strong>解释：</strong>
+拿到了原始信号后，需要经过激活函数变成真正的“门”：
+1.  <strong>Q</strong>: 经过 <code>swish</code> 激活。
+2.  <strong>F (遗忘率)</strong>: 这里的逻辑比较数学化。
+    *   代码里计算了 <code>g</code> (decay rate，衰减率)。
+    *   如果 <code>f</code> 很大，代表不遗忘；如果 <code>f</code> 很小，代表遗忘。
+    *   <code>lower_bound</code> 是一个保底机制，防止模型彻底把以前的事全忘光了，保证梯度能传回去。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">q</span> <span class="o">=</span> <span class="n">swish</span><span class="p">(</span><span class="n">q</span><span class="p">)</span> <span class="c1"># Q 激活</span>
+
+<span class="c1"># F 变成 衰减率 g 和 保持率 k</span>
+<span class="c1"># 简单理解：g 是 log 空间的衰减系数，控制历史记忆保留多少</span>
+<span class="k">if</span> <span class="n">lower_bound</span> <span class="ow">is</span> <span class="kc">None</span> <span class="o">...</span><span class="p">:</span>
+    <span class="n">k</span><span class="p">,</span> <span class="n">g</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">-</span> <span class="n">f</span><span class="o">.</span><span class="n">sigmoid</span><span class="p">(),</span> <span class="n">F</span><span class="o">.</span><span class="n">logsigmoid</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="c1"># 带有下界的遗忘门计算</span>
+    <span class="n">g</span> <span class="o">=</span> <span class="n">lower_bound</span> <span class="o">+</span> <span class="p">(</span><span class="mi">1</span> <span class="o">-</span> <span class="n">lower_bound</span><span class="p">)</span> <span class="o">*</span> <span class="n">f</span><span class="o">.</span><span class="n">sigmoid</span><span class="p">()</span>
+    <span class="n">k</span><span class="p">,</span> <span class="n">g</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">-</span> <span class="n">g</span><span class="p">,</span> <span class="n">g</span><span class="o">.</span><span class="n">log</span><span class="p">()</span>
+</code></pre></div>
+
+<hr />
+<h4>Task 4: 【核心加工】状态更新与混合 (Core Recurrence/GLA)</h4>
+<p><strong>代码位置：</strong> <code>chunk_gla</code>, <code>fused_chunk_gla</code>, 或 <code>fused_recurrent_gla</code> 的调用。</p>
+<p><strong>解释：</strong>
+这是整个文件最难懂但最重要的地方。它把 Q, K(由F变换来), V(即I), G 结合起来。
+*   <strong>Recurrent (循环模式)</strong>: 像传统 RNN 一样，一步步算：<code>新记忆 = 旧记忆 * 衰减率 + 新输入</code>。推理时用这个，省显存。
+*   <strong>Chunk (分块模式)</strong>: 像 Transformer 一样并行计算。把长序列切成小块（Chunk），块内并行算，块间串行传。训练时用这个，速度快。</p>
+<p>代码根据序列长度和模式选择不同的算子（kernel）：</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 调整形状以适应多头注意力机制</span>
+<span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">g</span> <span class="o">=</span> <span class="nb">map</span><span class="p">(</span><span class="k">lambda</span> <span class="n">x</span><span class="p">:</span> <span class="n">rearrange</span><span class="p">(</span><span class="o">...</span><span class="p">),</span> <span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">g</span><span class="p">))</span>
+
+<span class="k">if</span> <span class="n">mode</span> <span class="o">==</span> <span class="s1">&#39;fused_recurrent&#39;</span><span class="p">:</span>
+    <span class="c1"># 推理时：一步步循环</span>
+    <span class="n">o</span><span class="p">,</span> <span class="n">recurrent_state</span> <span class="o">=</span> <span class="n">fused_recurrent_gla</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="k">elif</span> <span class="n">mode</span> <span class="o">==</span> <span class="s1">&#39;chunk&#39;</span><span class="p">:</span>
+    <span class="c1"># 训练时：并行分块计算</span>
+    <span class="n">o</span><span class="p">,</span> <span class="n">recurrent_state</span> <span class="o">=</span> <span class="n">chunk_gla</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<blockquote>
+<p><strong>结果</strong>：<code>o</code> 就是混合了历史信息和当前信息的输出特征。</p>
+</blockquote>
+<hr />
+<h4>Task 5: 【状态保存】缓存管理 (Cache Management)</h4>
+<p><strong>代码位置：</strong> <code>if past_key_values is not None:</code></p>
+<p><strong>解释：</strong>
+如果你在做文本生成（比如 ChatGPT 一个字一个字蹦），你需要把当前的“记忆状态”（<code>recurrent_state</code>）和“卷积状态”（<code>conv_state</code>）存下来，传给下一次 forward。这样下一次就不用重算以前的内容了。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">past_key_values</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">past_key_values</span><span class="o">.</span><span class="n">update</span><span class="p">(</span>
+        <span class="n">recurrent_state</span><span class="o">=</span><span class="n">recurrent_state</span><span class="p">,</span> <span class="c1"># RNN 的全局记忆</span>
+        <span class="n">conv_state</span><span class="o">=...</span><span class="p">,</span>                  <span class="c1"># 卷积的局部记忆</span>
+        <span class="o">...</span>
+    <span class="p">)</span>
+</code></pre></div>
+
+<hr />
+<h4>Task 6: 【成品包装】输出归一化与投影 (Output Norm &amp; Projection)</h4>
+<p><strong>代码位置：</strong> <code>forward</code> 函数的最后两行。</p>
+<p><strong>解释：</strong>
+核心计算出来的 <code>o</code> 是多头分离的，形状也不对。
+1.  <strong>Rearrange</strong>: 把多头的数据拼回去。
+2.  <strong>RMSNorm &amp; Linear</strong>: 先做一次归一化（让数据分布更稳定），然后通过一个线性层 (<code>o_proj</code>) 映射回原本的 <code>hidden_size</code>，以便传给神经网络的下一层。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">o</span> <span class="o">=</span> <span class="n">rearrange</span><span class="p">(</span><span class="n">o</span><span class="p">,</span> <span class="s1">&#39;... h d -&gt; ... (h d)&#39;</span><span class="p">)</span> <span class="c1"># 拼合多头</span>
+<span class="c1"># 归一化 + 最终线性投影</span>
+<span class="n">o</span> <span class="o">=</span> <span class="n">rms_norm_linear</span><span class="p">(</span><span class="n">o</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">g_norm</span><span class="o">.</span><span class="n">weight</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">g_norm</span><span class="o">.</span><span class="n">bias</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">o_proj</span><span class="o">.</span><span class="n">weight</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">o_proj</span><span class="o">.</span><span class="n">bias</span><span class="p">)</span>
+<span class="k">return</span> <span class="n">o</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="n">past_key_values</span>
+</code></pre></div>
+
+<hr />
+<h3>总结</h3>
+<p>这个 <code>HGRN2Attention</code> 其实就是做一个加强版的“记忆读取”操作：</p>
+<ol>
+<li>把输入变成 <strong>内容(I)</strong> 和 <strong>控制信号(Q, F)</strong>。</li>
+<li>用 <strong>F</strong> 控制历史记忆衰减（忘了多少）。</li>
+<li>用 <strong>I</strong> 注入新的记忆。</li>
+<li>用 <strong>Q</strong> 从当前记忆中提取结果。</li>
+<li>中间穿插了 <strong>短卷积</strong> 来增强对邻近词的感知。</li>
+</ol>
+<p>它之所以写得复杂，是因为它为了快（Fast Linear Attention），使用了底层的 Triton 加速算子（<code>chunk_gla</code> 等），并且需要兼容训练（并行）和推理（串行）两种模式。</p>

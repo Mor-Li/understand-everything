@@ -1,0 +1,90 @@
+<h1>tests/functional_tests/test_scripts/t5/pretrain_t5_distributed_test.sh</h1>
+<p>这份脚本确实看起来很乱，因为它不仅仅是一个“训练脚本”，而是一个<strong>自动化测试脚本（CI/CD Script）</strong>。</p>
+<p>它的核心目的不是为了训练出一个完美的模型，而是为了<strong>测试代码有没有Bug</strong>。它会快速跑一小段训练，然后检查各项指标是否符合预期，或者检查断点续训（Resume）功能是否正常。</p>
+<p>为了让你看懂，我把这个脚本的工作流程拆解成一个 <strong>Task List（任务清单）</strong>，我们一步一步来完成这个任务。</p>
+<hr />
+<h3>📋 任务清单：T5 模型分布式训练测试流程</h3>
+<h4>Step 1: 拆包与环境准备 (Initialization)</h4>
+<p><strong>任务：</strong> 接收外部传进来的参数，并设置好默认值，防止后面报错。</p>
+<ul>
+<li><strong>代码对应：</strong> 开头的 <code>for ARGUMENT in "$@"</code> 循环和随后的一堆 <code>if [[ -z ... ]]</code>。</li>
+<li><strong>白话解释：</strong><ul>
+<li>脚本启动时可能带参数（比如 <code>MBS=4</code>），这段代码负责把这些参数读进去变成环境变量。</li>
+<li>如果没有传参数，就设置默认值（比如默认微批次大小 <code>MBS=4</code>，默认全局批次 <code>GBS=32</code>）。</li>
+<li>设定 GPU 数量（默认每台机器 8 张卡）。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 2: 选择“武器装备” (Configuration Logic)</h4>
+<p><strong>任务：</strong> 根据开关（Flags）决定使用什么样的技术栈来运行模型。</p>
+<ul>
+<li><strong>代码对应：</strong> 中间那一大段 <code>if</code> 判断（<code>ALLOW_NONDETERMINISTIC</code>, <code>USE_CORE</code>, <code>NO_FA</code>, <code>USE_TE</code>）。</li>
+<li><strong>白话解释：</strong><ul>
+<li><strong>确定性模式：</strong> 要不要保证每次跑的结果完全一样？（测试时通常需要）。</li>
+<li><strong>Megatron Core vs Legacy：</strong> 是用新版的 Megatron Core 代码（<code>USE_CORE=1</code>，用 <code>bf16</code> 精度），还是用旧版代码（<code>USE_LEGACY=1</code>，用 <code>fp16</code> 精度）？</li>
+<li><strong>Flash Attention：</strong> 是否开启 Flash Attention 加速？（<code>NO_FA</code> 控制）。</li>
+<li><strong>Transformer Engine：</strong> 是否使用 NVIDIA 的 Transformer Engine 库？（<code>USE_TE</code> 控制）。</li>
+<li><strong>断点续训测试：</strong> <code>CHECKPOINT_RESUME_TEST</code> 是关键开关。如果开启，说明这次不是为了跑通，而是为了测试“能不能存盘并恢复”。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 3: 组装训练命令 (Constructing the Command)</h4>
+<p><strong>任务：</strong> 拼凑出一个超长的 <code>torchrun</code> 命令行字符串，这是真正干活的指令。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>torch_run_cmd="torchrun ..."</code> 那一大坨。</li>
+<li><strong>白话解释：</strong> 这是一个 T5 模型（Encoder-Decoder 架构），脚本里硬编码了它的参数：<ul>
+<li><strong>模型大小：</strong> 12 层 Encoder，12 层 Decoder，隐藏层 768（这是一个比较小的 T5 模型，大概 220M 参数，为了跑得快）。</li>
+<li><strong>并行策略：</strong> 张量并行 (<code>TP_SIZE</code>) 和 流水线并行 (<code>PP_SIZE</code>)。</li>
+<li><strong>数据路径：</strong> 指定词表 (<code>VOCAB_PATH</code>) 和训练数据 (<code>DATA_PATH</code>)。</li>
+<li><strong>训练参数：</strong> 学习率、步数 (<code>MAX_STEPS</code>)、保存间隔等。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 4: 处理“断点续训”的特殊逻辑 (The Resume Trick)</h4>
+<p><strong>任务：</strong> 如果是测试“断点续训”，需要把命令变个魔术。</p>
+<ul>
+<li><strong>代码对应：</strong>
+    <code>bash
+    if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
+      command="$command; rm -rf ...; echo 50 &gt; ...; $torch_run_cmd"
+    fi</code></li>
+<li><strong>白话解释：</strong> 这是一个很骚的操作。如果开启了这个模式，脚本生成的最终命令会变成三步走：<ol>
+<li>先跑一次训练（跑 100 步）。</li>
+<li><strong>删掉</strong> 第 100 步的存档，并手动修改记录，假装只跑到了第 50 步。</li>
+<li><strong>再次运行</strong> 训练命令。</li>
+<li><strong>目的：</strong> 验证程序能不能成功加载第 50 步的存档，并继续往后跑。这是为了防止模型训练了一半挂了，结果发现存档坏了读不出来的惨剧。</li>
+</ol>
+</li>
+</ul>
+<h4>Step 5: 执行命令 (Execution)</h4>
+<p><strong>任务：</strong> 把刚才拼好的字符串真的在 Shell 里运行起来。</p>
+<ul>
+<li><strong>代码对应：</strong>
+    <code>bash
+    echo "$command" &gt; ...
+    eval $command</code></li>
+<li><strong>白话解释：</strong> 之前的步骤只是在拼接字符串，<code>eval $command</code> 才是真正按下“回车键”，开始烧显卡训练。</li>
+</ul>
+<h4>Step 6: 阅卷打分 (Validation)</h4>
+<p><strong>任务：</strong> 训练跑完了，结果对不对？通过分析日志和 Pytest 来判断测试通过还是失败。</p>
+<ul>
+<li><strong>代码对应：</strong> 脚本最后一部分。</li>
+<li><strong>白话解释：</strong><ol>
+<li><strong>提取成绩：</strong> 运行一个 Python 脚本 (<code>get_test_results...py</code>) 从 TensorBoard 日志里把 Loss（损失值）等数据抠出来存成 JSON。</li>
+<li><strong>对比答案：</strong><ul>
+<li>如果是 <strong>普通训练</strong>：运行 <code>pytest ... test_ci_pipeline.py</code>。它会把这次跑出来的 Loss 和预先设定好的“标准答案（Golden Values）”对比。如果误差太大，测试失败。</li>
+<li>如果是 <strong>断点续训</strong>：运行 <code>pytest ... test_resume_checkpoint_pipeline.py</code>。它会对比第一次跑的数据和续训后的数据，确保两者曲线能完美接上。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结一下</h3>
+<p>这个脚本其实就干了三件事：</p>
+<ol>
+<li><strong>配置环境</strong>：根据你输入的变量（比如是否用新版内核、是否测试续训）设置好参数。</li>
+<li><strong>跑模型</strong>：用 <code>torchrun</code> 启动一个分布式的 T5 预训练。</li>
+<li><strong>自动判卷</strong>：跑完后，用 Python 脚本去检查日志里的 Loss 曲线是不是正常的，或者是不是和预期一致。</li>
+</ol>
+<p><strong>你之所以看不懂，是因为它混杂了大量的 Shell 字符串拼接逻辑和测试专用的“骚操作”（比如删存档再跑），而不是单纯的机器学习代码。</strong></p>

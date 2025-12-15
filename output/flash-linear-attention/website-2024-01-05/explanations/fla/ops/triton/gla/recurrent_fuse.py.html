@@ -1,0 +1,140 @@
+<h1>fla/ops/triton/gla/recurrent_fuse.py</h1>
+<p>这份代码确实比较硬核，它涉及到 <strong>Triton 算子开发</strong>、<strong>线性 Attention 的循环（RNN）模式</strong> 以及 <strong>底层显存管理</strong>。看不懂很正常。</p>
+<p>为了让你读懂，我把这个任务拆解成一个 <strong>“学习/理解清单” (Todo List)</strong>，我们一步一步来攻克。</p>
+<hr />
+<h3>核心背景：这是什么？</h3>
+<p>这是一个 <strong>Gated Linear Attention (GLA)</strong> 的算法实现。
+简单说，它把 Transformer 的 Attention 变成了一个类似 RNN 的循环过程。
+*   <strong>普通 Attention</strong>: $O = \text{Softmax}(QK^T)V$ （需要 $N \times N$ 矩阵，很慢）。
+*   <strong>Linear Attention (RNN模式)</strong>: $S_t = S_{t-1} + K_t^T V_t$ （维护一个状态 $S$，像滚雪球一样处理，速度快）。
+*   <strong>Gated (带门控)</strong>: $S_t = S_{t-1} \cdot \text{decay} + K_t^T V_t$ （加了一个衰减/遗忘门 <code>g</code>，决定记住多少以前的信息）。</p>
+<p>这份代码就是用 Triton 语言在 GPU 上极速实现这个“滚雪球”的过程。</p>
+<hr />
+<h3>你的 Todo List</h3>
+<p>请按照这个顺序阅读代码：</p>
+<ol>
+<li><strong>Task 1: 搞懂输入输出 (Data Shapes)</strong></li>
+<li><strong>Task 2: 理解核心数学公式 (The RNN Logic)</strong></li>
+<li><strong>Task 3: 理解前向传播 Kernel (<code>fwd_kernel</code>)</strong></li>
+<li><strong>Task 4: 理解后向传播 Kernel (<code>bwd_kernel</code>)</strong></li>
+<li><strong>Task 5: 理解 PyTorch 包装层 (维度切分技巧)</strong></li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>Task 1: 搞懂输入输出</h4>
+<p>先看 <code>FusedRecurrentGLAFunction.forward</code> 函数的开头。</p>
+<ul>
+<li><strong>输入</strong>:<ul>
+<li><code>q, k, v</code>: 形状通常是 <code>[Batch, Heads, Length, Dim]</code>。</li>
+<li><code>g</code> (gate): 门控信号，决定遗忘多少历史信息。</li>
+</ul>
+</li>
+<li><strong>隐状态 (Hidden State)</strong>:<ul>
+<li>代码里有一个变量 <code>h</code> (在 kernel 里)。</li>
+<li>它的形状是矩阵 <code>[Dim_V, Dim_K]</code>。这就是那个“雪球”，它记住了历史信息。</li>
+</ul>
+</li>
+<li><strong>输出</strong>:<ul>
+<li><code>o</code>: 形状和 <code>v</code> 一样。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 理解核心数学公式</h4>
+<p>在看代码前，先记住这个核心循环公式（Kernel 就是在算这个）：</p>
+<p>对于每一个时间步 $t$：
+1.  <strong>读取数据</strong>: 拿当下的 $k_t, v_t, q_t, g_t$。
+2.  <strong>计算衰减</strong>: $\alpha = \exp(g_t)$。
+3.  <strong>更新记忆 (核心)</strong>:
+    $$H_t = H_{t-1} \odot \alpha + k_t^T \times v_t$$
+    <em>(人话：新的记忆 = 旧记忆 $\times$ 衰减系数 + 当前时刻的新知识)</em>
+4.  <strong>计算输出</strong>:
+    $$o_t = H_t \times q_t$$
+    <em>(人话：根据当前的记忆 $H$ 和查询 $q$，算出结果)</em></p>
+<h4>Task 3: 拆解前向传播 (<code>fused_recurrent_gla_fwd_kernel</code>)</h4>
+<p>这是代码的第一大块。</p>
+<ul>
+<li><strong>并行策略</strong>:<ul>
+<li>代码：<code>i_v, i_k, i_bh = tl.program_id(0)...</code></li>
+<li>解释：我们在 Batch 和 Head 上并行，<strong>但是在时间 $T$ 上不能并行</strong>（因为是 RNN，必须一步步算）。此外，为了快，它把特征维度 $D$ 切成了小块 (<code>BK</code>, <code>BV</code>) 并行处理。</li>
+</ul>
+</li>
+<li><strong>初始化</strong>:<ul>
+<li>代码：<code>h = tl.zeros([BV, BK], ...)</code></li>
+<li>解释：初始化记忆矩阵 $H$ 为全 0。</li>
+</ul>
+</li>
+<li><strong>时间循环 (The Loop)</strong>:<ul>
+<li>代码：<code>for _ in range(0, T):</code></li>
+<li><strong>Step A (加载)</strong>: <code>_k = tl.load(...)</code>, <code>_v = ...</code>, <code>_g = ...</code></li>
+<li><strong>Step B (计算衰减)</strong>: <code>_g = tl.math.exp(_g)</code></li>
+<li><strong>Step C (更新记忆)</strong>:
+    <code>python
+    # _g[None, :] 广播成行向量，让每一列衰减不同
+    # _k[None, :] * _v[:, None] 是外积 (Outer Product)，生成一个矩阵
+    h = h * _g[None, :] + _k[None, :] * _v[:, None]</code></li>
+<li><strong>Step D (计算输出)</strong>:
+    <code>python
+    # 记忆矩阵 h 乘以 query
+    _o = h * _q[None, :]
+    _o = tl.sum(_o, axis=1) # 累加得到最终向量</code></li>
+<li><strong>Step E (存结果 &amp; 移动指针)</strong>: <code>tl.store(...)</code>, <code>p_q += DK</code> (指针移到下一个时间步)。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 拆解后向传播 (<code>fused_recurrent_gla_bwd_kernel</code>)</h4>
+<p>这是最难的部分，它是为了算梯度（训练模型用）。它分成了两个阶段。</p>
+<ul>
+<li><strong>输入</strong>: <code>do</code> (输出的梯度)。</li>
+<li><strong>目标</strong>: 算出 <code>dq, dk, dv</code>。</li>
+</ul>
+<p><strong>阶段 1：重算一遍前向过程 (Re-materialization)</strong>
+*   代码：第一个 <code>for i in range(0, T):</code>
+*   <strong>为什么？</strong>: 为了省显存，我们没把每一步的 $H_t$ 存下来。但在反向传播时，计算 $dQ$ 需要用到 $H_t$。
+*   <strong>逻辑</strong>:
+    *   一边重新跑一遍 <code>h = h * g + k * v</code>。
+    *   一边利用当前的梯度 <code>do</code> 算出 <code>dq</code>: <code>d_q = h * _do</code>。
+    *   把 <code>dq</code> 存进显存。</p>
+<p><strong>阶段 2：真正的时间反向传播 (BPTT)</strong>
+*   代码：<code>tl.debug_barrier()</code> 之后的代码。
+*   <strong>准备</strong>: 指针跳到序列最后 <code>p_q = ... + (T - 1) * DK</code>。
+*   <strong>倒着跑的循环</strong>: <code>for _ in range(T):</code>
+*   <strong>逻辑 (梯度回传)</strong>:
+    *   这是一个逆过程。我们需要把误差从未来传回现在。
+    *   <code>d_h += _q * _do</code> (累积误差)。
+    *   算出当前步的 <code>dk, dv</code>:
+        *   <code>d_k = sum(d_h * _v)</code>
+        *   <code>d_v = sum(d_h * _k)</code>
+    *   更新误差状态 <code>d_h</code> 给上一步: <code>d_h = d_h * _g</code> (误差也要衰减)。
+    *   指针倒退: <code>p_q -= DK</code>。</p>
+<h4>Task 5: PyTorch 包装 (<code>FusedRecurrentGLAFunction</code>)</h4>
+<p>最后看底部的 Python class。</p>
+<ul>
+<li><strong>分块技巧 (Tiling)</strong>:<ul>
+<li>代码：<code>NK, NV = triton.cdiv(d_head_qk, BK), ...</code></li>
+<li>解释：如果你的 Head Dimension 是 128，但 Triton Block Size (<code>BK</code>) 是 32。那一个 Head 就需要切成 4 块 (<code>NK=4</code>) 来并行算。</li>
+</ul>
+</li>
+<li><strong>原子加法的替代方案</strong>:<ul>
+<li>代码：<code>o = q.new_empty(NK, ...)</code> 然后 <code>o.sum(0)</code>。</li>
+<li>解释：因为我们在 K 维度切块了，每个块算出了一部分 <code>o</code>。最后必须把这些部分加起来才是完整的 <code>o</code>。直接在 Kernel 里用 <code>atomic_add</code> 会慢，所以这里先写出多份结果，最后在 Python 里求和。</li>
+</ul>
+</li>
+<li><strong>Gate 的梯度 (<code>dg</code>)</strong>:<ul>
+<li>代码最后几行：<code>_dg = dq * q - dk * k</code> ... <code>cumsum</code>。</li>
+<li>解释：这是 GLA 的数学特性。Gate 的梯度计算比较特殊，可以用 $q, k$ 的梯度通过前缀和 (cumsum) 快速算出来，不需要在 Kernel 里死算，这样更快。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结 (Takeaway)</h3>
+<p>这代码其实就是在做一件事：
+<strong>把原本 PyTorch 里需要写成 <code>for t in range(T)</code> 的慢速循环，搬到了 GPU Kernel 内部去跑。</strong></p>
+<ol>
+<li><strong>Forward</strong>: 像 RNN 一样，维护一个矩阵 $H$，一步步吃进 $k, v$，吐出 $o$。</li>
+<li><strong>Backward</strong>:<ul>
+<li>先正着跑一遍算出 $q$ 的梯度。</li>
+<li>再倒着跑一遍算出 $k, v$ 的梯度。</li>
+</ul>
+</li>
+</ol>
+<p>如果你想修改或调试，重点关注 <code>fwd_kernel</code> 里的那个 <code>for</code> 循环，那里是算法的灵魂。</p>

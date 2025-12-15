@@ -1,0 +1,122 @@
+<h1>fla/ops/hgrn/naive.py</h1>
+<p>这份代码实现的是一种<strong>线性RNN（或者叫状态空间模型 SSM）</strong>的核心算子，名字叫 HGRN (Hierarchical Gated Recurrent Network)。</p>
+<p>看不懂很正常，因为这涉及到了深度学习中“序列建模”的底层逻辑。为了让你能看懂，我制定了一个 <strong>4步走的 Task List（任务清单）</strong>。</p>
+<p>我们不要一口气看完，而是完成一个任务，再进阶下一个。</p>
+<hr />
+<h3>📋 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 01: 理解核心数学逻辑（蓄水池模型）</strong><ul>
+<li>目标：搞懂 $x$ 和 $g$ 是干嘛的。</li>
+</ul>
+</li>
+<li><strong>Task 02: 研读 <code>naive_recurrent_hgrn</code> 函数</strong><ul>
+<li>目标：看懂最基础的“循环”实现方式。</li>
+</ul>
+</li>
+<li><strong>Task 03: 理解为什么要“分块” (Chunking)</strong><ul>
+<li>目标：明白为什么要有第二个函数（为了加速）。</li>
+</ul>
+</li>
+<li><strong>Task 04: 研读 <code>naive_chunk_hgrn</code> 函数</strong><ul>
+<li>目标：看懂它是如何把“历史记忆”和“当前计算”拆开的。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 01: 理解核心数学逻辑（蓄水池模型）</h3>
+<p>在看代码前，先建立一个物理模型。</p>
+<p>想象你有一个<strong>水桶（状态 $h$）</strong>：
+1.  <strong>输入 $x$ (Input)</strong>：每个时刻，你往桶里倒进去的新水。
+2.  <strong>门控 $g$ (Gate)</strong>：桶底有个洞，水会漏掉。$g$ 决定了漏水的速度（衰减率）。
+    *   代码里用了 <code>g.exp()</code>，因为 $g$ 通常是负数（对数域），取指数后变成 $(0, 1)$ 之间的一个小数，表示“保留多少水”。</p>
+<p><strong>核心公式就是：</strong>
+$$ 今天的水 = (昨天的水 \times 留存率) + 今天新倒的水 $$
+$$ h_t = h_{t-1} \cdot e^{g_t} + x_t $$</p>
+<p>这就是这个文件想做且唯一想做的事情。</p>
+<hr />
+<h3>✅ Task 02: 研读 <code>naive_recurrent_hgrn</code> 函数</h3>
+<p>这个函数就是上面公式的<strong>直译</strong>。它是“循环模式”（Recurrent），也就是一步一步算。</p>
+<p><strong>代码拆解：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">naive_recurrent_hgrn</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">g</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+    <span class="c1"># ... 省略类型转换 ...</span>
+
+    <span class="c1"># 1. 初始化水桶（h），一开始是空的</span>
+    <span class="n">h</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">D</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span> 
+
+    <span class="c1"># 2. 如果有之前的记忆（initial_state），先倒进桶里</span>
+    <span class="k">if</span> <span class="n">initial_state</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">h</span> <span class="o">+=</span> <span class="n">initial_state</span>
+
+    <span class="c1"># 3. 核心循环：从第 0 步走到第 T 步</span>
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">T</span><span class="p">):</span>
+        <span class="c1"># 公式：h = (衰减系数 * 旧h) + 新输入x</span>
+        <span class="n">h</span> <span class="o">=</span> <span class="n">g</span><span class="p">[:,</span> <span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">exp</span><span class="p">()</span> <span class="o">*</span> <span class="n">h</span> <span class="o">+</span> <span class="n">x</span><span class="p">[:,</span> <span class="n">i</span><span class="p">]</span>
+
+        <span class="c1"># 记录这一刻的水量作为输出</span>
+        <span class="n">o</span><span class="p">[:,</span> <span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">h</span>
+
+    <span class="c1"># ... 返回输出 o ...</span>
+</code></pre></div>
+
+<p><strong>这一步的总结：</strong>
+这就好比你拿着计算器，算完第1秒的结果，记下来；再用第1秒的结果算第2秒，记下来……
+*   <strong>优点</strong>：逻辑简单，容易懂。
+*   <strong>缺点</strong>：在 GPU 上非常慢，因为第 100 步必须等第 99 步算完，无法并行。</p>
+<hr />
+<h3>✅ Task 03: 理解为什么要“分块” (Chunking)</h3>
+<p>为了解决上面“慢”的问题，研究人员想出了“分块（Chunking）”的方法。</p>
+<p><strong>核心思想：</strong>
+虽然整体必须从左到右算（因为有时间顺序），但我们可以把长序列切成小块（比如每块 64 步）。
+*   <strong>块内</strong>：我们先算出每一小块内部的“局部变化”。
+*   <strong>块间</strong>：把上一块剩下的“水”，一下子“泼”到这一块的所有位置上。</p>
+<p>这就是第二个函数 <code>naive_chunk_hgrn</code> 存在的意义。</p>
+<hr />
+<h3>✅ Task 04: 研读 <code>naive_chunk_hgrn</code> 函数</h3>
+<p>这是最难懂的部分。它把公式拆成了两部分：
+$$ 输出 = (前一块遗留的水 \times 这一块的总衰减) + (这一块内部新产生的水) $$</p>
+<p><strong>代码拆解：</strong></p>
+<p><strong>1. 预处理衰减率</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># g 是衰减率。cumsum 是累加。</span>
+<span class="c1"># 这里算的是：在这个块内部，从开始到现在一共衰减了多少。</span>
+<span class="n">gc</span> <span class="o">=</span> <span class="n">g</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">B</span><span class="p">,</span> <span class="n">chunk_size</span><span class="p">,</span> <span class="n">D</span><span class="p">)</span><span class="o">.</span><span class="n">cumsum</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">view_as</span><span class="p">(</span><span class="n">g</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>2. 分块循环</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 步长是 chunk_size (比如64)，一跳一跳地处理</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">T</span><span class="p">,</span> <span class="n">chunk_size</span><span class="p">):</span>
+
+    <span class="c1"># hp (History Previous): 保存上一块结束时的状态（老本）</span>
+    <span class="n">hp</span> <span class="o">=</span> <span class="n">h</span>
+
+    <span class="c1"># h 重置为0：准备计算这一块内部“新产生”的状态</span>
+    <span class="n">h</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># --- 小循环：计算块内的新增量 ---</span>
+    <span class="k">for</span> <span class="n">j</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">i</span><span class="p">,</span> <span class="n">i</span> <span class="o">+</span> <span class="n">chunk_size</span><span class="p">):</span>
+        <span class="c1"># 这里只算“新水”的积累，不考虑“老本”</span>
+        <span class="n">h</span> <span class="o">=</span> <span class="n">g</span><span class="p">[:,</span> <span class="n">j</span><span class="p">]</span><span class="o">.</span><span class="n">exp</span><span class="p">()</span> <span class="o">*</span> <span class="n">h</span> <span class="o">+</span> <span class="n">x</span><span class="p">[:,</span> <span class="n">j</span><span class="p">]</span>
+
+        <span class="c1"># --- 关键的一行：合并 ---</span>
+        <span class="c1"># 输出 = (老本 * 这一刻对应的累计衰减) + 新积累的水</span>
+        <span class="n">o</span><span class="p">[:,</span> <span class="n">j</span><span class="p">]</span> <span class="o">=</span> <span class="n">hp</span> <span class="o">*</span> <span class="n">gc</span><span class="p">[:,</span> <span class="n">j</span><span class="p">]</span><span class="o">.</span><span class="n">exp</span><span class="p">()</span> <span class="o">+</span> <span class="n">h</span>
+
+    <span class="c1"># 这一块结束时的 h，将作为下一块的 hp (老本)</span>
+    <span class="n">h</span> <span class="o">=</span> <span class="n">o</span><span class="p">[:,</span> <span class="n">j</span><span class="p">]</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+</code></pre></div>
+
+<p><strong>为什么这段代码让人晕？</strong>
+因为它把一个简单的公式 $h_t = h_{t-1} \cdot \alpha + x_t$ 拆解了。
+*   <code>h</code> 变量在内层循环里，只代表<strong>当前块内</strong>积累的值（假设前面是空的）。
+*   <code>hp * gc[:, j].exp()</code> 代表<strong>前面的历史</strong>传到现在还剩多少。
+*   两者相加，才是真正的当前状态。</p>
+<hr />
+<h3>🎯 总结</h3>
+<ul>
+<li><strong>文件讲了啥？</strong>
+    实现了一个叫 HGRN 的序列模型算法。</li>
+<li><strong>第一个函数 (<code>recurrent</code>)：</strong>
+    老实人写法。一步一步算，如果不理解就看这个，它是数学定义的直接翻译。</li>
+<li><strong>第二个函数 (<code>chunk</code>)：</strong>
+    聪明人写法。为了在后续（虽然这个 naive 版本还没体现出并行优势，但它是为了验证并行算法逻辑的正确性）能并行计算，把“历史的衰减”和“当前的积累”拆分开来算了。</li>
+</ul>
+<p>建议你先只看 <code>naive_recurrent_hgrn</code>，只要明白 <strong>$h$ 是怎么随着时间 $i$ 变化的</strong>，你就抓住了这个文件的 90% 的精髓。第二个函数只是为了优化速度做的数学变换。</p>

@@ -1,0 +1,154 @@
+<h1>fla/ops/simple_gla/naive.py</h1>
+<p>这份代码实现的是 <strong>Simple GLA (Gated Linear Attention)</strong> 的一个朴素（Naive）版本。简单来说，它是一种试图结合 <strong>Transformer（并行训练快）</strong> 和 <strong>RNN（推理显存占用少）</strong> 优点的模型架构。</p>
+<p>因为它涉及很多矩阵变换（<code>rearrange</code>）和数学运算，直接看代码确实很晕。</p>
+<p>我们可以把理解这份代码的任务拆解成一个 <strong>To-Do List</strong>，由浅入深，一步步来攻克：</p>
+<h3>📝 学习 To-Do List</h3>
+<ol>
+<li><strong>Task 0: 搞懂基本概念</strong> —— 这里的 Q, K, V, G 到底是什么？</li>
+<li><strong>Task 1: 理解“循环模式” (Recurrent)</strong> —— 也就是 <code>torch_simple_gla_recurrent</code> 函数。这是最符合直觉的逻辑，先看懂它。</li>
+<li><strong>Task 2: 理解“分块并行模式” (Chunkwise)</strong> —— 也就是 <code>torch_simple_gla</code> 函数。这是为了加速训练做的数学变形，最难懂，放在最后。</li>
+</ol>
+<hr />
+<h3>Task 0: 搞懂基本概念</h3>
+<p>在看代码之前，先建立物理直觉。这其实是一个<strong>带遗忘机制的线性注意力</strong>。</p>
+<ul>
+<li><strong>Q (Query), K (Key), V (Value):</strong> 和 Transformer 一样。<ul>
+<li>想象你在查字典。Q 是你要查的字，K 是字典索引，V 是字典里的解释。</li>
+</ul>
+</li>
+<li><strong>G (Gate/Decay):</strong> 这是 GLA 的核心。<ul>
+<li>它是一个<strong>遗忘门</strong>。</li>
+<li>想象你是一个记性不好的人，每过一秒钟，你脑子里的记忆（State）就会衰减一点点。<code>g</code> 控制你忘掉多少旧信息，记住多少新信息。</li>
+</ul>
+</li>
+<li><strong>S (State):</strong> 隐藏状态（记忆）。<ul>
+<li>它存储了处理过的所有历史信息。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 1: 理解“循环模式” (Recurrent)</h3>
+<p><strong>目标函数：</strong> <code>torch_simple_gla_recurrent</code>
+<strong>核心逻辑：</strong> 像 RNN 一样，一步一步处理序列。</p>
+<p><strong>代码解读步骤：</strong></p>
+<ol>
+<li>
+<p><strong>准备工作：</strong>
+    <code>python
+    # 这里的 scale 就是注意力机制里常见的除以根号d，防止数值过大
+    if scale is None: scale = DK ** -0.5
+    q = q * scale</code></p>
+</li>
+<li>
+<p><strong>初始化记忆：</strong>
+    <code>python
+    # S 就是你的大脑（记忆容器），一开始是空的（全0）
+    S = torch.zeros(B, H, DK, DV)</code></p>
+</li>
+<li>
+<p><strong>时间步循环 (核心中的核心)：</strong>
+    代码里的 <code>for i in range(T):</code> 是按时间顺序处理每一个 token。</p>
+<ul>
+<li>
+<p><strong>第一步：计算遗忘和新知识</strong>
+    <code>python
+    gate = g[:, :, i].exp()  # 当前时刻的遗忘率（代码里输入的是log space，所以要exp）
+    key = k[:, :, i]
+    value = v[:, :, i]
+    # KV 乘积代表当前时刻的新知识
+    kv = key.unsqueeze(-1) * value.unsqueeze(-2)</code></p>
+</li>
+<li>
+<p><strong>第二步：更新记忆 (S)</strong>
+    <code>python
+    # 新记忆 = 旧记忆 * 衰减系数 + 新知识
+    S = S.clone() * gate.unsqueeze(-1).unsqueeze(-1) + kv</code>
+    <em>这行代码就是 GLA 的灵魂：旧的记忆 S 被 gate 衰减了（遗忘），然后加上了当前的 kv（写入）。</em></p>
+</li>
+<li>
+<p><strong>第三步：输出结果</strong>
+    <code>python
+    q_i = q[:, :, i, :]
+    # 输出 = Query * 当前的记忆 S
+    o_i = (q_i.unsqueeze(-1) * S).sum(-2)</code></p>
+</li>
+</ul>
+</li>
+</ol>
+<p><strong>总结 Task 1：</strong>
+这个函数告诉我们，模型本质上是一个 RNN。每读一个词，就根据 <code>g</code> 忘掉一点旧的 <code>S</code>，把新的 <code>k, v</code> 存进 <code>S</code>，然后用 <code>q</code> 从 <code>S</code> 里读取答案。</p>
+<hr />
+<h3>Task 2: 理解“分块并行模式” (Chunkwise)</h3>
+<p><strong>目标函数：</strong> <code>torch_simple_gla</code>
+<strong>为什么需要它？</strong> 上面的循环模式（RNN）虽然推理快，但训练太慢了（必须等上一步算完才能算下一步）。Transformer 之所以火，是因为可以并行训练。这个函数就是为了<strong>让 RNN 也能并行训练</strong>。</p>
+<p><strong>策略：</strong> 把长序列切成小块（Chunk）。
+*   <strong>块内 (Intra-chunk):</strong> 像 Transformer 一样并行计算。
+*   <strong>块间 (Inter-chunk):</strong> 像 RNN 一样传递记忆。</p>
+<p><strong>代码解读步骤：</strong></p>
+<ol>
+<li>
+<p><strong>切块 (Chunking):</strong>
+    <code>python
+    # 把长度 (n * c) 的序列切成 n 个块，每个块长度 c
+    q = rearrange(q, 'b h (n c) d -&gt; b h n c d', c=chunk_size) * scale
+    # ... k, v, g 同理</code></p>
+</li>
+<li>
+<p><strong>处理遗忘门 (G):</strong>
+    <code>python
+    # cumsum 是累加。因为在对数域(log space)里，累加等于概率域的连乘。
+    # 这步是为了快速计算任意两点之间的衰减量。
+    g = g.cumsum(-1)</code></p>
+</li>
+<li>
+<p><strong>块间记忆传递 (Inter-chunk):</strong>
+    这是最难的一段。我们要算出每个块结束时，传递给下一个块的记忆 <code>S</code> 是什么。</p>
+<ul>
+<li><code>kv</code> 计算：算出每个块内部所有时刻产生的“新知识”的总和（考虑了衰减）。</li>
+<li><code>for</code> 循环：
+    <code>python
+    for i in range(1, g.shape[-2]):
+        # 当前块的初始记忆 = 上一个块的最终记忆 * 衰减 + 上一个块产生的新记忆
+        S[:, :, i] = S[:, :, i-1].clone() * ... + kv[:, :, i-1]</code></li>
+<li><code>inter</code>: 计算来自于<strong>之前所有块</strong>的信息对当前块的影响。
+    <code>python
+    inter = (q * g[..., None].exp()) @ S</code></li>
+</ul>
+</li>
+<li>
+<p><strong>块内注意力 (Intra-chunk):</strong>
+    这部分看起来很像标准的 Attention。</p>
+<p>```python</p>
+<h1>典型的 Q * K^T</h1>
+<p>attn = q @ k.transpose(-1, -2)</p>
+<h1>加上衰减项 (g)</h1>
+<p>attn = attn * (g[..., None] - g[..., None, :]).exp()</p>
+<h1>加上 Mask (因果掩码，只能看过去，不能看未来)</h1>
+<p>attn = attn.masked_fill(torch.triu(..., diagonal=1), 0)</p>
+<h1>乘以 V</h1>
+<p>intra = attn @ v
+```
+<em>这部分计算的是：当前块内部，前面的词对后面的词的影响。</em></p>
+</li>
+<li>
+<p><strong>最终合并:</strong>
+    <code>python
+    # 总输出 = 来自之前块的记忆 (inter) + 当前块内的注意力 (intra)
+    o = inter + intra</code></p>
+</li>
+</ol>
+<hr />
+<h3>总结 (The Big Picture)</h3>
+<ol>
+<li><strong><code>torch_simple_gla_recurrent</code></strong> 是<strong>推理视角</strong>。它告诉你这个模型本质是一个带有遗忘机制的 RNN。<ul>
+<li>公式：$S_t = S_{t-1} \cdot g_t + K_t^T V_t$</li>
+</ul>
+</li>
+<li><strong><code>torch_simple_gla</code></strong> 是<strong>训练视角</strong>。为了利用 GPU 并行加速，它把 RNN 拆解了。<ul>
+<li>它不再一个词一个词算，而是一个块一个块算。</li>
+<li><strong>Intra (块内):</strong> 用矩阵乘法（像 Transformer）一次性算出块内互相关系。</li>
+<li><strong>Inter (块间):</strong> 用 RNN 方式把上一个块的记忆传给下一个块。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话概括：</strong> 这份代码实现了一个既能像 Transformer 一样并行训练，又能像 RNN 一样快速推理的线性注意力模型。</p>

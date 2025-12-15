@@ -1,0 +1,159 @@
+<h1>fla/ops/utils/pooling.py</h1>
+<p>这份代码确实比较硬核，因为它混合了 PyTorch 的上层逻辑和 <strong>OpenAI Triton</strong> 的底层 GPU 算子编程。Triton 是用来写高性能 CUDA 内核的 Python 库。</p>
+<p>这份代码的核心功能是实现 <strong>“分块平均池化” (Chunk-wise Mean Pooling)</strong>。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“学习任务清单 (To-Do List)”</strong>，我们一步一步来攻克。</p>
+<hr />
+<h3>📋 任务清单：分步解析 Mean Pooling</h3>
+<ol>
+<li><strong>Task 1: 理解核心概念 (What)</strong> - 搞清楚它在算什么数学题。</li>
+<li><strong>Task 2: 理解数据形状 (Shapes)</strong> - 输入和输出长什么样？</li>
+<li><strong>Task 3: 搞懂“变长序列”难点 (The Tricky Part)</strong> - 什么是 <code>offsets</code> 和 <code>indices</code>？</li>
+<li><strong>Task 4: 解析前向传播 (Forward Kernel)</strong> - GPU 是怎么并行计算平均值的？</li>
+<li><strong>Task 5: 解析反向传播 (Backward Kernel)</strong> - 梯度是怎么传回去的？</li>
+<li><strong>Task 6: 封装与调用 (API)</strong> - 怎么在外面用它？</li>
+</ol>
+<hr />
+<h3>🟢 Task 1: 理解核心概念 (What)</h3>
+<p><strong>目标</strong>：把一个长序列切成一小段一小段，然后每一段算一个平均值。</p>
+<ul>
+<li><strong>场景</strong>：假设你有一句话（Sequence），长度 $T=100$。</li>
+<li><strong>动作</strong>：设定 <code>chunk_size</code> (块大小) 为 $64$。</li>
+<li><strong>结果</strong>：<ul>
+<li>第 1 块：取 0~63 个 token，算出 1 个平均向量。</li>
+<li>第 2 块：取 64~99 个 token，算出 1 个平均向量。</li>
+<li>原序列长度 100 $\to$ 新序列长度 2。</li>
+</ul>
+</li>
+</ul>
+<p><strong>一句话总结</strong>：这是一个用来压缩序列长度的操作，把每 <code>chunk_size</code> 个向量压缩成 1 个向量。</p>
+<hr />
+<h3>🟢 Task 2: 理解数据形状 (Shapes)</h3>
+<p><strong>输入 <code>x</code></strong>:
+*   形状通常是 <code>[B, T, H, D]</code> (Batch大小, 序列长度, 头数, 维度)。
+*   或者在变长模式下是 <code>[Total_Tokens, H, D]</code>。</p>
+<p><strong>输出 <code>o</code></strong>:
+*   形状是 <code>[B, NT, H, D]</code>。
+*   这里的 <code>NT</code> 是压缩后的长度。比如 $T=100, chunk=64$，那么 $NT=2$。</p>
+<hr />
+<h3>🟢 Task 3: 搞懂“变长序列”难点 (The Tricky Part)</h3>
+<p>这是代码里最让人头晕的部分：<code>offsets</code> 和 <code>indices</code>。</p>
+<ul>
+<li>
+<p><strong>普通模式 (<code>offsets is None</code>)</strong>：</p>
+<ul>
+<li>每个样本长度一样，很简单。</li>
+<li>第 $i$ 个块的位置就是简单的数学计算。</li>
+</ul>
+</li>
+<li>
+<p><strong>变长模式 (<code>offsets is not None</code>)</strong>：</p>
+<ul>
+<li>为了高效，我们常把不同长度的句子拼成一个大长条（Packed Sequence）。</li>
+<li><strong><code>offsets</code></strong>: 记录每个句子在大长条里的起始位置。</li>
+<li><strong><code>indices</code></strong>: 这是一个辅助索引表。因为句子长度不一，有的句子切成 2 块，有的切成 5 块。GPU 线程是并行跑的，它不知道自己处理的是哪个句子的哪一块。</li>
+<li><strong><code>prepare_chunk_indices</code></strong>: 这个函数（在代码外部引入）生成一个表，告诉第 $i$ 个线程：“你去处理第 $A$ 个句子的第 $B$ 个块”。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🟢 Task 4: 解析前向传播 (Forward Kernel)</h3>
+<p>看代码段：<code>mean_pooling_fwd_kernel</code></p>
+<p>这是 Triton 写给 GPU 执行的指令。</p>
+<ol>
+<li>
+<p><strong>定位坐标 (<code>i_d, i_t, i_bh</code>)</strong>:</p>
+<ul>
+<li>GPU 启动了成千上万个线程块。</li>
+<li>每个线程块负责计算：<strong>某一个 Batch、某一个 Head、某一个 Chunk (时间段)</strong> 的数据。</li>
+</ul>
+</li>
+<li>
+<p><strong>处理变长逻辑 (<code>if USE_OFFSETS...</code>)</strong>:</p>
+<ul>
+<li>如果有 <code>offsets</code>，通过查表 (<code>indices</code>) 找到当前 Chunk 属于哪个句子，以及这个句子的开始和结束位置 (<code>bos</code>, <code>eos</code>)。</li>
+<li>如果没 <code>offsets</code>，直接算位置。</li>
+</ul>
+</li>
+<li>
+<p><strong>加载数据 (<code>tl.make_block_ptr</code>)</strong>:</p>
+<ul>
+<li><code>p_x</code>: 创建一个指针，指向输入数据 <code>x</code> 中当前 Chunk 的那一段。</li>
+<li>它一次性加载 <code>[BT, BD]</code> 这么大一块数据到 GPU 也就是 <code>[Chunk大小, 维度块大小]</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>计算平均值 (核心逻辑)</strong>:
+    <code>python
+    # 加载数据
+    b_x = tl.load(p_x, ...).to(tl.float32)
+    # 求和，axis=0 表示沿着时间轴(Chunk长度)求和
+    b_o = tl.sum(b_x, axis=0) 
+    # 除以实际长度 (处理最后一个块可能填不满 chunk_size 的情况)
+    b_o = b_o / min(BT, T - i_t * BT)</code></p>
+</li>
+<li>
+<p><strong>写回结果</strong>: 把算好的 <code>b_o</code> 存到输出 <code>o</code> 的对应位置。</p>
+</li>
+</ol>
+<hr />
+<h3>🟢 Task 5: 解析反向传播 (Backward Kernel)</h3>
+<p>看代码段：<code>mean_pooling_bwd_kernel</code></p>
+<p>训练神经网络需要反向传播梯度。平均池化的反向传播非常简单：</p>
+<ul>
+<li>
+<p><strong>数学原理</strong>：</p>
+<ul>
+<li>如果 $y = (x_1 + x_2) / 2$</li>
+<li>那么 $\frac{\partial y}{\partial x_1} = 0.5$, $\frac{\partial y}{\partial x_2} = 0.5$</li>
+<li><strong>规则</strong>：输出的梯度 <code>do</code>，均匀地分配给输入块里的每一个元素，除以块的大小。</li>
+</ul>
+</li>
+<li>
+<p><strong>代码逻辑</strong>:</p>
+<ol>
+<li><strong>加载梯度 <code>do</code></strong>: 拿到输出位置的梯度向量（1个向量）。</li>
+<li><strong>广播 (Broadcast)</strong>: 把这 1 个向量复制 <code>BT</code> (Chunk大小) 份。</li>
+<li><strong>除法</strong>: <code>b_dx = b_do / count</code>。</li>
+<li><strong>写回 <code>dx</code></strong>: 把计算好的梯度填回输入矩阵 <code>dx</code> 的对应块里。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>🟢 Task 6: 封装与调用 (API)</h3>
+<p>看代码段：<code>MeanPoolingFunction</code> 和 <code>mean_pooling</code></p>
+<ol>
+<li>
+<p><strong><code>MeanPoolingFunction</code></strong>:</p>
+<ul>
+<li>继承自 <code>torch.autograd.Function</code>。</li>
+<li>这是为了把刚才写的 Triton Kernel 包装成 PyTorch 能识别的算子，让它能自动求导。</li>
+<li><code>forward</code>: 调用 <code>mean_pooling_fwd</code>，并保存 <code>ctx</code> (上下文) 给反向用。</li>
+<li><code>backward</code>: 调用 <code>mean_pooling_bwd</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>mean_pooling</code> (用户接口)</strong>:</p>
+<ul>
+<li>这是你最终调用的函数。</li>
+<li>它处理了一些杂活，比如：<ul>
+<li><code>head_first</code>: 如果输入的 Head 维度在前，先转置一下。</li>
+<li><code>cu_seqlens</code>: 检查变长序列的格式是否正确。</li>
+<li>最后调用 <code>MeanPoolingFunction.apply</code>。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>📝 总结：这段代码在讲什么？</h3>
+<p><strong>一句话：</strong>
+这是一个<strong>手动优化</strong>的 PyTorch 算子，利用 Triton 编写 GPU 内核，实现了<strong>高效的、支持变长序列的、分块平均池化</strong>。</p>
+<p><strong>为什么要这么写？（而不是直接用 <code>x.mean()</code>）</strong>
+1.  <strong>显存优化 (IO Aware)</strong>: Triton 可以精细控制显存读写，比 PyTorch 默认的拼接+重塑+平均要快，且省显存。
+2.  <strong>支持 Flash Attention 风格的数据</strong>: 它原生支持 <code>offsets</code> (即 <code>cu_seqlens</code>)，这是处理变长 NLP 序列（如把很多短句子拼成一个 Batch）的标准高效做法，PyTorch 原生操作处理这个很麻烦。</p>
+<p><strong>你的学习路线建议：</strong>
+不要纠结每一行 Triton 语法（那些指针计算很枯燥）。
+1.  先明白输入 <code>(B, T, H, D)</code> 变成了输出 <code>(B, T/Chunk, H, D)</code>。
+2.  明白这是算平均值。
+3.  知道它支持变长序列（Packed Sequence）。
+这就够了。</p>

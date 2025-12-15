@@ -1,0 +1,115 @@
+<h1>megatron/core/fusions/fused_softmax.py</h1>
+<p>这份代码确实比较底层，它属于 <strong>深度学习性能优化</strong> 的范畴，具体来说是 Megatron-LM（一个训练超大模型的框架）中用于加速 Transformer 注意力机制核心计算的代码。</p>
+<p>简单来说，它的作用是：<strong>把“缩放(Scale) + 遮盖(Mask) + Softmax”这三步操作，合并成一步（Fused），扔给显卡（CUDA）去一次性算完。</strong></p>
+<p>为了让你看懂，我为你列了一个 <strong>“理解任务清单 (Todo List)”</strong>，我们一步一步来拆解这个文件。</p>
+<hr />
+<h3>📋 你的学习任务清单 (Todo List)</h3>
+<ol>
+<li><strong>搞懂背景</strong>：为什么要“融合 (Fused)”？这到底是在算什么？</li>
+<li><strong>认识工具</strong>：看懂代码前三个类（<code>Scaled...</code>）是干嘛的。</li>
+<li><strong>认识管家</strong>：看懂 <code>FusedScaleMaskSoftmax</code> 这个主类是干嘛的。</li>
+<li><strong>理清逻辑</strong>：看懂代码是如何判断“能不能加速”的。</li>
+<li><strong>看懂流程</strong>：看懂数据是怎么流转的（走快车道还是慢车道）。</li>
+</ol>
+<hr />
+<h3>✅ 任务 1：搞懂背景</h3>
+<p><strong>场景</strong>：Transformer 模型里最核心的公式是 $Attention(Q, K, V) = Softmax(\frac{QK^T}{\sqrt{d}} + Mask)V$。
+<strong>痛点</strong>：
+在 PyTorch 的标准写法里，括号里的操作是分三步走的：
+1.  <strong>Scale</strong>: 乘以 $\frac{1}{\sqrt{d}}$。
+2.  <strong>Mask</strong>: 把不需要关注的位置（比如 Padding 或者未来的词）填成负无穷大。
+3.  <strong>Softmax</strong>: 归一化转成概率。</p>
+<p>这三步如果分开做，GPU 需要反复读写显存，速度慢且占内存。
+<strong>解决方案</strong>：写一个 C++ CUDA 核心（kernel），把这三步合并在一起做，不用中间存取数据，这就是 <strong>Fused Softmax</strong>。</p>
+<hr />
+<h3>✅ 任务 2：认识工具 (前三个类)</h3>
+<p>文件开头定义了三个类，它们都继承自 <code>torch.autograd.Function</code>。这说明它们是<strong>自定义的算子</strong>，底层调用了 C++ 写的 CUDA 代码。</p>
+<ol>
+<li>
+<p><strong><code>ScaledUpperTriangMaskedSoftmax</code></strong></p>
+<ul>
+<li><strong>用途</strong>：专门给 <strong>GPT 类模型</strong> 用的。</li>
+<li><strong>特点</strong>：它包含了一个“上三角遮罩 (Upper Triangular Mask)”。在 GPT 里，当前的词不能看后面的词，这叫 Causal Mask（因果遮罩），形状像个三角形。</li>
+<li><strong>动作</strong>：缩放 -&gt; 加上三角遮罩 -&gt; Softmax。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>ScaledMaskedSoftmax</code></strong></p>
+<ul>
+<li><strong>用途</strong>：给 <strong>BERT 类模型</strong> 或者处理 <strong>Padding</strong> 用的。</li>
+<li><strong>特点</strong>：它接受一个用户传进来的任意形状的 Mask。</li>
+<li><strong>动作</strong>：缩放 -&gt; 加上给定的 Mask -&gt; Softmax。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>ScaledSoftmax</code></strong></p>
+<ul>
+<li><strong>用途</strong>：没有遮罩的情况。</li>
+<li><strong>动作</strong>：缩放 -&gt; Softmax。</li>
+</ul>
+</li>
+</ol>
+<blockquote>
+<p><strong>注意</strong>：这三个类里都有 <code>forward</code>（前向传播）和 <code>backward</code>（反向传播）。因为这是自定义算子，PyTorch 不知道怎么自动求导，所以必须手动写清楚反向传播怎么算（代码里通过 <code>import ..._cuda</code> 调用了底层的反向实现）。</p>
+</blockquote>
+<hr />
+<h3>✅ 任务 3：认识管家 (<code>FusedScaleMaskSoftmax</code>)</h3>
+<p>这是你真正调用的类，它是一个 <code>nn.Module</code>。它的作用是<strong>根据情况调度</strong>上面的工具。</p>
+<p><strong>初始化参数 (<code>__init__</code>) 里的关键点</strong>：
+*   <code>input_in_fp16/bf16</code>：输入数据是半精度的吗？（通常大模型训练都用半精度）。
+*   <code>attn_mask_type</code>：是 GPT 模式 (causal) 还是普通模式？
+*   <code>scaled_masked_softmax_fusion</code>：<strong>开关</strong>。用户是否想要开启融合加速？
+*   <code>mask_func</code>：如果不能加速，兜底用的普通 mask 函数。</p>
+<hr />
+<h3>✅ 任务 4：理清逻辑 (能不能加速？)</h3>
+<p>这是代码里最复杂的一块逻辑：<code>is_kernel_available</code> 函数。
+显卡加速代码（CUDA Kernel）通常很娇贵，对数据的形状有严格要求。如果不满足要求，强行调用会报错。</p>
+<p><strong>代码逻辑翻译</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">is_kernel_available</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">mask</span><span class="p">,</span> <span class="n">b</span><span class="p">,</span> <span class="n">np</span><span class="p">,</span> <span class="n">sq</span><span class="p">,</span> <span class="n">sk</span><span class="p">):</span>
+    <span class="c1"># b: batch size, np: number of heads, sq: sequence length (query), sk: sequence length (key)</span>
+
+    <span class="k">if</span> <span class="p">(</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">scaled_masked_softmax_fusion</span>  <span class="c1"># 1. 用户开启了加速开关</span>
+        <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_in_float16</span>          <span class="c1"># 2. 输入必须是半精度 (fp16/bf16)</span>
+        <span class="ow">and</span> <span class="mi">16</span> <span class="o">&lt;</span> <span class="n">sk</span> <span class="o">&lt;=</span> <span class="mi">4096</span>                <span class="c1"># 3. 序列长度必须在 16 到 4096 之间 (太长或太短都不行)</span>
+        <span class="ow">and</span> <span class="n">sq</span> <span class="o">%</span> <span class="mi">4</span> <span class="o">==</span> <span class="mi">0</span>                    <span class="c1"># 4. 长度必须能被 4 整除 (为了内存对齐)</span>
+        <span class="ow">and</span> <span class="n">sk</span> <span class="o">%</span> <span class="mi">4</span> <span class="o">==</span> <span class="mi">0</span>                    <span class="c1"># 5. 同上</span>
+        <span class="ow">and</span> <span class="n">attn_batches</span> <span class="o">%</span> <span class="mi">4</span> <span class="o">==</span> <span class="mi">0</span>          <span class="c1"># 6. batch * heads 必须能被 4 整除</span>
+    <span class="p">):</span>
+        <span class="c1"># ... 还有一些更细致的关于 block 大小的检查 ...</span>
+        <span class="k">return</span> <span class="kc">True</span>
+
+    <span class="k">return</span> <span class="kc">False</span> <span class="c1"># 如果任一条件不满足，就不能用加速</span>
+</code></pre></div>
+
+<hr />
+<h3>✅ 任务 5：看懂流程 (<code>forward</code> 函数)</h3>
+<p>这是数据流动的核心路口。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="nb">input</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">mask</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]):</span>
+    <span class="c1"># 1. 检查能不能用 CUDA 加速内核</span>
+    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_kernel_available</span><span class="p">(</span><span class="n">mask</span><span class="p">,</span> <span class="o">*</span><span class="nb">input</span><span class="o">.</span><span class="n">size</span><span class="p">()):</span>
+        <span class="c1"># 走快车道</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">forward_fused_softmax</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">mask</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="c1"># 走慢车道（兜底方案）</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">forward_torch_softmax</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">mask</span><span class="p">)</span>
+</code></pre></div>
+
+<h4>分支 A：快车道 (<code>forward_fused_softmax</code>)</h4>
+<p>如果条件满足，直接调用任务 2 中介绍的工具：
+*   如果是 GPT 模式 (<code>AttnMaskType.causal</code>) -&gt; 调用 <code>ScaledUpperTriangMaskedSoftmax</code>。
+*   如果是普通模式 -&gt; 调用 <code>ScaledMaskedSoftmax</code>。
+*   如果没有 mask -&gt; 调用 <code>ScaledSoftmax</code>。</p>
+<h4>分支 B：慢车道 (<code>forward_torch_softmax</code>)</h4>
+<p>如果条件不满足（比如序列长度是 4097，或者用了 float32），就得用 PyTorch 原生代码一步步算：
+1.  <strong>类型转换</strong>：如果需要，转成 float32（Softmax 在 float32 下更稳定）。
+2.  <strong>Scale</strong>：<code>input = input * self.scale</code>。
+3.  <strong>Mask</strong>：如果没有给 mask 且是 GPT 模式，现场生成一个上三角 mask，然后应用 mask。
+4.  <strong>Softmax</strong>：调用 <code>torch.nn.Softmax</code>。
+5.  <strong>转回半精度</strong>：如果输入是 fp16/bf16，把结果转回去。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件其实就在说一件事：</p>
+<blockquote>
+<p><strong>“我要算 Softmax，如果数据格式完美符合要求，我就调用底层超快的 C++ 代码（Fused）；如果格式不符合，我就老老实实调用 PyTorch 的普通函数算。”</strong></p>
+</blockquote>

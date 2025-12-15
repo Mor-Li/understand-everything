@@ -1,0 +1,111 @@
+<h1>tests/test_fused_chunk.py</h1>
+<p>这份代码确实非常硬核，因为它涉及到 <strong>OpenAI Triton</strong>（一种用于编写高效 GPU 内核的语言）和 <strong>线性注意力机制（Linear Attention）</strong> 的底层实现。看不懂是很正常的，因为它把数学逻辑隐藏在了显存指针操作里。</p>
+<p>为了帮你理解，我制定了一个 <strong>5步走的 Task List（待办清单）</strong>。我们将把这个文件拆解，像剥洋葱一样一步步看懂它。</p>
+<hr />
+<h3>📋 Task 1: 搞懂核心概念 —— 既然是 Attention，为什么不一样？</h3>
+<p><strong>目标：</strong> 理解这段代码在算什么数学公式。</p>
+<ul>
+<li><strong>普通 Attention (Softmax):</strong> 每一时刻都要看之前<strong>所有</strong>时刻，计算量是 $O(N^2)$。</li>
+<li><strong>这段代码 (Linear/Recurrent Attention):</strong><ul>
+<li>它把长序列切成很多小块（Chunk）。</li>
+<li><strong>块内（Intra-chunk）：</strong> 像普通 Attention 一样计算。</li>
+<li><strong>块间（Inter-chunk）：</strong> 维护一个“记忆状态” <code>h</code> (Hidden State)。前一个块算完，把精华浓缩进 <code>h</code>，传给下一个块。</li>
+<li><strong>计算量：</strong> 变成了线性的 $O(N)$，速度极快。</li>
+</ul>
+</li>
+</ul>
+<p><strong>代码对应：</strong> 文件名 <code>fused_chunk</code> 暗示了这是一种“融合的块级”算法。</p>
+<hr />
+<h3>📋 Task 2: 拆解 Triton 内核 —— <code>attention_fwd_kernel</code></h3>
+<p>这是文件的核心（第 8-63 行）。我们把它想象成一个流水线工人，它的任务是处理一个 Batch 中的一个 Head。</p>
+<h4>子任务 2.1：理解指针与加载 (Pointer Arithmetic)</h4>
+<p>Triton 最难读的地方就是 <code>tl.make_block_ptr</code>。
+*   <strong>代码：</strong> <code>p_q</code>, <code>p_k</code>, <code>p_v</code> 的定义。
+*   <strong>解释：</strong> 想象显存是一块巨大的 Excel 表格。
+    *   <code>BT</code> (Block Time) = 32：每次处理 32 个时间步。
+    *   <code>BD</code> (Block Dimension)：特征维度。
+    *   这些代码只是在告诉 GPU：“去显存的那个位置，把这 $32 \times BD$ 的小方块数据挖出来，放到寄存器里给我用。”</p>
+<h4>子任务 2.2：核心循环 (The Loop)</h4>
+<ul>
+<li><strong>代码：</strong> <code>for i in range(0, tl.cdiv(T, BT)):</code></li>
+<li><strong>解释：</strong> 这是一个时间轴上的循环。比如序列长度 1024，BT=32，它就要循环 32 次。每一步处理这一小段序列。</li>
+</ul>
+<h4>子任务 2.3：计算逻辑 (The Math)</h4>
+<p>这是最关键的部分，请仔细看这两行逻辑：</p>
+<ol>
+<li>
+<p><strong>当前块内的计算 (Local Attention):</strong>
+    <code>python
+    b_s = tl.dot(b_q, b_k, ...)  # 算出 Q 和 K 的关系
+    b_o = tl.dot(b_s, b_v, ...)  # 乘上 V，得到当前块的输出</code>
+    这部分和普通的 Attention 一模一样。</p>
+</li>
+<li>
+<p><strong>利用历史记忆 (Recurrent State):</strong>
+    <code>python
+    b_o += tl.dot(b_q, b_h, ...) # 把当前的 Q 乘上之前的记忆 h，加到输出里</code>
+    这就是为什么它能记得很久以前的信息。</p>
+</li>
+<li>
+<p><strong>更新记忆 (Update State):</strong>
+    <code>python
+    b_h += tl.dot(b_k, b_v, ...) # 把当前的 K 和 V 压缩，更新进 h 里，留给下一轮循环用</code>
+    这里 <code>b_h</code> 的形状是 <code>[BD, BD]</code>，它是一个压缩的状态矩阵。</p>
+</li>
+</ol>
+<hr />
+<h3>📋 Task 3: 理解 Python 包装器 —— <code>AttentionFunction</code></h3>
+<p><strong>目标：</strong> 理解怎么把 PyTorch 的 Tensor 喂给上面的 Triton 内核。</p>
+<ul>
+<li><strong>代码：</strong> <code>class AttentionFunction(torch.autograd.Function)</code></li>
+<li><strong>解释：</strong><ul>
+<li><code>BT = 32</code>：设定块大小。</li>
+<li><code>grid = (batch_size * n_heads,)</code>：这就好比显卡上有几千个核心，我们告诉显卡：“启动这么多线程，每个线程负责处理一个 (Batch, Head) 的序列。”</li>
+<li><code>q.stride(...)</code>：步幅信息，告诉内核如何在内存中跳跃读取数据。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📋 Task 4: 那个奇怪的 <code>IFCOND</code> 是干嘛的？</h3>
+<p><strong>目标：</strong> 理解代码中的 <code>if IFCOND:</code> 分支。</p>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>python
+    if IFCOND:
+        if i == 0:
+            b_h = tl.dot(b_k, b_v, ...) # 第一步直接初始化 h
+        else:
+            # ... 正常的累加逻辑</code></li>
+<li><strong>解释：</strong> 这通常是为了<strong>数值稳定性</strong>或者<strong>测试初始化逻辑</strong>。<ul>
+<li>如果 <code>IFCOND=True</code>，它显式地区分了“第一步”和“后续步骤”。</li>
+<li>如果 <code>IFCOND=False</code>，它假设 <code>b_h</code> 初始就是 0，直接累加。</li>
+<li>在测试中，作者想验证这两种写法的数学结果是否一致。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📋 Task 5: 运行测试 —— <code>if __name__ == '__main__':</code></h3>
+<p><strong>目标：</strong> 验证代码写得对不对。</p>
+<ul>
+<li><strong>步骤：</strong><ol>
+<li><strong>造数据：</strong> 生成随机的 Q, K, V。</li>
+<li><strong>跑基准 (Ref)：</strong> <code>ref = AttentionFunction.apply(q, k, v)</code>。注意，这里作者有点偷懒，他把第一次运行的结果当作“标准答案”（或者他确信默认参数是对的）。通常这里应该用一个纯 PyTorch 写得慢速版本做对比，但这里似乎是用同一个内核的不同配置在互相对比。</li>
+<li><strong>循环测试：</strong><ul>
+<li>测试 <code>float32</code> 和 <code>bfloat16</code>。</li>
+<li>测试 <code>store=True/False</code> (是否把中间状态 <code>h</code> 存回显存)。</li>
+<li>测试 <code>check=True/False</code> (也就是上面的 <code>IFCOND</code>)。</li>
+</ul>
+</li>
+<li><strong>比对差异：</strong> <code>diff = (ref - tri).abs().max()</code>。如果差异极小（<code>&lt;1</code> 对于 float 误差来说），就打印 <code>True</code>。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底讲了啥？</h3>
+<p><strong>一句话总结：</strong>
+这是一个<strong>基于 Triton 实现的高效线性注意力（Linear Attention）的前向传播（Forward）测试脚本</strong>。</p>
+<p><strong>核心观点/流程：</strong>
+1.  <strong>分块计算：</strong> 为了省显存和加速，把长序列切成 32 长度的小块。
+2.  <strong>混合模式：</strong> 小块内部用标准 Attention，小块之间用 RNN 风格的状态传递（$H_t = H_{t-1} + K^T V$）。
+3.  <strong>正确性验证：</strong> 脚本最后证明了，无论你是用 float32 还是 bf16，无论你是否显式处理循环的第一步，计算结果都是一致的。</p>
+<p>你可以把它理解为：作者写了一个<strong>超级快的 Attention 算子</strong>，然后写了这个脚本来证明<strong>“我这个算子在各种参数下算的数都是稳的”</strong>。</p>

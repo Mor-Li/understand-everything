@@ -1,0 +1,83 @@
+<h1>fla/layers/linear_attn.py</h1>
+<p>这份代码实现了一个 <strong>线性注意力机制（Linear Attention）</strong> 的层。</p>
+<p>为了让你更容易理解，我们可以把这段代码想象成一个<strong>“流水线工厂”</strong>。输入的数据（原材料）进入工厂，经过一系列工序，最后输出处理好的数据（成品）。</p>
+<p>标准的 Transformer 注意力机制（Softmax Attention）计算量很大（$O(N^2)$），而这个“工厂”的目标是用更高效的方法（$O(N)$）来达到类似的效果。</p>
+<p>下面我列一份 <strong>Task List (任务清单)</strong>，带你一步步看完这个工厂的运作流程：</p>
+<hr />
+<h3>📋 线性注意力机制处理清单 (To-Do List)</h3>
+<h4>✅ Task 1: 准备原材料与分发 (Projections)</h4>
+<p><strong>目标</strong>：把输入的向量 $x$ 转化为查询(Q)、键(K)、值(V)。
+<strong>代码对应</strong>：<code>__init__</code> 中的 <code>self.q_proj</code>, <code>self.k_proj</code>, <code>self.v_proj</code> 以及 <code>forward</code> 开头部分。</p>
+<ul>
+<li><strong>解释</strong>：<ul>
+<li>就像标准 Transformer 一样，我们首先通过全连接层（Linear）把输入 $x$ 变成三个不同的视角：$Q$ (Query), $K$ (Key), $V$ (Value)。</li>
+<li><strong>特殊情况 (GQA/MQA)</strong>：代码里提到了 <code>num_kv_groups</code>。这是一种优化技术。如果 $K$ 和 $V$ 的头数（Heads）比 $Q$ 少，就需要把 $K$ 和 $V$ 复制几份，让它们和 $Q$ 对齐。这叫 Grouped Query Attention，为了省显存和加速。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 调整形状与对齐 (Reshape &amp; Repeat)</h4>
+<p><strong>目标</strong>：把数据整理成多头（Multi-head）的格式。
+<strong>代码对应</strong>：<code>forward</code> 中的 <code>rearrange</code> 和 <code>repeat</code> 部分。</p>
+<ul>
+<li><strong>解释</strong>：<ul>
+<li>数据刚投影出来是混合在一起的。</li>
+<li>这一步把数据切分成多个“头”（Heads）。</li>
+<li>如果 Task 1 中 $K/V$ 的头数少，这里会用 <code>repeat</code> 把它们复制，确保 $Q, K, V$ 的头数一致，方便后续计算。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 特征映射 (Feature Map) —— <strong>这是核心魔法</strong> 🌟</h4>
+<p><strong>目标</strong>：把 $Q$ 和 $K$ 变换一下，替代 Softmax。
+<strong>代码对应</strong>：<code>__init__</code> 中的 <code>if feature_map == ...</code> 和 <code>forward</code> 中的 <code>self.feature_map_q(q)</code>。</p>
+<ul>
+<li><strong>解释</strong>：<ul>
+<li><strong>为什么要这步？</strong> 标准注意力用 $Softmax(QK^T)V$。那个 Softmax 很慢，而且让计算顺序锁死。</li>
+<li><strong>线性注意力的思路</strong>：如果我们把 $Q$ 和 $K$ 先通过一个函数 $\phi(\cdot)$ 处理一下（比如 ReLU, ELU, 或者代码里的 Hedgehog, T2R），变成 $\phi(Q)$ 和 $\phi(K)$。</li>
+<li>那么公式就可以变成 $\phi(Q) \cdot (\phi(K)^T V)$。这允许我们先算后面部分，把复杂度降下来。</li>
+<li><strong>代码做了啥</strong>：根据你选的配置（<code>hedgehog</code>, <code>elu</code>, <code>relu</code> 等），对 $Q$ 和 $K$ 进行非线性变换。这相当于给它们穿了一层“马甲”，让它们具备类似 Softmax 的聚焦能力，但计算更快。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 归一化 (Normalization - Optional)</h4>
+<p><strong>目标</strong>：防止数值爆炸，保持稳定。
+<strong>代码对应</strong>：<code>forward</code> 中的 <code>if self.norm_q:</code> 部分。</p>
+<ul>
+<li><strong>解释</strong>：<ul>
+<li>简单的数学处理。把 $Q$ 和 $K$ 除以它们的总和，确保数值在合理的范围内（类似概率分布，和为1）。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 核心计算 (Core Computation)</h4>
+<p><strong>目标</strong>：真正把 $Q, K, V$ 融合在一起，算出结果。
+<strong>代码对应</strong>：<code>forward</code> 中的 <code>chunk_linear_attn</code>, <code>fused_chunk_linear_attn</code>, <code>fused_recurrent_linear_attn</code>。</p>
+<ul>
+<li><strong>解释</strong>：<ul>
+<li>这是最“硬核”的一步，调用了底层的 CUDA 或 Triton 算子。</li>
+<li><strong>Mode (模式)</strong>：代码支持几种模式：<ol>
+<li><strong>Chunk (分块)</strong>：把长序列切成小块并行计算（训练时快）。</li>
+<li><strong>Recurrent (循环)</strong>：像 RNN 一样一步步算（推理/生成时省内存）。</li>
+</ol>
+</li>
+<li>这一步完成了 $O = \phi(Q) \cdot (\sum \phi(K)^T V)$ 的计算。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 6: 质检与出厂 (Output Norm &amp; Projection)</h4>
+<p><strong>目标</strong>：整理输出数据的分布，并映射回原本的大小。
+<strong>代码对应</strong>：<code>forward</code> 最后几行 <code>self.norm(o)</code> 和 <code>self.o_proj(o)</code>。</p>
+<ul>
+<li><strong>解释</strong>：<ul>
+<li><strong>Group Norm / RMSNorm</strong>：计算完注意力后，每个头（Head）输出的数据分布可能不太一致，这里用 Norm 统一一下，保证训练稳定。</li>
+<li><strong>Output Projection</strong>：最后通过一个全连接层 <code>o_proj</code>，把多头的结果融合，还原成和输入 $x$ 一样的维度，准备传给下一层网络。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结一下</h3>
+<p>这段代码讲的就是：
+<strong>“我不想用慢吞吞的 Softmax Attention，我要用 Linear Attention。”</strong></p>
+<p>为了实现这一点，它：
+1.  把 $Q, K$ 通过 <strong>Feature Map</strong> (如 ReLU, Hedgehog) 转换。
+2.  利用 <strong>数学结合律</strong>（先算 $K^T V$），把计算复杂度从 $N^2$ 降到了 $N$。
+3.  提供了 <strong>Chunk</strong>（并行训练）和 <strong>Recurrent</strong>（RNN式推理）两种实现方式。</p>
+<p>这就是 <code>fla</code> (Fast Linear Attention) 库中这个文件的核心逻辑。</p>

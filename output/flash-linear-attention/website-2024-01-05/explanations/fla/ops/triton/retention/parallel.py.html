@@ -1,0 +1,124 @@
+<h1>fla/ops/triton/retention/parallel.py</h1>
+<p>这份代码确实比较硬核，它使用了 <strong>OpenAI Triton</strong> 语言来编写在 GPU 上运行的高性能算子。简单来说，这是 <strong>RetNet (Retention Network)</strong> 模型中 <strong>“Parallel Retention” (并行保留机制)</strong> 的 GPU 加速实现。</p>
+<p>RetNet 是一种试图替代 Transformer 的架构，它的核心特点是既能像 Transformer 一样并行训练，又能像 RNN 一样低成本推理。</p>
+<p>为了让你看懂，我把阅读这份代码分解成一个 <strong>“任务清单 (Todo List)”</strong>，我们一步步来拆解它的逻辑。</p>
+<hr />
+<h3>📋 任务清单 (Todo List)</h3>
+<ol>
+<li><strong>搞懂输入输出</strong>：知道 Q, K, V 是什么，以及我们要算出的 O 是什么。</li>
+<li><strong>搞懂核心数学概念</strong>：理解 Retention 和 Attention 的区别（关键在于“衰减 Decay”）。</li>
+<li><strong>搞懂分块策略 (Tiling)</strong>：理解 <code>BTL</code> 和 <code>BTS</code> 是干嘛的（这是 GPU 优化的核心）。</li>
+<li><strong>解析前向传播 (Forward)</strong>：看它如何把“历史信息”和“当前信息”加在一起。</li>
+<li><strong>解析反向传播 (Backward)</strong>：看它是怎么算梯度的（用于训练）。</li>
+</ol>
+<hr />
+<h3>第一步：搞懂输入输出 (Wrapper 部分)</h3>
+<p>先看代码最底部的 <code>class ParallelRetentionFunction</code>。这是 PyTorch 和 Triton 的接口。</p>
+<ul>
+<li><strong>输入 (Inputs)</strong>: <code>q, k, v</code>。形状通常是 <code>[Batch, Heads, Seq_Len, Head_Dim]</code>。</li>
+<li><strong>输出 (Output)</strong>: <code>o</code>。形状和 <code>v</code> 一样。</li>
+<li><strong>任务</strong>: 计算 $O = (Q \cdot K^T \odot D) \cdot V$。<ul>
+<li>这看起来很像 Attention 的 $Softmax(Q \cdot K^T) \cdot V$。</li>
+<li><strong>区别</strong>: 没有 Softmax，取而代之的是一个 <strong>衰减矩阵 (Decay Mask, $D$)</strong>。</li>
+</ul>
+</li>
+</ul>
+<p><strong>代码细节</strong>:</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 在 forward 函数中</span>
+<span class="n">BTL</span><span class="p">,</span> <span class="n">BTS</span> <span class="o">=</span> <span class="mi">128</span><span class="p">,</span> <span class="mi">32</span>  <span class="c1"># 定义了分块的大小，后面会细讲</span>
+<span class="n">grid</span> <span class="o">=</span> <span class="o">...</span>          <span class="c1"># 定义启动多少个 GPU 线程块</span>
+<span class="n">parallel_retention_fwd_kernel</span><span class="p">[</span><span class="n">grid</span><span class="p">](</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 启动内核</span>
+</code></pre></div>
+
+<hr />
+<h3>第二步：搞懂核心数学概念 (Decay)</h3>
+<p>在 Retention 机制中，距离越远的 Token，关联度越低。
+代码里有一个很重要的变量 <code>b_b</code> (base decay) 和 <code>d_h</code> (decay vector)。</p>
+<ul>
+<li><strong>衰减率</strong>: 每一头 (Head) 的衰减速度不一样。<ul>
+<li>代码：<code>b_b = tl.math.log2(1 - tl.math.pow(2, -5 - i_h * 1.0))</code></li>
+<li>意思：Head 0 衰减得快，Head 1 衰减得慢...以此类推。</li>
+</ul>
+</li>
+<li><strong>空间几何衰减</strong>: 计算 $Q$ 和 $K$ 的点积时，会乘上一个指数衰减项。</li>
+</ul>
+<hr />
+<h3>第三步：解析前向传播 (Forward Kernel)</h3>
+<p>这是文件开头的 <code>parallel_retention_fwd_kernel</code> 函数。这是最难的部分，我们拆成小任务。</p>
+<h4>Task 3.1: 定位 (Grid &amp; Pointers)</h4>
+<p>GPU 是大规模并行的。每个线程块 (Block) 处理一部分数据。
+*   <code>i_c</code>: 当前处理的是序列中的哪一段 (Chunk)。
+*   <code>i_kv</code>: 处理特征维度的哪一部分。
+*   <code>p_q, p_k, p_v</code>: 指针，指向当前线程块需要读取的显存位置。</p>
+<h4>Task 3.2: 历史信息的处理 (Inter-Chunk)</h4>
+<p>想象你在读一本书（序列长度 T）。你把书分成了很多章（Chunk，长度为 <code>BTL</code>）。
+当你读第 5 章时，第 1, 2, 3, 4 章的信息就是“历史”。</p>
+<p>代码中的第一个 <code>for</code> 循环：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 遍历当前 Chunk 之前的所有 Chunk</span>
+<span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">i_c</span> <span class="o">*</span> <span class="n">BTL</span><span class="p">,</span> <span class="n">BTS</span><span class="p">):</span>
+    <span class="c1"># 1. 加载之前的 K 和 V</span>
+    <span class="n">b_k</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="n">b_v</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="c1"># 2. 计算 Q 和 K 的点积，并加上衰减 (d_h)</span>
+    <span class="n">b_s</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_q</span><span class="p">,</span> <span class="n">b_k</span><span class="p">)</span> <span class="o">*</span> <span class="n">d_h</span>
+    <span class="c1"># 3. 累加到结果 b_o 中</span>
+    <span class="n">b_o</span> <span class="o">=</span> <span class="n">b_o</span> <span class="o">*</span> <span class="n">decay</span> <span class="o">+</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_s</span><span class="p">,</span> <span class="n">b_v</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>关键点</strong>：这里不需要 Mask（掩码）。因为以前的章节肯定是在当前章节之前的，所有以前的信息都能被看见。</p>
+<h4>Task 3.3: 当前信息的处理 (Intra-Chunk)</h4>
+<p>现在处理当前这一章内部的关系。</p>
+<p>代码中的第二个 <code>for</code> 循环：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 遍历当前 Chunk 内部</span>
+<span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">i_c</span> <span class="o">*</span> <span class="n">BTL</span><span class="p">,</span> <span class="p">(</span><span class="n">i_c</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">BTL</span><span class="p">,</span> <span class="n">BTS</span><span class="p">):</span>
+    <span class="c1"># ...加载 K, V...</span>
+
+    <span class="c1"># 这里的关键是 Mask！</span>
+    <span class="c1"># 只有 &quot;当前词&quot; 之前的词才能被看见 (Causal Mask)</span>
+    <span class="n">m_s</span> <span class="o">=</span> <span class="n">o_q</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">&gt;=</span> <span class="n">o_k</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]</span> 
+    <span class="n">d_s</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">m_s</span><span class="p">,</span> <span class="o">...</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="c1"># 如果是未来的词，权重设为0</span>
+
+    <span class="c1"># 计算 QK * V</span>
+    <span class="n">b_s</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_q</span><span class="p">,</span> <span class="n">b_k</span><span class="p">)</span> <span class="o">*</span> <span class="n">d_s</span>
+    <span class="n">b_o</span> <span class="o">+=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_s</span><span class="p">,</span> <span class="n">b_v</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>总结 Forward</strong>:
+1.  把以前所有块算出来的结果，乘上衰减，加进来。
+2.  把当前块内部算出来的结果（带 Mask），加进来。
+3.  保存 <code>b_o</code> 到显存。</p>
+<hr />
+<h3>第四步：解析反向传播 (Backward Kernel)</h3>
+<p>这是训练神经网络必须的，计算梯度。代码拆成了两个函数：</p>
+<ol>
+<li><code>_parallel_retention_bwd_dq</code>: 算 $Q$ 的梯度。</li>
+<li><code>_parallel_retention_bwd_dkv</code>: 算 $K$ 和 $V$ 的梯度。</li>
+</ol>
+<p>原理和 Forward 几乎是镜像的，但是方向相反。
+*   Forward 是 $Q \times K \rightarrow \text{Score} \times V \rightarrow O$
+*   Backward 是利用输出的梯度 $dO$，逆向推导 $dQ, dK, dV$。</p>
+<p>这一部分非常复杂，主要难点在于：
+*   <strong>重计算 (Recomputation)</strong>: 为了省显存，反向传播时通常不存中间的 Attention Matrix，而是重新把 $Q, K$ 读进来再算一遍点积。
+*   <strong>原子加 (Atomic Add)</strong>: 或者是并行归约。因为 <code>dq</code> 的计算涉及对 V 维度的求和，<code>dk/dv</code> 涉及对 Q 维度的求和。</p>
+<p><strong>代码逻辑简化</strong>:
+*   加载 $dO$ (Output 的梯度)。
+*   重新加载 $K, V$。
+*   计算 $dO \cdot V^T$ 得到一部分梯度信息，乘上衰减，传给 $Q$。
+*   处理 Mask 逻辑（同样分为了“块内”和“块间”）。</p>
+<hr />
+<h3>总结：这篇文章到底在讲啥？</h3>
+<p>这就好比你在做一个<strong>超级并行的阅读理解任务</strong>：</p>
+<ol>
+<li><strong>分块 (Chunking)</strong>：把长文章切成小段，分给很多个工人（GPU 线程）同时读。</li>
+<li><strong>衰减 (Decay)</strong>：规定读的时候，越前面的内容忘得越快（Retention 的特性）。</li>
+<li><strong>两阶段计算</strong>：<ul>
+<li><strong>阶段一</strong>：每个工人先算出自己这一段内容里，前面的词对后面的词的影响（Intra-chunk，需要 Mask 防止偷看后面）。</li>
+<li><strong>阶段二</strong>：把前面所有工人读完总结出的“记忆”，按衰减比例传给当前的工人（Inter-chunk）。</li>
+</ul>
+</li>
+<li><strong>Triton 优化</strong>：使用 <code>block_ptr</code> 等技术，极其高效地管理内存读写，比直接写 PyTorch 快得多。</li>
+</ol>
+<p><strong>如果你只是想用这个模块</strong>：
+你只需要关注 <code>ParallelRetentionFunction.apply(q, k, v)</code>。它就是一个高性能的、带衰减的 Attention 变体。</p>
+<p><strong>如果你想修改它</strong>：
+你需要非常小心 <code>tl.dot</code> (矩阵乘法) 的维度，以及 <code>d_b</code> / <code>d_h</code> (衰减系数) 的计算逻辑。</p>

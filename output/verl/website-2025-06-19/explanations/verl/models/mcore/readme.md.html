@@ -1,0 +1,62 @@
+<h1>verl/models/mcore/readme.md</h1>
+<p>这份文档其实是一份<strong>技术路线图（Roadmap）和开发指南</strong>。</p>
+<p>简单来说，<code>verl</code> 这个项目正在进行一次<strong>“引擎大换血”</strong>。他们以前用的是老版本的 <code>Megatron-LM</code>，现在为了追求更快、更强的功能（比如支持超大模型），正在迁移到 <code>Megatron-Core</code> (简称 <strong>mcore</strong>)。</p>
+<p>由于这次迁移比较复杂，涉及到很多底层代码的改动，所以我把文档拆解成一个 <strong>“任务清单 (Todo List)”</strong>，按照<strong>模型在系统中的生命周期</strong>一步步给你讲。</p>
+<hr />
+<h3>核心目标：从“旧引擎”搬家到“新引擎 (mcore)”</h3>
+<p><strong>背景：</strong>
+*   <strong>HuggingFace (HF)</strong> 是业界标准（好用，但训练慢）。
+*   <strong>Megatron-Core (mcore)</strong> 是高性能训练库（训练极快，但格式独特，难上手）。
+*   <strong>vLLM</strong> 是用来做推理生成的引擎（verl 用它来做 Rollout）。
+*   <strong>挑战：</strong> 怎么让这三者无缝配合？</p>
+<hr />
+<h3>任务清单 (Step-by-Step Task List)</h3>
+<h4>第一阶段：装修与搬家（模型定义与权重转换）</h4>
+<p><strong>Task 1: 把 HuggingFace 的图纸改成 mcore 的图纸</strong>
+*   <strong>原文对应：</strong> <em>Modelling the huggingface model with mcore <code>GPTModel</code></em>
+*   <strong>解释：</strong> HF 和 mcore 对模型的定义（Config）不一样。
+*   <strong>Todo:</strong>
+    1.  写代码把 HF 的配置（Config）翻译成 mcore 的配置。
+    2.  用翻译好的配置去初始化 mcore 的核心类 <code>GPTModel</code>。
+    3.  <strong>现状：</strong> Llama 和 Qwen2 已经搞定了，DeepseekV3 和 MoE 模型还在开发中。</p>
+<p><strong>Task 2: 把家具搬进去（权重加载）</strong>
+*   <strong>原文对应：</strong> <em>Offline loading / dist_checkpointing</em>
+*   <strong>解释：</strong> 你要把下载好的 HF 格式的模型权重（weights），塞进 mcore 里去训练。
+*   <strong>Todo:</strong>
+    1.  <strong>废弃方案（Runtime loading）：</strong> 以前是训练开始时每个显卡都读一遍模型，太慢太占内存，不要了。
+    2.  <strong>推荐方案（Offline loading）：</strong> 写一个脚本，在训练前先把 HF 权重转成 mcore 专用的 <code>dist_checkpointing</code> 格式。这样加载速度极快。</p>
+<h4>第二阶段：高性能训练（利用 mcore 的新功能）</h4>
+<p><strong>Task 3: 开启加速器（并行策略支持）</strong>
+*   <strong>原文对应：</strong> <em>Support tensor parallel, pipeline parallel, etc.</em>
+*   <strong>解释：</strong> 模型太大，一张卡装不下，需要把模型切碎了放在不同卡上跑。
+*   <strong>Todo:</strong>
+    1.  支持各种切分姿势：张量并行 (TP)、流水线并行 (PP)、序列并行 (SP) 等。
+    2.  支持最新的 Context Parallel (CP) 以处理超长文本。
+    3.  <strong>开发中：</strong> 专家并行 (Expert Parallel)，这是为了跑 DeepseekV3 这种 MoE 模型必须的。</p>
+<h4>第三阶段：边训练边考试（与 vLLM 的交互）</h4>
+<p><strong>Task 4: 实时翻译给 vLLM 看（Online Resharding）</strong>
+*   <strong>原文对应：</strong> <em>online weight conversion from mcore to huggingface</em>
+*   <strong>解释：</strong> <code>verl</code> 的流程是：用 mcore 训练 -&gt; 暂停 -&gt; 把权重给 vLLM 去生成数据 -&gt; 继续训练。
+    *   问题是：vLLM 看不懂 mcore 的切分格式。
+*   <strong>Todo:</strong>
+    1.  在训练过程中，实时把 mcore 分散在各张卡上的权重，拼凑并转换成 vLLM 能懂的格式。
+    2.  <strong>难点：</strong> 这一步非常复杂，因为两边的并行策略可能完全不同，需要高效的“重切分 (Resharding)”。</p>
+<h4>第四阶段：存档与读档（Checkpointing）</h4>
+<p><strong>Task 5: 保存进度</strong>
+*   <strong>原文对应：</strong> <em>Checkpointing / dist_checkpointing</em>
+*   <strong>解释：</strong> 训练一半要存盘，或者训练完要把模型导出来给别人用。
+*   <strong>Todo:</strong>
+    1.  支持训练中断后的恢复（Resume）。
+    2.  支持把 mcore 训练好的模型，转回 HuggingFace 格式，方便大家推理使用。
+    3.  <strong>改进点：</strong> 现有的代码存盘太简单粗暴，需要重构为更高效的分布式存储格式。</p>
+<hr />
+<h3>给社区派发的“悬赏任务” (Community Call)</h3>
+<p>文档最后列出了一些作者没时间做，希望大家帮忙的功能：</p>
+<ol>
+<li><strong>更好的转换脚本：</strong> 现在的脚本只能单卡转，大模型（如 70B+）一张卡内存不够，需要支持多卡并行转换。</li>
+<li><strong>支持新模型：</strong> Llama 4, Qwen2.5-VL。</li>
+<li><strong>代码重构：</strong> 优化存档管理的代码 (<code>megatron_checkpoint_manager.py</code>)。</li>
+</ol>
+<h3>总结</h3>
+<p>这篇文档就是在说：
+<strong>“我们正在把底层换成 Megatron-Core 以支持 DeepseekV3 这种超大模型。基本的 Llama/Qwen 已经通了，但 MoE 模型、超大模型权重转换、以及和 vLLM 的高效配合还需要继续开发。谁有空来帮帮忙？”</strong></p>

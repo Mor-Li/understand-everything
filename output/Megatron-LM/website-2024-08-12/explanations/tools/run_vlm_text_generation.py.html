@@ -1,0 +1,102 @@
+<h1>tools/run_vlm_text_generation.py</h1>
+<p>这份代码确实涉及很多深度学习框架（Megatron-LM）的底层细节，乍一看很晕是很正常的。</p>
+<p>简单来说，这个脚本的功能是：<strong>让一个训练好的“视觉-语言模型”（VLM），看一堆图片，然后根据提示词（Prompt）生成文字描述，最后把结果保存下来。</strong> 也就是俗称的“看图说话”。</p>
+<p>为了让你看懂，我们可以把这个脚本想象成一个<strong>流水线工人</strong>。我为你列了一个 <strong>Task Todo List（任务清单）</strong>，代码的执行过程就是按顺序划掉这些任务。</p>
+<hr />
+<h3>📋 任务清单 (Task Todo List)</h3>
+<ol>
+<li><strong>准备工作</strong>：读取说明书（参数），启动机器环境。</li>
+<li><strong>加载大脑</strong>：把训练好的模型（Model）搬进内存。</li>
+<li><strong>整理素材</strong>：找到图片文件夹，把图片裁剪、清洗成模型能看懂的格式。</li>
+<li><strong>开始干活（循环）</strong>：<ul>
+<li>拿出一张图。</li>
+<li>给这张图配上一个问题（Prompt）。</li>
+<li><strong>关键步骤</strong>：把图和字一起塞给模型（Forward）。</li>
+<li>让模型吐出答案（Generate）。</li>
+</ul>
+</li>
+<li><strong>记录结果</strong>：把“图片ID+问题+模型回答”写到文件里。</li>
+</ol>
+<hr />
+<h3>🧐 逐步讲解 (Step-by-Step Guide)</h3>
+<p>接下来我们按照上面的清单，一步步拆解代码。</p>
+<h4>1. 准备工作 (Setup)</h4>
+<p><strong>代码位置</strong>：<code>main()</code> 函数开头 和 <code>add_text_generation_args</code> 函数。</p>
+<ul>
+<li><strong>做什么</strong>：工人开工前要看工单。比如：<ul>
+<li><code>--input-path</code>：图片在哪？</li>
+<li><code>--output-path</code>：结果写在哪？</li>
+<li><code>--temperature</code>：模型回答要有创意一点（高）还是死板一点（低）？</li>
+</ul>
+</li>
+<li><strong>代码对应</strong>：<ul>
+<li><code>initialize_megatron(...)</code>：启动Megatron分布式环境（因为大模型通常需要多张显卡一起跑）。</li>
+<li><code>get_args()</code>：获取上面提到的那些参数。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 加载大脑 (Load Model)</h4>
+<p><strong>代码位置</strong>：<code>main()</code> 函数中间。</p>
+<ul>
+<li><strong>做什么</strong>：把那个巨大的神经网络模型加载进来。</li>
+<li><strong>代码对应</strong>：<ul>
+<li><code>model = get_model(model_provider, ...)</code>：构建模型架构。</li>
+<li><code>load_checkpoint(...)</code>：读取训练好的权重文件（Checkpoint），相当于给大脑注入知识。</li>
+<li><code>model.eval()</code>：告诉模型“现在是考试时间，不是学习时间”，关闭Dropout等训练专用功能。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 整理素材 (Preprocess Images)</h4>
+<p><strong>代码位置</strong>：<code>generate_samples</code> 函数开头 和 <code>preprocess_image</code> 函数。</p>
+<ul>
+<li><strong>做什么</strong>：模型看不懂原始的 <code>.jpg</code> 文件，它只认识数字矩阵（Tensor）。而且图片大小必须统一。</li>
+<li><strong>代码对应</strong>：<ul>
+<li><code>glob.glob(args.input_path + "/*")</code>：列出文件夹里所有图片。</li>
+<li><code>preprocess_image(...)</code>：<ul>
+<li><strong>Resize</strong>：把图片缩放到指定大小（比如 336x336）。</li>
+<li><strong>Normalize</strong>：把像素值减去均值、除以方差（标准化），这是深度学习的标准操作。</li>
+<li><strong>Pad</strong>：如果长宽比不对，就用黑边补齐。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>4. 核心连接：把图和字连起来 (The VLM Bridge)</h4>
+<p><strong>这是全文最难懂的地方</strong>，在 <code>VLMForwardStep</code> 类中。</p>
+<ul>
+<li><strong>背景</strong>：普通的语言模型（LLM）只吃文字。VLM 需要同时吃“图片”和“文字”。</li>
+<li><strong>做什么</strong>：这个类是一个“连接器”。<ul>
+<li>它继承自 <code>ForwardStep</code>。</li>
+<li><strong><code>__init__</code></strong>：它记住了当前的图片 <code>self._images</code>。</li>
+<li><strong><code>_forward</code></strong>：当模型运行时，它不仅传入文字 tokens，还把 <code>self._images</code> 强行塞给模型：<code>return self.model(self._images, tokens, ...)</code>。</li>
+<li><strong><code>__call__</code></strong>：这里有一行奇怪的代码 <code>sequence_len_offset += ...</code>。意思是：模型在处理文字之前，先处理了图片。图片在模型眼里也是一串Token（比如一张图=256个Token）。所以，计算文字位置时，要往后挪256位，给图片腾出空间。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 开始干活与生成 (Generation Loop)</h4>
+<p><strong>代码位置</strong>：<code>generate_samples</code> 函数的 <code>while True</code> 循环。</p>
+<ul>
+<li><strong>做什么</strong>：<ol>
+<li><strong>Prompt</strong>：代码里写死了提示词：<code>prompt = "Give a short and clear explanation of the subsequent image.\n"</code>（请简短清晰地解释接下来的这张图）。</li>
+<li><strong>Inference</strong>：调用 <code>generate_and_post_process(...)</code>。这是 Megatron 的通用生成函数。它会不断调用上面的 <code>VLMForwardStep</code>，一个词一个词地蹦，直到达到长度限制或模型说“我讲完了”。</li>
+</ol>
+</li>
+</ul>
+<h4>6. 记录结果 (Save Results)</h4>
+<p><strong>代码位置</strong>：<code>generate_and_write_samples</code> 函数。</p>
+<ul>
+<li><strong>做什么</strong>：把结果存下来。</li>
+<li><strong>代码对应</strong>：<ul>
+<li>它是一个生成器（Generator），每生成一个结果，就 <code>yield output</code>。</li>
+<li><code>f.write(json.dumps(output) + "\n")</code>：把结果打包成 JSON 格式，追加写入到输出文件里。</li>
+<li>结果包含：<code>question_id</code> (图片名), <code>prompt</code> (问题), <code>caption</code> (模型生成的描述), <code>ground_truth</code> (参考答案，如果有的话)。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结 (Key Takeaway)</h3>
+<p>如果你要修改这个脚本，通常只需要关注这几点：
+1.  <strong>想改提示词？</strong> 去 <code>generate_samples</code> 里找 <code>prompt = "..."</code> 那一行。
+2.  <strong>想改图片处理方式？</strong> 去看 <code>preprocess_image</code> 函数。
+3.  <strong>看不懂 <code>VLMForwardStep</code>？</strong> 没关系，只要知道它是负责<strong>把图片塞进模型</strong>并<strong>告诉模型图片占了多少位置</strong>的黑盒即可。</p>
+<p>希望这个清单和讲解能帮你理清思路！</p>

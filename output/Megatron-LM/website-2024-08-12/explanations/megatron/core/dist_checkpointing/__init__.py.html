@@ -1,0 +1,89 @@
+<h1>megatron/core/dist_checkpointing/<strong>init</strong>.py</h1>
+<p>这份代码其实是一个 Python 包的<strong>入口文件</strong>（<code>__init__.py</code>）。它的代码虽然很少，但它背后的概念非常宏大。</p>
+<p>你可以把它想象成一个<strong>餐厅的菜单目录</strong>。这一页纸本身不包含烹饪的细节，但它告诉你这家餐厅（这个模块）能提供哪些菜品（功能）。</p>
+<p>为了让你理解这些“菜品”是干嘛的，我为你设计了一个由浅入深的 <strong>Task List（学习任务清单）</strong>。我们按照<strong>“保存和加载一个超大模型”</strong>的逻辑流程，一步步拆解这些代码对应的功能。</p>
+<hr />
+<h3>🚀 学习任务清单：理解分布式检查点 (Distributed Checkpointing)</h3>
+<h4>✅ Task 1: 理解背景 —— 为什么要搞这么复杂？</h4>
+<p><strong>对应代码：</strong> 整个文件路径 <code>megatron/core/dist_checkpointing</code></p>
+<ul>
+<li><strong>场景</strong>：你正在训练一个像 GPT-3 这样巨大的模型。</li>
+<li><strong>问题</strong>：模型太大了，一张显卡（GPU）根本装不下。你需要把模型切碎，分散存放在几百张显卡上。</li>
+<li><strong>痛点</strong>：当你需要保存进度（Checkpoint）时，不能简单地生成一个巨大的文件，因为太慢且内存不够。你需要让几百张显卡配合，各自保存自己那一小块，最后还得保证下次能拼回去。</li>
+<li><strong>结论</strong>：这个模块就是专门用来解决<strong>“如何高效地保存/加载分散在多张卡上的模型”</strong>这个问题的。</li>
+</ul>
+<hr />
+<h4>✅ Task 2: 定义数据形态 —— 怎么切分模型？</h4>
+<p><strong>对应代码：</strong> <code>from .mapping import ShardedTensor</code></p>
+<ul>
+<li><strong>概念</strong>：<strong>ShardedTensor (分片张量)</strong></li>
+<li><strong>解释</strong>：<ul>
+<li>普通的 Tensor（张量）是一整块披萨。</li>
+<li><code>ShardedTensor</code> 是被切分后的披萨片。</li>
+</ul>
+</li>
+<li><strong>作用</strong>：这个类用来告诉系统：“嘿，这个权重矩阵被切分了，我当前这张显卡只持有其中左上角这一小块。”这是实现分布式保存的核心数据结构。</li>
+</ul>
+<hr />
+<h4>✅ Task 3: 排除干扰 —— 哪些东西不需要存？</h4>
+<p><strong>对应代码：</strong> <code>from .mapping import LocalNonpersistentObject</code></p>
+<ul>
+<li><strong>概念</strong>：<strong>LocalNonpersistentObject (本地非持久化对象)</strong></li>
+<li><strong>解释</strong>：<ul>
+<li>有些数据是临时的，或者只跟当前这台机器的硬件状态有关（比如临时缓存、显卡特定的句柄）。</li>
+<li>当你保存模型时，这些东西就像你搬家时的垃圾，不需要打包带走。</li>
+</ul>
+</li>
+<li><strong>作用</strong>：用这个标记那些<strong>“不需要保存到硬盘里”</strong>或者<strong>“下次加载时不需要恢复”</strong>的东西。<ul>
+<li><em>注：代码里还有个 <code>LocalNonpersitentObject</code>（少了个 's'），那通常是用来兼容旧版本拼写错误的别名。</em></li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 4: 执行保存 —— 把内存里的东西落盘</h4>
+<p><strong>对应代码：</strong> <code>from .serialization import save</code></p>
+<ul>
+<li><strong>概念</strong>：<strong>save (保存)</strong></li>
+<li><strong>解释</strong>：<ul>
+<li>这不仅仅是写入文件。它是一个指挥官。</li>
+<li>它会协调所有显卡，确保大家把各自手里的 <code>ShardedTensor</code>（披萨片）有序地写入到存储中，并生成一个元数据文件（索引），记录哪块肉在哪张饼上。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 5: 执行加载 —— 最难的一步</h4>
+<p><strong>对应代码：</strong>
+*   <code>load</code>
+*   <code>load_common_state_dict</code>
+*   <code>load_plain_tensors</code>
+*   <code>load_tensors_metadata</code></p>
+<ul>
+<li><strong>概念</strong>：<strong>load (加载)</strong></li>
+<li><strong>解释</strong>：为什么加载比保存难？<ul>
+<li><strong>拓扑变化</strong>：你训练时用了 100 张显卡保存，但现在你想用 50 张显卡加载模型继续微调。</li>
+<li>这时候，原来的切分方式（100份）和现在的（50份）对不上了！</li>
+</ul>
+</li>
+<li><strong>功能拆解</strong>：<ul>
+<li><code>load_tensors_metadata</code>：先只读“目录”，看看原来的模型长啥样。</li>
+<li><code>load</code>：核心功能。它会自动计算：“哦，原来的第1块和第2块披萨，现在应该合并给第1号显卡”，以此实现<strong>重组分片</strong>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 6: 验证 —— 这是一个合法的存档吗？</h4>
+<p><strong>对应代码：</strong> <code>from .core import check_is_distributed_checkpoint</code></p>
+<ul>
+<li><strong>概念</strong>：<strong>Check (检查)</strong></li>
+<li><strong>作用</strong>：在开始漫长的加载过程前，先快速看一眼这个文件夹。<ul>
+<li>“这是 Megatron 的分布式存档吗？”</li>
+<li>“文件完整吗？”</li>
+<li>如果不是，就报错或者切换到普通的加载模式。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📝 总结</h3>
+<p>你看到的这个 <code>__init__.py</code> 文件，其实就是把上面这 6 个任务对应的工具拿出来，摆在桌面上供外部调用。</p>
+<p><strong>一句话概括这个文件的作用：</strong>
+它提供了一套工具包，允许你在多张显卡之间，<strong>智能地</strong>切分、保存、重组和加载那些大到单机无法处理的 AI 模型权重。</p>

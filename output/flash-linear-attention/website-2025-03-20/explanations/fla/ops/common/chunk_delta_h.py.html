@@ -1,0 +1,133 @@
+<h1>fla/ops/common/chunk_delta_h.py</h1>
+<p>这份代码确实非常硬核，因为它是用 <strong>Triton</strong> 编写的底层 GPU 内核代码，用于加速大模型中的“线性注意力”或“RNN”机制。看不懂是很正常的，因为它混合了数学算法、并行计算逻辑和内存管理。</p>
+<p>为了帮你理解，我制定了一个 <strong>“从概念到代码”的 5 步学习清单 (Todo List)</strong>。我们剥洋葱一样一层层来看。</p>
+<hr />
+<h3>📋 学习清单 (Todo List)</h3>
+<ol>
+<li><strong>Task 1: 理解背景</strong> —— 这段代码到底是干嘛的？</li>
+<li><strong>Task 2: 理解核心数学公式</strong> —— 什么是 "Delta Rule"？</li>
+<li><strong>Task 3: 理解 "Chunk" (分块)</strong> —— 为什么要写循环？</li>
+<li><strong>Task 4: 核心代码映射 (Forward)</strong> —— 逐行对应 Python 变量与数学含义。</li>
+<li><strong>Task 5: 总结输入输出</strong> —— 宏观上看它算出了什么。</li>
+</ol>
+<hr />
+<h3>💡 逐步讲解</h3>
+<h4>✅ Task 1: 理解背景 (Context)</h4>
+<p>这个文件属于 <code>fla</code> (Fast Linear Attention) 库。它的目的是计算一种特殊的 <strong>RNN 状态更新</strong>。
+在 Transformer 中，我们用 $QK^T V$ 计算注意力，显存消耗大。
+在 RNN/线性注意力中，我们维护一个 <strong>隐藏状态 (Hidden State, 也就是代码中的 <code>h</code>)</strong>。</p>
+<p><strong>一句话总结：</strong> 这个文件定义了如何在 GPU 上快速地、分块地计算这个隐藏状态 $h$ 是如何随着时间 $t$ 变化的。</p>
+<hr />
+<h4>✅ Task 2: 理解核心数学公式 (The "Delta Rule")</h4>
+<p>文件名叫 <code>chunk_delta_h</code>。这里的 <strong>Delta Rule</strong> 是核心。
+普通的 RNN 更新可能是简单的累加。但 Delta Rule 类似于“梯度下降”的思想：<strong>我们根据当前的预测误差来更新记忆</strong>。</p>
+<p>核心逻辑大概是这样的（简化版）：
+1.  用当前的记忆 $h$ 去预测一个值。
+2.  看输入 $v$ 和预测值的差距（<code>v - prediction</code>）。
+3.  把这个差距（Delta）更新回记忆 $h$ 中。
+4.  同时，有一个门控 $g$ (Gate) 控制我们要遗忘多少旧记忆。</p>
+<p><strong>对应代码中的关键行：</strong>
+在 <code>chunk_gated_delta_rule_fwd_kernel_h</code> 函数里：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># b_v 是当前输入</span>
+<span class="c1"># tl.dot(b_d, b_h) 是基于当前记忆的预测</span>
+<span class="n">b_v2</span> <span class="o">=</span> <span class="n">b_v</span> <span class="o">-</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_d</span><span class="p">,</span> <span class="n">b_h</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">b_d</span><span class="o">.</span><span class="n">dtype</span><span class="p">))</span> 
+</code></pre></div>
+
+<p>这就是 <strong>Delta (差值)</strong> 的计算。</p>
+<hr />
+<h4>✅ Task 3: 理解 "Chunk" (分块)</h4>
+<p>为什么要分块？
+如果序列长度 $T$ 很长（比如 4096），一步步循环 $t=1$ 到 $t=4096$ 太慢了（串行）。
+如果全部并行，显存（SRAM）又放不下巨大的状态矩阵。</p>
+<p><strong>解决方案：</strong> 把 $T$ 切成若干个小块（Chunk），块的大小是 <code>BT</code> (比如 64)。
+*   <strong>块间 (Inter-chunk):</strong> 串行处理。上一个块算出的最终 $h$，传给下一个块做初始 $h$。
+*   <strong>块内 (Intra-chunk):</strong> 尽可能利用矩阵乘法并行加速。</p>
+<p><strong>代码体现：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># NT 是块的数量 (Number of Chunks)</span>
+<span class="k">for</span> <span class="n">i_t</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">NT</span><span class="p">):</span> 
+    <span class="c1"># ... 加载上一个块的 h ...</span>
+    <span class="c1"># ... 计算当前块的更新 ...</span>
+    <span class="c1"># ... 保存当前块结束时的 h ...</span>
+</code></pre></div>
+
+<hr />
+<h4>✅ Task 4: 核心代码映射 (Forward Kernel)</h4>
+<p>让我们聚焦在 <code>chunk_gated_delta_rule_fwd_kernel_h</code> 这个函数，这是前向传播（算结果）的核心。</p>
+<p><strong>变量词典：</strong>
+*   <code>k</code>: Key (键)
+*   <code>v</code>: Value (值，代码里传入的是 <code>u</code>)
+*   <code>d</code>: Update direction (更新向量，代码里传入的是 <code>w</code>)
+*   <code>g</code>: Gate (门控，控制遗忘率，比如 <code>exp(g)</code>)
+*   <code>h</code>: Hidden State (我们要计算的记忆矩阵，形状通常是 <code>[K, V]</code>)</p>
+<p><strong>代码执行流程解析：</strong></p>
+<ol>
+<li>
+<p><strong>初始化状态：</strong>
+    <code>python
+    # 如果有初始状态 h0，先加载进来；否则初始化为 0
+    if USE_INITIAL_STATE:
+        b_h = tl.load(...)</code></p>
+</li>
+<li>
+<p><strong>大循环 (遍历时间块)：</strong>
+    <code>python
+    for i_t in range(NT):</code>
+    这代表我们一段一段地处理文本序列。</p>
+</li>
+<li>
+<p><strong>小循环 (块内计算)：</strong>
+    为了节省 GPU 极小的 SRAM 内存，即使在块 <code>BT</code> 内部，也被切成了更小的 <code>BC</code>。
+    ```python
+    # 这里的计算涉及数学推导，核心是更新 b_h
+    for i_c in range(...):
+        # 1. 加载数据 k, d, v, g
+        b_k = tl.load(...)
+        b_d = tl.load(...)</p>
+<div class="codehilite"><pre><span></span><code><span class="gh">#</span> 2. 引入门控 g (Gate)，即“遗忘”机制
+<span class="gh">#</span> tl.exp(b_g) 类似于遗忘系数
+b_k = b_k <span class="gs">* tl.exp(...)</span>
+
+<span class="gs"># 3. 核心 Delta 计算：计算新输入 v 与记忆的“冲突/差值”</span>
+<span class="gs"># b_v2 就是那个 &quot;Delta&quot;</span>
+<span class="gs">b_v2 = b_v - tl.dot(b_d, b_h)</span>
+
+<span class="gs"># 4. 将这个差值累加到临时状态 b_hc 中</span>
+<span class="gs"># 这相当于 h_new = h_old + k *</span> delta
+b_hc += tl.dot(b_k, b_v2)
+</code></pre></div>
+
+<p>```</p>
+</li>
+<li>
+<p><strong>更新 Hidden State：</strong>
+    <code>python
+    # 对旧的 h 进行衰减 (乘以门控 g)
+    b_h *= tl.exp(b_g_last)
+    # 加上这一轮累积的新记忆 b_hc
+    b_h += b_hc</code></p>
+</li>
+<li>
+<p><strong>保存状态：</strong>
+    <code>tl.store(p_h, b_h ...)</code> 把算好的状态存回显存，供下一个时间步或反向传播使用。</p>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 5: 宏观总结 (输入输出)</h4>
+<p>最后看 Python 包装函数 <code>chunk_gated_delta_rule_fwd_h</code>。</p>
+<p><strong>输入：</strong>
+*   <code>k</code>, <code>w</code> (即 d), <code>u</code> (即 v): 模型的输入序列。
+*   <code>g</code>: 门控信号。
+*   <code>initial_state</code>: 上一句话留下的记忆（可选）。</p>
+<p><strong>输出：</strong>
+1.  <code>h</code>: <strong>所有时间步的隐藏状态历史</strong>（用于反向传播算梯度）。
+2.  <code>v_new</code>: <strong>修正后的 Value</strong>（即上面的 <code>b_v2</code>，这个值通常会作为这一层的输出，传给下一层网络）。
+3.  <code>final_state</code>: <strong>最终的记忆</strong>（传给下一个 batch 或下一个序列）。</p>
+<hr />
+<h3>🚀 总结</h3>
+<p>你不需要读懂每一行 Triton 的指针操作（那些 <code>make_block_ptr</code> 是为了在内存中定位数据的）。你只需要知道：</p>
+<ol>
+<li>这是一个 <strong>有遗忘机制的记忆更新算法</strong>。</li>
+<li>公式核心是：<strong>新记忆 = 衰减后的旧记忆 + (Key $\times$ (Value - 根据旧记忆预测的Value))</strong>。</li>
+<li>为了快，它把长序列切成 <strong>Chunk</strong> 并行处理。</li>
+</ol>
+<p>现在再回去看 <code>b_v2 = b_v - tl.dot(b_d, b_h)</code> 这一行，是不是感觉亲切了一点？</p>

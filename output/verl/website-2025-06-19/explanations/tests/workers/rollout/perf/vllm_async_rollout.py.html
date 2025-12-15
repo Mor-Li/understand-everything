@@ -1,0 +1,102 @@
+<h1>tests/workers/rollout/perf/vllm_async_rollout.py</h1>
+<p>这份代码本质上是一个<strong>性能测试脚本（Benchmark Script）</strong>。</p>
+<p>简单来说，它的目的是：<strong>在多 GPU 环境下，对比 vLLM（一个大模型推理加速库）两种不同“后端”模式的推理速度，看看谁更快。</strong></p>
+<p>为了让你更容易理解，我把这个脚本要做的事情拆解成一个 <strong>Task To-Do List</strong>，然后逐一讲解。</p>
+<hr />
+<h3>核心任务清单 (Task To-Do List)</h3>
+<p>想象你是一个测试工程师，老板让你测一下新旧两种技术的速度，你的工作流如下：</p>
+<ol>
+<li><strong>[准备阶段] 环境搭建</strong>：准备测试用的数据集（GSM8K）和计算框架（Ray）。</li>
+<li><strong>[配置阶段] 设定参数</strong>：规定好用什么模型（Qwen2.5），用几张显卡，一次处理多少数据（Batch Size）。</li>
+<li><strong>[测试 A] 选手 1 上场 (Internal/Cgraph)</strong>：使用“编译图（Compiled Graph）”模式启动服务，跑一遍数据，记下时间。</li>
+<li><strong>[测试 B] 选手 2 上场 (External)</strong>：使用“外部调用（Remote Call）”模式启动服务，跑一遍数据，记下时间。</li>
+<li><strong>[测试 C] 压力/扩展性测试</strong>：在使用“外部模式”的情况下，分别用 2 张卡和 8 张卡跑，看看性能提升了多少。</li>
+</ol>
+<hr />
+<h3>逐步讲解 (Step-by-Step Breakdown)</h3>
+<p>下面我按照代码的逻辑顺序，带你一步步看懂它在干什么。</p>
+<h4>1. 顶部的注释 (Docstring)</h4>
+<p>代码最开头 <code>""" ... """</code> 包裹的部分是<strong>使用说明书</strong>。
+*   它告诉你在运行代码前需要先预处理数据（<code>gsm8k.py</code>）。
+*   需要安装特定版本的 <code>ray</code>。
+*   展示了预期的输出结果（<code>[DEBUG] ... time: 44.13 secs</code>），让你知道跑完大概长什么样。</p>
+<h4>2. <code>init_config</code> 函数：制定游戏规则</h4>
+<ul>
+<li><strong>作用</strong>：加载并修改配置文件。</li>
+<li><strong>关键点</strong>：<ul>
+<li><code>train_batch_size = 128</code>：一次训练的数据量。</li>
+<li><code>model.path = "Qwen/Qwen2.5-7B-Instruct"</code>：指定测试用的模型是 Qwen 2.5 7B。</li>
+<li><code>tensor_model_parallel_size = 2</code>：模型太大，一张卡放不下，需要切分到 2 张卡上跑。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 两位“选手” (Backends)</h4>
+<p>代码里定义了两个函数来启动不同的后端：</p>
+<ul>
+<li><strong>选手 1：<code>async_llm_backend_ray_compiled_graph</code></strong><ul>
+<li><strong>特点</strong>：这是 vLLM 内部集成的、更底层的 Ray 执行器。它使用了“计算图编译”技术，理论上通过 Ray 内部通信，速度应该很快。</li>
+</ul>
+</li>
+<li><strong>选手 2：<code>async_llm_backend_external_ray_executor</code></strong><ul>
+<li><strong>特点</strong>：这是通过外部 HTTP 请求或者远程调用的方式。代码里通过 <code>init_async_rollout_manager</code> 来管理。</li>
+</ul>
+</li>
+</ul>
+<h4>4. <code>initialize</code> 函数：赛前热身</h4>
+<ul>
+<li><strong>作用</strong>：<ol>
+<li>启动 Ray 分布式框架。</li>
+<li>根据传入的参数（<code>backend</code>），决定启动哪位“选手”（启动 LLM 服务）。</li>
+<li><strong>加载数据</strong>：把 GSM8K 数据集读进来，做成一个 <code>dataloader</code>，方便后面一批一批地喂给模型。</li>
+</ol>
+</li>
+</ul>
+<h4>5. <code>perf_without_chat_scheduler</code>：第一轮测试（纯推理）</h4>
+<ul>
+<li><strong>场景</strong>：不使用复杂的调度器，直接发请求测速度。</li>
+<li><strong>流程</strong>：<ol>
+<li>初始化环境。</li>
+<li>拿到数据 (<code>dataloader</code>)。</li>
+<li><strong>计时开始 (<code>t_start</code>)</strong>。</li>
+<li>构造 HTTP 请求 (<code>chat_completions</code>)，模拟用户给模型发 Prompt。</li>
+<li><code>asyncio.gather(*tasks)</code>：并发发送所有请求，等待模型生成回复。</li>
+<li><strong>计时结束 (<code>t_end</code>)</strong>。</li>
+<li>打印耗时。</li>
+</ol>
+</li>
+</ul>
+<h4>6. <code>perf_with_chat_scheduler</code>：第二轮测试（带调度器）</h4>
+<ul>
+<li><strong>场景</strong>：模拟真实的训练环境，使用 <code>verl</code> 框架自带的 <code>generate_sequences</code> 方法。</li>
+<li><strong>流程</strong>：<ol>
+<li>初始化环境（强制使用 <code>external</code> 后端）。</li>
+<li><strong>计时开始</strong>。</li>
+<li>调用 <code>server.generate_sequences(batch)</code>：这比上面的 HTTP 请求更高级，它内部会处理数据分发和回收。</li>
+<li><strong>计时结束</strong>。</li>
+<li>打印耗时。</li>
+</ol>
+</li>
+</ul>
+<h4>7. <code>if __name__ == "__main__":</code>：主控室</h4>
+<p>这是脚本实际执行的地方，它按顺序执行了以下任务：</p>
+<ol>
+<li>
+<p><strong>对比后端性能</strong>：</p>
+<ul>
+<li><code>backend="cgraph"</code>，2 张卡：跑选手 1。</li>
+<li><code>backend="external"</code>，2 张卡：跑选手 2。</li>
+<li><em>目的：看看到底是编译图快，还是外部调用快。</em></li>
+</ul>
+</li>
+<li>
+<p><strong>测试扩展性 (Scalability)</strong>：</p>
+<ul>
+<li><code>n_gpus_per_node=2</code>：用 2 张卡跑带调度器的测试。</li>
+<li><code>n_gpus_per_node=8</code>：用 8 张卡跑带调度器的测试。</li>
+<li><em>目的：看看卡多了以后，速度是不是线性提升（比如 8 卡是不是比 2 卡快 4 倍）。</em></li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p>这个文件的核心观点/结论隐藏在代码逻辑里：
+<strong>开发者想验证 vLLM 在 Ray 框架下，使用“编译图（Compiled Graph）”技术是否比传统的“外部调用”方式更高效，并且测试整个系统在增加显卡时的加速效果。</strong></p>

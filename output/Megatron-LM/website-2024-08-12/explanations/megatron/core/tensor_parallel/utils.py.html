@@ -1,0 +1,103 @@
+<h1>megatron/core/tensor_parallel/utils.py</h1>
+<p>完全没问题。这份代码文件 <code>megatron/core/tensor_parallel/utils.py</code> 其实就是一个<strong>工具箱</strong>。</p>
+<p>你可以把它想象成是一个<strong>切蛋糕和拼蛋糕</strong>的工具集。在训练超大模型时，单个显卡（GPU）放不下所有数据，所以我们需要把数据（Tensor）切开，分给不同的显卡去处理（这就叫张量并行 Tensor Parallel）。</p>
+<p>为了让你读懂，我们把这个过程拆解成一个 <strong>“团队分工 Task List”</strong>。假设你是一个显卡团队的组长，你需要完成以下任务：</p>
+<hr />
+<h3>任务清单 (Task To-Do List)</h3>
+<ol>
+<li><strong>Task 01: 把大矩阵按“列”切开，分给每个人。</strong><ul>
+<li><em>对应函数:</em> <code>split_tensor_along_last_dim</code></li>
+</ul>
+</li>
+<li><strong>Task 02: 不管形状，把数据拉成一条直线，平均切分。</strong><ul>
+<li><em>对应函数:</em> <code>split_tensor_into_1d_equal_chunks</code></li>
+</ul>
+</li>
+<li><strong>Task 03: 把大家手里的碎片数据，重新收集起来拼成一条直线。</strong><ul>
+<li><em>对应函数:</em> <code>gather_split_1d_tensor</code></li>
+</ul>
+</li>
+<li><strong>Task 04: 分配字典（词表），告诉每个人该负责查哪几页字典。</strong><ul>
+<li><em>对应类:</em> <code>VocabUtility</code></li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>逐步讲解 (Step-by-Step)</h3>
+<h4>Task 01: 把大矩阵按“列”切开</h4>
+<p><strong>函数：</strong> <code>split_tensor_along_last_dim</code></p>
+<ul>
+<li><strong>场景</strong>：你有一个巨大的参数矩阵（比如神经网络的权重）。为了并行计算，你需要把它切成几份。</li>
+<li><strong>代码逻辑</strong>：<ol>
+<li><strong>找到最后一维</strong>：<code>last_dim = tensor.dim() - 1</code>。通常在矩阵乘法中，我们是沿着最后一维（列）进行切分的。</li>
+<li><strong>计算每份大小</strong>：<code>last_dim_size</code>。比如总长度100，分给4个人，每人就是25。</li>
+<li><strong>切分</strong>：调用 PyTorch 的 <code>torch.split</code> 进行物理切割。</li>
+<li><strong>内存整理 (Contiguous)</strong>：代码里有个 <code>contiguous_split_chunks</code> 开关。<ul>
+<li><em>解释</em>：<code>torch.split</code> 切出来的东西在内存里可能是不连续的（像藕断丝连）。如果你后续要通过网络传输这些数据（比如用 NCCL），数据必须在内存里是<strong>连续</strong>的。如果是 <code>True</code>，它就强制整理一下内存，把“藕断丝连”变成“整整齐齐”。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>Task 02: 把数据拉直，平均分给每个人</h4>
+<p><strong>函数：</strong> <code>split_tensor_into_1d_equal_chunks</code></p>
+<ul>
+<li><strong>场景</strong>：有时候我们不在乎矩阵的长宽，只在乎里面的数据总量。比如要把优化器的状态或者梯度平均分摊到每张卡上以节省显存。</li>
+<li><strong>代码逻辑</strong>：<ol>
+<li><strong>算份数</strong>：<code>partition_size</code> = 总元素数量 / 显卡总数 (<code>world_size</code>)。</li>
+<li><strong>算我的位置</strong>：我是第几号显卡（<code>rank</code>）？<ul>
+<li>如果是第0号，我要取 <code>0</code> 到 <code>partition_size</code> 的数据。</li>
+<li>如果是第1号，我要取 <code>partition_size</code> 到 <code>2 * partition_size</code> 的数据。</li>
+</ul>
+</li>
+<li><strong>切片</strong>：<code>tensor.view(-1)</code> 把多维数组通过 <code>.view(-1)</code> 强行看作是一条长长的一维向量，然后根据上面的起止位置拿走属于“我”的那一段。</li>
+<li><strong>新建或引用</strong>：<code>new_buffer</code> 参数决定是只拿个“引用”（省内存，但原始数据不能丢）还是“复制一份新的”（安全，独立）。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 03: 把碎片收集回来</h4>
+<p><strong>函数：</strong> <code>gather_split_1d_tensor</code></p>
+<ul>
+<li><strong>场景</strong>：这是 Task 02 的逆过程。大家算完了，现在要把分散在各个显卡上的 1D 数据片段，通过网络收集回来，拼成一个完整的大向量。</li>
+<li><strong>代码逻辑</strong>：<ol>
+<li><strong>准备容器</strong>：先算一下所有人加起来有多少数据 (<code>numel_gathered</code>)，然后在显存里开辟一块空地 <code>gathered</code> 等着接收。</li>
+<li><strong>召唤数据 (All Gather)</strong>：<ul>
+<li>代码使用了 <code>torch.distributed._all_gather_base</code>。</li>
+<li><em>注意注释</em>：作者特意提到这是一个“实验性 API”。为什么要用它？因为它直接调用底层的 NCCL 通信库，没有中间的复制过程，<strong>速度最快</strong>。</li>
+<li>结果就是：所有显卡上的小片段，瞬间在这个 <code>gathered</code> 变量里拼成了一个完整的长条。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>Task 04: 分配字典（词表）任务</h4>
+<p><strong>类：</strong> <code>VocabUtility</code></p>
+<ul>
+<li><strong>场景</strong>：大语言模型的词表（Vocabulary）很大（比如5万、10万个词）。为了省显存，我们让 GPU 0 负责处理第 0-1000 个词的嵌入（Embedding），GPU 1 负责 1001-2000 个词，以此类推。</li>
+<li><strong>代码逻辑</strong>：
+    这个类其实就是做<strong>数学题</strong>，算出“我”负责的起始和结束编号是多少。<ol>
+<li><code>vocab_range_from_per_partition_vocab_size</code>：<ul>
+<li>已知每个人负责 <code>N</code> 个词。</li>
+<li>我是第 <code>rank</code> 号。</li>
+<li>我的开始编号 = <code>rank * N</code>。</li>
+<li>我的结束编号 = <code>开始编号 + N</code>。</li>
+</ul>
+</li>
+<li><code>vocab_range_from_global_vocab_size</code>：<ul>
+<li>已知总共有 <code>Total</code> 个词，总共有 <code>W</code> 个人。</li>
+<li>每个人负责 <code>N = Total / W</code>。</li>
+<li>然后调用上面那个方法算出起止编号。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>这个文件的核心思想就是<strong>“分而治之”</strong>：</p>
+<ol>
+<li><strong>切分 (Split)</strong>：怎么把大张量切成小块（按维度切，或者拉直了切）。</li>
+<li><strong>聚合 (Gather)</strong>：怎么把小块拼回大张量。</li>
+<li><strong>索引 (Index)</strong>：怎么算出每个人该负责哪一部分数据（词表范围）。</li>
+</ol>
+<p>它是 Megatron-LM 实现模型并行（Model Parallelism）的最底层积木。</p>

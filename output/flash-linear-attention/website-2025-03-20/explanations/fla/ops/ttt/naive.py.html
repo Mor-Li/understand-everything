@@ -1,0 +1,87 @@
+<h1>fla/ops/ttt/naive.py</h1>
+<p>这份代码确实看起来很吓人，因为它把<strong>深度学习的前向传播（Inference）</strong>和<strong>反向传播（Backprop/Training）</strong>混合在了一起写。</p>
+<p>这其实是 <strong>TTT (Test-Time Training)</strong> 算法的核心实现。为了让你看懂，我们不要把它当成一段普通的“代码”，而是把它想象成一个<strong>“一边考试一边复习”的学生</strong>。</p>
+<p>通常的神经网络是：训练好 -&gt; 考试（状态固定）。
+TTT的神经网络是：考试时，利用考题（Input）实时更新自己的脑子（Hidden State）。</p>
+<p>我把这段代码拆解成一个 <strong>Task To-Do List</strong>，一步步带你过一遍：</p>
+<hr />
+<h3>核心任务清单：实现一个“会实时进化的线性层”</h3>
+<h4>Task 1: 数据切块 (Chunking) —— 把长卷子剪成小纸条</h4>
+<p><strong>代码位置:</strong> <code>ttt_linear</code> 函数开头到 <code>for i in range(NT):</code> 之前。
+*   <strong>目标:</strong> 长序列（T）太长，我们要把它切成小块（Chunk/Batch），每块大小是 <code>mini_batch_size</code>。
+*   <strong>动作:</strong> 使用 <code>reshape</code> 和 <code>permute</code> 把 <code>q, k, v</code> 从 <code>[Batch, Head, Time, Dim]</code> 变成 <code>[Chunk数量, Batch, Head, Chunk长度, Dim]</code>。
+*   <strong>通俗解释:</strong> 试卷太长做不完，我们把试卷剪成若干个小片段，一个片段一个片段地做。</p>
+<h4>Task 2: 准备“大脑” (Initialization) —— 也就是 Hidden State</h4>
+<p><strong>代码位置:</strong> 定义 <code>h</code> 和 <code>hb</code> 的地方。
+*   <strong>目标:</strong> 初始化一个容器来装“学到的知识”。
+*   <strong>关键点:</strong> 这里的 <code>h</code> 形状是 <code>(D, D)</code>，而不是普通 RNN 的 <code>(D)</code>。
+*   <strong>为什么:</strong> 在 TTT 中，Hidden State <code>h</code> 其实等价于一个<strong>线性模型的权重矩阵</strong>。
+    *   你可以理解为：每一个 Batch 都有一个独立的、迷你的神经网络在里面训练。<code>h</code> 就是这个迷你网络的参数 $W$。</p>
+<h4>Task 3: 开始循环做题 (The Loop) —— 核心逻辑</h4>
+<p><strong>代码位置:</strong> <code>for i in range(NT):</code> 内部。这是最难懂的部分。</p>
+<p>这个循环里的每一步，其实是在做一次 <strong>“梯度下降（Gradient Descent）”</strong>。</p>
+<ul>
+<li>
+<p><strong>Sub-task 3.1: 回忆与预测 (Forward Pass)</strong></p>
+<ul>
+<li><strong>代码:</strong> <code>kh = k_i @ h + hb</code></li>
+<li><strong>含义:</strong> 用当前的脑子（<code>h</code>）去处理当前的输入（<code>k_i</code>）。这相当于迷你网络的前向传播 $X W$。</li>
+<li><strong>代码:</strong> <code>reconstruction_target = v_i - k_i</code></li>
+<li><strong>含义:</strong> 设定一个“复习目标”。我们希望模型能预测出 <code>v</code>。这里做了一个残差连接的变体。</li>
+</ul>
+</li>
+<li>
+<p><strong>Sub-task 3.2: 看看错得有多离谱 (Calculate Loss Gradient)</strong></p>
+<ul>
+<li><strong>代码:</strong> <code>mean = ...</code>, <code>var = ...</code>, <code>kh_hat = ...</code> (LayerNorm 的计算)</li>
+<li><strong>代码:</strong> <code>g = w * kh_hat + b - reconstruction_target</code></li>
+<li><strong>含义:</strong> 计算误差。<code>g</code> 代表了梯度（Gradient）的雏形。</li>
+<li><strong>代码:</strong> <code>v_new = ...</code> (那一大串复杂的公式)</li>
+<li><strong>核心解释:</strong> 这一大坨公式是 <strong>LayerNorm 的反向传播梯度公式的手写版</strong>。</li>
+<li><strong>通俗解释:</strong> 这一步是在算：为了让我的预测更接近目标 <code>v</code>，我的脑子 <code>h</code> 应该往哪个方向调整？算出来的 <code>v_new</code> 包含了调整方向的信息。</li>
+</ul>
+</li>
+<li>
+<p><strong>Sub-task 3.3: 真正的考试答题 (Output Generation)</strong></p>
+<ul>
+<li><strong>代码:</strong> <code>o_i = q_i @ h - ...</code></li>
+<li><strong>含义:</strong><ol>
+<li><code>q_i @ h</code>: 用<strong>旧的脑子</strong>回答当前的问题（Query）。</li>
+<li><code>... @ v_new</code>: 利用<strong>刚才算出来的梯度信息</strong>，对当前块内的关联进行修正（这一步类似 Attention，但也结合了梯度更新带来的即时影响）。</li>
+</ol>
+</li>
+<li><strong>目的:</strong> 生成这一段序列的最终输出 <code>o_i</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>Sub-task 3.4: 升级大脑 (State Update)</strong></p>
+<ul>
+<li><strong>代码:</strong> <code>h = h - ... @ v_new</code></li>
+<li><strong>含义:</strong> <strong>这就是训练！</strong></li>
+<li>公式本质是：$W_{new} = W_{old} - \eta \cdot \nabla L$。</li>
+<li><code>eta</code> 是学习率，<code>v_new</code> 是梯度相关项。</li>
+<li><strong>通俗解释:</strong> 做完这个片段的题，发现自己哪里不足，赶紧修改脑子里的知识（更新 <code>h</code> 矩阵），以便在这个片段的后面，或者下一个片段里表现得更好。</li>
+</ul>
+</li>
+<li>
+<p><strong>Sub-task 3.5: 整理答案 (Output Norm)</strong></p>
+<ul>
+<li><strong>代码:</strong> 最后几行 <code>o[i] = ...</code></li>
+<li><strong>含义:</strong> 对输出再做一次 LayerNorm，保证数值稳定性，存入结果列表。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 拼凑试卷 (Post-processing)</h4>
+<p><strong>代码位置:</strong> 循环结束后的 <code>o = o.permute...</code>
+*   <strong>目标:</strong> 把做完的小纸条（Chunks）按顺序拼回成一张完整的卷子。
+*   <strong>动作:</strong> 维度变回 <code>[Batch, Head, Time, Dim]</code>。</p>
+<hr />
+<h3>总结一下文中的核心观点</h3>
+<p>这段代码虽然叫 <code>naive.py</code>（朴素版），但它实现了一个非常前沿的概念：</p>
+<ol>
+<li><strong>RNN 的状态是一个模型</strong>: 普通 RNN 的 <code>h</code> 只是记忆；TTT 的 <code>h</code> 是一个参数矩阵，它在随时间不断通过梯度下降进行自我更新。</li>
+<li><strong>Attention 是梯度的另一种形式</strong>: 代码中计算 <code>v_new</code> 和 <code>o_i</code> 的过程，虽然写得像反向传播，但在数学形式上和 Attention 机制（Q, K, V）非常像。</li>
+<li><strong>Chunking (分块)</strong>: 为了并行加速，它不是一个字一个字学的，而是一小块一小块学的（Mini-batch Gradient Descent）。</li>
+</ol>
+<p><strong>一句话概括：</strong>
+这是一个<strong>线性 Attention</strong> 机制，但它把“记忆历史信息”这件事，建模成了“在一个小模型上不断进行梯度下降训练”的过程。代码里那些复杂的数学公式，其实就是<strong>手动写出来的反向传播梯度计算</strong>。</p>

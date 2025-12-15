@@ -1,0 +1,106 @@
+<h1>verl/utils/dataset/sft_dataset.py</h1>
+<p>没问题。这份代码文件 <code>sft_dataset.py</code> 定义了一个用于 <strong>SFT（Supervised Fine-Tuning，有监督微调）</strong> 的数据集类。</p>
+<p>简单来说，它的作用就是：<strong>把原始的问答数据（Parquet文件），加工成模型能看懂的数字格式（Tensor），并告诉模型“哪部分是你需要学习的答案，哪部分是题目”。</strong></p>
+<p>我们可以把这个过程想象成一个<strong>“出卷老师”</strong>在准备考试材料。我把这个过程拆解成一个 <strong>Task To-Do List</strong>，一步步带你看：</p>
+<hr />
+<h3>Task List: SFT 数据集处理流程</h3>
+<h4>✅ 第一阶段：准备工作 (初始化与配置)</h4>
+<p><strong>对应代码：</strong> <code>__init__</code> 方法</p>
+<ol>
+<li><strong>读取配置单</strong>：<ul>
+<li>老师先看“教学大纲”（<code>config</code>），确认几个关键信息：<ul>
+<li>题目在哪一列？（<code>prompt_key</code>，默认是 "prompt"）</li>
+<li>答案在哪一列？（<code>response_key</code>，默认是 "response"）</li>
+<li>最长能写多少字？（<code>max_length</code>，比如 1024）</li>
+<li>如果字数超了怎么办？（<code>truncation</code>，报错还是截断）</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>准备翻译器</strong>：<ul>
+<li>准备好 <code>tokenizer</code>（分词器）。它的作用是把人类的文字（"你好"）翻译成模型能懂的数字 ID（[34, 56]）。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ 第二阶段：进货与粗加工 (读取数据)</h4>
+<p><strong>对应代码：</strong> <code>_download</code> 和 <code>_read_files_and_tokenize</code> 方法</p>
+<ol>
+<li><strong>搬运素材</strong>：<ul>
+<li><code>_download</code>: 把存放在远程（比如云端）的 Parquet 数据文件拷贝到本地，或者加载到内存里，保证读取速度快。</li>
+</ul>
+</li>
+<li><strong>提取题库</strong>：<ul>
+<li><code>_read_files_and_tokenize</code>: 打开 Parquet 文件（这是一种类似 Excel 的表格格式）。</li>
+<li>从表格里把 <strong>“问题” (Prompts)</strong> 和 <strong>“标准答案” (Responses)</strong> 这两列内容单独拎出来，存成两个大列表。</li>
+<li><em>注意：虽然函数名叫 tokenize，但这一步其实主要是在整理纯文本，真正的分词在后面。</em></li>
+</ul>
+</li>
+</ol>
+<h4>✅ 第三阶段：精细加工 (制作单个样本)</h4>
+<p><strong>对应代码：</strong> <code>__getitem__</code> 方法 (这是最核心的部分，每训练一条数据都会跑一次)</p>
+<ol>
+<li><strong>拿出一道题</strong>：<ul>
+<li>根据索引 <code>item</code>，取出第 N 个“问题”和第 N 个“答案”。</li>
+</ul>
+</li>
+<li><strong>套用格式 (Chat Template)</strong>：<ul>
+<li>模型不能只看裸文本，需要特定的对话格式。</li>
+<li>代码把“问题”包装成：<code>[{"role": "user", "content": prompt}]</code>。</li>
+<li>然后用 <code>tokenizer.apply_chat_template</code> 把它变成类似 <code>&lt;|user|&gt; 问题 &lt;|end|&gt;&lt;|assistant|&gt;</code> 的字符串。</li>
+<li>把“答案”加上结束符 <code>eos_token</code>。</li>
+</ul>
+</li>
+<li><strong>翻译成数字 (Tokenization)</strong>：<ul>
+<li>把包装好的“问题字符串”变成数字列表 <code>prompt_ids</code>。</li>
+<li>把“答案字符串”变成数字列表 <code>response_ids</code>。</li>
+</ul>
+</li>
+<li><strong>拼接试卷</strong>：<ul>
+<li><strong>核心逻辑</strong>：<code>input_ids = prompt_ids + response_ids</code>。</li>
+<li>把问题和答案连起来，变成一长串数字。这就是模型最终看到的一整句话。</li>
+</ul>
+</li>
+<li><strong>统一长度 (Padding &amp; Truncation)</strong>：<ul>
+<li><strong>如果太短</strong>：用 <code>pad_token</code>（填充符）在后面补齐，直到达到 <code>max_length</code>。</li>
+<li><strong>如果太长</strong>：根据配置（<code>truncation</code>）砍掉多余的部分（通常是报错或者截断）。</li>
+<li>同时生成 <code>attention_mask</code>，告诉模型哪些是真字（1），哪些是补位的填充符（0，不要看）。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ 第四阶段：划重点 (生成 Loss Mask)</h4>
+<p><strong>对应代码：</strong> <code>__getitem__</code> 的最后部分</p>
+<ol>
+<li>
+<p><strong>制作“学习遮罩” (Loss Mask)</strong>：</p>
+<ul>
+<li><strong>这是 SFT 最重要的一步！</strong></li>
+<li>模型训练时，我们<strong>不希望</strong>模型去学习“如何预测问题”，只希望它学习“如何预测答案”。</li>
+<li>代码逻辑：<ul>
+<li>先复制一份全为 1 的 mask。</li>
+<li>找到 <code>prompt_length</code>（问题的长度）。</li>
+<li>把 mask 前面属于“问题”的部分全部置为 <strong>0</strong>。</li>
+</ul>
+</li>
+<li><strong>结果</strong>：计算损失（Loss）时，模型只会被考核“答案”写得对不对，“问题”部分写得烂不烂不扣分。</li>
+</ul>
+</li>
+<li>
+<p><strong>打包出货</strong>：</p>
+<ul>
+<li>最后返回一个字典，包含：<ul>
+<li><code>input_ids</code>: 完整的数字序列（问题+答案+填充）。</li>
+<li><code>attention_mask</code>: 哪是字，哪是填充。</li>
+<li><code>position_ids</code>: 每个字的位置编号。</li>
+<li><code>loss_mask</code>: 哪部分需要算分（只有答案部分）。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结一下文中的核心观点：</h3>
+<ol>
+<li><strong>SFT 是“完形填空”</strong>：虽然我们给模型看的是“问题+答案”，但通过 <code>Loss Mask</code>，我们只让模型学习生成答案。</li>
+<li><strong>内存数据集</strong>：这个类（<code>SFTDataset</code>）是一次性把所有数据读进内存（In-memory），适合数据量不是特别巨大的情况。</li>
+<li><strong>动态处理</strong>：分词（Tokenization）和拼接是在训练过程中实时进行的（在 <code>__getitem__</code> 里），而不是预先处理好存硬盘的，这样比较灵活。</li>
+</ol>

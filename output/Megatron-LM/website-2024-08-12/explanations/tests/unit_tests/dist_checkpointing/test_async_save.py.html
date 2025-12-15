@@ -1,0 +1,125 @@
+<h1>tests/unit_tests/dist_checkpointing/test_async_save.py</h1>
+<p>这份代码是 <strong>Megatron-Core</strong>（NVIDIA 开发的大模型训练框架）中的一个<strong>单元测试文件</strong>。</p>
+<p>它的核心目的是为了测试 <strong>“异步分布式检查点保存” (Async Distributed Checkpoint Saving)</strong> 功能是否正常工作。</p>
+<p>为了让你更容易理解，我把你当作这个功能的“测试官”，为你列一个 <strong>Task Todo List</strong>。我们按照这个清单，一步步把代码拆解开来看。</p>
+<hr />
+<h3>📋 你的任务清单 (Task Todo List)</h3>
+<p>作为一个测试官，你需要验证“异步保存”这个新功能是靠谱的。你需要完成以下三个任务：</p>
+<ol>
+<li><strong>任务一：搞懂背景</strong> —— 为什么要异步保存？</li>
+<li><strong>任务二：验证“数据一致性”</strong> —— 异步保存虽然快，但存下来的东西和普通（同步）保存的一样吗？</li>
+<li><strong>任务三：验证“报警机制”</strong> —— 如果后台偷偷保存时硬盘坏了，主程序能收到报错吗？（还是会假装成功？）</li>
+</ol>
+<hr />
+<h3>逐步讲解</h3>
+<h4>任务一：搞懂背景 (Concept)</h4>
+<ul>
+<li><strong>背景知识</strong>：训练大模型时，保存 Checkpoint（模型权重存档）非常慢，因为文件太大了。<ul>
+<li><strong>同步保存 (Sync)</strong>：训练停下来 -&gt; 写硬盘 -&gt; 写完 -&gt; 继续训练。（缺点：卡顿很久）</li>
+<li><strong>异步保存 (Async)</strong>：训练停下来 -&gt; 把数据快速复制到内存缓冲区 -&gt; 训练立即继续 -&gt; 后台线程慢慢把缓冲区数据写到硬盘。（优点：卡顿极短）</li>
+</ul>
+</li>
+<li><strong>代码对应</strong>：<ul>
+<li>这个文件里的 <code>test_async_save.py</code> 就是为了确保这个“异步保存”的逻辑没问题。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>任务二：验证“数据一致性” (Test Equivalence)</h4>
+<p><strong>目标</strong>：证明“异步保存”和“同步保存”的结果是<strong>完全一模一样</strong>的。</p>
+<p><strong>代码对应部分</strong>：<code>class TestAsyncSave</code> 下的 <code>def test_async_is_equivalent_to_sync(...)</code></p>
+<p><strong>步骤详解</strong>：</p>
+<ol>
+<li>
+<p><strong>准备数据</strong>：</p>
+<ul>
+<li><code>Utils.initialize_model_parallel(2, 4)</code>: 模拟一个分布式环境。</li>
+<li><code>sharded_state_dict = ...</code>: 创建一些假的“模型权重数据”（Tensor），比如 <code>sd_keyA</code> 和 <code>sd_keyB</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>动作 A：执行异步保存</strong>
+    <code>python
+    # 开启异步模式 async_sharded_save=True
+    async_request = save(sharded_state_dict, async_ckpt_dir, async_sharded_save=True)
+    # 把任务加入后台队列
+    async_calls.schedule_async_request(async_request)</code></p>
+</li>
+<li>
+<p><strong>动作 B：执行同步保存</strong>
+    <code>python
+    # 关闭异步模式 async_sharded_save=False
+    save(sharded_state_dict, sync_ckpt_dir, async_sharded_save=False)</code></p>
+</li>
+<li>
+<p><strong>等待异步完成</strong>
+    <code>python
+    # 强制等待后台线程写完，确保文件落地
+    async_calls.maybe_finalize_async_calls(blocking=True)</code></p>
+</li>
+<li>
+<p><strong>核心对比 (Assert)</strong>
+    <code>python
+    # 把两个文件夹里的东西加载回来
+    loaded_async = load(..., async_ckpt_dir)
+    loaded_sync = load(..., sync_ckpt_dir)
+    # 比较它们是否有区别
+    diffs = diff(loaded_async, loaded_sync)
+    # 如果有区别，测试失败；没区别，测试通过
+    assert not any(map(bool, diffs))</code></p>
+</li>
+</ol>
+<p><strong>结论</strong>：如果这个测试通过，说明你用异步模式存下来的文件是完好无损的。</p>
+<hr />
+<h4>任务三：验证“报警机制” (Test Error Reporting)</h4>
+<p><strong>目标</strong>：异步保存是在后台线程（Background Thread）里写的。如果后台线程写文件时硬盘满了或者坏了（OSError），主进程必须知道，不能悄悄吞掉错误导致用户以为保存成功了。</p>
+<p><strong>代码对应部分</strong>：
+1.  <strong>搞破坏的函数</strong>：<code>write_data_os_err_mock_fn</code>
+2.  <strong>测试逻辑</strong>：<code>def test_errors_are_reported(...)</code></p>
+<p><strong>步骤详解</strong>：</p>
+<ol>
+<li>
+<p><strong>制造一个“炸弹” (Mock Function)</strong>
+    代码开头定义了一个函数 <code>write_data_os_err_mock_fn</code>。</p>
+<ul>
+<li>它的逻辑是：如果是第2号进程 (<code>local_proc_idx == 2</code>)，就直接抛出异常 <code>raise OSError('worker #2 critical failure')</code>。</li>
+<li>这就好比模拟：所有人都正常，只有2号工人的硬盘坏了。</li>
+</ul>
+</li>
+<li>
+<p><strong>偷梁换柱 (Mocking)</strong>
+    在测试函数里：
+    <code>python
+    # 把真正的写文件函数备份一下
+    orig_fn = FileSystemWriterAsync.write_preloaded_data
+    # 把真正的函数替换成我们那个“会爆炸”的假函数
+    FileSystemWriterAsync.write_preloaded_data = worker_fn</code></p>
+</li>
+<li>
+<p><strong>触发保存并期待报错</strong>
+    <code>python
+    # 我们期待这段代码会报错 (RuntimeError)
+    with pytest.raises(RuntimeError) as exc_info:
+        if async_save:
+            # 异步保存
+            async_request = save(...)
+            async_calls.schedule_async_request(async_request)
+            # 等待结果时，应该会发现后台线程挂了
+            async_calls.maybe_finalize_async_calls(blocking=True)
+        else:
+            # 同步保存
+            save(...)</code></p>
+</li>
+<li>
+<p><strong>验证报错信息</strong>
+    <code>python
+    # 确认报错信息里包含 "Worker failure"，说明我们成功捕获了后台线程的崩溃
+    assert 'Worker failure' in str(exc_info.value)</code></p>
+</li>
+</ol>
+<p><strong>结论</strong>：如果这个测试通过，说明即使在后台线程里发生了严重错误，主程序也能立刻察觉并报错，保证了训练的安全性。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件其实就在讲两件事：
+1.  <strong>好人测试</strong>：一切正常时，异步保存的结果必须是对的（和同步一样）。
+2.  <strong>坏人测试</strong>：发生故障时，异步保存必须能把错误爆出来，不能装死。</p>

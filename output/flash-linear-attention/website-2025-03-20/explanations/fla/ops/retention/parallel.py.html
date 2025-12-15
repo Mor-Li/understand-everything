@@ -1,0 +1,82 @@
+<h1>fla/ops/retention/parallel.py</h1>
+<p>这段代码确实写得很“紧凑”，如果你不熟悉 <strong>RetNet (Retentive Network)</strong> 和 <strong>GLA (Gated Linear Attention)</strong> 这两个背景，确实像天书一样。</p>
+<p>简单来说，这段代码是 <strong>RetNet</strong> 论文中“并行 Retention”算法的一个<strong>高效实现</strong>。有趣的是，它并没有自己重头写算法，而是发现 Retention 其实是 GLA 的一种“特例”，所以直接“借用”了 GLA 的底层算子来实现。</p>
+<p>按照你的要求，我把它拆解成一个 <strong>TODO List</strong>，我们一步一步来完成这个“阅读任务”。</p>
+<hr />
+<h3>📝 阅读理解 Task List</h3>
+<h4>✅ Task 1: 搞懂“我是谁，我在哪” (代码定位)</h4>
+<ul>
+<li><strong>文件名</strong>: <code>parallel_retention</code>。</li>
+<li><strong>背景</strong>: 这是 RetNet 模型的核心机制。</li>
+<li><strong>目的</strong>: 计算 Query(Q), Key(K), Value(V) 之间的交互，类似于 Attention，但它引入了一个<strong>固定的衰减机制</strong>（Decay）。</li>
+<li><strong>核心发现</strong>: 作者通过这段代码告诉你：“嘿，RetNet 的 Retention 其实就是一个<strong>门控值(Gate)固定不变</strong>的 Simple GLA。”</li>
+</ul>
+<h4>✅ Task 2: 检查原材料 (输入参数)</h4>
+<p>看函数的参数定义：
+*   <strong><code>q, k, v</code></strong>: 这一看就是注意力机制的三大件。
+*   <strong><code>head_first</code></strong>: 只是为了处理数据形状是 <code>[Batch, Head, Time, ...]</code> 还是 <code>[Batch, Time, Head, ...]</code>，不影响核心逻辑。
+*   <strong><code>cu_seqlens</code></strong>: 这是为了处理变长序列（FlashAttention 的常见优化），可以先忽略。
+*   <strong>关键点</strong>: 这里<strong>没有</strong>输入 mask 或者复杂的 gate 参数，因为 Retention 的核心特性是<strong>自带位置衰减</strong>。</p>
+<h4>✅ Task 3: 破解核心密码 (变量 <code>s</code> 是什么？)</h4>
+<p>这是全篇最难懂的一行代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">s</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1</span> <span class="o">-</span> <span class="n">q</span><span class="o">.</span><span class="n">new_tensor</span><span class="p">(</span><span class="mf">2.</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float</span><span class="p">)</span><span class="o">.</span><span class="n">pow</span><span class="p">(</span><span class="o">-</span><span class="mf">5.</span> <span class="o">-</span> <span class="n">q</span><span class="o">.</span><span class="n">new_tensor</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">n_heads</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float</span><span class="p">)))</span><span class="o">.</span><span class="n">log</span><span class="p">()</span>
+</code></pre></div>
+
+<p>让我们像剥洋葱一样拆解它：</p>
+<ol>
+<li><strong>背景知识</strong>: 在 RetNet 论文中，不同“头”（Head）有不同的记忆衰减率 $\gamma$。<ul>
+<li>公式是：$\gamma_h = 1 - 2^{-5 - h}$ (其中 $h$ 是头的索引)。</li>
+<li>这意味着：有的头记得久一点，有的头忘得快一点。</li>
+</ul>
+</li>
+<li><strong>代码对应</strong>:<ul>
+<li><code>range(n_heads)</code>: 就是头的索引 $h$。</li>
+<li><code>pow(-5. - range(...))</code>: 就是 $2^{-5-h}$。</li>
+<li><code>1 - ...</code>: 就是 $\gamma$ (衰减因子)。</li>
+</ul>
+</li>
+<li><strong>为什么要取 <code>.log()</code>?</strong><ul>
+<li>代码最后加了 <code>.log()</code>。这是因为底层的 <code>simple_gla</code> 算子是在<strong>对数空间</strong>工作的。</li>
+<li>在数学上，连续乘一个衰减率 $\gamma$，等价于在对数空间连续加上 $\log(\gamma)$。</li>
+<li><strong>结论</strong>: 变量 <code>s</code> 存储的是 <strong>RetNet 每个头特有的衰减率的对数值</strong>。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 4: 构造“门控” (变量 <code>g</code>)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">head_first</span><span class="p">:</span>
+    <span class="n">g</span> <span class="o">=</span> <span class="n">s</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:,</span> <span class="kc">None</span><span class="p">]</span><span class="o">.</span><span class="n">expand</span><span class="p">(</span><span class="n">q</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">q</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="n">q</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">])</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>: 把刚才计算出来的每个头的衰减率 <code>s</code>，扩展（Expand）成和输入数据 <code>q</code> 一样的形状。</li>
+<li><strong>含义</strong>: 虽然 <code>g</code> 的形状是 <code>[Batch, Head, Time]</code>，但你会发现它在 Time（时间步）维度上是完全一样的。</li>
+<li><strong>观点</strong>: 这就是 Retention 的特点——<strong>它的遗忘门控（Decay）是与输入内容无关的、静态的几何衰减。</strong></li>
+</ul>
+<h4>✅ Task 5: “偷懒”外包 (调用 <code>parallel_simple_gla</code>)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">return</span> <span class="n">parallel_simple_gla</span><span class="p">(</span>
+    <span class="n">q</span><span class="o">=</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="o">=</span><span class="n">v</span><span class="p">,</span>
+    <span class="n">g</span><span class="o">=</span><span class="n">g</span><span class="p">,</span>  <span class="c1"># &lt;--- 把刚才算好的固定衰减率传进去</span>
+    <span class="o">...</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>动作</strong>: 将 Q, K, V 和刚刚构造的 Gate (<code>g</code>) 扔给 <code>parallel_simple_gla</code>。</li>
+<li><strong>核心观点</strong>:<ul>
+<li><strong>Simple GLA</strong> 是一个更通用的算法，它允许 Gate (<code>g</code>) 随时间变化（由数据计算得出）。</li>
+<li><strong>Retention</strong> 是 Simple GLA 的一个<strong>特例</strong>，它的 Gate (<code>g</code>) 是固定的几何衰减。</li>
+<li><strong>作者的逻辑</strong>: 既然我已经写好了一个很牛的、支持并行计算的 GLA 算子（CUDA加速过的），那我没必要专门为 Retention 再写一遍 CUDA 代码，我只要把 Retention 的衰减率伪装成 GLA 的 Gate 传进去就行了！</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结 (Takeaway)</h3>
+<p>如果你要用一句话给别人讲这段代码：</p>
+<blockquote>
+<p><strong>“这段代码通过构造一个固定的、基于几何级数衰减的 Gate（门控），强行调用 Simple GLA 的并行算子来计算 RetNet 的 Retention，从而复用了底层的高效 CUDA 实现。”</strong></p>
+</blockquote>
+<p><strong>步骤回顾：</strong>
+1.  <strong>拿数据</strong>: 拿到 Q, K, V。
+2.  <strong>算衰减</strong>: 根据 RetNet 论文公式，算出每个头该有的衰减率 $\gamma$。
+3.  <strong>取对数</strong>: 转成对数形式 $\log(\gamma)$，因为底层算子做的是加法（Log-space addition）。
+4.  <strong>调包</strong>: 把这个固定的衰减率当作 Gate，丢给 GLA 算子去跑。</p>

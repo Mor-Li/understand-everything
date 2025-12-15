@@ -1,0 +1,118 @@
+<h1>fla/ops/generalized_delta_rule/dplr/chunk_h_bwd.py</h1>
+<p>这份代码确实非常硬核，因为它涉及到 <strong>Triton 算子编程</strong>（用于 GPU 加速）和 <strong>线性注意力/RNN 的反向传播算法</strong>。</p>
+<p>简单来说，这个文件的作用是：<strong>在一个基于“块（Chunk）”的线性 RNN 模型中，计算隐藏状态（Hidden State $h$）的梯度，以便训练模型。</strong></p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“理解任务清单 (Todo List)”</strong>，我们一步步来划钩。</p>
+<hr />
+<h3>✅ Task 1: 搞清楚我们在干什么 (Context)</h3>
+<ul>
+<li><strong>文件名</strong>：<code>chunk_h_bwd.py</code><ul>
+<li><code>chunk</code>: 表示算法采用了“分块”策略（把长序列切成小段处理，为了并行加速）。</li>
+<li><code>h</code>: 指的是 Hidden State (隐藏状态/记忆)。</li>
+<li><code>bwd</code>: Backward，即<strong>反向传播</strong>。这是在训练阶段，计算梯度用的。</li>
+</ul>
+</li>
+<li><strong>数学目标</strong>：
+    在 RNN/SSM 中，前向传播是 $h_t = \text{decay} \times h_{t-1} + \text{input}$。
+    现在我们要反向算梯度：已知输出的梯度，我们要算出 $h$ 的梯度（<code>dh</code>），以及初始状态 $h_0$ 的梯度（<code>dh0</code>），并顺便更新一下 $v$ 的梯度（<code>dv2</code>）。</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 认识核心“玩家” (Inputs)</h3>
+<p>在看代码逻辑前，先认清几个关键变量（张量）：</p>
+<ol>
+<li><strong><code>dht</code> (Final Gradient)</strong>: 从未来时刻传回来的梯度（最后一个时刻的梯度）。</li>
+<li><strong><code>dh</code> (Output Gradient)</strong>: 我们要计算并存储的，每个 Chunk 的隐藏状态梯度。</li>
+<li><strong><code>gk</code> / <code>bg</code> (Gate/Decay)</strong>: 遗忘门或衰减系数。梯度往前传时，信号会衰减。</li>
+<li><strong><code>qg</code>, <code>w</code>, <code>do</code>, <code>dv</code></strong>: 各种中间变量的梯度或权重，用于计算当前时刻对 $h$ 的贡献。</li>
+<li><strong><code>dv2</code></strong>: 这是一个修正后的 <code>dv</code> 梯度，后续计算会用到。</li>
+</ol>
+<hr />
+<h3>✅ Task 3: 理解最外层的逻辑 (The Kernel Grid)</h3>
+<p>代码入口是 <code>chunk_dplr_bwd_kernel_dhu</code> 函数。</p>
+<ul>
+<li><strong>并行化策略</strong>：Triton 启动了大量的线程块（Program ID）。
+    <code>python
+    i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)</code>
+    这里是把计算任务拆散了：每个线程块只负责 <strong>一个 Head ($H$)</strong> 的 <strong>一小部分特征维度 ($K, V$)</strong>。</li>
+<li><strong>初始化累加器</strong>：
+    <code>python
+    b_dh = tl.zeros([BK, BV], dtype=tl.float32)</code>
+    <code>b_dh</code> 就是当前正在流动的“梯度水流”。如果提供了 <code>dht</code>（最后时刻的梯度），先把它装进桶里。</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 核心循环——时光倒流 (Time Loop)</h3>
+<p>这是整个代码的灵魂。因为是 <strong>反向传播</strong>，所以时间必须 <strong>倒着走</strong>。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># NT 是 Chunk 的总数</span>
+<span class="k">for</span> <span class="n">i_t</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">NT</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">):</span>
+    <span class="c1"># ...</span>
+</code></pre></div>
+
+<p><strong>这一步在做什么？</strong>
+我们在遍历序列的每一个“块”（Chunk）。从最后一个块，一直处理到第一个块。</p>
+<p><strong>循环内部的 Todo List：</strong></p>
+<ol>
+<li>
+<p><strong>保存当前的梯度状态</strong>：
+    <code>python
+    tl.store(p_dh, b_dh...)</code>
+    把当前累积到的梯度 <code>b_dh</code> 存入显存 <code>dh</code> 中。这代表“从未来流到当前块末尾的梯度”。</p>
+</li>
+<li>
+<p><strong>计算当前块内部的贡献 (Inner Loop)</strong>：
+    代码里有一个 <code>for i_c in range(...)</code>。这是在当前 Chunk 内部，把时间切得更细（Block Size <code>BC</code>），计算这一小段内的梯度变化。</p>
+<ul>
+<li>
+<p><strong>核心算式</strong>：
+    ```python
+    # 计算 dv2 (更新 value 的梯度)
+    b_dv2 = b_dv + tl.dot(b_bg, b_dh.to(b_bg.dtype))</p>
+<h1>累加对 hidden state 的贡献</h1>
+<p>b_dh_tmp += tl.dot(b_qg, b_do.to(b_qg.dtype))
+b_dh_tmp += tl.dot(b_w, b_dv2.to(b_qg.dtype))
+<code>``
+*   这里全是矩阵乘法 (</code>tl.dot<code>)。
+*   意思是：当前的 Query (</code>qg<code>) 和 Output Gradient (</code>do<code>) 结合，产生了新的梯度，要加到</code>dh` 里去。</p>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>梯度的“衰减” (Decay)</strong>：
+    这是 RNN/SSM 的本质。梯度从 $t$ 传到 $t-1$ 时，必须乘以一个衰减系数（比如 0.9）。如果不衰减，梯度会爆炸。
+    <code>python
+    # 加载衰减系数 (gk/bg)
+    bg_last = tl.load(...) 
+    # 让流动的梯度 b_dh 乘以衰减系数
+    b_dh *= exp(bg_last)[:, None]
+    # 加上当前块新产生的梯度
+    b_dh += b_dh_tmp</code>
+    <strong>翻译</strong>：<code>新的流动梯度 = 旧的流动梯度 * 衰减 + 当前块新产生的梯度</code>。</p>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 5: 处理初始状态 (Initial State)</h3>
+<p>循环结束后，我们已经倒退回了时间点 0。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">USE_INITIAL_STATE</span><span class="p">:</span>
+    <span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">p_dh0</span><span class="p">,</span> <span class="n">b_dh</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p>此时的 <code>b_dh</code> 就是整个序列传回到起点的梯度，也就是 $h_0$ 的梯度。这对于学习初始状态很有用。</p>
+<hr />
+<h3>✅ Task 6: 总结 (Summary)</h3>
+<p>把整个过程串起来，这个脚本干了这几件事：</p>
+<ol>
+<li><strong>准备</strong>：分配显存，计算并行计算的索引。</li>
+<li><strong>加载</strong>：如果有下一层的梯度 <code>dht</code>，先拿进来。</li>
+<li><strong>倒推循环</strong> (从最后一个 Chunk 到第一个)：<ul>
+<li>把手里的梯度 <code>b_dh</code> 存下来（供前一个算子使用）。</li>
+<li>在 Chunk 内部进行矩阵运算，计算当前数据产生的梯度增量。</li>
+<li><strong>关键点</strong>：把手里的梯度 <code>b_dh</code> 乘以衰减系数（Decay），然后加上增量。</li>
+</ul>
+</li>
+<li><strong>收尾</strong>：如果需要，保存 $h_0$ 的梯度。</li>
+</ol>
+<h3>为什么这个代码难读？</h3>
+<ol>
+<li><strong>Triton 语法</strong>：<code>tl.make_block_ptr</code>, <code>boundary_check</code> 是为了管理 GPU 内存访问，防止越界，看起来很乱，但逻辑只是“读数据”。</li>
+<li><strong>数学公式被拆散</strong>：原本简洁的公式 $dh_{t-1} = dh_t \cdot \lambda + \dots$ 被拆成了很多个 <code>tl.dot</code> 和 <code>tl.load/store</code>。</li>
+<li><strong>Head First vs Batch First</strong>：代码里有很多 <code>if HEAD_FIRST:</code>，这是为了兼容不同的数据排布格式（(B, H, T, K) 还是 (B, T, H, K)），增加了阅读干扰。</li>
+</ol>
+<p><strong>一句话总结：这是一个用 GPU 并行加速的、倒着时间跑的、带衰减的累加器。</strong></p>

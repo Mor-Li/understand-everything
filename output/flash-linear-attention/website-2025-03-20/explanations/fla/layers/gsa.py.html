@@ -1,0 +1,150 @@
+<h1>fla/layers/gsa.py</h1>
+<p>完全没问题。这段代码实现的是 <strong>GSA (Gated Slot Attention)</strong>，这是一种<strong>线性注意力机制（Linear Attention）</strong>的变体。</p>
+<p>简单来说，它的核心思想是：<strong>不想像传统 Transformer 那样计算庞大的 $N \times N$ 注意力矩阵，而是像 RNN 一样，用一个“记忆池（Slots）”一步步读入数据，同时用“门控（Gate）”机制来决定遗忘多少旧信息。</strong></p>
+<p>为了让你看懂，我把这个复杂的 Layer 拆解成一个 <strong>“流水线加工任务清单 (Task Todo List)”</strong>。我们假装自己是数据流，一步步通过这个工厂。</p>
+<hr />
+<h3>🛠️ GSA 模块加工流水线 (Task List)</h3>
+<h4>✅ Task 1: 准备原材料 (初始化与输入)</h4>
+<ul>
+<li><strong>目标</strong>: 接收输入 <code>hidden_states</code> (比如一句话的向量表示)。</li>
+<li><strong>关键点</strong>: 确定我们要用多少个头 (Heads)，多少个记忆槽 (Slots)。</li>
+</ul>
+<h4>✅ Task 2: 局部预处理 (Short Convolution)</h4>
+<ul>
+<li><strong>目标</strong>: 在处理长距离依赖之前，先看看<strong>周围</strong>的邻居。</li>
+<li><strong>动作</strong>: 用一个很短的卷积（Conv1d）扫一遍数据。</li>
+<li><strong>通俗解释</strong>: 就像在精读整本书之前，先快速扫一眼每个词的前后搭配，提取局部特征。</li>
+</ul>
+<h4>✅ Task 3: 特征变换 (Projections)</h4>
+<ul>
+<li><strong>目标</strong>: 把输入变成 Q, K, V 和 <strong>G (Gate/Forget)</strong>。</li>
+<li><strong>动作</strong>:<ul>
+<li>生成 <strong>Q (Query)</strong>: 我现在想查什么？</li>
+<li>生成 <strong>K (Key)</strong>: 记忆的索引是什么？</li>
+<li>生成 <strong>V (Value)</strong>: 实际要存的内容是什么？</li>
+<li><strong>重点</strong>: 生成 <strong>F (Forget Gate)</strong>: 这是一个特殊的向量，决定我们要<strong>遗忘</strong>多少之前的记忆。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 激活与门控计算 (Activation &amp; Decay)</h4>
+<ul>
+<li><strong>目标</strong>: 整理数据格式，并计算“遗忘率”。</li>
+<li><strong>动作</strong>:<ul>
+<li>对 Q, K 做非线性激活（如 Swish），这是线性注意力的标准操作。</li>
+<li><strong>核心</strong>: 根据 Task 3 生成的 <code>f</code>，计算衰减系数 <code>s</code>。如果 <code>s</code> 很大，说明旧记忆要被抹除；如果 <code>s</code> 很小，说明要保留记忆。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 核心记忆更新 (The Core GSA Ops)</h4>
+<ul>
+<li><strong>目标</strong>: 融合所有信息，更新记忆状态，输出结果。</li>
+<li><strong>动作</strong>: 调用核心算子 (<code>chunk_gsa</code> 或 <code>fused_recurrent_gsa</code>)。</li>
+<li><strong>原理</strong>: <code>新记忆 = 旧记忆 * (1 - 遗忘率) + 新信息(K*V)</code>。然后用 <code>Q</code> 去从记忆里读取结果。</li>
+</ul>
+<h4>✅ Task 6: 最终包装 (Output Norm &amp; Projection)</h4>
+<ul>
+<li><strong>目标</strong>: 整理输出形状，做最后的归一化。</li>
+<li><strong>动作</strong>: Group Norm + 线性投影，输出最终的 Tensor。</li>
+</ul>
+<hr />
+<h3>🧐 逐步代码详解 (跟着 Todo List 走)</h3>
+<p>现在我们对照代码，一步步看它是怎么实现上述 Task 的。</p>
+<h4>1. 初始化 (<code>__init__</code>)</h4>
+<p>这里主要是定义“工具”。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 定义 Q, K, V 的线性层</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">q_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">k_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">v_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+<span class="c1"># 【关键】定义 Forget Gate 的线性层</span>
+<span class="c1"># num_slots 是记忆槽的数量，类似 RNN 的隐藏层大小</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">f_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_kv_heads</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_slots</span><span class="p">,</span> <span class="n">bias</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+
+<span class="c1"># 定义局部卷积 (Task 2 用)</span>
+<span class="k">if</span> <span class="n">use_short_conv</span><span class="p">:</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">q_conv1d</span> <span class="o">=</span> <span class="n">ShortConvolution</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="o">...</span>
+</code></pre></div>
+
+<h4>2. 前向传播 (<code>forward</code>) - 真正的流水线开始</h4>
+<p><strong>Step 1: 局部卷积 (Short Conv)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_short_conv</span><span class="p">:</span>
+    <span class="c1"># 这里对 Q, K, V 先做了一个 1D 卷积。</span>
+    <span class="c1"># 目的是增强“局部性”，让模型知道每个词旁边的词是谁。</span>
+    <span class="n">q</span><span class="p">,</span> <span class="n">conv_state_q</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">q_conv1d</span><span class="p">(</span><span class="n">x</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">q_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">),</span> <span class="o">...</span><span class="p">)</span>
+    <span class="n">k</span><span class="p">,</span> <span class="n">conv_state_k</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">k_conv1d</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="n">v</span><span class="p">,</span> <span class="n">conv_state_v</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">v_conv1d</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="c1"># 如果不用卷积，就是普通的线性变换</span>
+    <span class="n">q</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">q_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+    <span class="o">...</span>
+</code></pre></div>
+
+<p><strong>Step 2: 生成门控信号 (The Gate)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 生成 f (forget logits)</span>
+<span class="n">f</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">f_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+
+<span class="c1"># 调整形状，准备多头处理</span>
+<span class="n">q</span> <span class="o">=</span> <span class="n">rearrange</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="n">k</span> <span class="o">=</span> <span class="n">rearrange</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="n">v</span> <span class="o">=</span> <span class="n">rearrange</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="n">f</span> <span class="o">=</span> <span class="n">rearrange</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>Step 3: 激活与计算衰减 (Decay)</strong>
+这是 GSA 的灵魂所在。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 对 Q, K 做 Feature Map (比如 Swish 激活)，保证数值稳定性</span>
+<span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">feature_map</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">q</span><span class="p">,</span> <span class="n">k</span> <span class="o">=</span> <span class="nb">map</span><span class="p">(</span><span class="k">lambda</span> <span class="n">x</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">feature_map</span><span class="p">(</span><span class="n">x</span><span class="p">),</span> <span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">))</span>
+
+<span class="c1"># 【核心数学】</span>
+<span class="c1"># f 是网络预测出的 logit</span>
+<span class="c1"># logsigmoid 将其压到负数区间</span>
+<span class="n">f</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">logsigmoid</span><span class="p">(</span><span class="n">f</span><span class="p">)</span> <span class="o">/</span> <span class="bp">self</span><span class="o">.</span><span class="n">gate_logit_normalizer</span>
+
+<span class="c1"># s 是 decay (衰减/遗忘系数)。</span>
+<span class="c1"># exp(f) 范围是 (0, 1)。</span>
+<span class="c1"># s 代表“保留多少信息”或者与“遗忘”相关。</span>
+<span class="c1"># 在 GSA 论文中，这通常控制记忆状态 H 随时间的衰减。</span>
+<span class="n">s</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1</span> <span class="o">-</span> <span class="n">f</span><span class="o">.</span><span class="n">exp</span><span class="p">())</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">f</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>Step 4: 核心计算 (Chunk / Recurrent)</strong>
+这里代码分了两条路，但做的事情是一样的，只是计算加速方式不同：
+*   <strong>Fused Recurrent</strong>: 像 RNN 一样，一个 token 一个 token 地串行处理（适合推理或短序列）。
+*   <strong>Chunk</strong>: 把序列切成小块（Chunk），块内并行，块间串行（适合训练长序列）。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">mode</span> <span class="o">==</span> <span class="s1">&#39;fused_recurrent&#39;</span><span class="p">:</span>
+    <span class="c1"># 这是一个底层的 CUDA 算子</span>
+    <span class="c1"># 输入：Query, Key, Value</span>
+    <span class="c1"># s: 衰减系数 (决定每一步忘掉多少旧的 KV)</span>
+    <span class="c1"># g: 这里的 g 其实传进去的是 f (logits)，用于底层计算</span>
+    <span class="n">o</span><span class="p">,</span> <span class="n">recurrent_state</span> <span class="o">=</span> <span class="n">fused_recurrent_gsa</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">s</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+<span class="k">elif</span> <span class="n">mode</span> <span class="o">==</span> <span class="s1">&#39;chunk&#39;</span><span class="p">:</span>
+    <span class="c1"># 并行版实现</span>
+    <span class="n">o</span><span class="p">,</span> <span class="n">recurrent_state</span> <span class="o">=</span> <span class="n">chunk_gsa</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">s</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>这一步发生了什么？</strong>
+你可以想象有一个记忆矩阵 $M$。
+1.  每来一个词，算出它的 $K$ 和 $V$。
+2.  根据 $S$ (衰减系数)，把 $M$ 里的旧东西忘掉一点：$M = M * S$。
+3.  把新的 $K, V$ 写入 $M$：$M = M + (K^T \cdot V)$。
+4.  用 $Q$ 从 $M$ 里读出结果：$O = Q \cdot M$。</p>
+<p><strong>Step 5: 输出 (Output)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 拼回原本的形状</span>
+<span class="n">o</span> <span class="o">=</span> <span class="n">rearrange</span><span class="p">(</span><span class="n">o</span><span class="p">,</span> <span class="s1">&#39;b t h d -&gt; b t (h d)&#39;</span><span class="p">)</span>
+
+<span class="c1"># Group Norm + Swish 激活 + 最后的线性层</span>
+<span class="c1"># 这里的 rms_norm_linear 是为了训练稳定</span>
+<span class="n">o</span> <span class="o">=</span> <span class="n">rms_norm_linear</span><span class="p">(</span><span class="n">F</span><span class="o">.</span><span class="n">silu</span><span class="p">(</span><span class="n">o</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">g_norm</span><span class="o">.</span><span class="n">weight</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">g_norm</span><span class="o">.</span><span class="n">bias</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">o_proj</span><span class="o">.</span><span class="n">weight</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">o_proj</span><span class="o">.</span><span class="n">bias</span><span class="p">)</span>
+
+<span class="k">return</span> <span class="n">o</span><span class="p">,</span> <span class="o">...</span>
+</code></pre></div>
+
+<h3>总结：GSA 到底在干啥？</h3>
+<p>GSA 就是一个 <strong>“带遗忘功能的记事本”</strong>：
+1.  <strong>Short Conv</strong>: 先快速扫一眼这一行字（局部特征）。
+2.  <strong>K, V</strong>: 提炼出这行字的重点内容。
+3.  <strong>Gate (s)</strong>: 决定翻页时，上一页的内容要忘掉多少。
+4.  <strong>Core GSA</strong>: 更新脑子里的记忆，并根据当前的问题 ($Q$) 产生理解 ($O$)。</p>
+<p>之所以这么写，是为了<strong>速度</strong>。传统的 Transformer 随着字数变多，计算量是平方级爆炸；而 GSA 这种写法，计算量是线性的，不管文章多长，处理速度都很快，而且显存占用低。</p>

@@ -1,0 +1,82 @@
+<h1>tests/ops/test_gla.py</h1>
+<p>这个文件 <code>tests/ops/test_gla.py</code> 是一个<strong>单元测试（Unit Test）</strong>文件。它的核心目的是验证一个叫 <strong>GLA (Gated Linear Attention)</strong> 的深度学习算子（Operator）计算结果是否正确。</p>
+<p>由于深度学习中为了加速，通常会写很多复杂的底层代码（比如用 Triton 或 CUDA 写），容易出错。所以需要用一个简单的、肯定正确的版本（Reference）去核对那个复杂的、快速的版本（Implementation）。</p>
+<p>我为你列了一个 <strong>学习任务清单 (ToDo List)</strong>，我们将分 5 步来彻底看懂这个文件：</p>
+<h3>📝 任务清单</h3>
+<ol>
+<li><strong>Task 1: 理解核心概念与角色</strong> (搞清楚 Q, K, V, G 是什么)</li>
+<li><strong>Task 2: 理解裁判员</strong> (看懂辅助函数 <code>assert_close</code>)</li>
+<li><strong>Task 3: 第一场比赛 - 基础测试</strong> (看懂 <code>test_fused_recurrent</code>)</li>
+<li><strong>Task 4: 第二场比赛 - 并行测试</strong> (看懂 <code>test_chunk</code>)</li>
+<li><strong>Task 5: 第三场比赛 - 变长序列测试</strong> (看懂 <code>test_chunk_varlen</code>)</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 1: 理解核心概念与角色</h4>
+<p>在看代码前，先了解这些变量代表什么。这是所有测试函数的输入：</p>
+<ul>
+<li><strong>Q, K, V</strong>: 注意力机制（Attention）的标配三件套 (Query, Key, Value)。</li>
+<li><strong>G (Gate)</strong>: GLA 算法特有的“门控”机制，用来控制遗忘多少历史信息。</li>
+<li><strong>H0 (Initial State)</strong>: 循环神经网络（RNN）的初始状态，相当于记忆的起点。</li>
+<li><strong>Ref (Reference)</strong>: 参考答案。通常由慢但逻辑简单的代码生成（比如 <code>naive_recurrent_gla</code>）。</li>
+<li><strong>Tri (Triton/Trial)</strong>: 待测目标。通常是优化过的、极快的代码（比如 <code>chunk_gla</code>），通常用 Triton 语言编写，所以变量名常叫 <code>tri</code>。</li>
+</ul>
+<h4>Task 2: 理解裁判员 (辅助函数)</h4>
+<p>代码开头的这几个函数是用来“找茬”的：</p>
+<ul>
+<li><code>get_abs_err</code>: 计算绝对误差（两个数差多少）。</li>
+<li><code>get_err_ratio</code>: 计算相对误差比例。</li>
+<li><strong><code>assert_close(prefix, ref, tri, ratio)</code></strong>: 这是核心裁判。<ul>
+<li>它对比 <code>ref</code> (标准答案) 和 <code>tri</code> (你的计算结果)。</li>
+<li>如果误差超过了 <code>ratio</code> (比如 0.005)，程序就会报错（Assert Fail），说明测试没通过。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 第一场比赛 - 基础测试 (<code>test_fused_recurrent</code>)</h4>
+<p><strong>目标</strong>：验证“融合循环模式 (Fused Recurrent)”算子是否正确。</p>
+<p><strong>步骤解析</strong>：
+1.  <strong>造数据</strong>：用 <code>torch.randn</code> 生成随机的 Q, K, V, G, H0。
+2.  <strong>跑标准答案 (<code>naive</code>)</strong>：
+    *   调用 <code>naive_recurrent_gla</code>。这是一个用纯 PyTorch 写的、最朴素的实现，跑得慢但肯定对。
+    *   计算它的反向传播（Backward），得到梯度 <code>ref_dq</code>, <code>ref_dk</code> 等。
+3.  <strong>跑待测代码 (<code>fused</code>)</strong>：
+    *   调用 <code>fused_recurrent_gla</code>。这是优化过的版本。
+    *   同样计算反向传播，得到梯度 <code>tri_dq</code>, <code>tri_dk</code> 等。
+4.  <strong>对比 (<code>assert_close</code>)</strong>：
+    *   对比输出 <code>o</code> 是否一致。
+    *   对比最终隐藏状态 <code>ht</code> 是否一致。
+    *   对比所有梯度 <code>dq</code>, <code>dk</code>, <code>dv</code>... 是否一致。</p>
+<p><strong>结论</strong>：如果这个测试通过，说明 <code>fused_recurrent_gla</code> 虽然写得复杂，但算出来的结果和朴素版一模一样。</p>
+<h4>Task 4: 第二场比赛 - 并行测试 (<code>test_chunk</code>)</h4>
+<p><strong>目标</strong>：验证“分块并行模式 (Chunk)”算子是否正确。
+<em>背景：RNN 只能一步步算，很慢。Chunk 模式把序列切成小块并行算，速度快。</em></p>
+<p><strong>步骤解析</strong>：
+1.  <strong>参数化 (<code>@pytest.mark.parametrize</code>)</strong>：测试了各种情况，比如不同的序列长度 <code>T</code>，不同的精度 <code>dtype</code>，以及内存排列方式 <code>head_first</code>。
+2.  <strong>造数据</strong>：同样生成随机 Q, K, V。
+3.  <strong>跑标准答案 (<code>Ref</code>)</strong>：
+    *   <strong>注意！</strong> 这里不再用 <code>naive</code> 版做标准答案了，而是用上一轮测试通过的 <code>fused_recurrent_gla</code> 做标准答案。（因为它已经验证过是正确的，且比 naive 快，适合做大规模测试的基准）。
+4.  <strong>跑待测代码 (<code>Tri</code>)</strong>：
+    *   调用 <code>chunk_gla</code>。这是我们要测的主角，分块计算版本。
+5.  <strong>对比</strong>：
+    *   同样对比前向输出结果和反向传播的梯度。</p>
+<p><strong>结论</strong>：如果通过，说明“分块并行算”和“一步步循环算”的结果是一致的，数学等价性成立。</p>
+<h4>Task 5: 第三场比赛 - 变长序列测试 (<code>test_chunk_varlen</code>)</h4>
+<p><strong>目标</strong>：验证处理“长短不一的句子 (Variable Length)”时是否正确。</p>
+<p><strong>场景</strong>：
+通常为了并行，我们会把短句子补零（Padding）成一样长。但这样浪费计算资源。<code>varlen</code> 模式允许把所有句子拼成一条长龙，用索引记录每句话在哪里结束。</p>
+<p><strong>步骤解析</strong>：
+1.  <strong>切分数据 (<code>offsets</code>)</strong>：
+    *   代码里 <code>offsets = torch.cat(...)</code> 这一段是在随机生成每句话的分割点。比如总长 2048，切成 4 句话，长度可能是 [100, 500, 400, 1048]。
+2.  <strong>传入参数 <code>cu_seqlens</code></strong>：
+    *   调用 <code>chunk_gla</code> 时传入了 <code>cu_seqlens=offsets</code>。这意味着告诉算子：“不要以为这是一个长句子，这是由好几段拼起来的，不要把上一句话的状态传给下一句。”
+3.  <strong>对比</strong>：
+    *   依然是对比 <code>fused_recurrent_gla</code> (Ref) 和 <code>chunk_gla</code> (Tri)。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件的逻辑非常清晰，就是典型的<strong>“控制变量法”</strong>：</p>
+<ol>
+<li>先证明 <strong>B (Fused)</strong> 和 <strong>A (Naive)</strong> 结果一样。</li>
+<li>再证明 <strong>C (Chunk)</strong> 和 <strong>B (Fused)</strong> 结果一样。</li>
+<li>最后证明在特殊情况（变长）下，<strong>C</strong> 依然和 <strong>B</strong> 结果一样。</li>
+</ol>
+<p>只要这些测试都跑通了（全是绿色的 Pass），开发者就可以放心地在模型里使用这些加速过的算子了。</p>

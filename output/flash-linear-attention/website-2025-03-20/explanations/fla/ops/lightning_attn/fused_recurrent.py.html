@@ -1,0 +1,61 @@
+<h1>fla/ops/lightning_attn/fused_recurrent.py</h1>
+<p>这代码乍一看全是参数和张量操作，确实容易晕。但其实它的核心逻辑非常简单，只有中间那 5 行代码。</p>
+<p>你可以把它想象成<strong>一个“配置生成器”</strong>。它本身不干重活，只是算出一个特殊的参数，然后把活儿外包给另一个函数。</p>
+<p>为了让你彻底看懂，我列了一个 <strong>Task Todo List</strong>，我们一步一步把它拆解开：</p>
+<h3>✅ Task 1: 搞清楚这是干嘛的（宏观视角）</h3>
+<ul>
+<li><strong>背景</strong>：这是一个叫做 <strong>Lightning Attention</strong> 的算法实现。</li>
+<li><strong>核心机制</strong>：它是一种线性注意力机制（Linear Attention），也是一种 RNN（循环神经网络）。这意味着它处理序列时，是“读一个词，更新一下记忆，输出一个结果”，而不是像 Transformer 那样一次性算所有词的矩阵。</li>
+<li><strong>关键点</strong>：既然是 RNN，就需要决定<strong>“记住多少旧信息，忘掉多少旧信息”</strong>。这个“遗忘率”（或者叫衰减率）就是这个文件要算的唯一核心东西。</li>
+</ul>
+<h3>✅ Task 2: 看看原材料（输入参数）</h3>
+<p>我们要关注这几个关键输入，其他的都是类似开关的配置：
+1.  <strong><code>q, k, v</code></strong>: 也就是 Query, Key, Value。这是注意力机制的三大件，数据本身。
+2.  <strong><code>layer_idx</code> (当前层数)</strong> 和 <strong><code>num_layers</code> (总层数)</strong>: ❗<strong>这很重要</strong>。这说明 Lightning Attention 在每一层的表现是不一样的。
+3.  <strong><code>head_first</code></strong>: 数据的形状格式，不用深究，只是为了代码能处理不同形状的张量。</p>
+<h3>✅ Task 3: 制作“遗忘药水”（核心逻辑）</h3>
+<p>这是代码里最难懂的部分，也就是 <code>H = ...</code> 和 <code>s = ...</code> 那几行。我们来翻译一下它在算什么。</p>
+<p><strong>目标</strong>：给每一个“注意力头”（Head）计算一个专属的<strong>衰减率（Decay Rate）</strong>。</p>
+<ol>
+<li>
+<p><strong><code>H</code> (Head Number)</strong>:</p>
+<ul>
+<li>也就是一共有多少个头。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>s</code> (Slope/Decay)</strong>:</p>
+<ul>
+<li>代码：<code>s = -(8 / H * (1 - layer_idx / num_layers)) * q.new_tensor(range(H), ...)</code></li>
+<li><strong>人话翻译</strong>：这是一个数学公式，用来生成一个向量。</li>
+<li><strong>这里面有两层意思</strong>：<ul>
+<li><strong>随层数变化</strong>：<code>(1 - layer_idx / num_layers)</code> 表示越浅的层（layer_idx 小），衰减越快；越深的层，衰减越慢。</li>
+<li><strong>随 Head 变化</strong>：<code>range(H)</code> 表示第 0 个头、第 1 个头... 第 H 个头，它们的衰减速度是逐渐拉开梯度的。有的头专门记短期记忆，有的头专门记长期记忆。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong><code>g</code> (Gate)</strong>:</p>
+<ul>
+<li>代码：<code>g = s[...].expand(...)</code></li>
+<li><strong>人话翻译</strong>：把上面算出来的那个小向量 <code>s</code>，复制粘贴很多份，扩展成和输入数据 <code>q</code> 一样大的形状。</li>
+<li><strong>作用</strong>：这个 <code>g</code> 就是具体的<strong>“门控信号”</strong>。它告诉模型：“在这个位置，对于这个头，请按这个速度遗忘之前的历史信息”。</li>
+</ul>
+</li>
+</ol>
+<h3>✅ Task 4: 甩手掌柜（外包执行）</h3>
+<ul>
+<li>代码最后一行：<code>return fused_recurrent_simple_gla(...)</code></li>
+<li><strong>解释</strong>：<ul>
+<li>这个函数自己并没有写循环或者矩阵乘法。</li>
+<li>它发现：<em>“哎？我要做的这个 Lightning Attention，其实本质上就是一种特殊的 </em><em>Simple GLA</em><em>（另一种注意力算法），只不过我的衰减率 <code>g</code> 是我自己根据层数算死的，不是学出来的。”</em></li>
+<li>于是，它把它算好的 <code>g</code>，连同原始的 <code>q, k, v</code>，直接丢给了 <code>fused_recurrent_simple_gla</code> 这个通用的底层函数去执行。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结（一句话看懂）</h3>
+<p>这个文件的作用是：<strong>根据当前的层数和头数，用一个固定的公式算出一个“遗忘率”张量 <code>g</code>，然后调用通用的 <code>Simple GLA</code> 算子来计算注意力。</strong></p>
+<p><strong>你只需要记住：</strong>
+Lightning Attention 在这里 = <strong>输入数据</strong> + <strong>特殊的数学公式生成的衰减率</strong> + <strong>通用 RNN 算子</strong>。</p>

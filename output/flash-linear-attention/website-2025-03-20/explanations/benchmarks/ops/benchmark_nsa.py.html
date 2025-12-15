@@ -1,0 +1,107 @@
+<h1>benchmarks/ops/benchmark_nsa.py</h1>
+<p>这份代码看起来确实充满了术语，但别担心，它的核心逻辑其实非常简单：<strong>这是一个“赛跑”脚本</strong>。</p>
+<p>它在让两个算法（<strong>NSA</strong> 和 <strong>Flash Attention</strong>）在显卡上进行速度比赛，并画出图表来看谁跑得快。</p>
+<p>为了让你能够看懂，我制定了一个 <strong>6步的学习 To-Do List</strong>。我们一步一步来拆解这个文件。</p>
+<hr />
+<h3>📝 学习 To-Do List</h3>
+<ol>
+<li><strong>搞懂目标</strong>：这文件到底是干嘛的？</li>
+<li><strong>认识选手</strong>：谁在比赛？（NSA vs Flash）</li>
+<li><strong>看懂赛制</strong>：比赛规则是什么？（Triton 装饰器）</li>
+<li><strong>准备跑道</strong>：数据是怎么生成的？（Q, K, V）</li>
+<li><strong>理解核心差异</strong>：NSA 为什么特殊？（Indices 的作用）</li>
+<li><strong>开始比赛</strong>：如何测量时间？（Forward vs Backward）</li>
+</ol>
+<hr />
+<h3>✅ Task 1: 搞懂目标 —— 这文件是干嘛的？</h3>
+<p><strong>核心观点</strong>：这是一个 <strong>Benchmark（基准测试）</strong> 脚本。</p>
+<ul>
+<li><strong>通俗解释</strong>：这就好比你要买两辆车，你想知道哪辆车加速快。你写了一个脚本，让两辆车在不同长度的跑道上（100米、200米、400米...）全力冲刺，然后记录下时间。</li>
+<li><strong>代码对应</strong>：文件名 <code>benchmark_nsa.py</code> 里的 <code>benchmark</code> 就是“跑分/基准测试”的意思。</li>
+</ul>
+<h3>✅ Task 2: 认识选手 —— 谁在比赛？</h3>
+<p><strong>核心观点</strong>：主要对比 <strong>NSA</strong> (Native Sparse Attention) 和 <strong>Flash Attention</strong>。</p>
+<ul>
+<li><strong>选手 A (蓝方)</strong>：<code>nsa</code>。这是 <code>fla</code> 库里实现的一种稀疏注意力机制（这也是这个文件主要想测试的对象）。</li>
+<li><strong>选手 B (红方)</strong>：<code>flash</code> (Flash Attention)。这是目前业界最流行的标准注意力加速算法，把它作为<strong>对照组</strong>（Baseline）。如果 NSA 比它快，说明 NSA 很厉害。</li>
+<li><strong>代码对应</strong>：
+    <code>python
+    line_names=['nsa', 'nsa_bwd', 'flash', 'flash_bwd']</code>
+    这里列出了四个名字，分别代表 NSA 的前向传播、反向传播，以及 Flash 的前向、反向。</li>
+</ul>
+<h3>✅ Task 3: 看懂赛制 —— 比赛规则是什么？</h3>
+<p><strong>核心观点</strong>：利用 <code>@triton.testing.perf_report</code> 自动生成比赛图表。</p>
+<ul>
+<li><strong>通俗解释</strong>：这是裁判席。它规定了 X 轴是什么，Y 轴是什么。</li>
+<li><strong>代码对应</strong>：<ul>
+<li><code>x_names=['T']</code>: 比赛的变量是 <strong>T</strong>（Sequence Length，序列长度）。</li>
+<li><code>x_vals=[128 * 2 ** i ...]</code>: 测试的长度从 128, 256, 512 一直到很大。这是为了看随着文本越来越长，谁还能跑得快。</li>
+<li><code>ylabel="Execution Time (ms)"</code>: Y 轴是执行时间，<strong>越低越好</strong>。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 4: 准备跑道 —— 数据是怎么生成的？</h3>
+<p><strong>核心观点</strong>：生成伪造的神经网络输入数据（Q, K, V）。</p>
+<ul>
+<li><strong>通俗解释</strong>：注意力机制（Attention）通常需要三个核心输入：Query (查询), Key (键), Value (值)。这里随机生成了一些数字来模拟这些数据。</li>
+<li><strong>代码对应</strong>：
+    <code>python
+    # B=Batch大小, T=序列长度, HQ/H=头数, D=维度
+    q = torch.randn(B, T, HQ, D, ...) 
+    k = torch.randn(B, T, H, D, ...)
+    v = torch.randn(B, T, H, D, ...)</code>
+    这里不需要深究具体的数字，只需要知道这是在<strong>造假数据</strong>给算法吃。</li>
+</ul>
+<h3>✅ Task 5: 理解核心差异 —— NSA 为什么特殊？</h3>
+<p><strong>核心观点</strong>：NSA 是<strong>稀疏</strong>的，它需要一个特殊的 <code>indices</code>（索引），这是它和 Flash Attention 最大的不同。</p>
+<ul>
+<li><strong>通俗解释</strong>：<ul>
+<li><strong>Flash Attention</strong> 像是<strong>全班点名</strong>，老师（Query）要看班里每一个学生（Key）。</li>
+<li><strong>NSA</strong> 像是<strong>抽查</strong>，老师只看名单上指定的几个学生。</li>
+</ul>
+</li>
+<li><strong>代码对应</strong>：
+    <code>python
+    # 生成索引，决定每个时刻 T 要看哪些块（Block）
+    indices = torch.full((B, T, H, S), T, ...)
+    for ...:
+        # 这里用 randperm 随机选择了一些块
+        i_i = torch.randperm(...)[:S] 
+        indices[...] = i_i</code>
+    这段看起来很复杂的循环，其实就是为了<strong>随机生成一份“抽查名单”</strong>。Flash Attention 不需要这个，因为它默认全看；NSA 需要这个名单才能工作。</li>
+</ul>
+<h3>✅ Task 6: 开始比赛 —— 如何测量时间？</h3>
+<p><strong>核心观点</strong>：使用 <code>triton.testing.do_bench</code> 进行精确计时。</p>
+<ul>
+<li><strong>通俗解释</strong>：让代码跑几百次，取平均时间，排除误差。分两种跑法：<ol>
+<li><strong>Forward (前向)</strong>：只算结果（推理时用）。</li>
+<li><strong>Backward (反向)</strong>：算梯度（训练时用，通常更慢）。</li>
+</ol>
+</li>
+<li><strong>代码对应</strong>：
+    <code>python
+    if provider == 'nsa':
+        # 跑 NSA 前向
+        results = triton.testing.do_bench(lambda: parallel_nsa(q, k, v, indices, block_size))
+    elif provider == 'nsa_bwd':
+        # 跑 NSA 反向 (backward)
+        results = triton.testing.do_bench(lambda: parallel_nsa(...).backward(do))
+    # Flash Attention 同理...</code></li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件的逻辑链条是：</p>
+<ol>
+<li><strong>设置比赛场地</strong>：定义 X 轴为序列长度 T（长度越长计算越慢）。</li>
+<li><strong>制造假数据</strong>：生成 Q, K, V 矩阵。</li>
+<li><strong>制造 NSA 特有的数据</strong>：生成稀疏索引 <code>indices</code>（抽查名单）。</li>
+<li><strong>发令枪响</strong>：<ul>
+<li>让 NSA 跑一遍，计时。</li>
+<li>让 NSA 算梯度（反向）跑一遍，计时。</li>
+<li>让 Flash Attention 跑一遍，计时。</li>
+<li>让 Flash Attention 算梯度跑一遍，计时。</li>
+</ul>
+</li>
+<li><strong>画图</strong>：最后生成一张图，展示随着 T 变大，谁的速度更稳、更快。</li>
+</ol>
+<p><strong>文中隐含的观点</strong>：作者写这个 benchmark 应该是为了证明 <strong>在某些长序列场景下，使用 NSA（稀疏注意力）比全量的 Flash Attention 更快或者显存占用更优</strong>（虽然代码里只测了时间）。</p>

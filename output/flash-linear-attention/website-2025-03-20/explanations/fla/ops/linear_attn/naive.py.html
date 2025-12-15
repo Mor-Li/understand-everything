@@ -1,0 +1,82 @@
+<h1>fla/ops/linear_attn/naive.py</h1>
+<p>这段代码实现的是 <strong>“分块线性注意力机制”（Chunkwise Linear Attention）</strong> 的一个朴素（Naive/未深度优化）版本。</p>
+<p>为了让你彻底搞懂，我们把这个复杂的数学过程拆解成一个 <strong>6步走的“学习任务清单” (To-Do List)</strong>。我们不直接看代码，而是先看我们要解决什么问题，然后再对应到代码上。</p>
+<hr />
+<h3>✅ 任务清单：一步步拆解 Linear Attention</h3>
+<h4>📝 Task 1: 理解背景——为什么要“线性”和“分块”？</h4>
+<ul>
+<li><strong>普通 Attention 的痛点</strong>：标准的 Transformer Attention 计算量是 $O(N^2)$。序列越长，速度越慢，显存爆炸。</li>
+<li><strong>Linear Attention 的解法</strong>：去掉 Softmax，把计算顺序从 $(QK^T)V$ 变成 $Q(K^T V)$。这样复杂度降为 $O(N)$。</li>
+<li><strong>Chunk（分块）的作用</strong>：为了结合并行计算（算得快）和递归推理（省显存），我们将长序列切成一个个小块（Chunk）。<ul>
+<li><strong>块内</strong>：像普通 Attention 一样并行算。</li>
+<li><strong>块间</strong>：像 RNN 一样，把前一个块的“记忆”传给下一个块。</li>
+</ul>
+</li>
+</ul>
+<h4>🔪 Task 2: 数据准备——切蛋糕 (Chunking)</h4>
+<p>代码的第一步是把长序列切碎。
+*   假设你有一本书（序列），一共有 $L$ 个字。
+*   我们设定每页（Chunk）写 64 个字（<code>chunk_size = 64</code>）。
+*   <strong>代码对应</strong>：
+    <code>python
+    # 把 (batch, head, total_len, dim) 变成 (batch, head, num_chunks, chunk_size, dim)
+    # n 是块的数量，c 是块的大小(64)
+    q = rearrange(q, 'b h (n c) d -&gt; b h n c d', c=chunk_size) * scale
+    k = rearrange(...)
+    v = rearrange(...)</code></p>
+<h4>💾 Task 3: 压缩记忆——制作“状态” (KV State)</h4>
+<p>在 Linear Attention 中，过去的信息不需要保留每一个单独的 Token，而是可以压缩成一个矩阵 $M = K^T V$。这个矩阵就是“记忆”。
+*   对于每一个小块（Chunk），我们算出这个块的“记忆浓缩”。
+*   <strong>代码对应</strong>：
+    <code>python
+    # 计算当前块的 K 和 V 的乘积。
+    # 这一步算出了每个块自己产生的“知识/记忆”。
+    kv = k.transpose(-1, -2) @ v</code></p>
+<h4>📚 Task 4: 历史传承——累积记忆 (Inter-Chunk)</h4>
+<p>这是最关键的一步。第 5 个块不仅要看第 5 块的内容，还得知道前 4 个块发生了什么。
+*   我们需要把前面所有块的记忆加起来（Cumulative Sum，前缀和）。
+*   <strong>注意细节</strong>：当我在读第 5 块时，我利用的是“第 1 到 4 块”累积下来的记忆，不能包含第 5 块自己的（因为自己的要在块内单独算）。所以代码里做了一个<strong>错位（Shift）</strong>操作。
+*   <strong>代码对应</strong>：
+    ```python
+    # 算出前缀和：第 i 个位置变成了 sum(0...i)
+    kv = kv.cumsum(2)
+    # 错位拼接：把第 i 个位置变成 sum(0...i-1)。
+    # 第 0 个块没有历史，所以补全为 0。
+    kv = torch.cat([torch.zeros_like(kv[:, :, :1]), kv[:, :, :-1]], dim=2)</p>
+<div class="codehilite"><pre><span></span><code># Inter (块间交互)：Query 查询的是“过去的历史记忆”
+inter = q @ kv
+```
+</code></pre></div>
+
+<h4>🔍 Task 5: 专注当下——块内注意力 (Intra-Chunk)</h4>
+<p>虽然我们有了历史记忆，但当前这一页（Chunk）内部的字与字之间也需要关联。
+*   这部分就是一个微型的、标准的 Causal Attention（加了 Mask，保证不能看后面的字）。
+*   <strong>代码对应</strong>：
+    <code>python
+    # 这一段就是一个标准的 Attention 公式：(Q @ K^T) @ V
+    # triu 是上三角掩码，用来做 Mask，保证只看当前字之前的字
+    intra = ((
+        q @ k.transpose(-1, -2)).masked_fill_(
+        torch.triu(torch.ones(chunk_size, chunk_size, ...), diagonal=1),
+        0
+    )) @ v</code></p>
+<h4>🧩 Task 6: 最终合体——输出结果</h4>
+<p>最后的输出由两部分组成：
+1.  <strong>来自历史的贡献</strong> (<code>inter</code>)：基于过去所有块的记忆算出来的结果。
+2.  <strong>来自当下的贡献</strong> (<code>intra</code>)：基于当前块内部关联算出来的结果。
+*   <strong>代码对应</strong>：
+    <code>python
+    o = inter + intra
+    # 最后把切开的块重新拼回长序列
+    return rearrange(o, 'b h n c d -&gt; b h (n c) d')</code></p>
+<hr />
+<h3>总结图解</h3>
+<p>想象你在读一本长篇小说：</p>
+<ol>
+<li><strong>Task 2 (Rearrange)</strong>: 把书按章节（Chunk）分开。</li>
+<li><strong>Task 3 (KV)</strong>: 读完每一章，写一个这一章的“剧情摘要”。</li>
+<li><strong>Task 4 (Inter / Cumsum)</strong>: 在读第 $N$ 章之前，你脑子里已经有了前 $N-1$ 章的“总剧情摘要”。你用这个总摘要来理解第 $N$ 章的背景（这叫 <code>inter</code>）。</li>
+<li><strong>Task 5 (Intra)</strong>: 在读第 $N$ 章的具体每一句话时，你还要联系这一章内部的前几句话（这叫 <code>intra</code>）。</li>
+<li><strong>Task 6 (Add)</strong>: 你对第 $N$ 章的理解 = <strong>之前的总背景</strong> + <strong>当前的上下文</strong>。</li>
+</ol>
+<p>这就是这段代码 <code>naive_chunk_linear_attn</code> 做的所有事情。</p>

@@ -1,0 +1,140 @@
+<h1>megatron/core/transformer/moe/experts.py</h1>
+<p>这份代码确实比较硬核，因为它涉及到了大模型训练中最底层的<strong>MoE（混合专家模型）</strong>的具体计算实现，而且用了很多并行计算和显存优化的技巧。</p>
+<p>为了让你读懂，我把阅读这份代码的任务拆解成一个 <strong>“学习 To-Do List”</strong>。我们按顺序一步步来，每一步只解决一个核心问题。</p>
+<hr />
+<h3>📋 任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>[概念理解]</strong> 搞懂这个文件到底是干嘛的？</li>
+<li><strong>[宏观分类]</strong> 区分文件里的三个核心类（三种不同的实现方式）。</li>
+<li><strong>[核心逻辑]</strong> 读懂最简单的实现：<code>SequentialMLP</code>（循环模式）。</li>
+<li><strong>[进阶逻辑]</strong> 读懂最高效的实现：<code>GroupedMLP</code>（融合模式）。</li>
+<li><strong>[工程细节]</strong> 了解 <code>sharded_state_dict</code> 是为了解决什么问题。</li>
+</ol>
+<hr />
+<h3>✅ 任务 1：[概念理解] 这个文件是干嘛的？</h3>
+<p><strong>背景：</strong>
+在 MoE 模型中，输入的数据（Token）会被路由（Router）分发给不同的“专家”（Expert）。每个“专家”本质上就是一个 <strong>MLP（多层感知机）</strong>，也就是两层全连接层（Linear -&gt; Activation -&gt; Linear）。</p>
+<p><strong>这个文件的作用：</strong>
+它定义了这些“专家”具体是怎么进行计算的。
+给定一堆已经被分配好去向的数据 <code>permuted_local_hidden_states</code> 和每个专家分到的数据量 <code>tokens_per_expert</code>，这个文件负责算出结果。</p>
+<hr />
+<h3>✅ 任务 2：[宏观分类] 三个核心类</h3>
+<p>代码里定义了三个类，它们功能一样，但<strong>性能和实现方式</strong>不同。你可以把它们想象成做同一道菜的三种厨师：</p>
+<ol>
+<li>
+<p><strong><code>SequentialMLP</code> (最后面那个类)</strong></p>
+<ul>
+<li><strong>外号：</strong> “老实人”。</li>
+<li><strong>做法：</strong> 写个 <code>for</code> 循环，一个专家一个专家地算。</li>
+<li><strong>特点：</strong> 代码最好懂，但速度慢（因为 GPU 不喜欢处理很多细碎的小任务）。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>GroupedMLP</code> (最前面那个类)</strong></p>
+<ul>
+<li><strong>外号：</strong> “高科技”。</li>
+<li><strong>做法：</strong> 使用 NVIDIA 的 CUTLASS 库里的 <code>GroupedGEMM</code> 技术。</li>
+<li><strong>特点：</strong> 把所有专家的计算合并成一个超大的 CUDA 内核一次性跑完，速度极快。这是 Megatron 优化的核心。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>TEGroupedMLP</code> (中间那个类)</strong></p>
+<ul>
+<li><strong>外号：</strong> “官方外挂”。</li>
+<li><strong>做法：</strong> 调用 NVIDIA Transformer Engine (TE) 库里的实现。</li>
+<li><strong>特点：</strong> 类似 GroupedMLP，但是用了 TE 库的封装，通常用于 FP8 等更高级的精度优化。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ 任务 3：[核心逻辑] 读懂 <code>SequentialMLP</code></h3>
+<p>先看代码最后的 <code>SequentialMLP</code>，这是最符合直觉的逻辑。</p>
+<ul>
+<li>
+<p><strong><code>__init__</code> (初始化):</strong></p>
+<ul>
+<li>它创建了一个 <code>self.local_experts = torch.nn.ModuleList()</code>。</li>
+<li>里面装了 <code>num_local_experts</code> 个标准的 <code>MLP</code> 层。</li>
+<li><strong>白话：</strong> 如果我有8个专家，我就实例化8个神经网络对象存起来。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>forward</code> (前向传播):</strong></p>
+<ul>
+<li><strong>输入：</strong> <code>permuted_local_hidden_states</code> (所有数据排好队拼在一起的大张量) 和 <code>tokens_per_expert</code> (一个列表，比如 <code>[10, 20, 5]</code> 表示专家1处理10个，专家2处理20个...)。</li>
+<li><strong>切片 (Slicing):</strong> 代码用了 <code>torch.cumsum</code> 计算切分点。</li>
+<li><strong>循环 (The Loop):</strong>
+    ```python
+    # 伪代码逻辑
+    for expert_idx, expert_layer in enumerate(self.local_experts):
+        # 1. 找出属于这个专家的数据片段
+        start = ...
+        end = ...
+        hidden = data[start:end]<div class="codehilite"><pre><span></span><code><span class="gh">#</span> 2. 让专家计算
+output = expert_layer(hidden)
+
+<span class="gh">#</span> 3. 把结果填回大张量
+output_local[start:end] = output
+</code></pre></div>
+
+<p>```
+    *   <strong>总结：</strong> 就像流水线，把数据切开，分别交给不同的工人处理，处理完再拼回去。</p>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ 任务 4：[进阶逻辑] 读懂 <code>GroupedMLP</code></h3>
+<p>这是这个文件的精华，也是最难懂的部分。它为了快，牺牲了代码的可读性。</p>
+<ul>
+<li>
+<p><strong><code>__init__</code>:</strong></p>
+<ul>
+<li>它<strong>没有</strong>创建 8 个 <code>MLP</code> 对象。</li>
+<li>它直接创建了两个巨大的参数矩阵：<code>self.weight1</code> 和 <code>self.weight2</code>。</li>
+<li>这两个矩阵包含了<strong>所有专家</strong>的权重。</li>
+<li><strong>注意：</strong> 这里用了 <code>gg.assert_grouped_gemm_is_available()</code>，说明它依赖底层的 C++ 算子。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>forward</code>:</strong></p>
+<ul>
+<li><strong>没有 for 循环！</strong></li>
+<li><strong>Reshape:</strong> <code>w1 = self.weight1.view(...)</code>。把大权重整理好形状。</li>
+<li><strong>核心算子 <code>gg.ops.gmm</code>:</strong>
+    <code>python
+    fc1_output = gg.ops.gmm(permuted_local_hidden_states, w1, tokens_per_expert, ...)</code><ul>
+<li><code>gmm</code> 代表 <strong>Grouped Matrix Multiplication</strong>。</li>
+<li>它告诉 GPU：“我有这一长串数据，和这一堆权重。请根据 <code>tokens_per_expert</code> 这个列表，自动帮我匹配哪段数据乘哪个权重，并且<strong>并行</strong>一次性算完。”</li>
+</ul>
+</li>
+<li><strong>流程：</strong><ol>
+<li><code>gmm</code> (第一层全连接)</li>
+<li><code>activation_func</code> (激活函数，如 SwiGLU)</li>
+<li><code>gmm</code> (第二层全连接)</li>
+</ol>
+</li>
+<li><strong>总结：</strong> 这种写法避免了 <code>SequentialMLP</code> 中 Python <code>for</code> 循环带来的 GPU 启动开销（Kernel Launch Overhead），在大模型训练中能带来巨大的速度提升。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ 任务 5：[工程细节] 读懂 <code>sharded_state_dict</code></h3>
+<p>你会发现每个类下面都有一个很长的 <code>sharded_state_dict</code> 方法。</p>
+<ul>
+<li><strong>问题：</strong> 我们在训练超大模型时，模型是切分（Sharding）存储在几百张显卡上的。保存检查点（Checkpoint）时，不能直接 <code>torch.save</code>，否则文件会乱套，或者内存爆掉。</li>
+<li><strong>解决：</strong> 这个方法是 Megatron 的分布式检查点机制。<ul>
+<li>它负责告诉保存程序：<strong>“我是第几号显卡，我手里存的是第几号专家的哪一部分权重，对应的全局位置在哪里。”</strong></li>
+<li>代码里的 <code>ReplicaId</code>、<code>ShardedTensor</code> 都是为了在保存和加载模型时，能正确地把破碎的权重拼回完整的样子，或者重新切分给不同数量的显卡。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结回顾</h3>
+<ol>
+<li><strong><code>experts.py</code></strong> 是 MoE 模型中负责“干活”的模块。</li>
+<li><strong><code>SequentialMLP</code></strong> 是教学版实现，用循环一个个算，慢。</li>
+<li><strong><code>GroupedMLP</code></strong> 是实战版实现，把权重拼在一起，用特殊算子一次性算，快。</li>
+<li><strong><code>sharded_state_dict</code></strong> 是为了在大规模集群上存取模型用的“地图”。</li>
+</ol>
+<p>建议你先看懂 <code>SequentialMLP</code> 的 <code>forward</code> 函数，理解 MoE 的基本数据流，然后再去硬啃 <code>GroupedMLP</code> 里的 <code>gmm</code> 调用。</p>

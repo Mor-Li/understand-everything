@@ -1,0 +1,117 @@
+<h1>megatron/core/models/common/embeddings/rotary_pos_embedding.py</h1>
+<p>这份代码看起来确实比较晦涩，因为它不仅包含<strong>数学公式（RoPE 旋转位置编码）</strong>，还混合了<strong>Megatron 的分布式训练逻辑（Context Parallelism）</strong>以及<strong>底层性能优化（Apex Fused Kernel）</strong>。</p>
+<p>为了让你看懂，我们可以把这个文件想象成一个<strong>“给大模型装配旋转位置编码（RoPE）的施工队”</strong>。</p>
+<p>我为你列了一个 <strong>Task To-Do List</strong>，我们按顺序一步步把这个任务完成，你就懂了。</p>
+<hr />
+<h3>🛠️ Task List: RoPE 施工流水线</h3>
+<ol>
+<li><strong>【备料】初始化频率 (Initialization)</strong><ul>
+<li><em>目标：</em> 准备好旋转的基础参数。</li>
+</ul>
+</li>
+<li><strong>【造尺子】生成位置编码矩阵 (Forward)</strong><ul>
+<li><em>目标：</em> 根据当前序列长度，造出对应的 cos 和 sin 矩阵。</li>
+</ul>
+</li>
+<li><strong>【切蛋糕】上下文并行处理 (Context Parallelism)</strong><ul>
+<li><em>目标：</em> 如果序列太长，多个 GPU 分着干，每个人只拿自己那一小段的尺子。</li>
+</ul>
+</li>
+<li><strong>【核心工艺】执行旋转 (Rotate Half &amp; Apply)</strong><ul>
+<li><em>目标：</em> 把输入的数据（Query/Key）按公式进行数学变换。</li>
+</ul>
+</li>
+<li><strong>【总调度】自动选择工具 (Dispatcher)</strong><ul>
+<li><em>目标：</em> 决定是用慢一点的 Python 算，还是调用底层超快的 CUDA 加速算。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>1. 【备料】初始化频率 (<code>__init__</code>)</h4>
+<p>RoPE 的核心思想是把向量两两分组进行旋转。旋转的角度取决于位置（Position）和频率（Frequency）。</p>
+<ul>
+<li><strong>代码位置：</strong> <code>class RotaryEmbedding</code> -&gt; <code>__init__</code></li>
+<li><strong>他在干啥：</strong><ul>
+<li><code>dim</code>: 拿到每个注意力头（Head）的维度。</li>
+<li><code>inv_freq</code>: 计算一个“频率表”。公式是 $1 / 10000^{2i/d}$。你可以理解为：向量中不同维度的元素，旋转的速度是不一样的。有的转得快，有的转得慢。</li>
+<li>这一步只是算好这些固定的数字，存起来备用。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 【造尺子】生成位置编码矩阵 (<code>forward</code>)</h4>
+<p>现在数据来了，假设长度是 <code>max_seq_len</code>（比如 4096），我们需要给这 4096 个位置每个都生成对应的旋转角度。</p>
+<ul>
+<li><strong>代码位置：</strong> <code>class RotaryEmbedding</code> -&gt; <code>forward</code></li>
+<li><strong>他在干啥：</strong><ol>
+<li><code>seq</code>: 生成一个序列 <code>[0, 1, 2, ..., max_seq_len-1]</code>。</li>
+<li><code>freqs = torch.outer(seq, self.inv_freq)</code>: 核心一步。把<strong>位置</strong>和<strong>频率</strong>相乘，得到每个位置、每个维度对应的<strong>角度</strong>。</li>
+<li><code>emb</code>: 这里生成了 <code>cos</code> 和 <code>sin</code> 需要用到的角度表。<ul>
+<li>代码里有一个 <code>rotary_interleaved</code> 判断：</li>
+<li><strong>False (默认)</strong>: 也就是 <code>[x, x]</code> 模式，前半部分和后半部分对应。</li>
+<li><strong>True</strong>: 也就是 <code>[x1, x2, x1, x2]</code> 交叉模式。</li>
+</ul>
+</li>
+<li><strong>结果：</strong> 返回一个 <code>emb</code> 张量，形状大概是 <code>[seq_len, 1, 1, dim]</code>，这就是一把做好的“尺子”。</li>
+</ol>
+</li>
+</ul>
+<h4>3. 【切蛋糕】上下文并行处理 (<code>get_pos_emb_on_this_cp_rank</code>)</h4>
+<p>这是 <strong>Megatron</strong> 特有的逻辑。假设你的输入序列特别长（比如 100k tokens），一张显卡存不下，需要用 <strong>Context Parallel (CP)</strong> 技术，把序列切开给多个显卡。</p>
+<ul>
+<li><strong>代码位置：</strong> <code>get_pos_emb_on_this_cp_rank</code> 和 <code>forward</code> 结尾处。</li>
+<li><strong>他在干啥：</strong><ul>
+<li>如果 <code>parallel_state.get_context_parallel_world_size() &gt; 1</code>，说明开启了 CP 并行。</li>
+<li>比如序列长 8000，开了 2 个 GPU。<ul>
+<li>GPU 0 负责处理第 0-4000 个 token。</li>
+<li>GPU 1 负责处理第 4001-8000 个 token。</li>
+</ul>
+</li>
+<li><strong>关键点：</strong> <code>RotaryEmbedding</code> 一开始生成了完整的 0-8000 的“尺子”。这个函数的作用是：<strong>GPU 1 说“把我的那一段（4001-8000）切给我，前面的我不要”</strong>。</li>
+<li>这样每个 GPU 拿到的位置编码，就能跟它手上拿到的那部分数据对齐了。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 【核心工艺】执行旋转 (<code>_rotate_half</code> &amp; <code>apply_...</code>)</h4>
+<p>这是 RoPE 的数学本体。公式是：
+$$f(x) = x \cdot \cos(\theta) + \text{rotate}(x) \cdot \sin(\theta)$$
+其中 $\text{rotate}(x)$ 就是把向量 <code>[a, b]</code> 变成 <code>[-b, a]</code>。</p>
+<ul>
+<li><strong>代码位置：</strong> <code>_rotate_half</code> 和 <code>apply_rotary_pos_emb_bshd</code></li>
+<li><strong>Task 4.1: <code>_rotate_half</code></strong><ul>
+<li>它把输入向量切成两半 <code>x1, x2</code>，然后拼接成 <code>[-x2, x1]</code>。这就是在做 90 度旋转的准备工作。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 4.2: <code>apply_rotary_pos_emb_bshd</code></strong></p>
+<ul>
+<li>输入 <code>t</code> (你的 Query 或 Key)。</li>
+<li>计算 <code>cos</code> 和 <code>sin</code>。</li>
+<li><strong>核心计算：</strong> <code>(t * cos_) + (_rotate_half(t) * sin_)</code>。</li>
+<li>这就是把位置信息“注入”到你的向量里去了。</li>
+</ul>
+<p><em>注：代码里还有一个 <code>apply_rotary_pos_emb_thd</code>，这是针对 "Packed Sequence"（去掉了 padding 的紧凑格式）的处理，逻辑一样，只是数据形状不同。</em></p>
+</li>
+</ul>
+<h4>5. 【总调度】自动选择工具 (<code>apply_rotary_pos_emb</code>)</h4>
+<p>最后，这个是外部调用的入口函数。</p>
+<ul>
+<li><strong>代码位置：</strong> 文件最底部的 <code>apply_rotary_pos_emb</code></li>
+<li><strong>他在干啥：</strong><ul>
+<li>它像一个工头。</li>
+<li><strong>检查工具：</strong> 看看有没有安装 NVIDIA 的 <code>apex</code> 库（<code>HAVE_APPLY_ROPE_FUSION</code>）。</li>
+<li><strong>分支选择：</strong><ul>
+<li><strong>方案 A (Fused):</strong> 如果有 <code>apex</code> 且配置开启，直接调用 <code>fused_apply_rotary_pos_emb</code>。这是 C++ 写好的 CUDA kernel，速度极快，一步到位。</li>
+<li><strong>方案 B (Unfused):</strong> 如果没有，就调用上面定义的 Python 函数 (<code>apply_rotary_pos_emb_bshd</code>)，虽然慢一点，但逻辑清晰，哪里都能跑。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码在讲什么？</h3>
+<p>这段代码定义了一个 <strong>RoPE 模块</strong>，它的独特之处在于：
+1.  <strong>能算：</strong> 实现了标准的 RoPE 旋转数学逻辑。
+2.  <strong>能分：</strong> 能够处理 <strong>Context Parallel</strong>，支持超长序列在多卡间切分时的位置对齐（<code>get_pos_emb_on_this_cp_rank</code>）。
+3.  <strong>能快：</strong> 只要环境允许，它会自动切换到 <strong>Apex Fused Kernel</strong> 进行加速。</p>
+<p>你看懂这个 List，再回头看代码，就会发现它只是把这些步骤翻译成了 Python 而已。</p>

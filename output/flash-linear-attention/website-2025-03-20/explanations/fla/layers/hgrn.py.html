@@ -1,0 +1,113 @@
+<h1>fla/layers/hgrn.py</h1>
+<p>这份代码确实比较硬核，它实现的是 <strong>HGRN (Hierarchically Gated Recurrent Neural Network)</strong>，一种试图结合 Transformer 的并行训练能力和 RNN 的快速推理能力的模型（通常被称为 Linear RNN 或 SSM 类模型）。</p>
+<p>为了让你读懂，我们不直接扣每一行代码，而是把它拆解成一个<strong>学习任务清单 (To-Do List)</strong>。我们可以把这个层想象成一个<strong>“信息加工流水线”</strong>。</p>
+<p>以下是你的学习路径：</p>
+<h3>📝 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1: 理解核心概念 (The "Why")</strong> - 搞清楚这个模块到底想干什么（输入是什么，输出是什么）。</li>
+<li><strong>Task 2: 拆解输入加工 (Pre-processing)</strong> - 看懂 <code>__init__</code> 里的投影层 (<code>proj</code>) 是怎么把输入数据分流的。</li>
+<li><strong>Task 3: 理解局部混合 (Short Conv)</strong> - 搞懂为什么要加一个“短卷积”。</li>
+<li><strong>Task 4: 核心门控逻辑 (The Gating)</strong> - 這是 HGRN 的灵塊，看懂 <code>i</code> (输入) 和 <code>f</code> (遗忘) 是怎么算出来的。</li>
+<li><strong>Task 5: 记忆更新 (Recurrence)</strong> - 理解 <code>chunk_hgrn</code> 和 <code>fused_recurrent</code> 是怎么更新“记忆”的。</li>
+<li><strong>Task 6: 输出与标准化 (Output)</strong> - 看最后怎么把数据整合输出。</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 1: 理解核心概念 (The "Why")</h4>
+<p><strong>核心思想：</strong>
+传统的 RNN (如 LSTM) 是一步一步走的，很慢；Transformer 是并行计算的，很快但推理时显存占用大。HGRN 这种模型试图“既要又要”：
+*   <strong>训练时</strong>：像 Transformer 一样并行（用 <code>chunk</code> 模式）。
+*   <strong>推理时</strong>：像 RNN 一样省内存（用 <code>fused_recurrent</code> 模式）。</p>
+<p><strong>代码对应：</strong>
+整个类 <code>HGRNAttention</code> 就是 Transformer 中的一个 Layer（类似 Self-Attention 层），输入是 <code>hidden_states</code> (形状通常是 <code>[batch, seq_len, dim]</code>)，输出也是同样形状的张量。</p>
+<h4>Task 2: 拆解输入加工 (Pre-processing)</h4>
+<p>在 RNN 里，我们需要决定：有多少信息要<strong>记住</strong>，有多少要<strong>遗忘</strong>，有多少要<strong>输出</strong>。</p>
+<p><strong>代码对应 (<code>__init__</code> 和 <code>forward</code> 开头):</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 定义了三个线性层（全连接层）</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">i_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># Input: 负责提取“新知识”</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">f_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># Forget: 负责计算“遗忘率”（或者叫衰减率）</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">g_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># Gate/Output: 负责计算“输出门”（决定最后输出多少）</span>
+
+<span class="c1"># forward 中：</span>
+<span class="n">i</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">i_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+<span class="n">f</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">f_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+</code></pre></div>
+
+<p>你可以把 <code>hidden_states</code> 想象成一句话，这三个投影层分别从这句话里提取不同的特征。</p>
+<h4>Task 3: 理解局部混合 (Short Conv)</h4>
+<p>在做长期的记忆更新之前，模型通常希望能先看看“邻居”的信息。比如理解单词 "not"，最好能看到后面的 "good"。</p>
+<p><strong>代码对应:</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_short_conv</span><span class="p">:</span>
+    <span class="c1"># 这是一个一维卷积，窗口很小（比如 conv_size=4）</span>
+    <span class="c1"># 它的作用是：在进入 RNN 核心逻辑前，先把当前词和它前面几个词混合一下。</span>
+    <span class="n">i</span><span class="p">,</span> <span class="n">conv_state_i</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">i_conv1d</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="n">f</span><span class="p">,</span> <span class="n">conv_state_f</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">f_conv1d</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>目的</strong>：增强局部特征的提取能力，让 RNN 专注于长距离依赖，短距离的交给卷积搞定。</li>
+<li><strong>KV Cache</strong>: 代码里出现的 <code>conv_state</code> 是为了在生成文本时，不用每次都重新计算卷积，而是缓存之前的状态。</li>
+</ul>
+<h4>Task 4: 核心门控逻辑 (The Gating) - <strong>最难点</strong></h4>
+<p>这是 HGRN 论文的核心数学部分。它定义了如何生成“输入信号”和“遗忘门”。</p>
+<p><strong>代码对应:</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 下界处理：为了数值稳定性，防止梯度消失，给遗忘门设一个下限</span>
+<span class="k">if</span> <span class="n">lower_bound</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">layer_idx</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+    <span class="c1"># 这里的 swiglu 是激活函数，用来处理输入 i</span>
+    <span class="c1"># 1 - f.sigmoid() 是控制输入有多少能进入记忆</span>
+    <span class="c1"># F.logsigmoid(f) 是把 f 变成对数域，方便后续计算</span>
+    <span class="n">i</span><span class="p">,</span> <span class="n">f</span> <span class="o">=</span> <span class="n">swiglu</span><span class="p">(</span><span class="n">i</span><span class="p">,</span> <span class="mi">1</span> <span class="o">-</span> <span class="n">f</span><span class="o">.</span><span class="n">sigmoid</span><span class="p">()),</span> <span class="n">F</span><span class="o">.</span><span class="n">logsigmoid</span><span class="p">(</span><span class="n">f</span><span class="p">)</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="c1"># 如果有 lower_bound，公式会稍微复杂一点，强行把 f 限制在一定范围内</span>
+    <span class="n">g</span> <span class="o">=</span> <span class="n">lower_bound</span> <span class="o">+</span> <span class="p">(</span><span class="mi">1</span> <span class="o">-</span> <span class="n">lower_bound</span><span class="p">)</span> <span class="o">*</span> <span class="n">f</span><span class="o">.</span><span class="n">sigmoid</span><span class="p">()</span>
+    <span class="n">i</span><span class="p">,</span> <span class="n">f</span> <span class="o">=</span> <span class="n">swiglu</span><span class="p">(</span><span class="n">i</span><span class="p">,</span> <span class="mi">1</span> <span class="o">-</span> <span class="n">g</span><span class="p">),</span> <span class="n">g</span><span class="o">.</span><span class="n">log</span><span class="p">()</span>
+</code></pre></div>
+
+<p><strong>通俗解释：</strong>
+*   <strong><code>f</code> (Forget Gate)</strong>: 决定了上一时刻的记忆 $h_{t-1}$ 有多少能留到现在的 $h_t$。如果 <code>f</code> 接近 0，说明要忘掉过去；如果接近 1，说明要记住。
+*   <strong><code>i</code> (Input)</strong>: 这是当前时刻经过筛选后的新信息，准备加到记忆里去。</p>
+<h4>Task 5: 记忆更新 (Recurrence) - <strong>核心引擎</strong></h4>
+<p>这一步是真正的 RNN 步骤：$h_t = h_{t-1} \cdot f_t + i_t$ (记忆 = 旧记忆 $\times$ 衰减 + 新信息)。</p>
+<p><strong>代码对应:</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># mode 决定了计算方式</span>
+<span class="k">if</span> <span class="n">mode</span> <span class="o">==</span> <span class="s1">&#39;chunk&#39;</span><span class="p">:</span>
+    <span class="c1"># 训练时用。把序列切成小块（Chunk），并行计算，速度快。</span>
+    <span class="c1"># 这是一个高度优化的 CUDA kernel 封装。</span>
+    <span class="n">o</span><span class="p">,</span> <span class="n">recurrent_state</span> <span class="o">=</span> <span class="n">chunk_hgrn</span><span class="p">(</span><span class="n">i</span><span class="p">,</span> <span class="n">f</span><span class="p">,</span> <span class="n">recurrent_state</span><span class="p">,</span> <span class="n">use_cache</span><span class="p">)</span>
+
+<span class="k">elif</span> <span class="n">mode</span> <span class="o">==</span> <span class="s1">&#39;fused_recurrent&#39;</span><span class="p">:</span>
+    <span class="c1"># 推理时（或者序列很短时）用。</span>
+    <span class="c1"># 标准的 RNN 循环模式，一个 token 一个 token 地算。</span>
+    <span class="n">o</span><span class="p">,</span> <span class="n">recurrent_state</span> <span class="o">=</span> <span class="n">fused_recurrent_hgrn</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p>这一步算出来的 <code>o</code> 是还没有经过最终处理的 RNN 输出。</p>
+<h4>Task 6: 输出与标准化 (Output)</h4>
+<p>RNN 算出来的结果通常数值范围很不稳定，而且需要结合最开始计算的 <code>g</code> (Output Gate) 来决定最终输出。</p>
+<p><strong>代码对应:</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># g_norm 是一个融合层：</span>
+<span class="c1"># 1. 对 RNN 的输出 o 进行 RMSNorm (标准化)</span>
+<span class="c1"># 2. 乘以 swish(g_proj(hidden_states)) (门控机制)</span>
+<span class="n">o</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">g_norm</span><span class="p">(</span><span class="n">o</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">g_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">))</span>
+
+<span class="c1"># 最后通过一个线性层把维度投射回去，完成这一层的计算</span>
+<span class="n">o</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">o_proj</span><span class="p">(</span><span class="n">o</span><span class="p">)</span>
+</code></pre></div>
+
+<h3>总结：数据流向图</h3>
+<ol>
+<li><strong>输入</strong> (<code>hidden_states</code>)
+    ↓</li>
+<li><strong>分流</strong> (变成 <code>i</code>, <code>f</code>, <code>g</code> 三路信号)
+    ↓</li>
+<li><strong>短卷积</strong> (可选，<code>i</code> 和 <code>f</code> 稍微混合一下局部信息)
+    ↓</li>
+<li><strong>激活与门控</strong> (计算最终的输入强度和遗忘速率)
+    ↓</li>
+<li><strong>HGRN 核心</strong> (并行 Chunk 或 串行 Recurrent 计算，更新记忆状态)
+    ↓</li>
+<li><strong>输出门控</strong> (将 RNN 结果与 <code>g</code> 结合，并标准化)
+    ↓</li>
+<li><strong>输出投影</strong> (<code>o_proj</code>，得到最终结果)</li>
+</ol>
+<p>现在回头看代码，是不是稍微清晰一点了？它本质上就是一个<strong>带有复杂门控机制和特殊并行技巧的 RNN 层</strong>。</p>

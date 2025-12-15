@@ -1,0 +1,87 @@
+<h1>tests/unit_tests/tensor_parallel/test_cross_entropy.py</h1>
+<p>这份代码确实涉及到了深度学习中比较高阶的<strong>分布式训练（Distributed Training）</strong>概念，特别是<strong>张量并行（Tensor Parallelism）</strong>。如果你没有这方面的背景，看不懂是非常正常的。</p>
+<p>别担心，我们把它拆解成一个学习任务清单（TODO List），像剥洋葱一样一步步来看。</p>
+<h3>你的学习任务清单 (TODO List)</h3>
+<p>为了读懂这段代码，我们需要按顺序完成以下 5 个任务：</p>
+<ol>
+<li><strong>Task 1: 搞清楚“我们在测什么？”（目标定位）</strong></li>
+<li><strong>Task 2: 理解“模拟环境”（初始化）</strong></li>
+<li><strong>Task 3: 看懂“输入数据”（Logits 和 Target）</strong></li>
+<li><strong>Task 4: 理解核心魔法（Vocab Parallel Cross Entropy）</strong></li>
+<li><strong>Task 5: 验证结果（断言）</strong></li>
+</ol>
+<hr />
+<h3>详细讲解</h3>
+<h4>✅ Task 1: 搞清楚“我们在测什么？”</h4>
+<p><strong>概念</strong>：这是一个<strong>单元测试（Unit Test）</strong>文件。
+<strong>目的</strong>：它的唯一目的是验证 <code>vocab_parallel_cross_entropy</code> 这个函数算出来的结果是否正确。
+<strong>背景</strong>：在训练像 GPT 这样的大模型时，词表（Vocabulary）非常大（比如 5 万、10 万个词）。为了省显存，我们把词表切成好几份，放在不同的 GPU 上。这个函数就是用来在<strong>切分状态下</strong>计算交叉熵损失（Cross Entropy Loss）的。</p>
+<h4>✅ Task 2: 理解“模拟环境”</h4>
+<p>代码行：<code>Utils.initialize_model_parallel(4,2)</code></p>
+<ul>
+<li><strong>发生了什么</strong>：
+    这段代码在“假装”我们现在有多个 GPU。<ul>
+<li>参数 <code>4</code> (Tensor Model Parallel Size)：表示我们将模型切分成了 4 份（TP=4）。</li>
+<li>这意味着，原本完整的词表被切成了 4 块，当前的进程只负责其中 1 块。</li>
+</ul>
+</li>
+<li><strong>通俗理解</strong>：
+    想象一本很厚的字典，太重了，一个人拿不动。我们把它撕成 4 本薄字典，分给 4 个人拿。这个测试就是在模拟其中一个人的环境。</li>
+</ul>
+<h4>✅ Task 3: 看懂“输入数据”</h4>
+<p>这里准备了两个核心数据：<strong>预测值 (Logits)</strong> 和 <strong>真实标签 (Target)</strong>。</p>
+<p><strong>1. 预测值 (<code>vocab_parallel_logits</code>)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">vocab_parallel_logits</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="mi">7</span><span class="p">)</span><span class="o">.</span><span class="n">repeat</span><span class="p">(</span><span class="mi">16</span><span class="p">,</span><span class="mi">4</span><span class="p">)</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span>
+</code></pre></div>
+
+<ul>
+<li><code>torch.range(0,7)</code>: 生成 <code>[0, 1, 2, 3, 4, 5, 6, 7]</code> (共8个数)。</li>
+<li><code>.repeat(16, 4)</code>: 把它变成一个矩阵。<ul>
+<li><strong>行数 (Batch Size)</strong>: 16 (一次处理16句话)。</li>
+<li><strong>列数 (Local Vocab Size)</strong>: $8 \times 4 = 32$。</li>
+</ul>
+</li>
+<li><strong>关键点</strong>：注意这里列数是 32。因为 TP=4（Task 2 中设置的），这意味着<strong>全局（Global）</strong>的词表大小其实是 $32 \times 4 = 128$。当前的 GPU 只看到了属于它的那 32 个预测分数。</li>
+</ul>
+<p><strong>2. 真实标签 (<code>target</code>)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">target</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="mi">32</span><span class="p">,</span><span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">cuda</span><span class="p">()</span>
+</code></pre></div>
+
+<ul>
+<li>生成 <code>[0, 2, 4, ..., 30]</code>。</li>
+<li>这代表这 16 个样本对应的真实单词的 ID。</li>
+</ul>
+<h4>✅ Task 4: 理解核心魔法</h4>
+<p>代码行：<code>output = vocab_parallel_cross_entropy(vocab_parallel_logits, target)</code></p>
+<p>这是全篇最重要的一行。</p>
+<ul>
+<li><strong>普通 Cross Entropy</strong>：拿到所有单词的分数 -&gt; 算 Softmax -&gt; 算 Loss。</li>
+<li><strong>Vocab Parallel Cross Entropy (本文主角)</strong>：
+    由于每个 GPU 只有<strong>一部分</strong>单词的分数（比如 GPU 1 只有单词 0-31 的分数，GPU 2 有 32-63 的分数...），单个 GPU 无法直接做 Softmax（因为 Softmax 需要全部分数的总和）。</li>
+<li><strong>这个函数在做什么</strong>：
+    它会在后台悄悄地把所有 GPU 的最大值和总和进行通信（All-Reduce），算出正确的 Loss，<strong>就好像词表从来没有被切分过一样</strong>。</li>
+</ul>
+<h4>✅ Task 5: 验证结果</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">expected_output</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="o">...</span><span class="p">])</span> <span class="c1"># 一串硬编码的数字</span>
+<span class="k">assert</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">equal</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">round</span><span class="p">(</span><span class="n">expected_output</span><span class="p">),</span> <span class="n">torch</span><span class="o">.</span><span class="n">round</span><span class="p">(</span><span class="n">output</span><span class="p">)))</span>
+</code></pre></div>
+
+<ul>
+<li><strong>发生了什么</strong>：程序员预先算好了一个“标准答案”（<code>expected_output</code>）。</li>
+<li><strong>测试逻辑</strong>：如果 <code>vocab_parallel_cross_entropy</code> 算出来的 <code>output</code> 和“标准答案”一样，说明函数写对了，测试通过。如果不一样，程序报错，说明函数有 Bug。</li>
+<li><strong>Cleanup</strong>: <code>Utils.destroy_model_parallel()</code> 也就是打扫战场，关闭模拟的分布式环境。</li>
+</ul>
+<hr />
+<h3>总结：这段代码在讲个什么故事？</h3>
+<p>用大白话把整个流程串一遍：</p>
+<ol>
+<li><strong>（环境）</strong> 嘿，电脑，假装我们现在有 4 个 GPU 在并行工作。</li>
+<li><strong>（数据）</strong> 我手里有一部分预测分数（Logits），形状是 16x32。还有 16 个正确的答案 ID。</li>
+<li><strong>（动作）</strong> 也就是这一行 <code>output = ...</code>：请用那个<strong>“并行版交叉熵算法”</strong>帮我算一下 Loss 应该是多少。</li>
+<li><strong>（检查）</strong> 算出来的结果是不是 <code>[10.2309, 8.2309...]</code> 这一串？<ul>
+<li>如果是：OK，代码没毛病。</li>
+<li>如果不是：出事了，算法写错了。</li>
+</ul>
+</li>
+</ol>
+<p><strong>你看不懂的核心原因</strong>可能在于 <code>vocab_parallel</code> 这个概念。只要记住：<strong>在大模型训练中，为了存得下巨大的词表，我们把它切碎了分给不同显卡，这个函数就是用来处理这种切碎数据的数学计算的。</strong></p>

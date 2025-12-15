@@ -1,0 +1,119 @@
+<h1>megatron/core/dist_checkpointing/strategies/two_stage.py</h1>
+<p>这份代码确实比较硬核，因为它涉及到了<strong>分布式深度学习系统</strong>中最底层的“模型加载”逻辑。</p>
+<p>简单来说，这个文件的核心目的是：<strong>为了防止成百上千个 GPU 同时读取硬盘把文件系统搞崩，我们采用“一人读取，全组共享”的策略。</strong></p>
+<p>这就是所谓的 <strong>Two-Stage（两阶段）</strong>：
+1.  <strong>Stage 1（读取）</strong>：只有少数几个“组长”去硬盘读文件。
+2.  <strong>Stage 2（分发）</strong>：“组长”通过网络把读到的数据广播（Broadcast）给组员。</p>
+<p>下面我按照你的要求，列一个 <strong>Task Todo List</strong>，并结合代码逐步讲解。</p>
+<hr />
+<h3>核心任务清单 (Task Todo List)</h3>
+<p>想象你是指挥官，要指挥一群 GPU 加载一个巨大的模型，你的步骤如下：</p>
+<ol>
+<li>
+<p><strong>[准备阶段] 建立通讯群组</strong></p>
+<ul>
+<li>把 GPU 按照“数据并行（Data Parallel）”分组。比如 0,1,2,3 是一组，它们需要加载一模一样的模型参数。</li>
+<li><em>对应代码：<code>__init__</code>, <code>maybe_init_gloo_group</code></em></li>
+</ul>
+</li>
+<li>
+<p><strong>[计划阶段] 统计需求与分工 (Build Load Plan)</strong></p>
+<ul>
+<li>让每张显卡汇报自己需要哪些参数（Tensor）。</li>
+<li><strong>去重（Deduplicate）</strong>：既然大家需要的参数都一样，没必要每个人都去读硬盘。</li>
+<li><strong>指派任务</strong>：指定每组里 ID 最小的那张卡（Rank 0）作为“搬运工”，负责去硬盘读数据，其他人等着。</li>
+<li><em>对应代码：<code>_build_load_plan</code>, <code>deduplicate_chunks</code></em></li>
+</ul>
+</li>
+<li>
+<p><strong>[执行阶段] 循环加载与分发 (Exchange Loop)</strong></p>
+<ul>
+<li>遍历每一个需要加载的参数：<ul>
+<li><strong>Step A (读取)</strong>：如果你是被指派的“搬运工”，从硬盘读取文件到内存。</li>
+<li><strong>Step B (准备)</strong>：如果你是“等待者”，申请一块空的内存准备接收。</li>
+<li><strong>Step C (广播)</strong>：通过网络（<code>torch.distributed.broadcast</code>），搬运工把数据发给所有人。</li>
+<li><strong>Step D (填入)</strong>：大家把收到的数据填入自己的模型里。</li>
+<li><strong>Step E (清理)</strong>：释放临时内存，准备下一个参数。</li>
+</ul>
+</li>
+<li><em>对应代码：<code>_exchange_loaded_tensors</code></em></li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>逐步详细讲解</h3>
+<p>下面我把代码拆解开，对应上面的清单给你讲。</p>
+<h4>1. 准备阶段：建立群组</h4>
+<p>在 <code>__init__</code> 和 <code>load</code> 方法的开头。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 代码片段</span>
+<span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">data_parallel_group</span><span class="p">,</span> <span class="n">cpu_transfer</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
+    <span class="c1"># ... 省略 ...</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">cpu_transfer</span> <span class="o">=</span> <span class="n">cpu_transfer</span> <span class="c1"># 标记是否先加载到 CPU 内存（防止 GPU 显存爆了）</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">maybe_init_gloo_group</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="c1"># 建立基于 CPU 通信的 Gloo 组。</span>
+    <span class="c1"># 因为如果模型很大，直接在 GPU 之间传可能会 OOM (Out of Memory)，</span>
+    <span class="c1"># 所以这里支持先在 CPU 内存里传，虽然慢点但稳。</span>
+</code></pre></div>
+
+<p><strong>观点：</strong> 这里体现了<strong>稳定性优先</strong>。加载 Checkpoint 时，显存通常很紧张，所以代码里特意设计了 <code>cpu_transfer</code> 模式，利用 CPU 内存做缓冲。</p>
+<h4>2. 计划阶段：谁来干活？</h4>
+<p>这是 <code>load</code> 函数调用的 <code>_build_load_plan</code>。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 代码片段</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_build_load_plan</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">sharded_state_dict</span><span class="p">):</span>
+    <span class="c1"># 1. 每个人看看自己缺啥数据 (local_meta)</span>
+    <span class="c1"># 2. 把大家的需求汇总在一起 (all_gather_object)</span>
+    <span class="c1"># 3. 去重并分配任务 (deduplicate_chunks)</span>
+    <span class="k">return</span> <span class="n">all_tensors_sorted</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">deduplicate_chunks</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">ten_metas</span><span class="p">):</span>
+    <span class="c1"># 这里的逻辑是：</span>
+    <span class="c1"># 既然大家都在一个数据并行组里，需要的参数是一样的。</span>
+    <span class="c1"># 比如 Tensor A，Rank 0,1,2,3 都需要。</span>
+    <span class="c1"># 代码里用了 min 函数：选 rank 最小的那个人（Rank 0）去负责加载。</span>
+    <span class="c1"># 这样就避免了 4 个人同时去读同一个文件。</span>
+</code></pre></div>
+
+<p><strong>观点：</strong> 这是<strong>IO 优化</strong>的关键。如果不做这一步，几千张卡同时读文件系统（Lustre/NFS），存储瞬间就会卡死。这里把 N 次读取变成了 1 次读取 + N 次网络传输。</p>
+<h4>3. 执行阶段：一手交钱，一手交货</h4>
+<p>这是最核心的函数 <code>_exchange_loaded_tensors</code>。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 代码片段</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_exchange_loaded_tensors</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">ten_metas</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+    <span class="k">for</span> <span class="n">ten_meta</span> <span class="ow">in</span> <span class="n">ten_metas</span><span class="p">:</span> <span class="c1"># 遍历每一个要加载的参数</span>
+
+        <span class="c1"># 算出谁是这次任务的源头（src_rank）</span>
+        <span class="n">src_rank</span> <span class="o">=</span> <span class="o">...</span> 
+
+        <span class="c1"># === Step A: 读取 ===</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">dp_group_rank</span> <span class="o">==</span> <span class="n">ten_meta</span><span class="o">.</span><span class="n">dist_group_rank</span><span class="p">:</span>
+            <span class="c1"># 如果我是被选中的那个“搬运工”</span>
+            <span class="c1"># 我去读硬盘！</span>
+            <span class="n">exchange_tensor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">load_tensor_from_storage</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="c1"># === Step B: 准备 ===</span>
+            <span class="c1"># 如果我是“等待者”</span>
+            <span class="c1"># 我造一个空的 Tensor 等着接数据</span>
+            <span class="n">exchange_tensor</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+        <span class="c1"># === Step C: 广播 ===</span>
+        <span class="c1"># 这是 PyTorch 分布式通信的核心指令。</span>
+        <span class="c1"># src_rank 手里的数据会被复制并通过网络发给组里所有人。</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">distributed</span><span class="o">.</span><span class="n">broadcast</span><span class="p">(</span><span class="n">exchange_tensor</span><span class="p">,</span> <span class="n">src</span><span class="o">=</span><span class="n">src_rank</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+        <span class="c1"># === Step D: 填入 ===</span>
+        <span class="c1"># 把收到的 exchange_tensor 数据，塞进模型真正的参数位置</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_distribute_data_to_state_dict</span><span class="p">(</span><span class="n">ten_meta</span><span class="p">,</span> <span class="n">exchange_tensor</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+        <span class="c1"># === Step E: 清理 ===</span>
+        <span class="n">exchange_tensor</span> <span class="o">=</span> <span class="kc">None</span> <span class="c1"># 扔掉临时数据，省内存</span>
+</code></pre></div>
+
+<p><strong>观点：</strong>
+1.  <strong>串行化处理</strong>：注意它是放在 <code>for</code> 循环里的，一个 Tensor 一个 Tensor 地处理。为什么不一起读？为了<strong>省内存</strong>。读一个，发一个，扔一个。
+2.  <strong>网络换磁盘带宽</strong>：在高性能计算集群里，GPU 之间的网络带宽（NVLink/InfiniBand）通常比磁盘带宽大得多。这个策略就是用网络流量换取了磁盘的安宁。</p>
+<h3>总结</h3>
+<p>这个文件的逻辑就是：</p>
+<blockquote>
+<p><strong>不要大家一窝蜂去抢着读硬盘。排好队，选个代表去读，读完用局域网发给大家。为了防止显存不够，我们最好在 CPU 内存里倒腾这一手。</strong></p>
+</blockquote>
+<p>这就是所谓的 <strong>Two-Stage（两阶段）加载策略</strong>。</p>

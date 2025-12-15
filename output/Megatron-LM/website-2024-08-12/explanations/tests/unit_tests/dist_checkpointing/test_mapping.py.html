@@ -1,0 +1,137 @@
+<h1>tests/unit_tests/dist_checkpointing/test_mapping.py</h1>
+<p>完全没问题。这段代码看起来确实很晦涩，因为它属于<strong>底层基础设施代码</strong>。它是 NVIDIA Megatron-LM（一个训练超大模型的库）的一部分，专门处理<strong>分布式检查点（Distributed Checkpointing）</strong>。</p>
+<p>简单来说，当一个巨大的 AI 模型（比如 GPT）大到一张显卡装不下时，我们需要把它切碎（切分/Sharding）放在很多张显卡上。这个文件测试的就是：<strong>如何把这些切碎的小块（Shards）正确地描述清楚，以便保存和加载。</strong></p>
+<p>为了让你看懂，我制定了一个<strong>学习任务清单 (To-Do List)</strong>。我们将分 5 个步骤，由浅入深地拆解这个文件。</p>
+<hr />
+<h3>📋 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1: 理解核心概念 <code>ShardedTensor</code> (什么是碎片？)</strong></li>
+<li><strong>Task 2: 搞懂坐标系 (如何描述碎片的位置？)</strong></li>
+<li><strong>Task 3: 处理特殊情况 (扁平化数据)</strong></li>
+<li><strong>Task 4: 安全检查 (防止数据对不上)</strong></li>
+<li><strong>Task 5: 高级功能 (工厂模式与合并)</strong></li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 1: 理解核心概念 <code>ShardedTensor</code></h4>
+<p><strong>目标：</strong> 看懂 <code>test_from_rank_offsets_constructor</code> 测试函数的前半部分。</p>
+<p><strong>背景：</strong>
+想象一张巨大的拼图（全局张量 Global Tensor）。你手里只有其中一块（本地张量 Local Tensor）。为了能把拼图拼回去，你需要知道你这一块属于整张图的哪个位置。<code>ShardedTensor</code> 就是用来包装这块拼图，并贴上位置标签的对象。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">test_from_rank_offsets_constructor</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+    <span class="c1"># 1. 创建一个本地数据，形状是 (1, 3, 7, 9)</span>
+    <span class="n">data</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">ones</span><span class="p">((</span><span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">7</span><span class="p">,</span> <span class="mi">9</span><span class="p">),</span> <span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># 2. 定义这块数据在整体中的位置关系 (重点！)</span>
+    <span class="n">rank_offsets</span> <span class="o">=</span> <span class="p">[</span>
+        <span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">10</span><span class="p">),</span> <span class="c1"># 意思：在第0维度，我是第0块，这一维总共有10块</span>
+        <span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">6</span><span class="p">)</span>   <span class="c1"># 意思：在第2维度，我是第3块，这一维总共有6块</span>
+    <span class="p">]</span>
+
+    <span class="c1"># 3. 创建 ShardedTensor 对象</span>
+    <span class="n">sh_ten</span> <span class="o">=</span> <span class="n">ShardedTensor</span><span class="o">.</span><span class="n">from_rank_offsets</span><span class="p">(</span><span class="s1">&#39;keyA&#39;</span><span class="p">,</span> <span class="n">data</span><span class="p">,</span> <span class="o">*</span><span class="n">rank_offsets</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点：</strong> 这个测试验证了我们能否通过简单的“坐标描述”（rank_offsets），自动计算出这块碎片在全局大图中的精确位置和大小。</li>
+</ul>
+<h4>Task 2: 搞懂坐标系 (验证计算结果)</h4>
+<p><strong>目标：</strong> 看懂 <code>test_from_rank_offsets_constructor</code> 的断言（assert）部分。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># 验证本地形状没变</span>
+    <span class="k">assert</span> <span class="n">sh_ten</span><span class="o">.</span><span class="n">local_shape</span> <span class="o">==</span> <span class="n">shape</span> 
+
+    <span class="c1"># 验证全局形状 (Global Shape) 计算是否正确</span>
+    <span class="c1"># 原来第0维长度是 shape[0]，因为总共有10块，所以全局长度 = shape[0] * 10</span>
+    <span class="c1"># 原来第2维长度是 shape[2]，因为总共有6块，所以全局长度 = shape[2] * 6</span>
+    <span class="k">assert</span> <span class="n">sh_ten</span><span class="o">.</span><span class="n">global_shape</span> <span class="o">==</span> <span class="p">(</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">*</span> <span class="mi">10</span><span class="p">,</span> <span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">*</span> <span class="mi">6</span><span class="p">,</span> <span class="n">shape</span><span class="p">[</span><span class="mi">3</span><span class="p">])</span>
+
+    <span class="c1"># 验证全局偏移量 (Global Offset)，即我从哪里开始？</span>
+    <span class="c1"># 第2维我是第3块(索引从0开始)，所以前面有3块。偏移量 = shape[2] * 3</span>
+    <span class="k">assert</span> <span class="n">sh_ten</span><span class="o">.</span><span class="n">global_offset</span> <span class="o">==</span> <span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">*</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点：</strong> <code>ShardedTensor</code> 能够自动根据切分规则（比如“我是10份中的第1份”），推算出整个模型原本应该有多大，以及当前这块数据应该放在哪个坐标点。</li>
+</ul>
+<h4>Task 3: 处理特殊情况 (扁平化数据)</h4>
+<p><strong>目标：</strong> 看懂 <code>test_from_rank_offsets_flat_constructor</code>。</p>
+<p><strong>背景：</strong>
+有时候为了节省内存或者传输方便，我们会把多维数组“拍扁”成一维数组（Flatten）。这个测试是为了验证：即使数据被拍扁了，或者只取了拍扁后的一小段，我们依然能把它还原回多维世界的正确位置。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># 创建一个扁平化的一小段数据 (只取索引 4 到 9)</span>
+    <span class="n">flattened_range</span> <span class="o">=</span> <span class="nb">slice</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="mi">9</span><span class="p">)</span>
+    <span class="n">flat_data</span> <span class="o">=</span> <span class="n">data</span><span class="o">.</span><span class="n">flatten</span><span class="p">()[</span><span class="n">flattened_range</span><span class="p">]</span>
+
+    <span class="c1"># 创建对象，注意这里用的是 from_rank_offsets_flat</span>
+    <span class="n">sh_ten</span> <span class="o">=</span> <span class="n">ShardedTensor</span><span class="o">.</span><span class="n">from_rank_offsets_flat</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">flat_data</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># 断言：虽然输入是扁的，但它应该记得自己原来的形状和位置</span>
+    <span class="k">assert</span> <span class="n">sh_ten</span><span class="o">.</span><span class="n">local_shape</span> <span class="o">==</span> <span class="n">shape</span> 
+</code></pre></div>
+
+<ul>
+<li><strong>观点：</strong> 系统必须具备鲁棒性，支持从非标准的、扁平化的数据片段中重建出结构化的张量信息。</li>
+</ul>
+<h4>Task 4: 安全检查 (防止数据对不上)</h4>
+<p><strong>目标：</strong> 看懂 <code>test_metadata_integrity_violation</code>。</p>
+<p><strong>背景：</strong>
+如果你告诉系统“这是一块 10x10 的拼图”，但实际给的数据只有 5x5，程序应该报错，而不是悄悄存个错误的文件。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># 正常创建</span>
+    <span class="n">sh_ten</span> <span class="o">=</span> <span class="n">ShardedTensor</span><span class="o">.</span><span class="n">from_rank_offsets</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="n">sh_ten</span><span class="o">.</span><span class="n">validate_metadata_integrity</span><span class="p">()</span> <span class="c1"># 检查通过</span>
+
+    <span class="c1"># 故意搞破坏：修改元数据，说形状是 (1, 2, 7, 9)，但实际数据是 (1, 3, 7, 9)</span>
+    <span class="k">with</span> <span class="n">pytest</span><span class="o">.</span><span class="n">raises</span><span class="p">(</span><span class="n">CheckpointingException</span><span class="p">):</span> <span class="c1"># 期待程序抛出异常</span>
+        <span class="n">sh_ten</span><span class="o">.</span><span class="n">local_shape</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">7</span><span class="p">,</span> <span class="mi">9</span><span class="p">)</span>
+        <span class="n">sh_ten</span><span class="o">.</span><span class="n">validate_metadata_integrity</span><span class="p">()</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点：</strong> 这是一个防御性编程测试。必须确保元数据（描述信息）和实际数据（Tensor）是严格匹配的，否则在保存模型时会抛出 <code>CheckpointingException</code>。</li>
+</ul>
+<h4>Task 5: 高级功能 (工厂模式与合并)</h4>
+<p><strong>目标：</strong> 看懂 <code>TestShardedTensorFactory</code> 类。</p>
+<p><strong>背景：</strong>
+这是最复杂的部分。有时候，我们保存模型时，并不是直接保存显卡里的那个 Tensor，而是需要先处理一下（比如把一个大 Tensor 拆成两个存，或者反过来）。
+*   <strong>Factory (工厂):</strong> 用来生成 ShardedTensor 的蓝图。
+*   <strong>Merge (合并):</strong> 加载时，把分开存的文件合并回原本的变量。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># build_fn: 模拟保存时的逻辑。</span>
+    <span class="c1"># 这里它把一个 tensor 拆成了 &#39;level2_a&#39; 和 &#39;level2_b&#39; 两个部分存进去</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">build_fn</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">tensor</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s1">&#39;level2_a&#39;</span><span class="p">:</span> <span class="o">...</span><span class="p">,</span> <span class="c1"># 存一部分</span>
+            <span class="s1">&#39;level2_b&#39;</span><span class="p">:</span> <span class="o">...</span>  <span class="c1"># 存另一部分</span>
+        <span class="p">}</span>
+
+    <span class="c1"># 模拟加载逻辑</span>
+    <span class="c1"># 我们希望加载后，只取 &#39;level2_b&#39; 的部分作为最终结果</span>
+    <span class="n">state_dict</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="s1">&#39;level1&#39;</span><span class="p">:</span> <span class="n">ShardedTensorFactory</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">build_fn</span><span class="p">,</span> <span class="k">lambda</span> <span class="n">x</span><span class="p">:</span> <span class="n">x</span><span class="p">[</span><span class="s1">&#39;level2_b&#39;</span><span class="p">])</span>
+    <span class="p">}</span>
+
+    <span class="c1"># 1. apply_factories: 执行 build_fn，生成要保存的数据结构</span>
+    <span class="n">apply_factories</span><span class="p">(</span><span class="n">state_dict</span><span class="p">)</span> 
+
+    <span class="c1"># 2. apply_factory_merges: 模拟加载。</span>
+    <span class="c1"># 它会把读取到的数据（level2_b）通过 merge_fn (lambda x: x[&#39;level2_b&#39;]) 提取出来</span>
+    <span class="n">loaded_state_dict</span> <span class="o">=</span> <span class="n">apply_factory_merges</span><span class="p">(</span><span class="n">state_dict</span><span class="p">,</span> <span class="n">get_state_dict</span><span class="p">())</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点：</strong> Megatron 允许在保存/加载过程中动态地转换数据结构。这个测试验证了“构建（保存前拆分）”和“合并（加载后重组）”的流程是闭环的。</li>
+</ul>
+<hr />
+<h3>💡 总结</h3>
+<p>这个文件其实就在讲一件事：</p>
+<blockquote>
+<p><strong>在一个有很多张显卡的系统里，如何精确地描述“我手里这块数据”在“整个大模型”里的坐标，并确保保存和加载时，这些坐标和数据能严丝合缝地对上。</strong></p>
+</blockquote>
+<ul>
+<li><code>rank_offsets</code> 是计算坐标的核心工具。</li>
+<li><code>ShardedTensor</code> 是携带坐标信息的信封。</li>
+<li><code>Factory</code> 是处理复杂存取逻辑的流水线。</li>
+</ul>
+<p>现在再回去看代码，你应该能对应上这些概念了。</p>

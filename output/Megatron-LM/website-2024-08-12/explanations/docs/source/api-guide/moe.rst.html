@@ -1,0 +1,94 @@
+<h1>docs/source/api-guide/moe.rst</h1>
+<p>这是一个非常好的问题。首先，<strong>不要慌，你看不懂是因为这个文件本身几乎是空的！</strong></p>
+<h3>1. 为什么这个文件看起来没内容？</h3>
+<p>你看到的 <code>docs/source/api-guide/moe.rst</code> 只是一个<strong>索引文件</strong>（Wrapper）。
+它的核心代码只有这一行：
+<code>.. mdinclude :: ../../../megatron/core/transformer/moe/README.md</code></p>
+<p>这句话的意思是：“<strong>请去把 <code>megatron/core/transformer/moe/</code> 目录下的 <code>README.md</code> 内容搬过来显示在这里。</strong>”</p>
+<p>所以，实际上你需要理解的是 <strong>Megatron-Core 中的 MoE（Mixture of Experts，混合专家模型）</strong> 是什么。</p>
+<hr />
+<h3>2. MoE 学习任务清单 (To-Do List)</h3>
+<p>为了让你彻底理解 MoE，我为你设计了一个由浅入深的 <strong>5步学习清单</strong>。我们将把复杂的数学和代码转换成一个“公司管理”的故事。</p>
+<ul>
+<li><strong>Task 01: 理解痛点</strong> —— 为什么要用 MoE？（稠密 vs 稀疏）</li>
+<li><strong>Task 02: 核心架构</strong> —— 什么是“专家”和“路由器”？</li>
+<li><strong>Task 03: 工作流程</strong> —— 一个 Token（单词）的奇幻漂流。</li>
+<li><strong>Task 04: 工程挑战</strong> —— 负载均衡与“丢包”。</li>
+<li><strong>Task 05: 并行策略</strong> —— 显卡是怎么分工的？（Expert Parallelism）</li>
+</ul>
+<hr />
+<h3>3. 逐步讲解 (Step-by-Step)</h3>
+<h4>Task 01: 理解痛点 —— 为什么要用 MoE？</h4>
+<ul>
+<li>
+<p><strong>传统模型 (Dense Model):</strong>
+    想象一家初创小公司，只有 5 个人。无论来的是什么业务（做饭、修车、写代码），这 5 个人都要一起上，每个人都要参与讨论。</p>
+<ul>
+<li><strong>缺点：</strong> 当你想把公司扩建成 10,000 人（增加模型参数）时，如果每个业务还要 10,000 人一起开会，效率会低到爆炸，计算成本太高。</li>
+</ul>
+</li>
+<li>
+<p><strong>MoE 模型 (Sparse Model):</strong>
+    现在你把公司变成了大集团，有 10,000 人，但分成了很多个<strong>部门（专家）</strong>。</p>
+<ul>
+<li><strong>优点：</strong> 来了“修车”的业务，只叫“汽修部”的 10 个人去干活，其他人休息。</li>
+<li><strong>结论：</strong> 模型参数总量极大（10,000人），但每次计算只激活一小部分（10人）。<strong>实现了“参数量巨大”但“计算速度很快”。</strong></li>
+</ul>
+</li>
+</ul>
+<h4>Task 02: 核心架构 —— 什么是“专家”和“路由器”？</h4>
+<p>MoE 就在 Transformer 的层里加了两个关键角色：</p>
+<ol>
+<li><strong>专家 (Experts):</strong>
+    这就是上面说的“部门”。在代码里，它们通常就是普通的 MLP（多层感知机）层。一个模型里可能有 8 个、16 个甚至更多专家。</li>
+<li><strong>路由器 (Router / Gating Network):</strong>
+    这是公司的“前台接待员”。它的工作是看一眼进来的任务（Token），然后决定：“你，去汽修部；你，去财务部。”</li>
+</ol>
+<h4>Task 03: 工作流程 —— 一个 Token 的奇幻漂流</h4>
+<p>假设我们输入一句话：“<strong>苹果</strong> 很好吃”。</p>
+<ol>
+<li><strong>输入：</strong> 单词“苹果”进入模型。</li>
+<li><strong>路由 (Routing):</strong> 路由器分析“苹果”这个词的特征，计算它属于哪个专家的概率。<ul>
+<li>比如：属于“食物专家”的概率是 90%，属于“科技专家”的概率是 10%。</li>
+</ul>
+</li>
+<li><strong>分发 (Top-K):</strong> 通常我们只选概率最高的 <strong>Top-1</strong> 或 <strong>Top-2</strong> 个专家。<ul>
+<li>路由器把“苹果”发送给“食物专家”。</li>
+</ul>
+</li>
+<li><strong>计算：</strong> “食物专家”处理这个数据，提取特征。其他专家（如汽车专家）完全不工作。</li>
+<li><strong>加权聚合：</strong> 专家处理完的结果，会被加权合并，继续送往下一层。</li>
+</ol>
+<h4>Task 04: 工程挑战 —— 负载均衡 (Load Balancing)</h4>
+<p>这是 Megatron MoE 文档中经常提到的难点。</p>
+<ul>
+<li><strong>问题：</strong> 假设大家都问“苹果”、“香蕉”、“牛排”，那“食物专家”会累死，而“修车专家”在摸鱼。这会导致计算堵塞。</li>
+<li><strong>解决方案 (Auxiliary Loss / Jitter):</strong><ul>
+<li><strong>强行分配：</strong> 训练时强迫路由器把任务分均匀点。</li>
+<li><strong>丢弃 (Token Dropping):</strong> 每个专家有“接待上限”（Capacity）。如果“食物专家”门口排队太长，新来的“苹果”可能直接被丢掉（不经过专家处理，直接跳过），或者被强行塞给“修车专家”。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 05: 并行策略 —— 显卡是怎么分工的？(Expert Parallelism)</h4>
+<p>在 Megatron 这种超大模型框架下，一张显卡放不下所有东西。</p>
+<ul>
+<li><strong>专家并行 (Expert Parallelism - EP):</strong><ul>
+<li><strong>GPU 1:</strong> 负责“食物专家”和“科技专家”。</li>
+<li><strong>GPU 2:</strong> 负责“汽车专家”和“医疗专家”。</li>
+</ul>
+</li>
+<li><strong>通信 (All-to-All):</strong>
+    当 GPU 1 上的路由器发现一个词需要去“汽车专家”那里时，它需要把这个数据通过网络发送给 GPU 2。处理完后，GPU 2 再把结果发回来。<ul>
+<li><em>这就是为什么 MoE 对网络带宽要求很高的原因。</em></li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>如果那个文档里有内容，它讲的一定是下面这一套逻辑：</p>
+<ol>
+<li><strong>MoE 是为了省算力：</strong> 让模型变大，但计算量不变。</li>
+<li><strong>核心机制：</strong> 路由器 (Router) 选人，专家 (Expert) 干活。</li>
+<li><strong>Megatron 的工作：</strong> 主要是解决怎么把这些专家分散到不同的显卡上（Expert Parallelism），以及怎么让它们之间高效通信（All-to-All 通信优化）。</li>
+</ol>
+<p>现在的你可以把这一页文档理解为：<strong>“这里是通往 Megatron 高级省力模式（MoE）的入口。”</strong></p>

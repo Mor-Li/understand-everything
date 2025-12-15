@@ -1,0 +1,98 @@
+<h1>megatron/core/datasets/retro/db/build.py</h1>
+<p>这份代码是 <strong>NVIDIA Megatron-LM</strong> 项目中用于 <strong>RETRO (Retrieval-Enhanced Transformer)</strong> 模型的数据预处理部分。</p>
+<p>简单来说，RETRO 模型在生成文本时，需要去一个庞大的数据库里检索相似的文本块（Chunk）作为参考。<strong>这个脚本及其相关文件的作用，就是把原始的文本数据，转换成 RETRO 模型可以用来检索和训练的“块数据库”（Chunk Database）。</strong></p>
+<p>为了让你听懂，我把这个过程想象成<strong>“把一堆书（原始数据）加工成一本本精简的索引卡片（Chunk DB）”</strong>的过程。</p>
+<p>下面是一个按逻辑顺序排列的 <strong>Task Todo List</strong>，带你一步步看懂代码在干什么。</p>
+<hr />
+<h3>任务清单：构建 RETRO 块数据库 (Chunk Database Building Todo)</h3>
+<h4>✅ Task 1: 准备工作 (初始化与配置)</h4>
+<p><strong>代码入口:</strong> <code>build_db</code> -&gt; <code>init_indexed_dataset_infos</code>
+*   <strong>目标</strong>: 搞清楚我们有哪些“书”（数据集）需要处理。
+*   <strong>动作</strong>:
+    1.  读取配置文件（比如数据路径、块的大小）。
+    2.  加载原始的索引数据集（IndexedDataset），这些通常是已经 Tokenize 过的 GPT 格式数据。
+    3.  决定是要“新建数据库”还是“验证已有数据库”（<code>task_validate</code>）。</p>
+<h4>✅ Task 2: 分解任务 (并行化处理策略)</h4>
+<p><strong>代码入口:</strong> <code>build_individual_dbs</code> -&gt; <code>build_individual_db</code>
+*   <strong>目标</strong>: 书太多了，一个人读不完，需要分给很多人（多进程）一起读。
+*   <strong>动作</strong>:
+    1.  为每一个数据集创建一个独立的存储目录。
+    2.  将整个数据集按“文档（Document）”切分成多个<strong>Block（任务块）</strong>。
+    3.  启动一个进程池（<code>ProcessPoolExecutor</code>），把这些 Block 分发给不同的 CPU 核心去并行处理。</p>
+<h4>✅ Task 3: 核心加工 (切块与清洗 - 最重要的一步)</h4>
+<p><strong>代码入口:</strong> <code>build_block_db</code> -&gt; <code>build_partial_db</code>
+*   <strong>目标</strong>: 把每一篇文档切成固定长度的片段（Chunk），并确保这些片段是有效的。
+*   <strong>逻辑细节</strong>:
+    1.  <strong>切分 (Chunking)</strong>: 读取一篇文档（比如 GPT Token 序列），按固定的长度（<code>retro_gpt_chunk_length</code>）切成一段一段。
+    2.  <strong>去重/清洗 (Re-tokenization &amp; Validation)</strong>:
+        *   RETRO 的检索器通常基于 BERT，而生成器基于 GPT。
+        *   代码会将切出来的 GPT Token 还原成文本，再用 <strong>BERT Tokenizer</strong> 重新切分一次。
+        *   <strong>关键点</strong>: 如果一段文本用 BERT 切分后是空的（比如全是特殊符号），这段 Chunk 就被标记为 <strong>Invalid（无效）</strong>，会被丢弃。
+    3.  <strong>记录</strong>: 记录下有效的 Chunk 在原始数据中的位置（Start/End Index）。</p>
+<h4>✅ Task 4: 保存中间结果 (存入 HDF5)</h4>
+<p><strong>代码入口:</strong> <code>save_block_db</code>
+*   <strong>目标</strong>: 把处理好的“卡片”先存到硬盘上，防止内存爆了。
+*   <strong>动作</strong>:
+    1.  使用 <code>h5py</code> 库，将处理好的数据写入 <code>.h5</code> 文件。
+    2.  保存的内容包括：
+        *   <code>chunks_valid</code>: 有效的块信息。
+        *   <code>chunks_invalid</code>: 无效的块信息。
+        *   <code>doc_offsets</code>: 记录每篇文档包含多少个块（用于后续索引）。</p>
+<h4>✅ Task 5: 统计与划分 (训练集/采样集划分)</h4>
+<p><strong>代码入口:</strong> <code>update_chunk_counts</code>
+*   <strong>目标</strong>: 所有的书都处理完了，现在要统计一下总共有多少张卡片，并决定哪些用来训练索引，哪些用来做检索库。
+*   <strong>动作</strong>:
+    1.  遍历所有生成的 HDF5 文件，统计 Chunk 的总数。
+    2.  根据配置比例（<code>train_fraction</code>），计算出训练集需要多少个 Chunk，采样集（Sampled）需要多少个。</p>
+<h4>✅ Task 6: 最终合并 (Merge DBs)</h4>
+<p><strong>代码入口:</strong> <code>build_merged_dbs</code> -&gt; <code>merge_dbs</code>
+*   <strong>目标</strong>: 之前是每个数据集单独存的，现在要把它们合并成三个大的总文件，方便模型直接读取。
+*   <strong>动作</strong>:
+    1.  创建三个最终的大数据库文件：
+        *   <strong>Sampled</strong>: 用于训练检索器（Retriever）的索引。
+        *   <strong>Train</strong>: 用于添加到检索索引中的数据（知识库本身）。
+        *   <strong>Valid</strong>: 验证集。
+    2.  把之前分散在各个小文件里的数据，通过拷贝的方式，汇总写入到这三个大文件中。</p>
+<hr />
+<h3>代码逻辑映射图 (由微观到宏观)</h3>
+<p>如果你再回看代码，可以这样对应：</p>
+<ol>
+<li>
+<p><strong>最底层干苦力的工人</strong> (<code>build_partial_db</code>):</p>
+<ul>
+<li>拿着一个文档，切切切。</li>
+<li>把切出来的东西转成 BERT 格式看看是不是空的。</li>
+<li>返回：“这个文档切出了 5 个好块，1 个坏块”。</li>
+</ul>
+</li>
+<li>
+<p><strong>工头</strong> (<code>build_block_db</code>):</p>
+<ul>
+<li>管理一组工人（进程）。</li>
+<li>收集工人们的切分结果。</li>
+<li>把结果整理成 Numpy 数组。</li>
+</ul>
+</li>
+<li>
+<p><strong>仓库管理员</strong> (<code>save_block_db</code>):</p>
+<ul>
+<li>把工头整理好的 Numpy 数组存进硬盘文件。</li>
+</ul>
+</li>
+<li>
+<p><strong>项目经理</strong> (<code>build_individual_db</code>):</p>
+<ul>
+<li>负责一个特定的数据集（比如 Wikipedia）。</li>
+<li>安排工头们去处理这个数据集的不同部分。</li>
+</ul>
+</li>
+<li>
+<p><strong>总指挥</strong> (<code>build_db</code> &amp; <code>merge_dbs</code>):</p>
+<ul>
+<li><code>build_db</code>: 启动整个流程。</li>
+<li><code>merge_dbs</code>: 最后把所有项目经理产出的结果汇总，打包成最终产品。</li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p>这个文件的核心观点是：<strong>为了训练 RETRO，我们需要把原始的长文本数据，精准地切分成固定长度的小段（Chunks），并且必须验证这些小段在 BERT Tokenizer 下也是有意义的。为了处理海量数据，必须采用“分块-并行处理-中间存储-最终合并”的流水线策略。</strong></p>

@@ -1,0 +1,119 @@
+<h1>megatron/core/datasets/masked_dataset.py</h1>
+<p>这份代码确实比较复杂，它是 <strong>Megatron-LM</strong>（NVIDIA 开发的大模型训练框架）的核心部分之一。</p>
+<p>简单来说，这个文件的作用是：<strong>为 BERT 或 SpanBERT 这类模型准备“完形填空”的训练数据。</strong></p>
+<p>也就是把一句话里的某些词挖掉（变成 <code>[MASK]</code>），或者打乱顺序，让模型去猜原本是什么。</p>
+<p>为了让你看懂，我把这个代码执行的逻辑拆解成一个 <strong>“老师出考卷”</strong> 的 Todo List。你可以想象这个类（Class）就是一位正在出题的老师。</p>
+<hr />
+<h3>📝 任务清单 (Todo List)</h3>
+<h4>第一阶段：制定出题规则 (Configuration)</h4>
+<ol>
+<li><strong>设定难度</strong>：每句话要挖掉多少个空？（<code>masking_probability</code>，通常是 15%）</li>
+<li><strong>设定题型</strong>：<ul>
+<li>是挖掉单个字，还是挖掉整个词？（<code>masking_do_full_word</code>）</li>
+<li>是随机挖，还是按某种数学分布（几何分布）挖连续的片段？（<code>masking_use_geometric_distribution</code>，类似 SpanBERT）</li>
+<li>要不要把句子的顺序打乱？（<code>masking_do_permutation</code>）</li>
+</ul>
+</li>
+</ol>
+<h4>第二阶段：整理题库 (Indexing)</h4>
+<ol>
+<li><strong>加载原文</strong>：找到硬盘上的原始文本数据（<code>IndexedDataset</code>）。</li>
+<li><strong>建立索引</strong>：因为数据量太大（几百 GB），不能一次性读进内存。需要建立一个“目录”，记录每句话在文件的什么位置。<ul>
+<li><em>检查缓存</em>：如果以前建过目录，直接读取（<code>_build_sample_index</code> 中的 cache 逻辑）。</li>
+<li><em>新建目录</em>：如果没有，就重新扫描一遍数据并保存。</li>
+</ul>
+</li>
+</ol>
+<h4>第三阶段：出题 (Masking - 核心逻辑)</h4>
+<p>当训练开始，模型需要数据时，执行以下步骤（对应 <code>_create_masked_lm_predictions</code> 方法）：
+5.  <strong>拿到原句</strong>：比如 <code>["我", "爱", "吃", "苹", "##果"]</code>。
+6.  <strong>识别词的边界</strong>：辨认出 "苹" 和 "##果" 其实是一个词“苹果”。
+7.  <strong>生成候选名单</strong>：列出所有可以被挖掉的词或短语（N-gram）。
+8.  <strong>随机抽题</strong>：根据设定的概率，随机选中几个词。
+9.  <strong>执行挖空</strong>：
+    *   把选中的词变成 <code>[MASK]</code>。
+    *   或者随机替换成别的词（为了增加鲁棒性）。
+    *   或者保持不变（但打上标记让模型去预测）。
+10. <strong>生成答案</strong>：记录下被挖掉的位置和原本正确的字。</p>
+<hr />
+<h3>🔍 逐步代码解读</h3>
+<p>现在我们对照上面的 List，看看代码里具体是怎么写的：</p>
+<h4>1. 制定规则 (<code>MaskedWordPieceDatasetConfig</code>)</h4>
+<p>代码开头定义的 <code>dataclass</code> 就是用来存规则的。
+*   <code>masking_probability</code>: 挖空的比例。
+*   <code>masking_max_ngram</code>: 最多允许连续挖掉几个词（比如最多挖掉连续的3个词）。
+*   <code>masking_do_full_word</code>: <strong>重点</strong>。BERT 的分词器会把“苹果”分成 <code>['苹', '##果']</code>。如果这个开关是 True，那么挖空时必须把 <code>苹</code> 和 <code>##果</code> 一起挖掉，不能只挖一半。</p>
+<h4>2. 整理题库 (<code>_build_sample_index</code>)</h4>
+<p>这个函数在 <code>__init__</code> 后会被调用。
+*   它会检查 <code>path_to_cache</code>（缓存路径）。
+*   如果有缓存 (<code>cache_hit</code>)，直接 <code>numpy.load</code>，省时间。
+*   如果没有，它会调用 <code>helpers.build_mapping</code> 来建立索引，把文档切分成固定长度（比如 512 长度）的样本，然后保存到硬盘。</p>
+<h4>3. 核心出题逻辑 (<code>_create_masked_lm_predictions</code>)</h4>
+<p>这是全篇最难懂、最核心的函数。让我们一步步拆解它的内部 Todo：</p>
+<ul>
+<li>
+<p><strong>Todo 3.1: 识别单词边界</strong>
+    <code>python
+    # 代码片段
+    for i, token_id in enumerate(token_ids):
+        if ... startswith("##"):
+            # 如果是 ## 开头，说明是上一个词的后半截，归并到同一个 candidate
+            candidates[-1].append(i)
+        else:
+            # 新的词，建立新的 candidate
+            candidates.append([i])</code>
+    这一步是为了保证“全词掩码”（Whole Word Masking）。</p>
+</li>
+<li>
+<p><strong>Todo 3.2: 计算要挖多少个空</strong>
+    <code>python
+    n_maskings = min(..., max(1, int(round(len(token_ids) * self.config.masking_probability))))</code>
+    比如句子长 100 个词，概率 0.15，那就得挖 15 个空。</p>
+</li>
+<li>
+<p><strong>Todo 3.3: 生成 N-gram (短语) 组合</strong>
+    代码里有一段复杂的 <code>candidate_ngrams</code> 生成逻辑。</p>
+<ul>
+<li>它不仅考虑单个词，还考虑连续的词（比如“人工智能”是一个 4-gram）。</li>
+<li><code>ngram_nvals</code> 是 N-gram 的长度数组。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 3.4: 循环抽题 (While Loop)</strong>
+    <code>python
+    for candidate_idx in range(len(candidate_ngrams)):
+        # 如果已经挖够了 (n_maskings)，就停手
+        if len(masked_positions_and_labels) &gt;= n_maskings:
+            break
+        ...
+        # 决定这次挖多长的词（是挖1个词，还是连续挖3个词？）
+        # 这里可能用到几何分布 (SpanBERT 的做法)
+        if self.config.masking_use_geometric_distribution:
+            n = ... geometric(p) ...</code></p>
+</li>
+<li>
+<p><strong>Todo 3.5: 应用掩码 (Masking)</strong>
+    <code>python
+    for index in ngram_indices:
+        mask = self._get_token_mask(numpy_random_state) # 获取 [MASK] 的 token ID
+        masked_token_ids[index] = mask # 把原句的词替换掉
+        masked_positions_and_labels.append((index, token_ids[index])) # 记录正确答案</code></p>
+</li>
+<li>
+<p><strong>Todo 3.6: 乱序 (Permutation - 可选)</strong>
+    代码后半段有一个 <code>if self.config.masking_do_permutation:</code>。
+    如果开启，它会选一些词，把它们的顺序打乱。这通常用于类似 XLNet 的训练目标，普通的 BERT 不太用这个。</p>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这文件就是一个<strong>“高级填空题生成器”</strong>。</p>
+<ol>
+<li>它读取你硬盘上的文章。</li>
+<li>它根据你设定的概率（15%）和策略（全词掩码、Span掩码）。</li>
+<li>它吐出处理后的数据：<ul>
+<li><strong>Input</strong>: <code>[CLS] 今天天气真 [MASK] [SEP]</code></li>
+<li><strong>Label</strong>: <code>位置: 5, 答案: 好</code></li>
+</ul>
+</li>
+</ol>
+<p>你看懂这个逻辑后，再回看代码里的 <code>for</code> 循环和 <code>numpy</code> 操作，就会发现它们只是在实现这个“随机挖词”的过程而已。</p>

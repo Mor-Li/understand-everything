@@ -1,0 +1,144 @@
+<h1>fla/ops/linear_attn/fused_chunk.py</h1>
+<p>这份代码确实非常硬核，因为它是用 <strong>Triton</strong> 编写的底层 GPU 内核代码，用于加速 <strong>线性注意力机制 (Linear Attention)</strong>。看不懂是很正常的，因为这需要同时懂深度学习算法原理和 GPU 并行编程。</p>
+<p>简单来说，这个文件的核心目的是：<strong>用一种“分块（Chunk）”的方式，极快地计算 Linear Attention，既省显存又跑得快。</strong></p>
+<p>为了让你理解，我把这个复杂的 GPU 代码逻辑拆解成一个<strong>人类能看懂的“任务清单 (Task Todo List)”</strong>。我们主要关注前向传播（Forward），弄懂了它，你就懂了原理。</p>
+<hr />
+<h3>核心概念：什么是“分块线性注意力”？</h3>
+<p>在看代码前，先建立一个直观模型：
+*   <strong>普通 Attention</strong>：要把整本书（整个序列 $T$）的所有字两两对比，计算量巨大 ($T^2$)。
+*   <strong>Linear Attention (线性注意力)</strong>：像是一边读书一边做“笔记”（Hidden State $h$）。读后面的内容时，只需要看当前的字和之前的“笔记”，不需要回头翻整本书。计算量小 ($T$)。
+*   <strong>Chunk (分块)</strong>：Linear Attention 虽然快，但每次只处理一个字效率低（GPU 喜欢并行）。所以我们把书分成很多<strong>小章节（Chunk）</strong>。
+    *   <strong>章节内</strong>：用普通 Attention 的方法快速扫视（并行计算）。
+    *   <strong>章节间</strong>：把这一章的精华压缩成“笔记”，传给下一章。</p>
+<hr />
+<h3>任务清单 (Task Todo List)</h3>
+<p>假设你是 GPU 的一个线程块（Block），你的任务是处理数据中的<strong>一段序列</strong>。以下是你的工作流程：</p>
+<h4><strong>Task 1: 准备工作 (Setup)</strong></h4>
+<ol>
+<li><strong>认领任务</strong>：确定我负责哪一批数据（Batch）、哪个头（Head）以及输出向量的哪一部分（$K$或$V$的维度切片）。</li>
+<li><strong>划分内存</strong>：在 GPU 的高速缓存（SRAM）里划定小块区域，用来暂存 Query ($q$), Key ($k$), Value ($v$) 和 Output ($o$)。</li>
+<li><strong>获取初始笔记</strong>：如果是从半截开始读，或者有上一段对话的记忆，先去把那个“初始状态” ($h_0$) 读进来。如果没有，就拿一张白纸（全0矩阵）。</li>
+</ol>
+<h4><strong>Task 2: 循环处理每一章 (The Loop)</strong></h4>
+<p>我们要把长序列 $T$ 切成长度为 <code>BT</code> (比如 64) 的小块，一块一块地处理：</p>
+<ul>
+<li>
+<p><strong>Step 2.1: 加载数据</strong></p>
+<ul>
+<li>把当前这一小块的 $q, k, v$ 从显存加载到高速缓存。</li>
+<li>给 $q$ 乘上一个缩放系数 (<code>scale</code>)。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 2.2: 计算“章节内”的关联 (Intra-Chunk Attention)</strong></p>
+<ul>
+<li><em>逻辑</em>：计算这一小块内部，$q$ 和 $k$ 的匹配度。</li>
+<li><em>代码行为</em>：<code>b_s = q * k^T</code> (矩阵乘法)。</li>
+<li><em>Mask</em>：因为是因果序列（只能看过去），要把“未来”的信息遮掉（Mask 掉上三角）。</li>
+<li><em>局部输出</em>：用匹配度乘上 $v$，得到局部的输出 <code>b_o</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 2.3: 融合“过去的笔记” (Inter-Chunk / Recurrent)</strong></p>
+<ul>
+<li><em>逻辑</em>：当前的 $q$ 不仅要看这一章的 $k$，还要结合之前的“笔记” ($h$)。</li>
+<li><em>代码行为</em>：<code>b_o += q * h</code>。这一步把历史信息加到了当前输出里。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 2.4: 更新“笔记” (Update State)</strong></p>
+<ul>
+<li><em>逻辑</em>：读完这一章，要把这一章的 $k$ 和 $v$ 压缩进“笔记”里，供下一章使用。</li>
+<li><em>代码行为</em>：<code>h_new = h_old + (k^T * v)</code>。</li>
+<li><em>注意</em>：这里是 Linear Attention 的精髓，它把 $K$ 和 $V$ 乘起来存成状态，而不是存巨大的 $QK^T$ 矩阵。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 2.5: 保存结果</strong></p>
+<ul>
+<li>把计算好的当前块的输出 <code>b_o</code> 写回显存。</li>
+<li>移动指针，准备处理下一块。</li>
+</ul>
+</li>
+</ul>
+<h4><strong>Task 3: 收尾 (Finalize)</strong></h4>
+<ol>
+<li><strong>保存最终笔记</strong>：如果用户要求输出最后的记忆状态 ($h_t$)，把它写回显存。</li>
+</ol>
+<hr />
+<h3>代码逐步讲解 (对应上面的 Todo)</h3>
+<p>现在我们对照代码 <code>fused_chunk_linear_attn_fwd_kernel</code> 来看：</p>
+<h4>1. 准备阶段</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这里的 i_v, i_k, i_bh 就是在认领任务，确定自己处理数据的哪个部分</span>
+<span class="n">i_v</span><span class="p">,</span> <span class="n">i_k</span><span class="p">,</span> <span class="n">i_bh</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span>
+
+<span class="c1"># ... (中间省略了一些 mask 的生成)</span>
+
+<span class="c1"># Task 1: 准备工作 - 初始化“笔记” b_h</span>
+<span class="n">b_h</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">zeros</span><span class="p">([</span><span class="n">BK</span><span class="p">,</span> <span class="n">BV</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+
+<span class="c1"># make block pointers (Triton 特有的指针生成，用于高效加载数据块)</span>
+<span class="n">p_q</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">make_block_ptr</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> 
+<span class="n">p_k</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">make_block_ptr</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="c1"># ...</span>
+
+<span class="c1"># 如果有初始状态，就加载进来</span>
+<span class="k">if</span> <span class="n">USE_INITIAL_STATE</span><span class="p">:</span>
+    <span class="n">p_h0</span> <span class="o">=</span> <span class="o">...</span>
+    <span class="n">b_h</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_h0</span><span class="p">,</span> <span class="n">boundary_check</span><span class="o">=</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+</code></pre></div>
+
+<h4>2. 循环阶段 (核心逻辑)</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Task 2: 循环处理每一章</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">tl</span><span class="o">.</span><span class="n">cdiv</span><span class="p">(</span><span class="n">T</span><span class="p">,</span> <span class="n">BT</span><span class="p">)):</span>
+    <span class="c1"># Step 2.1: 加载数据</span>
+    <span class="n">b_q</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_q</span><span class="p">,</span> <span class="n">boundary_check</span><span class="o">=</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span>
+    <span class="n">b_q</span> <span class="o">=</span> <span class="p">(</span><span class="n">b_q</span> <span class="o">*</span> <span class="n">scale</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">b_q</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span> <span class="c1"># 缩放</span>
+    <span class="n">b_k</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_k</span><span class="p">,</span> <span class="n">boundary_check</span><span class="o">=</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span>
+    <span class="n">b_v</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_v</span><span class="p">,</span> <span class="n">boundary_check</span><span class="o">=</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span>
+
+    <span class="c1"># Step 2.2: 章节内 Attention (Local)</span>
+    <span class="c1"># 计算 Q * K^T</span>
+    <span class="n">b_s</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_q</span><span class="p">,</span> <span class="n">b_k</span><span class="p">,</span> <span class="n">allow_tf32</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+    <span class="c1"># 加上 Mask (只看过去)</span>
+    <span class="n">b_s</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">m_s</span><span class="p">,</span> <span class="n">b_s</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+    <span class="c1"># 乘上 V，得到局部结果</span>
+    <span class="n">b_o</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_s</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">b_q</span><span class="o">.</span><span class="n">dtype</span><span class="p">),</span> <span class="n">b_v</span><span class="p">,</span> <span class="n">allow_tf32</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+
+    <span class="c1"># Step 2.3 &amp; 2.4: 融合历史笔记 &amp; 更新笔记</span>
+    <span class="c1"># 这里代码写了一个 if CHECK，主要是为了处理 Triton 编译器的精度 bug，逻辑是一样的</span>
+
+    <span class="c1"># 逻辑：输出 += 当前 Q * 历史笔记 h</span>
+    <span class="n">b_o</span> <span class="o">+=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_q</span><span class="p">,</span> <span class="n">b_h</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">b_q</span><span class="o">.</span><span class="n">dtype</span><span class="p">),</span> <span class="n">allow_tf32</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+
+    <span class="c1"># 逻辑：历史笔记 h += 当前 K^T * 当前 V</span>
+    <span class="c1"># 这就是把当前的 Key-Value 键值对压缩进记忆里</span>
+    <span class="n">b_h</span> <span class="o">=</span> <span class="n">b_h</span> <span class="o">+</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_k</span><span class="p">,</span> <span class="n">b_v</span><span class="p">,</span> <span class="n">allow_tf32</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+
+    <span class="c1"># Step 2.5: 保存当前块的结果</span>
+    <span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">p_o</span><span class="p">,</span> <span class="n">b_o</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">p_o</span><span class="o">.</span><span class="n">dtype</span><span class="o">.</span><span class="n">element_ty</span><span class="p">),</span> <span class="n">boundary_check</span><span class="o">=</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span>
+
+    <span class="c1"># 指针前进到下一块</span>
+    <span class="n">p_q</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">advance</span><span class="p">(</span><span class="n">p_q</span><span class="p">,</span> <span class="p">(</span><span class="n">BT</span><span class="p">,</span> <span class="mi">0</span><span class="p">))</span>
+    <span class="n">p_k</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">advance</span><span class="p">(</span><span class="n">p_k</span><span class="p">,</span> <span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">BT</span><span class="p">))</span>
+    <span class="c1"># ...</span>
+</code></pre></div>
+
+<h4>3. 收尾阶段</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Task 3: 保存最终笔记</span>
+<span class="k">if</span> <span class="n">STORE_FINAL_STATE</span><span class="p">:</span>
+    <span class="n">p_ht</span> <span class="o">=</span> <span class="o">...</span>
+    <span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">p_ht</span><span class="p">,</span> <span class="n">b_h</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">p_ht</span><span class="o">.</span><span class="n">dtype</span><span class="o">.</span><span class="n">element_ty</span><span class="p">),</span> <span class="n">boundary_check</span><span class="o">=</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span>
+</code></pre></div>
+
+<h3>总结：这段代码到底牛在哪里？</h3>
+<ol>
+<li><strong>快</strong>：它没有把所有东西都存下来算 $T \times T$ 的矩阵，而是变成 $T$ 个步骤，每步算一点。</li>
+<li><strong>混合模式 (Fused Chunk)</strong>：<ul>
+<li>纯 Linear Attention (RNN模式) 无法并行，只能串行算，GPU 利用率低。</li>
+<li>这段代码把序列切成块，块内用并行算（利用 Tensor Cores），块间用串行传状态。<strong>这是目前长序列处理最主流的优化手段。</strong></li>
+</ul>
+</li>
+<li><strong>Triton 优化</strong>：使用了 <code>tl.make_block_ptr</code> 和 <code>tl.dot</code>，这是 Triton 针对 NVIDIA GPU 的硬件指令优化，比手写 CUDA 简单，但比 PyTorch 原生快得多。</li>
+</ol>
+<p>看不懂细节没关系，只要记住：<strong>它是一个把“并行计算”和“串行记忆”结合起来的算法，目的是为了快速处理超长文本。</strong></p>

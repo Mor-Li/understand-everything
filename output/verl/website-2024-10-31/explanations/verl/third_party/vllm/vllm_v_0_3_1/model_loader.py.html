@@ -1,0 +1,83 @@
+<h1>verl/third_party/vllm/vllm_v_0_3_1/model_loader.py</h1>
+<p>这份代码确实比较晦涩，因为它不是一段独立的程序，而是一个<strong>“魔改”（Monkey Patching）</strong>脚本。</p>
+<p>它的核心目的是：<strong>把 vLLM（一个高性能的大模型推理库）集成到 <code>verl</code>（一个强化学习训练框架）中，让 vLLM 能够直接从内存中读取正在训练的模型（Actor），而不是从硬盘加载文件。</strong></p>
+<p>为了让你看懂，我把阅读这份代码的任务拆解成 <strong>5个 Todo Task</strong>，我们一步步来完成。</p>
+<hr />
+<h3>任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1: 理解背景与目标</strong> —— 为什么要写这个文件？</li>
+<li><strong>Task 2: 注册改装件 (Registry)</strong> —— 告诉系统用我们自定义的方法加载权重。</li>
+<li><strong>Task 3: 修改词表层 (Vocab Patch)</strong> —— 解决分布式训练时的词表切分问题。</li>
+<li><strong>Task 4: 核心加载逻辑 (Get Model)</strong> —— 创建模型壳子并注入权重。</li>
+<li><strong>Task 5: 修改采样器 (Sampler Patch)</strong> —— 解决多卡通信时的 Logits 收集问题。</li>
+</ol>
+<hr />
+<h3>逐步讲解</h3>
+<h4>Task 1: 理解背景与目标</h4>
+<p><strong>观点：</strong> 这是一个“桥梁”文件。
+在强化学习（RLHF）中，我们有一个正在训练的模型（叫 Actor）。为了生成数据（Rollout），我们需要用 vLLM 来加速推理。
+*   <strong>普通 vLLM：</strong> 从硬盘读取 <code>.bin</code> 或 <code>.safetensors</code> 权重文件。
+*   <strong>这个文件：</strong> 直接从 Python 内存里的 <code>actor_model</code> 把权重“拷贝”给 vLLM，省去了存盘再读盘的时间，并处理了分布式训练的特殊情况。</p>
+<h4>Task 2: 注册改装件 (Registry)</h4>
+<p><strong>代码位置：</strong> <code>__LAYER_WEIGHT_LOADER_REGISTRY__</code> 和随后的 <code>for</code> 循环。</p>
+<p><strong>解读：</strong>
+vLLM 内部有很多层（比如 <code>ColumnParallelLinear</code>）。这段代码做了一件事：<strong>偷梁换柱</strong>。
+它把 vLLM 原本的权重加载方法，替换成了 <code>verl</code> 自定义的 <code>parallel_weight_loader</code>。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 意思是：当 vLLM 遇到并行线性层时，使用我们自定义的 parallel_weight_loader 函数来加载权重</span>
+<span class="n">__LAYER_WEIGHT_LOADER_REGISTRY__</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="n">ColumnParallelLinear</span><span class="p">:</span> <span class="n">parallel_weight_loader</span><span class="p">,</span>
+    <span class="c1"># ... 其他层</span>
+<span class="p">}</span>
+
+<span class="c1"># 真正的“魔改”动作：直接修改类的属性</span>
+<span class="k">for</span> <span class="n">layer_class</span><span class="p">,</span> <span class="n">weight_loader</span> <span class="ow">in</span> <span class="n">__LAYER_WEIGHT_LOADER_REGISTRY__</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+    <span class="n">layer_class</span><span class="o">.</span><span class="n">weight_loader</span> <span class="o">=</span> <span class="n">weight_loader</span>
+</code></pre></div>
+
+<p><strong>为什么要做这个？</strong> 因为 vLLM 原生的加载器是读文件的，我们需要一个能读内存字典（State Dict）的加载器。</p>
+<h4>Task 3: 修改词表层 (Vocab Patch)</h4>
+<p><strong>代码位置：</strong> <code>vocab_init</code> 函数 和 <code>VocabParallelEmbedding.__init__ = vocab_init</code>。</p>
+<p><strong>解读：</strong>
+在大模型分布式训练（Tensor Parallel）中，词表（Vocabulary）通常会被切分到不同的 GPU 上。
+*   vLLM 原本的初始化逻辑可能不符合 <code>verl</code> 的切分方式，或者会有越界问题（注释里提到了 padding 64 的问题）。
+*   这段代码重写了 <code>VocabParallelEmbedding</code> 的初始化函数 (<code>__init__</code>)。</p>
+<p><strong>关键点：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 计算当前 GPU 负责词表的哪一部分（Start 到 End）</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">vocab_start_index</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">vocab_end_index</span> <span class="o">=</span> <span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="c1"># 创建空的权重张量，稍后会填入数据</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">weight</span> <span class="o">=</span> <span class="n">Parameter</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p>最后一行 <code>VocabParallelEmbedding.__init__ = vocab_init</code> 是 Python 的黑魔法，强行把 vLLM 库里的类初始化函数给换掉了。</p>
+<h4>Task 4: 核心加载逻辑 (Get Model)</h4>
+<p><strong>代码位置：</strong> <code>get_model</code> 函数。</p>
+<p><strong>解读：</strong>
+这是外部调用的主入口。流程如下：
+1.  <strong>配置检查：</strong> 检查量化配置（Quantization），看 GPU 是否支持。
+2.  <strong>创建空壳：</strong> <code>model = model_class(...)</code>。这时候模型是在 CPU 上的，而且权重是空的（或者随机的）。
+3.  <strong>注入权重（最重要的一步）：</strong>
+    <code>python
+    if model_config.load_format == 'model' ...:
+        # 如果传入的是一个 PyTorch 模型对象 (Actor)，直接提取它的 named_parameters
+        if isinstance(actor_model, nn.Module):
+            load_weights(actor_weights=dict(actor_model.named_parameters(...)), vllm_model=model)</code>
+4.  <strong>搬运到 GPU：</strong> 最后把填好权重的模型 <code>.cuda()</code> 放到显卡上。</p>
+<h4>Task 5: 修改采样器 (Sampler Patch)</h4>
+<p><strong>代码位置：</strong> <code>_get_logits</code>, <code>forward</code> 函数 以及最后的 <code>Sampler.forward = forward</code>。</p>
+<p><strong>解读：</strong>
+这是为了解决分布式通信的问题。
+*   <strong>原版 vLLM：</strong> 通常使用 Ray 进行调度，采样结果可能只需要汇总到主节点（Driver）。
+*   <strong>Verl 的需求：</strong> 使用 SPMD（单程序多数据）模式。意味着<strong>每一张显卡</strong>都需要知道最终的 Logits（概率分布），以便计算强化学习的奖励或进行下一步策略更新。</p>
+<p><strong>关键改动：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 原版可能用 gather (只给一个人)，这里改成 all_gather (所有人都能拿到)</span>
+<span class="n">logits</span> <span class="o">=</span> <span class="n">tensor_model_parallel_all_gather</span><span class="p">(</span><span class="n">logits</span><span class="p">)</span>
+</code></pre></div>
+
+<p>最后几行代码同样是“魔改”，把 vLLM 里的 <code>Sampler</code> 类的 <code>forward</code> 和 <code>_get_logits</code> 方法直接覆盖掉。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件不是在“写”一个模型，而是在<strong>“入侵”</strong> vLLM。</p>
+<p>它像一个<strong>适配器</strong>：
+1.  <strong>拦截</strong>了 vLLM 的初始化过程。
+2.  <strong>塞入</strong>了自定义的权重加载逻辑（从内存读而非文件）。
+3.  <strong>修正</strong>了分布式通信的方式（从 Gather 改为 All-Gather），以适应强化学习的训练架构。</p>

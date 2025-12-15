@@ -1,0 +1,55 @@
+<h1>megatron/core/dist_checkpointing/validation.py</h1>
+<p>这份代码文件 <code>megatron/core/dist_checkpointing/validation.py</code> 的核心作用就是 <strong>“安检”</strong> 和 <strong>“对账”</strong>。</p>
+<p>在分布式训练中，模型被切分成很多小块（Shards）散落在不同的显卡（Rank）上。保存和加载这些切片非常容易出错。这个文件的任务就是确保：<strong>你要加载的模型结构</strong> 和 <strong>硬盘里存的检查点文件</strong> 是匹配的，而且这些切片拼起来是完整的。</p>
+<p>为了让你更容易理解，我把这个文件的逻辑拆解成一个 <strong>“加载模型时的任务清单 (To-Do List)”</strong>。想象你是一个仓库管理员，现在要把仓库里的零件（Checkpoint）发给流水线上的工人（Model）。</p>
+<hr />
+<h3>📦 分布式模型加载任务清单 (To-Do List)</h3>
+<h4>任务 1：检查仓库和工具 (Environment Check)</h4>
+<p><strong>对应函数：</strong> <code>verify_checkpoint_and_load_strategy</code>
+*   <strong>动作：</strong>
+    1.  看看用户给的路径 <code>checkpoint_dir</code> 存在不存在？
+    2.  这个路径里有没有配置文件？是不是一个合法的 Megatron 检查点？
+    3.  检查手中的工具（Strategy，比如是用 PyTorch 原生加载还是 Zarr/TensorStore 等后端）是否兼容当前的检查点版本。
+*   <strong>目的：</strong> 确保还没开始干活之前，环境是正常的，不要等到加载一半才报错。</p>
+<h4>任务 2：确定严格程度 (Define Strictness)</h4>
+<p><strong>对应类：</strong> <code>StrictHandling</code> (枚举类)
+*   <strong>动作：</strong> 决定当“账目不平”时该怎么办。比如模型想要参数 A, B, C，但文件里只有 A, B, D。
+    *   <code>ASSUME_OK_UNEXPECTED</code>: 假装没看见多余的，不报错（最快，默认）。
+    *   <code>LOG_UNEXPECTED</code>: 记录个警告日志：“嘿，这里有个多余的 D，但我忽略它了”。
+    *   <code>RAISE_ALL</code>: 只要有一点对不上（缺了 C 或多了 D），立马报错并停止程序（最严格）。
+*   <strong>目的：</strong> 给用户选择权，是想要极致的安全性，还是想要兼容性（比如微调时经常会多出或缺少某些层）。</p>
+<h4>任务 3：对账 (Matchmaking / Mismatch Check)</h4>
+<p><strong>对应函数：</strong> <code>validate_integrity_and_strict_load</code> 和 <code>_determine_missing_and_unexpected_keys</code>
+*   <strong>动作：</strong>
+    1.  <strong>列出清单：</strong> 此时此刻，每张显卡（Rank）手里的模型需要什么参数？（Local Metadata）
+    2.  <strong>查看库存：</strong> 硬盘里的检查点里有什么参数？（Checkpoint Metadata）
+    3.  <strong>对比：</strong>
+        *   <strong>Missing Keys (缺货)：</strong> 模型要，但硬盘里没有。这通常是大问题。
+        *   <strong>Unexpected Keys (多货)：</strong> 硬盘里有，但模型不要。这通常发生在加载预训练模型进行微调时。
+    4.  <strong>执行任务 2 的规则：</strong> 根据刚才定的严格程度，决定是报错、警告还是默默剔除多余的参数。</p>
+<h4>任务 4：检查拼图完整性 (Sharding Integrity Check)</h4>
+<p><strong>对应函数：</strong> <code>validate_sharding_integrity</code>
+这是分布式训练最特有的一步。因为一个大张量（Tensor）被切碎了，我们需要确保它们能拼回去。
+*   <strong>动作：</strong>
+    1.  <strong>收集信息：</strong> 所有显卡把自己的切片信息（位置、大小）汇报给 0 号显卡（Rank 0）。
+    2.  <strong>拼图检查 (Rank 0 专属任务)：</strong>
+        *   <strong>覆盖检查：</strong> 这些切片拼起来，是不是正好等于原本那个大张量的形状？有没有中间缺了一块（空洞）？
+        *   <strong>重叠检查：</strong> 有没有两个显卡抢着负责同一个位置的数据？（除非是复制模式，否则通常是不允许的）。
+    3.  <strong>扁平化检查：</strong> 如果数据是扁平化存储的，检查范围是否首尾相连。
+*   <strong>目的：</strong> 防止加载出来的模型是个“破洞”的模型，或者数据错乱的模型。</p>
+<h4>任务 5：检查对象处理能力 (Object Handling Check)</h4>
+<p><strong>对应函数：</strong> <code>validate_sharded_objects_handling</code>
+*   <strong>动作：</strong> 确认当前的保存/加载策略（Strategy）是否支持保存非 Tensor 的普通 Python 对象。
+*   <strong>目的：</strong> 有些策略只支持存纯数值矩阵，不支持存配置字典。如果不支持还硬要存，就报错。</p>
+<hr />
+<h3>总结：文中的核心观点</h3>
+<ol>
+<li><strong>非对称的“对账”：</strong> 代码特别区分了“Missing（缺失）”和“Unexpected（多余）”。<ul>
+<li>“多余”的键可以在本地（Local）判断，因为我自己不要就是多余。</li>
+<li>“缺失”的键必须从全局（Global）判断，因为可能我自己不需要，但别的显卡需要。</li>
+</ul>
+</li>
+<li><strong>元数据（Metadata）先行：</strong> 在真正读取巨大的权重数据之前，先读取轻量级的元数据（Metadata）进行校验。这样如果出错，能瞬间发现，不用等几个小时加载完才报错。</li>
+<li><strong>Rank 0 负责统筹：</strong> 复杂的拼图完整性检查（Integrity Check）由 Rank 0 统一处理，其他 Rank 只需要上报信息。</li>
+</ol>
+<p>简单来说，这个文件就是 <strong>Megatron 加载模型时的“安检员”</strong>，防止你加载了一个形状不对、参数缺失或者版本不兼容的模型。</p>

@@ -1,0 +1,156 @@
+<h1>verl/models/qwen2/megatron/checkpoint_utils/qwen2_loader_depracated.py</h1>
+<p>这份代码确实比较硬核，因为它涉及到<strong>大模型分布式训练（Distributed Training）</strong>中最复杂的底层逻辑：如何把一个完整的模型权重文件（比如 HuggingFace 下载的 <code>pytorch_model.bin</code>），切分并加载到分布在多张显卡上的 Megatron-LM 架构模型中。</p>
+<p>简单来说，这个文件的作用是：<strong>“分蛋糕”</strong>。
+你有一个巨大的蛋糕（完整的模型权重），但你有一群人（多张显卡）要吃。这个人负责吃奶油（某一层），那个人负责吃蛋糕胚（另一层），还有人负责吃水果（Attention 矩阵的一部分）。这个脚本就是负责把蛋糕切好，通过网络精准地扔给对应的人。</p>
+<p>为了让你看懂，我把它拆解为一个 <strong>Task List（任务清单）</strong>，然后一步步解释。</p>
+<hr />
+<h3>核心任务清单 (Task List)</h3>
+<p>这段代码在执行时，实际上是在按顺序完成以下任务：</p>
+<ol>
+<li><strong>[规划] 绘制地图 (<code>_megatron_calc_layer_map</code>)</strong>：<ul>
+<li>算出每一层（Layer 0, Layer 1...）到底应该放在哪张显卡（Pipeline Rank）上。</li>
+</ul>
+</li>
+<li><strong>[准备] 建立通信管道</strong>：<ul>
+<li>确认当前显卡的角色（我是负责切蛋糕的 Rank 0，还是等着接蛋糕的普通 Rank）。</li>
+<li>定义好“投喂”工具函数（Broadcast），用于把数据从 Rank 0 传给其他显卡。</li>
+</ul>
+</li>
+<li><strong>[分发] 加载词表 (Embeddings)</strong>：<ul>
+<li>把输入的 Embedding 层切分并分发给负责第一阶段的显卡。</li>
+</ul>
+</li>
+<li><strong>[循环] 加载中间层 (Transformer Layers)</strong>：<ul>
+<li><strong>核心循环</strong>：遍历模型的每一层（Layer 0 到 Layer N）。</li>
+<li><strong>定位</strong>：查地图，看这一层归谁管。</li>
+<li><strong>切分 QKV</strong>：处理 Attention 层的 Query/Key/Value 权重（最麻烦的一步，需要特殊拼接）。</li>
+<li><strong>切分 MLP</strong>：处理全连接层的 Gate/Up/Down 投影权重。</li>
+</ul>
+</li>
+<li><strong>[分发] 加载输出层 (Final Norm &amp; Head)</strong>：<ul>
+<li>加载最后的归一化层和输出层（LM Head）。</li>
+<li>如果是强化学习（RL），还要处理 Value Head。</li>
+</ul>
+</li>
+<li><strong>[同步] 确保全员就位</strong>：<ul>
+<li>确保所有显卡都拿到了属于自己的那份权重，并且数据是一致的。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>逐步详解 (Step-by-Step)</h3>
+<h4>1. 绘制地图 (<code>_megatron_calc_layer_map</code>)</h4>
+<p><strong>背景知识</strong>：Megatron 使用了 <strong>流水线并行 (Pipeline Parallelism, PP)</strong>。假设模型有 32 层，你有 4 张卡做 PP。
+*   卡 1 负责：层 0-7
+*   卡 2 负责：层 8-15
+*   ...以此类推。
+*   <em>进阶情况</em>：如果有 Virtual Pipeline（虚拟流水线），卡 1 可能负责层 0-3 和层 16-19（交错负责）。</p>
+<p><strong>代码逻辑</strong>：
+这个函数生成一个字典 <code>layer_map</code>。
+*   <strong>输入</strong>：全局层号（比如第 10 层）。
+*   <strong>输出</strong>：<code>(pp_rank, virtual_pp_rank, layer_idx)</code>。即：这一层归“几号流水线显卡”管，它在显卡内部是“第几层”。</p>
+<h4>2. 定义“投喂”工具 (内部函数 <code>_broadcast_...</code>)</h4>
+<p>这是整个脚本中最长的一块。因为只有 <strong>主进程 (Rank 0)</strong> 读取了完整的权重文件（为了省内存，不可能让所有卡都读一遍 70GB 的文件）。Rank 0 需要把权重“广播”给其他卡。</p>
+<p>这里定义了几个不同的广播方式，对应不同的切分逻辑：</p>
+<ul>
+<li>
+<p><strong><code>_broadcast_tensor</code> (直接广播)</strong>：</p>
+<ul>
+<li>适用于不需要切分的参数（比如 LayerNorm 的参数，每张卡上存的都是完整的）。</li>
+<li><strong>逻辑</strong>：Rank 0 读取 -&gt; 发送 -&gt; 其他卡接收。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>_broadcast_tp_shard_tensor</code> (切片广播)</strong>：</p>
+<ul>
+<li>适用于 <strong>张量并行 (Tensor Parallelism, TP)</strong>。</li>
+<li>比如一个巨大的矩阵 $4096 \times 4096$，如果有 2 张卡做 TP，每张卡只存 $2048 \times 4096$。</li>
+<li><strong>逻辑</strong>：Rank 0 读取完整矩阵 -&gt; 按维度切成几块 -&gt; 把第 $i$ 块发给第 $i$ 号 TP 显卡。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>_broadcast_tp_shard_tensor_qkv</code> (QKV 特殊处理)</strong>：</p>
+<ul>
+<li><strong>Qwen2 的特点</strong>：它使用了 GQA (Grouped Query Attention)，Query 的头数和 Key/Value 的头数不一样。</li>
+<li><strong>逻辑</strong>：Rank 0 必须先把 Q、K、V 的权重拼在一起，但这不能瞎拼。必须按照 TP 的份数，把属于卡 1 的 Q、K、V 挑出来拼好发给卡 1，把属于卡 2 的挑出来发给卡 2。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>_broadcast_tp_shard_tensor_gate_up</code> (MLP 特殊处理)</strong>：</p>
+<ul>
+<li><strong>SwiGLU 的特点</strong>：MLP 层有两个投影矩阵（Gate 和 Up），通常也是拼在一起计算的。</li>
+<li><strong>逻辑</strong>：同上，先拆分再按卡拼接，最后分发。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 加载词表 (Embeddings)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">dp_rank</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+    <span class="c1"># ...</span>
+    <span class="k">if</span> <span class="n">pp_rank</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="n">embed_tokens_weight</span> <span class="o">=</span> <span class="n">gpt_model_module</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">embed_tokens</span><span class="o">.</span><span class="n">weight</span>
+    <span class="n">_broadcast_tp_shard_tensor_vocab</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>逻辑</strong>：Embedding 层通常只存在于 <strong>流水线的第一张卡 (pp_rank == 0)</strong>。</li>
+<li>Rank 0 读取权重，通过 <code>_broadcast_tp_shard_tensor_vocab</code> 切分（词表很大，通常也是切分存的）并发送给 PP Rank 0 的显卡们。</li>
+</ul>
+<h4>4. 循环加载中间层 (Transformer Layers)</h4>
+<p>这是代码的主体循环部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">for</span> <span class="n">layer</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">):</span>
+    <span class="c1"># 1. 查地图：这一层归谁？</span>
+    <span class="n">dst_pp_rank</span><span class="p">,</span> <span class="n">dst_virtual_pp_rank</span><span class="p">,</span> <span class="n">dst_layer_idx</span> <span class="o">=</span> <span class="n">layer_map</span><span class="p">[</span><span class="n">layer</span><span class="p">]</span>
+
+    <span class="c1"># 2. 只有负责这一层的显卡才需要获取指针，其他显卡这里是 None</span>
+    <span class="c1"># ...</span>
+
+    <span class="c1"># 3. 逐个组件加载</span>
+
+    <span class="c1"># 加载 Attention 的 QKV (最复杂的部分)</span>
+    <span class="n">_broadcast_tp_shard_tensor_qkv</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">layer_name</span><span class="si">}</span><span class="s2">.self_attn.q_proj.weight&quot;</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># 加载 Attention 的 Output Projection</span>
+    <span class="n">_broadcast_tp_shard_tensor</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">layer_name</span><span class="si">}</span><span class="s2">.self_attn.o_proj.weight&quot;</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># 加载 MLP 的 Gate 和 Up (SwiGLU)</span>
+    <span class="n">_broadcast_tp_shard_tensor_gate_up</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">layer_name</span><span class="si">}</span><span class="s2">.mlp.gate_proj.weight&quot;</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># 加载 MLP 的 Down Projection</span>
+    <span class="n">_broadcast_tp_shard_tensor</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">layer_name</span><span class="si">}</span><span class="s2">.mlp.down_proj.weight&quot;</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：这个循环在所有显卡上同时运行。</li>
+<li>对于每一层，所有显卡都会问：“这一层是我的吗？”<ul>
+<li>如果是：它会准备好一个空的 Tensor，等着 Rank 0 投喂数据。</li>
+<li>如果不是：它就在旁边看着（参与通信但不保存数据，或者由 Broadcast 机制内部处理跳过）。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 加载输出层 (Final Norm &amp; Head)</h4>
+<ul>
+<li><strong>Final Norm</strong>：只有流水线的 <strong>最后一张卡</strong> 需要这个。</li>
+<li><strong>LM Head (语言模型头)</strong>：将隐藏层状态映射回词表概率。<ul>
+<li>代码中特别处理了 <code>is_value_model</code>。这是因为在 RLHF（PPO 训练）中，除了生成模型，还有一个 <strong>Critic (Value) Model</strong>。</li>
+<li>如果这是一个 Value Model，它可能没有 <code>lm_head</code>，或者它的 head 维度是 1（只输出一个分值），代码在这里做了兼容性判断。</li>
+</ul>
+</li>
+</ul>
+<h4>6. 同步 (Barrier &amp; Broadcast)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">dist</span><span class="o">.</span><span class="n">barrier</span><span class="p">()</span>
+<span class="k">for</span> <span class="n">wrapped_model</span> <span class="ow">in</span> <span class="n">wrapped_models</span><span class="p">:</span>
+    <span class="n">broadcast_params</span><span class="p">(</span><span class="n">wrapped_model</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><code>dist.barrier()</code>：大家停一下，等最慢的那个人做完。</li>
+<li><code>broadcast_params</code>：这一步是为了处理 <strong>数据并行 (Data Parallel, DP)</strong>。<ul>
+<li>前面所有的操作都是在处理 TP 和 PP。</li>
+<li>如果有 DP（比如你有 16 张卡，8 张卡存一个模型副本，另外 8 张卡存另一个副本），这里把刚才加载好的那个副本的权重，直接复制给其他 DP 组的显卡。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件的核心逻辑就是：</p>
+<p><strong>Rank 0 手里拿着图纸（State Dict），根据 Qwen2 的结构特点（GQA, SwiGLU），把零件（权重）拆解（Slicing），然后通过传送带（Broadcast），精准地送到流水线上每一个工人（GPU）的手里组装起来。</strong></p>
+<p>之所以难读，是因为它把“切分逻辑”、“通信逻辑”和“模型结构”耦合在了一起。</p>

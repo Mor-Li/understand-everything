@@ -1,0 +1,145 @@
+<h1>fla/ops/based/parallel.py</h1>
+<p>这份代码确实比较硬核，因为它是用 <strong>OpenAI Triton</strong> 编写的高性能 GPU 算子。它的核心目的是实现一种叫做 <strong>"Based"</strong> 的线性 Attention 机制（来自斯坦福 Hazy Research 的研究）。</p>
+<p>简单来说，它在做类似于 Transformer 中 Self-Attention 的事情，但计算方式不同（更高效），且为了速度手动管理了显存读写。</p>
+<p>为了让你看懂，我把这个代码的执行逻辑拆解成一个 <strong>“GPU 的任务清单 (Todo List)”</strong>。想象你是 GPU 的一个线程块（Block），你需要按照这个清单一步步干活。</p>
+<hr />
+<h3>核心任务目标</h3>
+<p>我们要计算公式：
+$$ O = \frac{\text{Taylor}(Q K^T) \cdot V}{\text{rowsum}(\text{Taylor}(Q K^T))} $$
+其中 $\text{Taylor}(x) = 1 + x + 0.5x^2$ （这是对 $e^x$ 的二阶泰勒展开近似）。
+这比标准的 Softmax Attention 更快，因为可以并行化且没有 Softmax 的全局依赖。</p>
+<hr />
+<h3>任务清单 (Task List)</h3>
+<h4>Phase 1: 准备工作 (分块与切片)</h4>
+<p><strong>背景</strong>：显存（HBM）很大但很慢，SRAM（片上内存）很快但很小。我们不能一次性算出整个大矩阵乘法，必须切成小块（Tiling）。</p>
+<ul>
+<li>
+<p><strong>Task 1.1: 确定身份</strong></p>
+<ul>
+<li>我是哪个 Batch？哪个 Head？</li>
+<li>我负责序列（Sequence）中的哪一段？（代码中的 <code>i_c</code>，即 chunk index）。</li>
+<li><em>代码对应</em>：<code>parallel_based_fwd_kernel</code> 开头的 <code>tl.program_id</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 1.2: 准备指针 (Block Pointers)</strong></p>
+<ul>
+<li>定位到大矩阵 $Q, K, V$ 中我负责的那一小块数据的起始位置。</li>
+<li><em>代码对应</em>：<code>tl.make_block_ptr(...)</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>Phase 2: 前向传播 (Forward Kernel)</h4>
+<p><strong>目标</strong>：计算 Output $O$ 和归一化因子 $Z$。</p>
+<ul>
+<li>
+<p><strong>Task 2.1: 加载 Query (Q)</strong></p>
+<ul>
+<li>把属于我这个时间段的 $Q$ 块加载到 SRAM 中。这块 $Q$ 在整个计算过程中常驻 SRAM。</li>
+<li><em>代码对应</em>：<code>b_q = tl.load(p_q, ...)</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 2.2: 处理“历史”信息 (非对角线块)</strong></p>
+<ul>
+<li><strong>逻辑</strong>：我要算 $Q \times K^T$。对于当前时间段之前的 $K$ 和 $V$（即“过去”的信息），我肯定是全都能看到的，<strong>不需要</strong>做 Causal Mask（因果遮罩，即防止看到未来的 mask）。</li>
+<li><strong>行动</strong>：<ol>
+<li>循环加载之前所有的 $K$ 和 $V$ 块。</li>
+<li>计算分数：$S = Q \times K^T$。</li>
+<li><strong>核心魔法</strong>：应用 Based 的激活函数 $S' = 1 + S + 0.5 S^2$。</li>
+<li>累加到输出：$O += S' \times V$。</li>
+<li>累加归一化因子：$Z += \text{sum}(S')$。</li>
+</ol>
+</li>
+<li><em>代码对应</em>：第一个 <code>for</code> 循环 <code>range(0, i_c * BTL, BTS)</code>。这里没有 mask，计算效率极高。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 2.3: 处理“当前”信息 (对角线块)</strong></p>
+<ul>
+<li><strong>逻辑</strong>：现在处理我自己这个时间段内的 $K$ 和 $V$。因为是自回归模型（如 GPT），我不能看到“未来”的词。所以需要 Mask。</li>
+<li><strong>行动</strong>：<ol>
+<li>加载当前的 $K$ 和 $V$。</li>
+<li>生成 Mask：创建一个上三角矩阵（Mask 掉未来）。</li>
+<li>计算分数 $S$，应用 $1 + S + 0.5 S^2$。</li>
+<li><strong>应用 Mask</strong>：把未来的位置设为 0。</li>
+<li>累加 $O$ 和 $Z$。</li>
+</ol>
+</li>
+<li><em>代码对应</em>：第二个 <code>for</code> 循环 <code>range(i_c * BTL, (i_c + 1) * BTL, BTS)</code>。注意里面的 <code>m_s = o_q[:, None] &gt;= o_k[None, :]</code> 就是在做 Mask。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 2.4: 写回结果</strong></p>
+<ul>
+<li>把算好的 $O$ 和 $Z$ 写回显存。</li>
+<li><em>代码对应</em>：<code>tl.store(p_o, ...)</code> 和 <code>tl.store(p_z, ...)</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>Phase 3: 后向传播 (Backward Kernel)</h4>
+<p><strong>背景</strong>：训练需要梯度。这部分最难，因为要算 $dQ, dK, dV$。</p>
+<ul>
+<li>
+<p><strong>Task 3.1: 准备</strong></p>
+<ul>
+<li>加载前向传播时的 $Q, K, V$ 以及传回来的梯度 $dO, dZ$。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 3.2: 计算 dQ (梯度对 Q 的导数)</strong></p>
+<ul>
+<li>根据链式法则，$dQ$ 取决于 $dO$ 和 $K, V$。</li>
+<li>逻辑和前向传播类似，先算没 Mask 的部分，再算有 Mask 的部分，把梯度累加起来。</li>
+<li><em>代码对应</em>：<code>_parallel_based_bwd_dq</code> 函数。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 3.3: 计算 dK 和 dV</strong></p>
+<ul>
+<li>这是一个逆向过程。</li>
+<li>我们需要重新计算一遍 Attention Score ($S$)，结合 $dO$ 来算出 $K$ 和 $V$ 需要怎么变。</li>
+<li><em>代码对应</em>：<code>_parallel_based_bwd_dkv</code> 函数。</li>
+</ul>
+</li>
+</ul>
+<h4>Phase 4: Python 封装 (API)</h4>
+<p><strong>目标</strong>：让普通用户像用 <code>torch.nn</code> 一样调用它。</p>
+<ul>
+<li>
+<p><strong>Task 4.1: 维度检查与 Padding</strong></p>
+<ul>
+<li>确保输入的维度是 Triton 喜欢的（比如 16 的倍数）。</li>
+<li>设置 Grid 大小（启动多少个 GPU 核心）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 4.2: 最终计算</strong></p>
+<ul>
+<li>调用 Triton Kernel 得到 $O$ 和 $Z$。</li>
+<li>执行除法：$\text{Output} = \frac{O}{Z}$ (这步是在 Python 里做的，Triton 算子只负责算出分子和分母)。</li>
+<li><em>代码对应</em>：<code>parallel_based</code> 函数末尾的 <code>o = o / (z[..., None] + 1e-6)</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底牛在哪？</h3>
+<ol>
+<li><strong>泰勒展开 (Taylor Expansion)</strong>：<ul>
+<li>代码里反复出现的 <code>1 + b_s + 0.5 * b_s * b_s</code> 就是 Based 模型的灵魂。它用多项式近似替代了 Softmax，去掉了指数运算，更适合硬件加速。</li>
+</ul>
+</li>
+<li><strong>分块流水线 (Pipelining)</strong>：<ul>
+<li>它把“历史数据”（没有 Mask，纯矩阵乘法，快）和“当前数据”（有 Mask，逻辑复杂，慢）拆开处理。这最大化了 GPU 的吞吐量。</li>
+</ul>
+</li>
+<li><strong>IO 优化</strong>：<ul>
+<li>利用 <code>Block Pointer</code> (Triton 的高级功能) 极大地减少了地址计算的开销。</li>
+</ul>
+</li>
+</ol>
+<h3>如何阅读建议</h3>
+<p>不要试图一行行读 Triton 的汇编级逻辑。
+1.  先看最后的 <code>parallel_based</code> Python 函数，理解输入输出。
+2.  再看 <code>parallel_based_fwd_kernel</code>，重点看那两个 <code>for</code> 循环（一个无 Mask，一个有 Mask）。
+3.  Backward 部分通常不需要深究，除非你要改算法，它本质上就是 Forward 的数学逆过程。</p>

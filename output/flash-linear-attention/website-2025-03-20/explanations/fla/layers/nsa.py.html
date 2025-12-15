@@ -1,0 +1,119 @@
+<h1>fla/layers/nsa.py</h1>
+<p>这份代码确实乍一看有点吓人，因为它涉及了很多Transformer底层的优化细节（比如KV Cache、RoPE旋转位置编码、以及自定义的CUDA算子）。</p>
+<p>但别担心，它的核心其实就是一个<strong>“魔改版”的注意力机制</strong>。</p>
+<p>为了让你听懂，我把阅读这份代码拆解成 <strong>5个具体的 Task（任务）</strong>。我们像剥洋葱一样，一层一层把这个 <code>NativeSparseAttention</code> (原生稀疏注意力) 弄明白。</p>
+<hr />
+<h3>📝 你的学习 Task List</h3>
+<ol>
+<li><strong>Task 1：搞懂“原材料” (Q, K, V)</strong> —— 它是怎么把输入变成查询、键、值的？</li>
+<li><strong>Task 2：发现“指挥官” (Gate G)</strong> —— 这是这个算法最独特的地方，它比普通Attention多算了一个东西。</li>
+<li><strong>Task 3：理解“稀疏策略” (NSA的核心)</strong> —— 为什么要分 <code>cmp</code>, <code>slc</code>, <code>swa</code> 这三个名字？</li>
+<li><strong>Task 4：处理“位置”与“记忆” (RoPE &amp; Cache)</strong> —— 它是怎么知道“第几个词”以及怎么“省显存”的？</li>
+<li><strong>Task 5：最后的大合奏 (Parallel NSA)</strong> —— 所有东西是怎么丢进黑盒子里计算的？</li>
+</ol>
+<hr />
+<h3>🟢 Task 1：搞懂“原材料” (Q, K, V)</h3>
+<p>在标准的 Transformer 里，我们都需要计算 Query (Q), Key (K), Value (V)。这一步和普通的 Llama/GPT 几乎一样。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 初始化部分 (__init__)</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">q_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_heads</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">head_dim</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">k_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_dim</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">v_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_dim</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+<span class="c1"># 前向传播部分 (forward)</span>
+<span class="n">q</span> <span class="o">=</span> <span class="n">rearrange</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">q_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">),</span> <span class="o">...</span><span class="p">)</span>
+<span class="n">k</span> <span class="o">=</span> <span class="n">rearrange</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">k_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">),</span> <span class="o">...</span><span class="p">)</span>
+<span class="n">v</span> <span class="o">=</span> <span class="n">rearrange</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">v_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">),</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>白话解释：</strong>
+*   把输入的向量 <code>hidden_states</code> 通过三个不同的线性层（全连接层），分别变成了 Q、K、V。
+*   <code>rearrange</code> 是把形状调整好，把“多头”（Multi-head）的维度拆出来。
+*   <strong>注意点</strong>：这里用了 <strong>GQA (Grouped Query Attention)</strong>，也就是 K 和 V 的头数 (<code>num_kv_heads</code>) 可能比 Q 的头数少。这是为了省显存和加速。</p>
+<hr />
+<h3>🟢 Task 2：发现“指挥官” (Gate G) —— 最关键的一步</h3>
+<p>这是 NSA (Native Sparse Attention) 和普通 Attention 最大的区别。普通 Attention 只有 QKV，但这里多了一个 <strong>G (Gate，门控)</strong>。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 初始化</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">g_proj</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_heads</span> <span class="o">*</span> <span class="mi">3</span><span class="p">,</span> <span class="n">bias</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+
+<span class="c1"># 前向传播</span>
+<span class="n">g</span> <span class="o">=</span> <span class="n">rearrange</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">g_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">),</span> <span class="s1">&#39;... (h d) -&gt; ... h d&#39;</span><span class="p">,</span> <span class="n">d</span><span class="o">=</span><span class="mi">3</span><span class="p">)</span>
+<span class="n">g_cmp</span><span class="p">,</span> <span class="n">g_slc</span><span class="p">,</span> <span class="n">g_swa</span> <span class="o">=</span> <span class="n">g</span><span class="o">.</span><span class="n">sigmoid</span><span class="p">()</span><span class="o">.</span><span class="n">unbind</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>白话解释：</strong>
+*   它多训练了一个线性层 <code>g_proj</code>。
+*   这个层输出 3 个数值（针对每个头）。
+*   <code>.sigmoid()</code> 把这些值压缩到 0 到 1 之间，变成了“概率”或者“权重”。
+*   <code>.unbind(-1)</code> 把这 3 个值拆开，分别命名为：
+    1.  <strong><code>g_cmp</code></strong>: Compression (压缩)
+    2.  <strong><code>g_slc</code></strong>: Selection (选择/稀疏)
+    3.  <strong><code>g_swa</code></strong>: Sliding Window Attention (滑窗)</p>
+<p><strong>观点：</strong> 模型在<strong>动态决定</strong>每一时刻应该用哪种注意力方式。比如，“我现在应该看全局摘要（cmp）？还是挑重点看（slc）？还是只看刚才那句话（swa）？”</p>
+<hr />
+<h3>🟢 Task 3：理解“稀疏策略” (NSA的核心)</h3>
+<p>为什么要有上面那三个 Gate？因为 NSA 认为全量 Attention（看所有历史token）太慢太贵了。它把注意力拆成了三部分混合：</p>
+<ol>
+<li><strong>SWA (Sliding Window)</strong>: 只看最近的邻居（比如最近512个词）。这叫“关注当下”。</li>
+<li><strong>SLC (Selection)</strong>: 从历史中挑选出最重要的几个块（Block）。这叫“关注重点”。</li>
+<li><strong>CMP (Compression)</strong>: 把历史信息压缩成摘要。这叫“关注全局”。</li>
+</ol>
+<p><strong>代码里的线索：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="bp">self</span><span class="o">.</span><span class="n">block_size</span> <span class="o">=</span> <span class="n">block_size</span>      <span class="c1"># 块的大小</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">block_counts</span> <span class="o">=</span> <span class="n">block_counts</span>  <span class="c1"># 选多少个块 (Selection)</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">window_size</span> <span class="o">=</span> <span class="n">window_size</span>    <span class="c1"># 滑窗大小 (SWA)</span>
+</code></pre></div>
+
+<p>这三个参数就是用来控制这三种策略的具体范围的。</p>
+<hr />
+<h3>🟢 Task 4：处理“位置”与“记忆” (RoPE &amp; Cache)</h3>
+<p>为了让模型知道词的顺序，以及在生成长文本时不要重复计算，需要 RoPE 和 KV Cache。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 旋转位置编码 (RoPE)</span>
+<span class="n">q</span><span class="p">,</span> <span class="n">k</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">rotary</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+<span class="c1"># 2. KV Cache (推理加速)</span>
+<span class="k">if</span> <span class="n">past_key_values</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="c1"># ... 省略部分代码 ...</span>
+    <span class="n">k_cached</span><span class="p">,</span> <span class="n">v_cached</span> <span class="o">=</span> <span class="n">past_key_values</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="c1"># 使用缓存的历史 K 和 V</span>
+    <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="o">=</span> <span class="n">k_cached</span><span class="p">,</span> <span class="n">v_cached</span>
+</code></pre></div>
+
+<p><strong>白话解释：</strong>
+*   <strong>RoPE</strong>: 给 Q 和 K 加上位置信息，这样“我爱你”和“你爱我”的向量计算结果才会不一样。
+*   <strong>KV Cache</strong>: 如果你是像 ChatGPT 那样一个字一个字蹦出来的，你不需要每次都重新算前面讲过的话。把之前的 K 和 V 存起来（Cache），这次只算新蹦出来的这个字，然后拼上去。</p>
+<hr />
+<h3>🟢 Task 5：最后的大合奏 (Parallel NSA)</h3>
+<p>最后，所有的准备工作（Q, K, V, Gates, Cache）都做好了，要进行真正的注意力计算了。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">o</span> <span class="o">=</span> <span class="n">parallel_nsa</span><span class="p">(</span>
+    <span class="n">q</span><span class="o">=</span><span class="n">q</span><span class="p">,</span>
+    <span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span>
+    <span class="n">v</span><span class="o">=</span><span class="n">v</span><span class="p">,</span>
+    <span class="n">g_cmp</span><span class="o">=</span><span class="n">g_cmp</span><span class="p">,</span>  <span class="c1"># 压缩门控</span>
+    <span class="n">g_slc</span><span class="o">=</span><span class="n">g_slc</span><span class="p">,</span>  <span class="c1"># 选择门控</span>
+    <span class="n">g_swa</span><span class="o">=</span><span class="n">g_swa</span><span class="p">,</span>  <span class="c1"># 滑窗门控</span>
+    <span class="n">block_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">block_size</span><span class="p">,</span>
+    <span class="n">block_counts</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">block_counts</span><span class="p">,</span>
+    <span class="n">window_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">window_size</span><span class="p">,</span>
+    <span class="o">...</span>
+<span class="p">)</span>
+<span class="n">o</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">o_proj</span><span class="p">(</span><span class="n">o</span><span class="p">)</span> <span class="c1"># 最后输出投影</span>
+</code></pre></div>
+
+<p><strong>白话解释：</strong>
+*   <code>parallel_nsa</code> 是一个写好的底层加速算子（通常是 CUDA 写的，为了快）。
+*   它做的事情是：根据 Q 和 K 计算相似度，但是<strong>不计算所有 token</strong>。
+    *   它用 <code>window_size</code> 算局部的。
+    *   它用 <code>block_counts</code> 挑几个重要的块算。
+    *   它结合 <code>g_cmp</code>, <code>g_slc</code>, <code>g_swa</code> 这三个门控权重，把三种结果加权融合在一起。
+*   最后出来的 <code>o</code> 就是融合了局部、重点和全局信息的向量，经过 <code>o_proj</code> 输出给下一层。</p>
+<hr />
+<h3>总结：这篇文章讲的观点是什么？</h3>
+<p>这段代码（NSA）的核心观点是：<strong>Attention 不需要是 $O(N^2)$ 的全量计算。</strong></p>
+<p>它认为：
+1.  我们可以把注意力分解为 <strong>局部（Window）</strong>、<strong>稀疏重点（Selection）</strong> 和 <strong>压缩摘要（Compression）</strong> 三种形式。
+2.  我们可以让模型自己学习一个 <strong>Gate（门控）</strong>，针对不同的头、不同的时刻，动态决定这三种形式的混合比例。
+3.  这样做既能处理长文本（因为稀疏了，计算量小），又能保留精度（因为有多种策略互补）。</p>

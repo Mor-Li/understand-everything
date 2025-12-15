@@ -1,0 +1,155 @@
+<h1>megatron/core/tensor_parallel/mappings.py</h1>
+<p>这份代码确实非常抽象，因为它处理的是<strong>分布式训练中最底层的“通信逻辑”</strong>。如果不了解 Megatron-LM 的并行原理，看这份代码就像看天书。</p>
+<p>简单来说，这个文件的作用是：<strong>告诉 PyTorch，当模型被切分到多张显卡上时，数据（Tensor）该怎么切（Split）、怎么合（Gather）、怎么同步（Reduce），以及在反向传播算梯度时，该怎么做相反的操作。</strong></p>
+<p>为了让你读懂，我制定了一个 <strong>5步走的 Task List</strong>，我们一步步来拆解。</p>
+<hr />
+<h3>📚 学习任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1: 理解背景</strong> —— 为什么要切分 Tensor？</li>
+<li><strong>Task 2: 掌握四个原子动作</strong> —— 显卡之间怎么“传球”？</li>
+<li><strong>Task 3: 理解核心机制 (Autograd)</strong> —— 为什么会有 <code>Forward</code> 和 <code>Backward</code>？</li>
+<li><strong>Task 4: 场景一 (Tensor Parallel)</strong> —— 模型太宽，横着切还是竖着切？</li>
+<li><strong>Task 5: 场景二 (Sequence Parallel)</strong> —— 句子太长，怎么切？</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 1: 理解背景 —— 为什么要切分 Tensor？</h4>
+<p>假设你有一个巨大的矩阵乘法 $Y = X \times A$。
+*   $X$ 是输入数据。
+*   $A$ 是模型参数（权重矩阵）。
+*   <strong>问题</strong>：矩阵 $A$ 太大了，一张显卡（GPU）放不下。
+*   <strong>解决</strong>：我们把 $A$ 切成几块，分给不同的 GPU。这就是 <strong>Tensor Parallel (TP)</strong>。</p>
+<p><strong>这个文件的作用</strong>：定义了一些“连接器”。当数据流经这些被切开的层时，需要用这些函数来处理数据的合并与分发。</p>
+<hr />
+<h4>Task 2: 掌握四个原子动作 —— 显卡之间怎么“传球”？</h4>
+<p>代码的前半部分（<code>_reduce</code>, <code>_split...</code>, <code>_gather...</code>）全是这种基础动作。想象有 2 张 GPU（Rank 0 和 Rank 1）：</p>
+<ol>
+<li>
+<p><strong>Split (切分)</strong>:</p>
+<ul>
+<li><strong>代码</strong>: <code>_split_along_last_dim</code>, <code>_split_along_first_dim</code></li>
+<li><strong>含义</strong>: 一个完整的 Tensor <code>[1, 2, 3, 4]</code>。</li>
+<li><strong>结果</strong>: GPU 0 拿 <code>[1, 2]</code>，GPU 1 拿 <code>[3, 4]</code>。大家各拿一部分。</li>
+</ul>
+</li>
+<li>
+<p><strong>Gather (收集/聚合)</strong>:</p>
+<ul>
+<li><strong>代码</strong>: <code>_gather_along_last_dim</code>, <code>_gather_along_first_dim</code></li>
+<li><strong>含义</strong>: Split 的逆操作。GPU 0 有 <code>[1, 2]</code>，GPU 1 有 <code>[3, 4]</code>。</li>
+<li><strong>结果</strong>: 大家通信，最后每张卡都得到了完整的 <code>[1, 2, 3, 4]</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>Reduce (All-Reduce 归约)</strong>:</p>
+<ul>
+<li><strong>代码</strong>: <code>_reduce</code></li>
+<li><strong>含义</strong>: 大家都有不一样的数据，想求和。GPU 0 有 <code>[1]</code>，GPU 1 有 <code>[2]</code>。</li>
+<li><strong>结果</strong>: 通信后，GPU 0 得到 <code>[3]</code> (1+2)，GPU 1 也得到 <code>[3]</code>。<strong>关键点：保持形状不变，数值相加。</strong></li>
+</ul>
+</li>
+<li>
+<p><strong>Reduce-Scatter (归约并切分)</strong>:</p>
+<ul>
+<li><strong>代码</strong>: <code>_reduce_scatter...</code></li>
+<li><strong>含义</strong>: 先求和，再切分。比 "先Reduce再Split" 更高效。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>Task 3: 理解核心机制 (Autograd) —— 为什么会有 Forward 和 Backward？</h4>
+<p>这是看懂这份代码最关键的一步。</p>
+<p>PyTorch 的 <code>torch.autograd.Function</code> 允许你自定义算子。对于分布式训练，有一个<strong>黄金法则</strong>：</p>
+<blockquote>
+<p><strong>前向传播 (Forward) 做的通信操作，反向传播 (Backward) 通常要做“数学上共轭”的操作（通常是逆操作）。</strong></p>
+</blockquote>
+<p><strong>举个例子（代码中的 <code>_CopyToModelParallelRegion</code> 类）：</strong></p>
+<ul>
+<li><strong>场景</strong>: 输入 $X$ 是完整的，准备进入一个被切分的层。</li>
+<li><strong>Forward</strong>: 什么都不用做，直接把 $X$ 复制给各个 GPU 即可（代码里直接 return input）。</li>
+<li><strong>Backward (算梯度)</strong>:<ul>
+<li>因为 Forward 时大家都有 $X$，相当于 $X$ 被用了 $N$ 次（每张卡一次）。</li>
+<li>算 $X$ 的梯度时，必须把所有卡上算出来的关于 $X$ 的梯度<strong>加起来</strong>。</li>
+<li><strong>代码逻辑</strong>:
+    <code>python
+    def backward(ctx, grad_output):
+        return _reduce(grad_output) # 调用 All-Reduce 动作</code></li>
+</ul>
+</li>
+</ul>
+<p><strong>再举个例子（代码中的 <code>_ScatterToModelParallelRegion</code> 类）：</strong></p>
+<ul>
+<li><strong>Forward</strong>: 把完整的 Tensor 切开，分给不同 GPU（调用 <code>_split</code>）。</li>
+<li><strong>Backward</strong>: 既然前向是切开，反向传播时，就要把各张卡上的梯度<strong>拼回来</strong>（调用 <code>_gather</code>）。</li>
+</ul>
+<hr />
+<h4>Task 4: 场景一 (Tensor Parallel) —— 模型太宽，怎么切？</h4>
+<p>Megatron-LM 经典的 MLP 层切分策略是：先列切（Column Parallel），再行切（Row Parallel）。</p>
+<ol>
+<li>
+<p><strong><code>copy_to_tensor_model_parallel_region</code></strong>:</p>
+<ul>
+<li><strong>用途</strong>: 在进入并行区域前使用。</li>
+<li><strong>动作</strong>: Forward 复制（Identity），Backward 求和（All-Reduce）。</li>
+<li><strong>什么时候用</strong>: 当你把权重矩阵按“列”切分时，输入数据 $X$ 需要完整地拷贝到每张卡上。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>gather_from_tensor_model_parallel_region</code></strong>:</p>
+<ul>
+<li><strong>用途</strong>: 并行计算结束了，想把结果拼起来。</li>
+<li><strong>动作</strong>: Forward 拼凑（All-Gather），Backward 切分（Split）。</li>
+<li><strong>什么时候用</strong>: 当你需要得到一个完整的输出 Tensor 时。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>reduce_from_tensor_model_parallel_region</code></strong>:</p>
+<ul>
+<li><strong>用途</strong>: 也就是代码里的 <code>_ReduceFromModelParallelRegion</code>。</li>
+<li><strong>动作</strong>: Forward 求和（All-Reduce），Backward 复制（Identity）。</li>
+<li><strong>什么时候用</strong>: 当你把权重矩阵按“行”切分时，每张卡算出的是部分和，最后需要把结果加起来。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>Task 5: 场景二 (Sequence Parallel) —— 句子太长，怎么切？</h4>
+<p>后来人们发现，显存还是不够，于是发明了 <strong>Sequence Parallel (SP)</strong>。不再切权重矩阵，而是把输入数据的“句子长度”切开。</p>
+<ul>
+<li>
+<p>比如句子长 1024，有 2 张卡。每张卡只处理 512 个 token。</p>
+</li>
+<li>
+<p><strong><code>scatter_to_sequence_parallel_region</code></strong>:</p>
+<ul>
+<li><strong>动作</strong>: Forward 沿着第1维度（序列长）切分。</li>
+<li><strong>含义</strong>: 把长句子切短，分给每张卡。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>gather_from_sequence_parallel_region</code></strong>:</p>
+<ul>
+<li><strong>动作</strong>: Forward 沿着第1维度拼接。</li>
+<li><strong>含义</strong>: 把各张卡处理完的半截句子，拼成一个长句子。</li>
+</ul>
+</li>
+<li>
+<p><strong>MoE (Mixture of Experts) 相关</strong>:</p>
+<ul>
+<li>代码里带 <code>_moe</code> 后缀的，是因为 MoE 模型的通信量巨大，有时需要用特殊的 Global Memory Buffer 来优化性能，但逻辑和普通 SP 是一样的。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📝 总结：如何阅读这个文件</h3>
+<p>不要一行行读，要按<strong>类 (Class)</strong> 读。每个 Class 代表一个“连接器”。</p>
+<ol>
+<li>看 <strong>类名</strong>：猜它是干嘛的（比如 <code>Scatter</code> 就是切分，<code>Gather</code> 就是拼接）。</li>
+<li>看 <strong>Forward</strong>：看它在前向传播时调用了哪个原子函数（<code>_split</code>, <code>_gather</code>, <code>_reduce</code>）。</li>
+<li>看 <strong>Backward</strong>：<strong>验证你的直觉</strong>。<ul>
+<li>如果 Forward 是 <code>Split</code>，Backward 必须是 <code>Gather</code>。</li>
+<li>如果 Forward 是 <code>Gather</code>，Backward 必须是 <code>Split</code> (或者 ReduceScatter)。</li>
+<li>如果 Forward 是 <code>Identity</code> (直接通过)，Backward 必须是 <code>All-Reduce</code>。</li>
+</ul>
+</li>
+</ol>
+<p>这个文件就是 Megatron-LM 的<strong>交通指挥官</strong>，指挥数据流在多张显卡的高速公路上如何拆分、合并和掉头（反向传播）。</p>

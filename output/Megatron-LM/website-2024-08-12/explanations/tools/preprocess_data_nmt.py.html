@@ -1,0 +1,94 @@
+<h1>tools/preprocess_data_nmt.py</h1>
+<p>这份代码确实涉及了很多底层数据处理的逻辑，如果不熟悉 Megatron-LM（一个训练超大模型的框架）的流程，读起来会很晦涩。</p>
+<p>简单来说，这个脚本的<strong>核心目的</strong>是：<strong>把人类能看懂的文本文件（比如一行行的句子），转换成机器能高效读取的二进制数据文件（.bin 和 .idx）。</strong></p>
+<p>为了让你听懂，我把这个脚本拆解成一个 <strong>“数据加工流水线”的 To-Do List</strong>。我们可以把这个脚本看作是一个工厂的<strong>车间主任</strong>。</p>
+<p>以下是车间主任的 <strong>5 个步骤任务清单</strong>：</p>
+<hr />
+<h3>✅ Task 1: 接收订单与准备工具 (Arguments &amp; Setup)</h3>
+<p><strong>代码对应位置：</strong> <code>get_args()</code> 函数</p>
+<ul>
+<li><strong>这是在干嘛？</strong>
+    在开工前，必须搞清楚今天的任务是什么。</li>
+<li><strong>具体步骤：</strong><ol>
+<li><strong>原材料在哪？</strong> (<code>--input</code>)：指定要读取的 JSON 或文本文件路径。</li>
+<li><strong>用什么翻译器？</strong> (<code>--tokenizer-type</code>)：机器不认识字，只认识数字。我们需要选一个“分词器”（Tokenizer），比如 BERT 或 GPT2 的分词器，把“你好”变成 <code>[1023, 4521]</code> 这样的数字 ID。</li>
+<li><strong>成品放哪？</strong> (<code>--output-prefix</code>)：指定处理好的文件存到哪里。</li>
+<li><strong>雇多少人？</strong> (<code>--workers</code>)：决定开多少个进程（CPU核心）来并行处理，为了快。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 培训工人 (The Encoder Class)</h3>
+<p><strong>代码对应位置：</strong> <code>class Encoder</code> 类</p>
+<ul>
+<li><strong>这是在干嘛？</strong>
+    定义具体的“加工动作”。因为我们要多进程（雇很多人）干活，所以需要把干活的逻辑封装好。</li>
+<li><strong>具体步骤：</strong><ol>
+<li><strong>初始化 (<code>initializer</code>)</strong>：每个工人上岗前，先领一套“分词器”（Tokenizer）。这样他们每个人都能独立把文字转成数字，互不干扰。</li>
+<li><strong>执行加工 (<code>encode</code>)</strong>：<ul>
+<li>拿到一行文字（text）。</li>
+<li>用分词器切分成数字列表（ids）。</li>
+<li>汇报产出：返回 <code>(数字列表, 原始文本长度)</code>。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 建立流水线 (Multiprocessing &amp; Builder)</h3>
+<p><strong>代码对应位置：</strong> <code>main()</code> 函数的前半部分</p>
+<ul>
+<li><strong>这是在干嘛？</strong>
+    打开原材料仓库，建立并行处理的流水线，并准备好存放成品的箱子。</li>
+<li><strong>具体步骤：</strong><ol>
+<li><strong>打开文件</strong>：<code>fin = open(...)</code>，打开原材料文件。</li>
+<li><strong>组建团队</strong>：<code>pool = multiprocessing.Pool(...)</code>。根据 Task 1 设定的 <code>workers</code> 数量，启动多进程池。</li>
+<li><strong>开始分发任务</strong>：<code>pool.imap(encoder.encode, fin, 25)</code>。这句代码非常关键。它把文件里的每一行内容，源源不断地分发给不同的工人去处理（变成数字）。</li>
+<li><strong>准备包装箱</strong>：<code>IndexedDatasetBuilder</code>。<ul>
+<li>这是 Megatron-LM 特有的存储格式。</li>
+<li>它会创建两个文件：<code>.bin</code>（存实际数据）和 <code>.idx</code>（存数据的索引/目录）。</li>
+<li><strong>为什么要这么做？</strong> 训练大模型时，读取文本文件太慢了。这种二进制格式可以让显卡以极快的速度读取数据。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 监控生产与装箱 (The Loop)</h3>
+<p><strong>代码对应位置：</strong> <code>main()</code> 函数中的 <code>for</code> 循环</p>
+<ul>
+<li><strong>这是在干嘛？</strong>
+    车间主任（主进程）站在流水线末端，接收工人们处理好的数据，并把它们塞进包装箱。</li>
+<li><strong>具体步骤：</strong><ol>
+<li><strong>接收数据</strong>：<code>for i, (sentence, ...) in enumerate(encoded_sentences)</code>。从流水线上拿到转换好的数字 ID（sentence）。</li>
+<li><strong>装入数据</strong>：<code>builder.add_item(...)</code>。把这串数字写入内存缓冲区。</li>
+<li><strong>标记结束</strong>：<code>builder.end_document()</code>。告诉系统“这一句话/这篇文章结束了”。</li>
+<li><strong>进度汇报</strong>：<code>if i % args.log_interval == 0</code>。每处理几百行，就打印一下日志：“处理了多少句了？现在的速度是多少 MB/s？” 防止你以为程序卡死了。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 5: 封箱出库 (Finalize)</h3>
+<p><strong>代码对应位置：</strong> <code>builder.finalize(...)</code></p>
+<ul>
+<li><strong>这是在干嘛？</strong>
+    所有原材料都处理完了，把最后的数据写入硬盘，生成最终的索引文件。</li>
+<li><strong>具体步骤：</strong><ol>
+<li>把所有还在内存里的数据刷入 <code>.bin</code> 文件。</li>
+<li>生成 <code>.idx</code> 文件。这个文件就像字典的目录，告诉程序：“第 100 句话在 .bin 文件的第 5000 个字节位置”。</li>
+<li>程序结束。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结一下</h3>
+<p><strong>这个脚本的逻辑流就是：</strong>
+<strong>输入文本</strong> (Hello World)
+⬇️
+<strong>多进程分词</strong> (变成 [101, 202])
+⬇️
+<strong>主进程收集</strong>
+⬇️
+<strong>写入二进制格式</strong> (为了训练时读得快)</p>
+<p><strong>如果不跑这个脚本，直接把文本丢给大模型训练会怎样？</strong>
+训练速度会极慢，因为 CPU 会把大量时间浪费在“读文件”和“把字转成数字”上，导致昂贵的 GPU 显卡在旁边干等。这个脚本就是为了<strong>预处理</strong>，把脏活累活提前干完。</p>

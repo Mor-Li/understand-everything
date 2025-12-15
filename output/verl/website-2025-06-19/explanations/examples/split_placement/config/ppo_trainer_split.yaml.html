@@ -1,0 +1,54 @@
+<h1>examples/split_placement/config/ppo_trainer_split.yaml</h1>
+<p>这份配置文件 (<code>ppo_trainer_split.yaml</code>) 是用于 <strong>RLHF（基于人类反馈的强化学习）</strong> 训练的“控制面板”。具体来说，它是基于 <code>verl</code> 这个框架，使用 <strong>PPO 算法</strong> 来训练一个大模型（这里是 DeepSeek-7b）去解数学题（GSM8K 数据集）。</p>
+<p>文件名里的 <code>split_placement</code> 是个重要线索，它指的是<strong>模型在显卡上的放置策略</strong>：训练时用一种切分方式（FSDP），推理（生成答案）时用另一种切分方式（vLLM 的张量并行），以达到最高效率。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“训练大模型的 Todo List（任务清单）”</strong>。想象你是一个班主任，要训练一个学生（模型）去参加数学竞赛。</p>
+<hr />
+<h3>📋 任务清单：RLHF 训练全流程</h3>
+<h4>1. 准备教材 (Data Section)</h4>
+<p><strong>任务：</strong> 告诉系统我们要学什么，数据从哪来。
+*   <strong>配置解读 (<code>data</code>)：</strong>
+    *   <code>train_files</code>: <code>~/data/rlhf/gsm8k/train.parquet</code> -&gt; 指定了教材是 <strong>GSM8K</strong>（一个著名的小学数学题库）。
+    *   <code>max_prompt_length</code>: <code>512</code> -&gt; 题目最长 512 个词。
+    *   <code>max_response_length</code>: <code>512</code> -&gt; 学生回答最长 512 个词。
+    *   <code>train_batch_size</code>: <code>1024</code> -&gt; 一次发 1024 道题给大家做（批量大小）。</p>
+<h4>2. 选定“学生”与“陪练” (Actor &amp; Ref Section)</h4>
+<p><strong>任务：</strong> 确定我们要训练哪个模型，以及找一个“原始版本”做对照。
+*   <strong>配置解读 (<code>actor_rollout_ref</code> -&gt; <code>model</code> &amp; <code>actor</code> &amp; <code>ref</code>)：</strong>
+    *   <code>path</code>: <code>~/models/deepseek-llm-7b-chat</code> -&gt; 我们的学生是 <strong>DeepSeek 7B</strong> 模型。
+    *   <code>strategy</code>: <code>fsdp</code> -&gt; <strong>关键点</strong>。训练时使用 FSDP（Fully Sharded Data Parallel）。这是把模型参数切碎了放在不同显卡上，为了省显存，能训练更大的模型。
+    *   <code>optim</code>: <code>lr: 1e-6</code> -&gt; 学习率很低，说明是微调，不能改得太猛。
+    *   <code>ref</code> (Reference Model): 这是一个“对照组”模型，通常和学生模型一模一样，但是<strong>参数冻结不更新</strong>。它的作用是防止学生“学歪了”（防止 KL 散度过大，即防止模型为了拿高分而胡言乱语，偏离人话）。</p>
+<h4>3. 进行模拟考 (Rollout Section)</h4>
+<p><strong>任务：</strong> 让学生做题，生成答案。这一步非常消耗算力。
+*   <strong>配置解读 (<code>rollout</code>)：</strong>
+    *   <code>name</code>: <code>vllm</code> -&gt; <strong>核心亮点</strong>。这里不用普通的 PyTorch 生成，而是调用了 <strong>vLLM</strong> 引擎。vLLM 是目前最快的推理引擎之一。
+    *   <code>tensor_model_parallel_size</code>: <code>2</code> -&gt; <strong>这是 Split Placement 的精髓</strong>。
+        *   <strong>训练时</strong>（Actor）：模型被 FSDP 切得很碎。
+        *   <strong>做题时</strong>（Rollout）：模型被重新组装，用 TP=2（两张卡一组张量并行）来加速生成。
+        *   <strong>为什么？</strong> 因为训练和推理对显卡的利用方式不同，这个配置实现了“训练用 FSDP，推理用 TP”，混合部署以榨干显卡性能。
+    *   <code>temperature</code>: <code>1.0</code> -&gt; 让学生发挥一点创造力，不要太死板。</p>
+<h4>4. 老师打分 (Reward &amp; Critic Section)</h4>
+<p><strong>任务：</strong> 评价学生做得对不对，并估计这道题的价值。
+*   <strong>配置解读 (<code>reward_model</code> &amp; <code>critic</code>)：</strong>
+    *   <code>reward_model</code>: <code>enable: False</code> -&gt; <strong>注意</strong>，这里把奖励模型关了。
+        *   <strong>为什么？</strong> 因为这是数学题（GSM8K）。数学题不需要一个神经网络去猜“写得好不好”，只需要一个代码脚本去判断“答案对不对”。所以这里禁用了神经网络 RM，改用规则打分（隐含在代码逻辑里）。
+    *   <code>critic</code>: <code>deepseek-llm-7b-chat</code> -&gt; 这是一个“评论家”模型。它的任务是预测“学生这道题能不能做对”。它帮助 PPO 算法稳定更新。它也使用 FSDP 策略训练。</p>
+<h4>5. 总结与改进 (Algorithm Section)</h4>
+<p><strong>任务：</strong> 根据分数，更新学生的大脑（参数）。
+*   <strong>配置解读 (<code>algorithm</code>)：</strong>
+    *   <code>kl_penalty</code>: <code>kl</code> -&gt; 如果学生写的答案和“对照组（Ref）”差别太大，就要扣分（惩罚）。
+    *   <code>kl_coef</code>: <code>0.001</code> -&gt; 惩罚力度系数。</p>
+<h4>6. 考场后勤 (Trainer Section)</h4>
+<p><strong>任务：</strong> 设定训练时长、保存进度、硬件分配。
+*   <strong>配置解读 (<code>trainer</code>)：</strong>
+    *   <code>total_epochs</code>: <code>30</code> -&gt; 这一套题反复练 30 轮。
+    *   <code>n_gpus_per_node</code>: <code>8</code> -&gt; 使用一台 8 卡的服务器。
+    *   <code>logger</code>: <code>wandb</code> -&gt; 把训练曲线画在 Weights &amp; Biases 网站上，方便监控。</p>
+<hr />
+<h3>💡 总结：这个配置文件的核心观点</h3>
+<p>如果你看不懂细节，只需要记住这个配置是为了解决一个核心矛盾：</p>
+<p><strong>矛盾：</strong> PPO 训练中最慢的一步通常是“模型生成答案”（Rollout）。
+<strong>解决方案：</strong>
+1.  <strong>混合引擎 (Hybrid Engine)：</strong> 训练时用 PyTorch FSDP（省显存），生成时把权重转给 vLLM（速度极快）。
+2.  <strong>Split Placement (分离放置)：</strong> 配置文件里的 <code>tensor_model_parallel_size: 2</code> 暗示了在生成阶段，它会把 8 张卡分成 4 组（每组 2 张卡）并行做题，比单卡生成快得多。</p>
+<p><strong>一句话概括：</strong> 这是一个<strong>追求极致速度</strong>的配置，用来在 8 卡机器上，用 DeepSeek 7B 模型跑数学题的强化学习训练。</p>

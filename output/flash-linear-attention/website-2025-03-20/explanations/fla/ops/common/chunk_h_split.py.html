@@ -1,0 +1,79 @@
+<h1>fla/ops/common/chunk_h_split.py</h1>
+<p>这份代码确实比较硬核，它是用 OpenAI 的 <strong>Triton</strong> 语言编写的 GPU 内核（Kernel），主要用于加速 <strong>线性注意力机制（Linear Attention）</strong> 或 <strong>RNN 类模型</strong>（如 Mamba, GLA, RWKV 等）中的核心计算步骤：<strong>Hidden State（隐藏状态/KV Cache）的累积</strong>。</p>
+<p>简单来说，它的作用是高效地计算公式：$h_t = \text{decay} \times h_{t-1} + k_t^T v_t$。</p>
+<p>为了让你听懂，我们把“阅读这份代码”当做一个项目，我列一个 <strong>Task Todo List</strong>，然后一步步带你拆解它的逻辑。</p>
+<hr />
+<h3>📋 Task Todo List：理解 Chunk H Split</h3>
+<p>我们要解决的核心问题是：<strong>如何利用 GPU 并行加速，把长序列切碎（Split），算出每一段的局部状态，最后再把它们串起来。</strong></p>
+<ol>
+<li><strong>Task 0: 搞懂输入和目标</strong> (我们要算什么？)</li>
+<li><strong>Task 1: 并行策略 - 分块 (Split)</strong> (怎么切分任务？)</li>
+<li><strong>Task 2: 前向传播 - 局部累积 (Fwd Split Kernel)</strong> (每个小分队自己算自己的)</li>
+<li><strong>Task 3: 前向传播 - 全局归约 (Fwd Reduction Kernel)</strong> (把小分队的成果串联起来)</li>
+<li><strong>Task 4: 衰减机制 (Decay)</strong> (怎么处理遗忘门控？)</li>
+<li><strong>Task 5: 反向传播 (Backward)</strong> (怎么算梯度？)</li>
+</ol>
+<hr />
+<h3>🚀 逐步拆解讲解</h3>
+<h4>Task 0: 搞懂输入和目标</h4>
+<p>在这个文件中，我们处理的是类似 Transformer 的 K (Key) 和 V (Value)，以及衰减项 G。
+*   <strong>输入</strong>: $K, V$ 序列，以及衰减系数 $g$ (scalar), $gk$ (vector), $gv$ (vector)。
+*   <strong>目标</strong>: 计算时刻 $t$ 的隐藏状态 $h_t$。在标准 Transformer 里这是 $QK^T$，但在线性 Attention 里，我们先算 $K^T V$ 存成状态 $h$。</p>
+<h4>Task 1: 并行策略 - 分块 (Split)</h4>
+<p>标准的 RNN 是串行的（算完 $t=1$ 才能算 $t=2$），这在 GPU 上很慢。
+这个文件的核心思想是 <strong>Chunkwise Parallelism（分块并行）</strong>：
+*   假设序列长度 $T=1000$。
+*   我们把它切成 4 个 <strong>Split</strong>，每个长度 250。
+*   GPU 同时启动 4 个线程块（Block），分别处理这 4 段。</p>
+<h4>Task 2: 前向传播 - 局部累积 (<code>chunk_fwd_kernel_h_split</code>)</h4>
+<p>这是代码中的第一个内核函数。
+*   <strong>任务</strong>: 它是“每个分队内部的计算”。它只负责计算自己这一段 split 里的 $K$ 和 $V$ 产生的累积值，暂时不管前一段传过来什么。
+*   <strong>代码逻辑</strong>:
+    1.  <strong>定位</strong>: 根据 <code>program_id</code> 找到当前负责哪一段序列 (<code>i_s</code>)。
+    2.  <strong>加载</strong>: 使用 <code>tl.make_block_ptr</code> 高效加载 K 和 V。
+    3.  <strong>循环</strong>: 在当前 Split 内部，以更小的 <code>BT</code> (Chunk size) 为单位循环。
+    4.  <strong>计算</strong>: <code>b_h += tl.dot(b_k, b_v)</code>。这就是核心的 $h += k^T v$。
+    5.  <strong>应用衰减</strong>: 代码中有 <code>if USE_G</code>, <code>if USE_GK</code>, <code>if USE_GV</code>，分别对应标量衰减、Key端向量衰减、Value端向量衰减。公式形如 $h = h \times \exp(g)$。
+    6.  <strong>存储</strong>:
+        *   如果是第一段 split (<code>i_s == 0</code>)，直接存入结果。
+        *   如果不是，先存入临时变量 <code>hs</code> (unreduced state)，等待下一步处理。</p>
+<h4>Task 3: 前向传播 - 全局归约 (<code>chunk_fwd_kernel_h_reduction</code>)</h4>
+<p>这是代码中的第二个内核函数。
+*   <strong>任务</strong>: 它是“接力跑”。Split 2 虽然算出了自己的 $K^T V$，但它不知道 Split 1 留下的“遗产”（历史状态）。这个 Kernel 负责把 Split 1 的结尾传给 Split 2 的开头，以此类推。
+*   <strong>代码逻辑</strong>:
+    1.  <strong>跳过第一段</strong>: <code>range(1, NS)</code>，因为第一段不需要继承历史。
+    2.  <strong>加载前一段的历史</strong>: 读取前一个 Split 的累积状态。
+    3.  <strong>应用衰减</strong>: 计算两个 Split 之间跨度产生的衰减（decay）。
+    4.  <strong>累加</strong>: 把衰减后的前一段状态，加到当前段的状态 <code>hr</code> 上。
+    5.  <strong>最终输出</strong>: 如果需要，把最后一个 Split 的结果存入 <code>ht</code> (Final State)。</p>
+<h4>Task 4: 衰减机制 (Decay)</h4>
+<p>代码里有三种复杂的衰减方式，这是为了适配不同的模型变体（如 GLA）：
+1.  <strong><code>USE_G</code> (Scalar Decay)</strong>: 全局标量衰减。所有通道共享一个遗忘率。
+2.  <strong><code>USE_GK</code> (Vector Decay on K)</strong>: 针对 Key 维度的向量级衰减。
+3.  <strong><code>USE_GV</code> (Vector Decay on V)</strong>: 针对 Value 维度的向量级衰减。</p>
+<p>代码片段：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 标量衰减</span>
+<span class="n">b_h</span> <span class="o">*=</span> <span class="n">tl</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="n">b_g_last</span><span class="p">)</span>
+<span class="c1"># 向量衰减 (利用广播机制 [:, None] 或 [None, :])</span>
+<span class="n">b_h</span> <span class="o">*=</span> <span class="n">tl</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="n">b_gk_last</span><span class="p">)[:,</span> <span class="kc">None</span><span class="p">]</span>
+</code></pre></div>
+
+<p>这意味着历史记忆 $h$ 在时间流逝中会根据这些参数逐渐被“遗忘”。</p>
+<h4>Task 5: 反向传播 (Backward)</h4>
+<p>文件后半部分的 <code>chunk_bwd_kernel_dh_split</code> 和 <code>chunk_bwd_kernel_dh_reduction</code> 是反向传播。
+*   <strong>逻辑</strong>: 和前向传播完全对称，但是方向相反。
+*   <strong>目标</strong>: 给定输出的梯度 <code>do</code> (gradient of output)，计算输入 $Q, K, V$ 和衰减项 $G$ 的梯度。
+*   <strong>流程</strong>:
+    1.  先算局部梯度 (<code>dh_split</code>)：利用链式法则，计算当前块内的梯度贡献。
+    2.  再算全局梯度归约 (<code>dh_reduction</code>)：从最后一个 Split 往前推，把梯度传回前面的 Split（因为后面的误差会受到前面状态的影响）。</p>
+<hr />
+<h3>💡 总结：这个脚本在干嘛？</h3>
+<p>想象你在整理一本几千页的账本（长序列）：</p>
+<ol>
+<li><strong>Python Wrapper (<code>chunk_fwd_h</code>)</strong>: 它是包工头，负责把账本撕成几份（Split），并安排工人（GPU Grid）。</li>
+<li><strong>Kernel 1 (<code>h_split</code>)</strong>: 工人 A、B、C 同时工作。A 算第 1-100 页的账，B 算 101-200 页的账。B 此时不管 A 的结果，只算自己这一百页的净增量。</li>
+<li><strong>Kernel 2 (<code>h_reduction</code>)</strong>: 会计 D 来了。他拿 A 的最终结果，加上 B 的净增量，算出 B 结尾时的总账，再传给 C。</li>
+<li><strong>Decay (<code>g/gk/gv</code>)</strong>: 账本里的债务有“利息”或“折旧”。每一页翻过去，之前的数值都要乘一个系数（衰减），这增加了计算的复杂度，代码里花了很多行处理这个 <code>exp(g)</code>。</li>
+</ol>
+<p><strong>一句话观点</strong>：
+这是一个<strong>高度优化的、分块并行的</strong>线性注意力状态计算实现，它通过“先局部并行计算，后全局串行修正”的策略，极大提高了长序列处理在 GPU 上的速度。</p>

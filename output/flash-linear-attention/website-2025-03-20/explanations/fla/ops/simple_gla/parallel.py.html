@@ -1,0 +1,123 @@
+<h1>fla/ops/simple_gla/parallel.py</h1>
+<p>这份代码确实非常硬核，因为它涉及到 <strong>Triton GPU 编程</strong>、<strong>线性注意力机制（Linear Attention）</strong> 以及 <strong>并行计算优化</strong>。看不懂是很正常的，因为它不是普通的 Python 逻辑，而是直接在指挥显卡如何搬运数据和计算。</p>
+<p>为了帮你理解，我制定了一个 <strong>“学习任务清单 (To-Do List)”</strong>。我们将把这份代码拆解成 5 个步骤，由浅入深地讲解它的核心观点和实现逻辑。</p>
+<hr />
+<h3>📝 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1: 搞懂核心概念</strong> —— 这到底是个什么算法？（Simple GLA 是啥？）</li>
+<li><strong>Task 2: 理解宏观策略</strong> —— 为什么要“分块”（Chunking）？</li>
+<li><strong>Task 3: 拆解前向传播 (Forward)</strong> —— <code>fwd_kernel</code> 里到底在算什么？</li>
+<li><strong>Task 4: 理解门控机制 (Gating)</strong> —— 变量 <code>g</code> 是怎么起作用的？</li>
+<li><strong>Task 5: 扫一眼反向传播 (Backward)</strong> —— 梯度是怎么算的？</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>✅ Task 1: 搞懂核心概念 —— Simple GLA 是啥？</h4>
+<p><strong>背景：</strong>
+普通的 Transformer 注意力机制（Softmax Attention）计算量很大，是 $O(T^2)$（序列长度的平方）。
+<strong>Linear Attention（线性注意力）</strong> 试图把这个复杂度降到 $O(T)$。
+<strong>GLA (Gated Linear Attention)</strong> 在线性注意力的基础上加了一个<strong>门控（Gate, 变量 <code>g</code>）</strong>，用来决定要“记住”多少以前的信息，或者“遗忘”多少。</p>
+<p><strong>本文代码的核心观点：</strong>
+这不仅仅是 GLA，而是 <strong>Parallel Simple GLA</strong>。
+*   <strong>Simple:</strong> 简化版，门控机制是标量（scalar）或者按头（head-wise）的，而不是按元素（element-wise）的矩阵。
+*   <strong>Parallel:</strong> 它不使用像 RNN 那样“一个词一个词”串行算的慢方法，而是利用 GPU 并行能力，把序列切成块，同时计算。</p>
+<p><strong>一句话总结代码目的：</strong></p>
+<blockquote>
+<p>输入 Query(q), Key(k), Value(v) 和 门控(g)，利用 GPU 并行计算出带有遗忘机制的注意力输出 Output(o)。</p>
+</blockquote>
+<hr />
+<h4>✅ Task 2: 理解宏观策略 —— 为什么要“分块” (Chunking)？</h4>
+<p>代码中反复出现 <code>BT</code> (Block Time), <code>BS</code> (Block Size), <code>chunk_size</code>。</p>
+<ul>
+<li><strong>纯串行 (RNN模式):</strong> 算完第1个词才能算第2个，无法利用 GPU 的几千个核心。</li>
+<li><strong>纯并行 (标准 Attention):</strong> 算一个巨大的 $T \times T$ 矩阵，显存爆炸。</li>
+<li><strong>本代码的策略 (Chunk-wise Parallel):</strong><ol>
+<li>把长序列 $T$ 切分成很多小块（Chunk），每块长度为 <code>BT</code> (例如 128)。</li>
+<li><strong>块内 (Intra-chunk):</strong> 在这个小块内部，计算类似标准 Attention 的操作。</li>
+<li><strong>块间 (Inter-chunk):</strong> 计算前面的块对当前块的影响。</li>
+</ol>
+</li>
+</ul>
+<p><strong>Triton 的作用：</strong>
+Triton 是 OpenAI 开发的语言，专门用来写这种“分块计算”的 GPU 内核。代码中的 <code>@triton.jit</code> 装饰器下的函数，都是直接在 GPU 上跑的。</p>
+<hr />
+<h4>✅ Task 3: 拆解前向传播 (Forward) —— <code>fwd_kernel</code></h4>
+<p>请看函数 <code>parallel_simple_gla_fwd_kernel</code>。这是最核心的部分。</p>
+<p><strong>输入变量：</strong>
+*   <code>q, k, v</code>: 你的输入数据。
+*   <code>g</code>: 遗忘门（决定保留多少历史信息）。
+*   <code>o</code>: 存放输出结果。</p>
+<p><strong>核心逻辑流程：</strong>
+想象你正在处理第 <code>i_t</code> 个块（比如第 5 个块，时间步 512~640）：</p>
+<ol>
+<li>
+<p><strong>加载 Q (Query):</strong>
+    <code>b_q = tl.load(p_q, ...)</code>
+    把当前块的 Query 加载到一种极快的显存（SRAM）里。</p>
+</li>
+<li>
+<p><strong>循环计算历史块的影响 (Inter-chunk):</strong>
+    代码里有两个大的 <code>for</code> 循环。</p>
+<ul>
+<li>它不像 RNN 那样传递一个 hidden state，而是直接去<strong>回顾</strong>之前的 K 和 V。</li>
+<li><code>for i_s in range(...)</code>: 遍历当前块之前的所有块（或者当前块内的部分）。</li>
+<li><strong>计算注意力分数:</strong> <code>b_s = tl.dot(b_q, b_k)</code> (即 $Q \times K^T$)。</li>
+</ul>
+</li>
+<li>
+<p><strong>应用门控 (Decay):</strong></p>
+<ul>
+<li><code>b_s *= safe_exp(b_gq - b_gk)</code></li>
+<li>这是核心数学公式：$Score = QK^T \times e^{(g_{query} - g_{key})}$。</li>
+<li>如果 $g$ 变小了，说明要“遗忘”，之前的 $K$ 对现在的 $Q$ 贡献就变小了。</li>
+</ul>
+</li>
+<li>
+<p><strong>计算输出:</strong></p>
+<ul>
+<li><code>b_o += tl.dot(b_s, b_v)</code> (即 $Score \times V$)。</li>
+<li>不断累加，得到最终结果。</li>
+</ul>
+</li>
+</ol>
+<p><strong>代码中的 <code>HEAD_FIRST</code>:</strong>
+这是一个内存布局的细节。是 <code>[Batch, Head, Time, Dim]</code> 还是 <code>[Batch, Time, Head, Dim]</code>。Triton 需要知道内存怎么跳跃（stride），所以代码里有很多 <code>if HEAD_FIRST</code>。</p>
+<hr />
+<h4>✅ Task 4: 理解门控机制 (Gating) —— 变量 <code>g</code></h4>
+<p>在 Python 包装函数 <code>parallel_simple_gla_fwd</code> 中，有一行很关键：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">g</span> <span class="o">=</span> <span class="n">chunk_local_cumsum</span><span class="p">(</span><span class="n">g</span><span class="p">,</span> <span class="n">chunk_size</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p>在 Kernel 内部，你会看到 <code>chunk_global_cumsum</code> 或类似的逻辑（虽然这里是 pre-process 过的）。</p>
+<p><strong>观点：</strong>
+这里的 <code>g</code> 是在 <strong>Log Space（对数空间）</strong> 运作的。
+*   乘法衰减（例如乘以 0.9）在对数空间变成了减法（$\log(0.9)$）。
+*   代码中的 <code>safe_exp(b_gq - b_gk)</code> 实际上等于 $\exp(g_q) / \exp(g_k)$。
+*   这表示从时刻 $k$ 到时刻 $q$ 之间积累了多少“衰减”。</p>
+<hr />
+<h4>✅ Task 5: 扫一眼反向传播 (Backward) —— 梯度计算</h4>
+<p>文件后半部分 <code>parallel_simple_gla_bwd_kernel</code> 是反向传播。</p>
+<p><strong>为什么它这么长？</strong>
+因为在前向传播中，我们算的是 $O = f(Q, K, V, g)$。
+在反向传播中，我们需要根据输出的误差 <code>do</code> (gradient of output)，反推回 <code>dq</code>, <code>dk</code>, <code>dv</code>, <code>dg</code>。</p>
+<p><strong>你需要知道的：</strong>
+*   <strong><code>_dq</code> kernel:</strong> 专门算 Query 的梯度。
+*   <strong><code>_dkv</code> kernel:</strong> 专门算 Key 和 Value 的梯度。
+*   逻辑基本上是前向传播的<strong>逆运算</strong>。如果前向是 $Q \times K$，反向往往涉及到 $dO \times V^T$ 等矩阵转置操作。
+*   <strong>重计算 (Re-computation):</strong> 为了节省显存，反向传播时往往会重新加载 Q, K, V 再算一遍注意力分数，而不是把前向传播巨大的分数矩阵存下来。</p>
+<hr />
+<h3>💡 总结：这代码在干嘛？</h3>
+<p>如果把这个文件看作一个黑盒，它的功能是：</p>
+<ol>
+<li><strong>输入：</strong> 类似于 Transformer 的 Q, K, V，外加一个控制遗忘的门控 g。</li>
+<li><strong>处理：</strong><ul>
+<li>为了快，它不用 PyTorch 的矩阵乘法，而是用 <strong>Triton</strong> 写了底层 GPU 代码。</li>
+<li>为了省显存并利用并行性，它采用了 <strong>Chunking（分块）</strong> 技术。</li>
+<li>它在块内部并行计算，块之间通过累积的门控值 $g$ 进行关联。</li>
+</ul>
+</li>
+<li><strong>输出：</strong> 经过门控衰减后的线性注意力结果。</li>
+</ol>
+<p><strong>给你的建议：</strong>
+不要试图一行行去读 Triton 的指针运算（比如 <code>tl.make_block_ptr</code>），除非你要修改底层算法。
+重点关注 Python 函数 <code>parallel_simple_gla_fwd</code> 的接口，以及它如何预处理 <code>g</code>（cumsum），这才是算法逻辑的入口。Triton kernel 只是一个极度优化的执行者。</p>

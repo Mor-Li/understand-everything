@@ -1,0 +1,157 @@
+<h1>fla/ops/utils/cumsum.py</h1>
+<p>这份代码确实比较晦涩，因为它是用 <strong>Triton</strong> 语言写的，专门用于在 GPU 上进行高性能计算，而且涉及到了很多并行计算的优化细节。</p>
+<p>简单来说，这个文件的核心功能就是：<strong>高效地计算“累加和”（Cumulative Sum / Cumsum），并且支持分块（Chunking）和变长序列。</strong></p>
+<p>为了让你读懂它，我为你列了一个 <strong>“学习任务清单” (Task Todo List)</strong>。我们按照这个顺序，一步步拆解文中的观点和逻辑。</p>
+<hr />
+<h3>✅ Task 1: 搞懂基础目标 —— 什么是 Cumsum 和 Chunk？</h3>
+<p>在看代码之前，先明确它在算什么。</p>
+<ol>
+<li>
+<p><strong>Cumsum (累加和)</strong>:</p>
+<ul>
+<li>输入: <code>[1, 2, 3, 4]</code></li>
+<li>输出: <code>[1, 3, 6, 10]</code> (第i个位置是前i个元素的和)</li>
+<li>代码里还支持 <code>Reverse</code> (反向累加)。</li>
+</ul>
+</li>
+<li>
+<p><strong>Chunk (分块)</strong>:</p>
+<ul>
+<li>在 Transformer 或线性 Attention (Linear Attention) 中，处理超长序列（比如长度 4096）时，为了并行加速，通常会把序列切成小块（比如每块长度 128）。</li>
+<li>这份代码就是专门处理这种 <strong>切块后的累加</strong> 逻辑的。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 2: 搞懂代码的“四大金刚” (分类逻辑)</h3>
+<p>文件里有 4 个主要的 Kernel（核函数），你需要先从宏观上区分它们。它们是按照两个维度组合出来的：</p>
+<p><strong>维度一：数据形状 (Scalar vs Vector)</strong>
+*   <strong>Scalar (标量)</strong>: 输入形状是 <code>[Batch, Head, Time]</code>。每个时间步只有一个数值。
+*   <strong>Vector (向量)</strong>: 输入形状是 <code>[Batch, Head, Time, State]</code>。每个时间步是一个向量（比如 hidden state）。</p>
+<p><strong>维度二：累加范围 (Local vs Global)</strong>
+*   <strong>Local (局部)</strong>: <strong>块内独立累加</strong>。切块后，每个块自己从 0 开始算，不看前一个块。
+    *   <em>例子</em>: <code>[1, 1, 1, 1]</code> 切成两块 <code>[1, 1] | [1, 1]</code>。
+    *   <em>结果</em>: <code>[1, 2] | [1, 2]</code>。
+*   <strong>Global (全局)</strong>: <strong>跨块持续累加</strong>。虽然切块算了，但会把前一个块的总和加到当前块上，保证结果和没切块一样。
+    *   <em>例子</em>: <code>[1, 1, 1, 1]</code> 切成两块 <code>[1, 1] | [1, 1]</code>。
+    *   <em>结果</em>: <code>[1, 2] | [3, 4]</code>。</p>
+<p><strong>对应代码中的函数名：</strong>
+1.  <code>chunk_local_cumsum_scalar</code>
+2.  <code>chunk_local_cumsum_vector</code>
+3.  <code>chunk_global_cumsum_scalar</code>
+4.  <code>chunk_global_cumsum_vector</code></p>
+<hr />
+<h3>✅ Task 3: 逐行拆解一个 Kernel (以 Local Scalar 为例)</h3>
+<p>我们拿最简单的 <code>chunk_local_cumsum_scalar_kernel</code> 来“精读”，理解 Triton 是怎么工作的。</p>
+<p><strong>核心逻辑流：</strong></p>
+<ol>
+<li>
+<p><strong>定位 (Indexing)</strong>:</p>
+<ul>
+<li><code>i_t</code>: 当前处理的是第几个块 (Chunk ID)。</li>
+<li><code>i_bh</code>: 当前处理的是第几个 Batch 和 Head。</li>
+<li>代码：<code>i_t, i_bh = tl.program_id(0), tl.program_id(1)</code></li>
+</ul>
+</li>
+<li>
+<p><strong>处理变长序列 (Offsets - 可选)</strong>:</p>
+<ul>
+<li>如果是 Packed Dataset（把很多短句子拼成一个长序列训练），需要 <code>offsets</code> 来知道每个句子的起止点。</li>
+<li>代码中 <code>if USE_OFFSETS:</code> 部分就是在算当前句子的开始位置 <code>bos</code> (begin of sequence) 和结束位置 <code>eos</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>加载数据 (Load)</strong>:</p>
+<ul>
+<li>Triton 使用 <code>tl.make_block_ptr</code> 创建数据指针。这就像告诉 GPU：“去内存的这个地址，给我挖一块 <code>BT</code> 这么大的数据出来”。</li>
+<li><code>p_s</code> 是输入数据的指针，<code>p_o</code> 是输出数据的指针。</li>
+<li><code>b_s = tl.load(p_s)</code>: 把数据加载到 GPU 的 SRAM (高速缓存) 中。</li>
+</ul>
+</li>
+<li>
+<p><strong>计算 (Compute)</strong>:</p>
+<ul>
+<li>这是核心的一行：<code>b_o = tl.cumsum(b_s, axis=0)</code>。</li>
+<li>直接在寄存器/SRAM 级别对这一个小块数据做累加。</li>
+<li>如果是 <code>REVERSE</code> (反向)，公式稍复杂一点：<code>b_o = -b_o + b_z[None] + b_s</code> (这是数学上的技巧，用正向 cumsum 算出反向结果)。</li>
+</ul>
+</li>
+<li>
+<p><strong>写回 (Store)</strong>:</p>
+<ul>
+<li><code>tl.store(p_o, b_o)</code>: 把算好的结果写回显存。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 4: 理解 Vector 版本有什么不同？</h3>
+<p>看完 Scalar，再看 <code>chunk_local_cumsum_vector_kernel</code>。</p>
+<ul>
+<li><strong>区别</strong>: Scalar 是处理一维数组，Vector 是处理二维矩阵（时间轴 x 特征轴）。</li>
+<li><strong>难点</strong>: <code>tl.cumsum</code> 在 Triton 旧版本或者特定维度上可能性能不好或不支持直接对矩阵某维操作。</li>
+<li>
+<p><strong>技巧</strong>: 代码里用了一个矩阵乘法技巧来实现累加！
+    ```python
+    # 构造一个下三角矩阵 (Mask)
+    # 比如 BT=3:
+    # [[1, 0, 0],
+    #  [1, 1, 0],
+    #  [1, 1, 1]]
+    m_s = tl.where(o_i[:, None] &gt;= o_i[None, :], 1., 0.)</p>
+<h1>矩阵乘法: 下三角矩阵 x 输入数据</h1>
+<h1>这等价于做 Cumsum</h1>
+<p>b_o = tl.dot(m_s, b_s, allow_tf32=False)
+```
+<em>解释</em>: 用一个全是 1 的下三角矩阵去乘数据，本质上就是把当前位置之前的所有行加起来。这是 GPU 上做向量累加的常见加速手段。</p>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 5: 理解 Global 版本是怎么“接力”的？</h3>
+<p><code>chunk_global_cumsum_scalar_kernel</code> 是如何跨越块的边界的？</p>
+<ol>
+<li>
+<p><strong>循环 (Loop)</strong>:</p>
+<ul>
+<li>Local 版本每个 Kernel 只处理一个块。</li>
+<li>Global 版本里有一个 <code>for i_c in range(NT):</code> 循环。它是一个线程块 (Thread Block) 负责处理一整条序列的所有块。</li>
+</ul>
+</li>
+<li>
+<p><strong>累加器 (Accumulator)</strong>:</p>
+<ul>
+<li>代码里定义了 <code>b_z = tl.zeros(...)</code>。这个变量一直存在于寄存器中。</li>
+<li>每处理完一个块，就算出这个块的总和 <code>b_ss = tl.sum(b_s, 0)</code>。</li>
+<li>把 <code>b_ss</code> 加到 <code>b_z</code> 上：<code>b_z += b_ss</code>。</li>
+<li>处理下一个块时，把之前的 <code>b_z</code> 加到当前的累加结果上。这就实现了“接力”。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 6: 总结代码结构 (Overview)</h3>
+<p>现在你再回头看文件，结构就清晰了：</p>
+<ol>
+<li><strong>Imports</strong>: 引入 PyTorch 和 Triton。</li>
+<li><strong>Kernels (<code>@triton.jit</code>)</strong>:<ul>
+<li><code>chunk_local_cumsum_scalar_kernel</code>: 块内累加，标量。</li>
+<li><code>chunk_local_cumsum_vector_kernel</code>: 块内累加，向量（用矩阵乘法实现）。</li>
+<li><code>chunk_global_cumsum_scalar_kernel</code>: 全局累加，标量（带循环和状态传递）。</li>
+<li><code>chunk_global_cumsum_vector_kernel</code>: 全局累加，向量。</li>
+</ul>
+</li>
+<li><strong>Python Wrappers (Python 函数)</strong>:<ul>
+<li><code>chunk_local_cumsum_scalar</code>: 准备 Grid，调用对应的 Kernel。</li>
+<li>... (其他三个对应的 wrapper)</li>
+</ul>
+</li>
+<li><strong>Public Interface (对外接口)</strong>:<ul>
+<li><code>chunk_global_cumsum</code>: 自动判断输入维度，调用 scalar 或 vector 版本。</li>
+<li><code>chunk_local_cumsum</code>: 同上。</li>
+</ul>
+</li>
+</ol>
+<h3>💡 核心观点总结</h3>
+<p>这个文件的观点其实是：
+1.  <strong>Triton 优于 PyTorch 原生操作</strong>: 对于这种特定的、分块的、可能带 Mask 或变长的累加操作，手写 Triton Kernel 能够极大减少显存读写（IO），提高速度。
+2.  <strong>分块并行 (Chunk-wise Parallelism)</strong>: 即使是顺序依赖很强的 cumsum，也可以通过分块，在块内并行（Local）或者在块间流水线化（Global）来优化。
+3.  <strong>矩阵乘法替代循环</strong>: 在 GPU 上，用矩阵乘法（Tensor Core 友好）来实现 Vector 的累加，比写循环要快得多。</p>
+<p>希望这个 List 能帮你把代码读薄！建议先只看 <code>chunk_local_cumsum_scalar_kernel</code>，它是最基础的。</p>

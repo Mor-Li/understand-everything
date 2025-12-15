@@ -1,0 +1,105 @@
+<h1>tests/ops/test_ttt.py</h1>
+<p>这段代码看起来很复杂，主要是因为它涉及到了<strong>深度学习算子（Operator）的单元测试</strong>。</p>
+<p>简单来说，这个文件的目的是：<strong>验证一个新的、优化过的算法（TTT - Test-Time Training layer），算出来的结果是否和标准答案（Reference）一致。</strong> 既要验证结果对不对（前向传播），也要验证训练时的梯度对不对（反向传播）。</p>
+<p>为了让你能看懂，我列一个<strong>学习任务清单 (To-Do List)</strong>，把这个文件拆解成 5 个步骤，带你一步步消化。</p>
+<hr />
+<h3>📋 任务清单 (Task To-Do List)</h3>
+<ol>
+<li><strong>理解核心目标</strong>：搞清楚我们在测什么（什么是 Tri vs Ref）。</li>
+<li><strong>看懂测量工具</strong>：理解代码里的 <code>assert_close</code> 是怎么判断对错的。</li>
+<li><strong>拆解测试流程 (<code>test_chunk</code>)</strong>：看懂如何造数据、跑模型、比对结果。</li>
+<li><strong>理解核心输入</strong>：搞懂 Q, K, V, W, b, eta, h0 这些变量代表什么。</li>
+<li><strong>进阶测试场景</strong>：理解 <code>fused</code> 和 <code>varlen</code> 是在测什么特殊情况。</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>任务 1：理解核心目标 (The Goal)</h4>
+<p>在代码中，你会反复看到两个关键词：
+*   <strong><code>tri</code> (Triton/Trial)</strong>: 这是<strong>待测试的对象</strong>。通常是用 Triton 语言写的、或者经过高度优化的 GPU 算子（<code>chunk_ttt_linear</code>）。它跑得快，但我们不确定它算得对不对。
+*   <strong><code>ref</code> (Reference)</strong>: 这是<strong>参考答案</strong>。通常是用 PyTorch 原生写的朴素实现（<code>chunk_ttt_linear_ref</code>）。它跑得慢，但逻辑简单，我们默认它是绝对正确的。</p>
+<p><strong>这个文件的核心逻辑就是：</strong></p>
+<blockquote>
+<p>如果 <code>tri</code> 的输出结果 和 <code>ref</code> 的输出结果 差距极小（误差在允许范围内），测试就通过。</p>
+</blockquote>
+<h4>任务 2：看懂测量工具 (The Tools)</h4>
+<p>文件开头定义了几个函数，用来做“裁判”：</p>
+<ul>
+<li><code>get_abs_err(x, y)</code>: 计算绝对误差。就是看两个数字差多少。</li>
+<li><code>get_err_ratio(x, y)</code>: 计算相对误差比率。</li>
+<li><strong><code>assert_close(prefix, ref, tri, ratio)</code></strong>: 这是最重要的裁判函数。<ul>
+<li>它对比 <code>ref</code> (标准答案) 和 <code>tri</code> (测试对象)。</li>
+<li>如果误差超过了 <code>ratio</code> (比如 0.005)，程序就会报错（Assert Fail），测试不通过。</li>
+<li>代码里的 <code>assert_close(" o", ref, tri, 0.005)</code> 意思就是：判断输出 <code>o</code> 的误差是否小于 0.5%。</li>
+</ul>
+</li>
+</ul>
+<h4>任务 3：拆解测试流程 (<code>test_chunk</code>)</h4>
+<p>这是文件中最重要的函数 <code>test_chunk</code>。我们把它拆成三步走：</p>
+<p><strong>第一步：造数据 (Preparation)</strong>
+代码用了 <code>@pytest.mark.parametrize</code>，这是为了在不同参数下（不同的 Batch 大小、序列长度 T、头数 H、维度 D）都测一遍。
+然后它随机生成了一堆张量（Tensor）：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># Query</span>
+<span class="n">k</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># Key</span>
+<span class="n">v</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># Value</span>
+<span class="c1"># ... 以及 W, b, eta 等</span>
+</code></pre></div>
+
+<ul>
+<li><code>.requires_grad_(True)</code> 意思是：告诉 PyTorch 后面我们要对这些变量求导（测试反向传播）。</li>
+</ul>
+<p><strong>第二步：跑模型 (Execution)</strong>
+这里跑了两遍同样的逻辑：</p>
+<ol>
+<li>
+<p><strong>跑测试对象 (<code>tri</code>)</strong>:
+    <code>python
+    tri, tri_ht, tri_hbt = chunk_ttt_linear(...) # 运行优化后的算子
+    # ... 计算 loss ...
+    loss.backward() # 反向传播，算出 tri_dq, tri_dk 等梯度</code></p>
+</li>
+<li>
+<p><strong>跑标准答案 (<code>ref</code>)</strong>:
+    <code>python
+    ref, ref_ht, ref_hbt = chunk_ttt_linear_ref(...) # 运行参考实现
+    # ... 计算 loss ...
+    loss.backward() # 反向传播，算出 ref_dq, ref_dk 等梯度</code></p>
+</li>
+</ol>
+<p><strong>第三步：比对结果 (Validation)</strong>
+最后一大段 <code>assert_close</code> 就是在疯狂找茬：
+*   <code>assert_close(" o", ref, tri, ...)</code>: 输出结果一样吗？
+*   <code>assert_close(" dq", ref_dq, tri_dq, ...)</code>: 对 Q 的梯度（求导结果）一样吗？
+*   <code>assert_close(" dk", ...)</code>: 对 K 的梯度一样吗？
+*   ...</p>
+<p>如果所有梯度和输出都对得上，说明优化后的算子是<strong>数学上等价</strong>的。</p>
+<h4>任务 4：理解核心输入 (The Inputs)</h4>
+<p>这个测试针对的是 <strong>TTT (Test-Time Training)</strong> 线性层。你需要大概知道这些变量在模型里代表什么：</p>
+<ul>
+<li><strong>Q, K, V</strong>: 经典的注意力机制（Attention）输入，分别代表 Query, Key, Value。</li>
+<li><strong>W, b</strong>: 这是一个线性层（Linear Layer）的权重（Weight）和偏置（Bias）。TTT 的特点是利用输入数据在测试时动态更新这些权重。</li>
+<li><strong>eta ($\eta$)</strong>: 学习率（Learning Rate）。在 TTT 中，这个参数控制模型根据当前输入更新权重的幅度。</li>
+<li><strong>h0, hb0</strong>: 初始的隐藏状态（Hidden States）。因为这像 RNN 一样是序列处理的，需要上一步传下来的状态。</li>
+</ul>
+<h4>任务 5：进阶测试场景 (Edge Cases)</h4>
+<p>除了基础的 <code>test_chunk</code>，文件里还有两个函数：</p>
+<ol>
+<li>
+<p><strong><code>test_fused_chunk_fwd</code></strong>:</p>
+<ul>
+<li><strong>含义</strong>: 测试“融合（Fused）”版本。</li>
+<li><strong>解释</strong>: 深度学习里，把好几步计算合并成一步算（比如由一个 GPU Kernel 完成）叫 Fused。这通常更快，但更容易写错。这个测试就是专门测这个更快的版本对不对。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>test_chunk_varlen_fwd</code></strong>:</p>
+<ul>
+<li><strong>含义</strong>: 测试“变长序列（Variable Length）”。</li>
+<li><strong>解释</strong>: 在实际处理文本时，一句话长，一句话短。通常我们会把它们拼在一起（Batching）。</li>
+<li>代码里的 <code>offsets</code> 和 <code>cu_seqlens</code> 就是用来标记“哪儿是第一句话的结束，哪儿是第二句话的开始”。</li>
+<li>这个测试是为了确保：即使处理长短不一的句子，算法也能正确处理，不会把第一句话的信息错误地泄露给第二句话。</li>
+</ul>
+</li>
+</ol>
+<h3>总结 (Summary)</h3>
+<p><strong>这个文件在讲什么？</strong>
+它在说：“嘿，我们写了一个超级快的新算法 <code>chunk_ttt_linear</code>。为了证明它是对的，我造了一堆随机数据，分别用<strong>新算法</strong>和<strong>老算法</strong>跑了一遍。我比较了它们的<strong>输出结果</strong>和<strong>反向传播的梯度</strong>。如果在各种变态的参数组合下（包括长短不一的句子），两者的误差都非常小，那我就敢放心地用这个新算法了。”</p>

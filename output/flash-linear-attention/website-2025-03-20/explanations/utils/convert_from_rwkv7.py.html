@@ -1,0 +1,85 @@
+<h1>utils/convert_from_rwkv7.py</h1>
+<p>这个脚本 <code>convert_from_rwkv7.py</code> 的核心作用只有一个：<strong>搬家 + 装修</strong>。</p>
+<p>它把 <strong>原始 RWKV7 格式</strong> 的模型权重文件（<code>.pth</code>），转换成 <strong>FLA 库（基于 Hugging Face 格式）</strong> 能识别的模型格式。</p>
+<p>因为两边的“房间布局”（代码结构）和“家具命名”（变量名）不一样，所以不能直接加载，必须写个脚本来一一对应。</p>
+<p>下面我把这个脚本的工作拆解成一个 <strong>Task To-Do List</strong>，带你一步步看它是怎么完成“搬家”的：</p>
+<hr />
+<h3>✅ Task 1: 摸清底细 (读取旧权重 &amp; 推导配置)</h3>
+<p><strong>目标</strong>：打开旧包裹，看看里面有多少东西，以此来决定新房子要盖多大。</p>
+<ul>
+<li><strong>动作</strong>：<ol>
+<li><code>torch.load(rwkv7)</code>: 加载原始的 <code>.pth</code> 权重文件。</li>
+<li><strong>自动侦探</strong>：脚本没有让你手动输入配置，而是通过读取权重的形状（Shape）来反推配置 <code>RWKV7Config</code>。<ul>
+<li>看 <code>emb.weight</code> 的大小 $\rightarrow$ 推算出 <strong>词表大小 (vocab_size)</strong>。</li>
+<li>看 <code>ffn.key.weight</code> 的大小 $\rightarrow$ 推算出 <strong>隐藏层维度 (hidden_size)</strong>。</li>
+<li>循环检查 <code>blocks.0</code>, <code>blocks.1</code>... $\rightarrow$ 数出一共有多少层 <strong>(num_hidden_layers)</strong>。</li>
+<li>读取 <code>att.w1</code>, <code>att.g1</code> 等 $\rightarrow$ 推算出 <strong>LoRA 相关的维度参数</strong>。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 2: 建造空房 (初始化新模型)</h3>
+<p><strong>目标</strong>：根据刚才推导出的图纸，造一个空的 FLA 风格的模型壳子。</p>
+<ul>
+<li><strong>动作</strong>：<ol>
+<li><code>AutoModelForCausalLM.from_config(config)</code>: 用刚才推导的配置，创建一个全新的、没填数据的 FLA 模型。</li>
+<li><strong>精度转换</strong>：根据用户参数 <code>precision</code> (比如 <code>bf16</code>, <code>float16</code>)，把这个空模型的精度转好。</li>
+<li>拿到新模型的“花名册” (<code>model.state_dict()</code> 和 <code>model_names</code>)，准备往里面填数据。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 3: 编写翻译字典 (核心逻辑)</h3>
+<p><strong>目标</strong>：旧模型叫 <code>blocks.0.att.key</code>，新模型可能叫 <code>model.layers.0.attn.k_proj</code>。需要一个函数把名字对上。</p>
+<ul>
+<li><strong>动作</strong>：定义了内部函数 <code>translate_into_fla(name)</code>。<ul>
+<li><strong>改名</strong>：把 <code>blocks</code> 改成 <code>model.layers</code>，把 <code>att</code> 改成 <code>attn</code>，把 <code>ln0</code> 改成 <code>pre_norm</code> 等等。</li>
+<li><strong>丢弃垃圾</strong>：如果遇到 <code>unused_names</code> (如 <code>v0</code>, <code>v1</code>)，直接标记为不要，因为新模型不需要这些旧参数。</li>
+<li><strong>处理 LoRA 命名</strong>：把原始的 <code>w1</code>, <code>g2</code> 这种命名，转换成 FLA 里的 <code>_lora.lora.0.weight</code> 这种 Hugging Face 风格的层级命名。</li>
+<li><strong>标记是否转置</strong>：有些矩阵在原始代码里是横着的，在 Hugging Face 里要求竖着，这里会返回一个 <code>transposed</code> 标记（告诉后面要不要旋转矩阵）。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 4: 搬运与组装 (填充权重)</h3>
+<p><strong>目标</strong>：把旧数据填进新壳子。这是代码里的 <code>for name in weights:</code> 循环。</p>
+<ul>
+<li><strong>动作</strong>：<ol>
+<li><strong>查字典</strong>：调用 <code>translate_into_fla</code> 拿到新名字。</li>
+<li><strong>形状调整</strong>：<ul>
+<li>如果标记了 <code>transposed</code>，就执行 <code>.t_()</code> 把矩阵转置。</li>
+<li>如果有维度是 <code>[1, 1, hidden]</code> 这种多余的维度，执行 <code>.squeeze_()</code> 把它压扁。</li>
+</ul>
+</li>
+<li><strong>特殊组装 (Fusing)</strong>：<ul>
+<li><strong>难点</strong>：原始 RWKV7 把 <code>x_r</code>, <code>x_w</code>, <code>x_k</code>, <code>x_v</code>, <code>x_a</code>, <code>x_g</code> 分成了 6 个不同的小参数。</li>
+<li><strong>FLA的做法</strong>：FLA 把它们合并成了一个大的张量叫 <code>x_x</code>。</li>
+<li><strong>代码逻辑</strong>：<code>if fla_name.endswith('attn.x_x')</code>，它会根据当前参数名字的最后一个字母（r, w, k...），把数据复制到 <code>x_x</code> 对应的切片位置里去。</li>
+</ul>
+</li>
+<li><strong>普通搬运</strong>：对于其他普通参数，直接 <code>copy_</code> 复制数值。</li>
+<li><strong>销项</strong>：每填好一个，就从 <code>model_names</code> 清单里划掉。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 5: 最终检查与交房 (保存)</h3>
+<p><strong>目标</strong>：确保所有必须填的坑都填了，然后保存文件。</p>
+<ul>
+<li><strong>动作</strong>：<ol>
+<li><strong>查缺补漏</strong>：检查 <code>model_names</code> 是否为空。如果还有剩下来的名字（除了允许缺失的 <code>pre_norm</code>），说明转换不完整，报错 <code>KeyError</code>。</li>
+<li><code>model.save_pretrained(output)</code>: 把填好数据的模型保存到指定文件夹。这就是你最后能用来推理的 Hugging Face 模型了。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这篇文章其实就是在做一个 <strong>格式转换器</strong>。</p>
+<ul>
+<li><strong>输入</strong>：RWKV 官方原始权重的路径。</li>
+<li><strong>处理</strong>：<ol>
+<li>读形状猜配置。</li>
+<li>建新模型。</li>
+<li><strong>名字映射 + 矩阵转置 + 参数合并(x_r/w/k/v/a/g -&gt; x_x)</strong>。</li>
+</ol>
+</li>
+<li><strong>输出</strong>：一个可以直接用 <code>transformers</code> 库加载的文件夹。</li>
+</ul>

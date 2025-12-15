@@ -1,0 +1,100 @@
+<h1>benchmarks/ops/benchmark_rwkv6.py</h1>
+<p>这份代码其实不是在“讲”一个算法原理，而是在<strong>“跑分”</strong>（Benchmark）。</p>
+<p>简单来说，它的作用就是让几个不同的 AI 模型核心算法（RWKV6, GLA, Flash Attention 等）在同一个赛道上赛跑，看看随着处理的文字变长，谁跑得更快。</p>
+<p>为了让你完全理解，我把阅读这份代码拆解成一个 <strong>6步走的 Task List（任务清单）</strong>。你只需要跟着这个清单一步步走，就能看懂了。</p>
+<hr />
+<h3>Task 1: 搞清楚“我们在做什么？”（宏观目的）</h3>
+<p><strong>任务目标：</strong> 理解这个文件的核心功能。
+<strong>代码位置：</strong> 文件名 <code>benchmark_rwkv6.py</code> 和 装饰器 <code>@triton.testing.perf_report</code>。</p>
+<ul>
+<li><strong>解读：</strong><ul>
+<li>这不是在训练模型，也不是在推理，而是在做<strong>性能测试</strong>。</li>
+<li>它使用了 <code>triton</code> 这个库（专门用来写高效 GPU 代码的库）自带的测试工具，用来生成一张性能对比图。</li>
+<li><strong>核心观点：</strong> 作者想证明或者观察，RWKV6 这个算法相比于 GLA 或者经典的 Flash Attention，在速度上处于什么水平。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 2: 认识“参赛选手”（对比对象）</h3>
+<p><strong>任务目标：</strong> 看看这次比赛都有谁参加。
+<strong>代码位置：</strong> 装饰器里的 <code>line_vals</code> 和 <code>line_names</code>。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">line_vals</span><span class="o">=</span><span class="p">[</span><span class="s1">&#39;rwkv6&#39;</span><span class="p">,</span> <span class="s1">&#39;gla&#39;</span><span class="p">,</span> <span class="s1">&#39;rwkv6_bwd&#39;</span><span class="p">,</span> <span class="s1">&#39;gla_bwd&#39;</span><span class="p">,</span> <span class="s1">&#39;retention_bwd&#39;</span><span class="p">,</span> <span class="s1">&#39;flash_bwd&#39;</span><span class="p">],</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong> 这里列出了要测试的 6 种情况：<ol>
+<li><strong>rwkv6</strong>: RWKV-6 模型的前向传播（推理速度）。</li>
+<li><strong>gla</strong>: Gated Linear Attention 模型的前向传播。</li>
+<li><strong>rwkv6_bwd</strong>: RWKV-6 的反向传播（训练时的速度，计算梯度）。</li>
+<li><strong>gla_bwd</strong>: GLA 的反向传播。</li>
+<li><strong>retention_bwd</strong>: Retention 机制的反向传播。</li>
+<li><strong>flash_bwd</strong>: 著名的 Flash Attention 的反向传播（通常作为行业标杆）。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>Task 3: 设定“比赛规则”（变量控制）</h3>
+<p><strong>任务目标：</strong> 理解测试的变量是什么（X轴）。
+<strong>代码位置：</strong> 装饰器里的 <code>x_names</code> 和 <code>x_vals</code>。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">x_names</span><span class="o">=</span><span class="p">[</span><span class="s1">&#39;T&#39;</span><span class="p">],</span>
+<span class="n">x_vals</span><span class="o">=</span><span class="p">[</span><span class="mi">128</span> <span class="o">*</span> <span class="mi">2</span> <span class="o">**</span> <span class="n">i</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">8</span><span class="p">)],</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong><ul>
+<li><strong>T (Time/Token)</strong>: 代表序列长度（也就是一次处理多少个字）。</li>
+<li><strong>x_vals</strong>: 测试的长度从 128 开始，每次翻倍（128, 256, 512, ..., 16384）。</li>
+<li><strong>核心观点：</strong> 线性 Attention（如 RWKV, GLA）通常在序列很长时（T很大）比传统 Attention 更快。这个测试就是为了验证这一点，看随着 <code>T</code> 变大，谁的时间增长得慢。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 4: 准备“比赛用具”（数据构造）</h3>
+<p><strong>任务目标：</strong> 理解 <code>benchmark</code> 函数开头的数据初始化部分。
+<strong>代码位置：</strong> <code>benchmark</code> 函数的前半部分。</p>
+<ul>
+<li><strong>解读：</strong><ul>
+<li><strong>B, H, D</strong>: 设定了 Batch Size (16), Head (8), Dimension (128)。这些是固定的。</li>
+<li><strong>生成 Q, K, V</strong>: 也就是 Query, Key, Value，这是所有 Attention 机制都需要的基础输入数据。</li>
+<li><strong>特殊待遇</strong>:<ul>
+<li><code>if provider.startswith('flash')</code>: Flash Attention 对数据的形状要求不一样（要把 T 放在 H 前面），所以单独处理。</li>
+<li><code>if provider.startswith('gla')</code>: GLA 算法除了 QKV 还需要一个门控值 <code>g</code>。</li>
+<li><code>if provider.startswith('rwkv6')</code>: RWKV6 算法比较复杂，除了 QKV 还需要衰减率 <code>w</code> 和 额外参数 <code>u</code>。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 5: 开始“计时跑”（核心测试）</h3>
+<p><strong>任务目标：</strong> 找到真正执行代码的地方。
+<strong>代码位置：</strong> <code>benchmark</code> 函数的后半部分 (<code>triton.testing.do_bench(...)</code>)。</p>
+<ul>
+<li><strong>解读：</strong><ul>
+<li>代码根据 <code>provider</code> 的名字，执行不同的函数。</li>
+<li><code>triton.testing.do_bench(lambda: ...)</code>: 这行代码的意思是，“运行在这个 lambda 里面的函数，多跑几次，帮我算出平均耗时”。</li>
+<li><strong>具体动作</strong>:<ul>
+<li><code>chunk_rwkv6(...)</code>: 跑 RWKV6 的计算核心。</li>
+<li><code>... .backward(do)</code>: 如果名字里带 <code>_bwd</code>，就测<strong>反向传播</strong>（即训练过程），这通常比前向传播更慢，计算量更大。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 6: 总结（得出的结论）</h3>
+<p><strong>任务目标：</strong> 脑补这个脚本运行后的结果。</p>
+<ul>
+<li><strong>解读：</strong><ul>
+<li>脚本运行结束后，会在屏幕上打印数据，并生成一张图表。</li>
+<li><strong>Y轴</strong>: Execution Time (ms) - 执行时间（毫秒）。</li>
+<li><strong>X轴</strong>: T (Sequence Length) - 序列长度。</li>
+<li><strong>预期的观点（代码作者想表达的）：</strong><ul>
+<li>你通常会看到，在 <code>T</code> 特别大的时候，<code>rwkv6</code> 和 <code>gla</code> 的曲线应该比 <code>flash_attn</code> 更平缓（或者在某些特定维度更有优势），因为它们是线性复杂度 $O(T)$，而标准 Attention 往往计算量增长更快。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h3>一句话总结这个文件：</h3>
+<p><strong>这是一个赛车场（Benchmark脚本），专门用来测试 RWKV6 引擎和它的竞争对手（GLA, Flash Attention）在不同赛道长度（序列长度 T）下的加速性能和训练速度对比。</strong></p>

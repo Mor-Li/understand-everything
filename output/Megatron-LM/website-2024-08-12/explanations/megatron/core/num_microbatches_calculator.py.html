@@ -1,0 +1,97 @@
+<h1>megatron/core/num_microbatches_calculator.py</h1>
+<p>没问题，这个文件看起来全是代码和数学逻辑，确实容易让人头大。</p>
+<p>简单来说，这个文件的核心作用就是做一道<strong>除法题</strong>。</p>
+<p><strong>背景知识：</strong>
+在训练大模型时，我们想让模型一次看很多数据（比如 1000 条，这叫 <strong>Global Batch Size</strong>），这样训练才稳。但是，显卡显存有限，一次塞不进 1000 条，只能塞 10 条（这叫 <strong>Micro Batch Size</strong>）。
+如果你有 8 张卡（<strong>Data Parallel Size</strong>），那么一次并行只能处理 $10 \times 8 = 80$ 条。
+为了凑够 1000 条，显卡得跑多少轮（<strong>Num Micro Batches</strong>）才能更新一次参数？
+答案是：$1000 \div 80 = 12.5$ (取整即 12 或 13 轮)。</p>
+<p>这个文件就是负责<strong>算出这个“12”</strong>，并且处理<strong>Global Batch Size 会变大</strong>（Rampup）的情况。</p>
+<hr />
+<h3>任务清单 (Task List)</h3>
+<p>为了帮你理解，我把这个代码执行的逻辑拆解成一个 <strong>Task Todo List</strong>，这是代码在运行时一步步做的事情：</p>
+<ol>
+<li><strong>[准备] 定义三个核心数字</strong>：<ul>
+<li>我要凑够多少数据？(<code>global_batch_size</code>)</li>
+<li>一张卡一次能吃多少？(<code>micro_batch_size</code>)</li>
+<li>我有多少张卡在并行干活？(<code>data_parallel_size</code>)</li>
+</ul>
+</li>
+<li><strong>[决策] 选定一种计算策略</strong>：<ul>
+<li><strong>策略 A (Constant)</strong>: 从头到尾 Global Batch Size 都不变。</li>
+<li><strong>策略 B (Rampup)</strong>: 刚开始训练怕不稳定，Global Batch Size 从小一点开始，慢慢变大，直到设定值。</li>
+</ul>
+</li>
+<li><strong>[初始化] 创建计算器</strong>：<ul>
+<li>根据策略 A 或 B，生成一个全局唯一的计算器对象（存放在 <code>_GLOBAL_NUM_MICROBATCHES_CALCULATOR</code>）。</li>
+</ul>
+</li>
+<li><strong>[循环] 训练过程中的每一步</strong>：<ul>
+<li><strong>Task 4.1</strong>: 告诉计算器：“我已经训练了多少样本了（<code>consumed_samples</code>）？”</li>
+<li><strong>Task 4.2 (如果是策略 B)</strong>: 计算器判断：“根据进度，现在的 Global Batch Size 该变大了吗？” -&gt; 更新当前的 Global Batch Size。</li>
+<li><strong>Task 4.3</strong>: 做除法：<code>当前 Global Batch Size / (Micro Batch * 卡数)</code> = <strong>我们需要跑几轮 Micro Batches</strong>。</li>
+</ul>
+</li>
+<li><strong>[输出] 获取结果</strong>：<ul>
+<li>Megatron 的其他代码调用 <code>get_num_microbatches()</code> 拿到这个数字，去安排显卡干活。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>逐步详解 (Step-by-Step)</h3>
+<p>现在我们对应代码，把上面的 List 展开讲讲。</p>
+<h4>第一步：核心数学公式</h4>
+<p>代码里反复出现一个逻辑，体现在 <code>ConstantNumMicroBatchesCalculator</code> 类中：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">micro_batch_times_data_parallel</span> <span class="o">=</span> <span class="n">micro_batch_size</span> <span class="o">*</span> <span class="n">data_parallel_size</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">num_micro_batches</span> <span class="o">=</span> <span class="n">global_batch_size</span> <span class="o">//</span> <span class="n">micro_batch_times_data_parallel</span>
+</code></pre></div>
+
+<ul>
+<li><strong>翻译</strong>：<ul>
+<li><code>micro_batch_times_data_parallel</code> = 所有显卡加起来，跑一轮能处理多少数据。</li>
+<li><code>num_micro_batches</code> = 总目标除以单轮能力，也就是<strong>梯度累积的步数 (Gradient Accumulation Steps)</strong>。</li>
+</ul>
+</li>
+<li><strong>检查</strong>：代码里有很多 <code>assert</code>，是用来确保能整除。如果不能整除，数据对不齐，程序会报错。</li>
+</ul>
+<h4>第二步：策略 A - 固定模式 (Constant)</h4>
+<p>这是最简单的模式。
+*   <strong>代码对应</strong>：<code>ConstantNumMicroBatchesCalculator</code> 类。
+*   <strong>逻辑</strong>：
+    *   初始化时算好 <code>num_micro_batches</code> 是多少。
+    *   不管训练到第几步，这个数字永远不变。
+    *   <code>update()</code> 函数是空的（<code>pass</code>），因为它不需要更新。</p>
+<h4>第三步：策略 B - 爬坡模式 (Rampup)</h4>
+<p>这是最复杂的模式，也是让你看不懂的地方。
+*   <strong>代码对应</strong>：<code>RampupBatchsizeNumMicroBatchesCalculator</code> 类。
+*   <strong>为什么要爬坡？</strong> 模型刚开始学东西时很脆弱，如果一次塞太多数据（大 Global Batch），容易学崩。所以要从小的 Global Batch 开始，慢慢加到大的。
+*   <strong>参数意思</strong>：
+    *   <code>start_global_batch_size</code>: 起步价（比如从 128 开始）。
+    *   <code>batch_size_increment</code>: 每次加多少（比如每次加 64）。
+    *   <code>ramup_samples</code>: 用多少样本的时间完成爬坡（比如前 100万个样本里慢慢加）。
+*   <strong>Update 逻辑 (核心难点)</strong>：
+    每次调用 <code>update(consumed_samples)</code>：
+    1.  如果 <code>consumed_samples</code> 超过了 <code>ramup_samples</code>（爬坡期过了），那就用最终的 <code>global_batch_size</code>。
+    2.  如果还在爬坡期：
+        *   算出当前处于第几个台阶 (<code>steps</code>)。
+        *   <code>当前 GBS = 起步价 + (台阶数 * 每次加价)</code>。
+    3.  <strong>重新做除法</strong>：用<strong>新的</strong>当前 GBS 算出<strong>新的</strong> <code>num_micro_batches</code>。</p>
+<h4>第四步：全局单例模式 (Global Variable)</h4>
+<p>你会看到很多 <code>global _GLOBAL_NUM_MICROBATCHES_CALCULATOR</code>。
+*   <strong>逻辑</strong>：
+    *   Megatron 框架很大，很多地方都需要知道“我现在该跑几个 micro batch”。
+    *   为了不把这个计算器对象传得到处都是，它搞了一个全局变量。
+    *   <code>init_num_microbatches_calculator</code>：程序启动时调用一次，把计算器造好放进去。
+    *   <code>get_num_microbatches()</code>：任何地方调用这个函数，实际上就是问那个全局变量要数字。</p>
+<h3>总结文中的观点</h3>
+<p>这个文件不讲大道理，它就是一个<strong>管家</strong>。</p>
+<ol>
+<li><strong>职责</strong>：根据当前的训练进度，告诉系统每一轮参数更新需要切分多少个小批次（Micro Batches）。</li>
+<li><strong>观点/假设</strong>：<ul>
+<li>Global Batch Size 必须能被 (Micro Batch Size * Data Parallel Size) 整除。</li>
+<li>如果使用了 Rampup（爬坡），Global Batch Size 会随时间线性增长，导致 Micro Batches 的数量也会动态变化。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句人话总结：</strong>
+这个文件就是一个计算器，用来算出<strong>为了凑够一大批数据（Global Batch），每张显卡需要分几小口（Micro Batch）吃完</strong>。如果处于训练初期（Rampup），这个“一大批”的数量会变，所以它得实时重新算。</p>

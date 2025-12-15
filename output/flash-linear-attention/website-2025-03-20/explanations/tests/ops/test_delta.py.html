@@ -1,0 +1,70 @@
+<h1>tests/ops/test_delta.py</h1>
+<p>这份代码是一个<strong>单元测试（Unit Test）</strong>文件。它的主要目的是为了验证一个深度学习算子（Operator）——这里称为 <strong>"Delta Rule"</strong> —— 的计算结果是否正确。</p>
+<p>简单来说，开发者写了一个新的、可能跑得很快的算法（叫 <code>chunk_delta_rule</code>），为了保证它算得对，开发者拿它和另一个已经验证过的、跑得慢但很稳的算法（叫 <code>fused_recurrent_delta_rule</code>）进行对比。如果两者的结果一样，说明新算法是正确的。</p>
+<p>为了让你能够读懂，我列了一个 <strong>“学习任务清单 (To-Do List)”</strong>，然后一步步给你讲解。</p>
+<hr />
+<h3>📋 学习任务清单 (Task To-Do List)</h3>
+<ol>
+<li><strong>搞懂基础工具</strong>：看懂辅助函数是用来干嘛的（怎么判断两个数是否相等）。</li>
+<li><strong>搞懂输入数据</strong>：理解 $B, T, H, D$ 这些字母代表什么，以及 $Q, K, V$ 是什么。</li>
+<li><strong>核心任务：对比测试 (<code>test_chunk</code>)</strong>：理解“分块计算”和“循环计算”的对比逻辑（正向传播 + 反向传播）。</li>
+<li><strong>进阶任务：变长序列测试 (<code>test_chunk_varlen</code>)</strong>：理解如何处理长短不一的句子。</li>
+<li><strong>优化任务：内核归一化测试 (<code>test_l2_in_kernel</code>)</strong>：理解一种为了加速而做的特殊优化验证。</li>
+</ol>
+<hr />
+<h3>💡 逐步讲解 (Step-by-Step)</h3>
+<h4>Step 1: 搞懂基础工具 (Helper Functions)</h4>
+<p>代码最开始定义了几个函数，用来做“找茬”的工作：</p>
+<ul>
+<li><code>get_abs_err(x, y)</code>: 计算 x 和 y 之间的最大绝对误差。</li>
+<li><code>get_err_ratio(x, y)</code>: 计算相对误差（误差占原本数值的比例）。</li>
+<li><code>assert_close(...)</code>: 这是一个断言函数。如果两个张量（Tensor）的误差超过了设定的阈值（比如 0.005），程序就会报错停止。</li>
+</ul>
+<p><strong>观点</strong>：这部分是为了确立“什么叫做算对了”。只要误差足够小，就认为两个算法结果一致。</p>
+<h4>Step 2: 核心测试逻辑 (<code>test_chunk</code>)</h4>
+<p>这是最重要的测试函数。</p>
+<p><strong>1. 参数含义：</strong>
+*   <code>B</code>: Batch size (一批有多少个样本)
+*   <code>T</code>: Time steps (序列长度，比如一句话有多少个字)
+*   <code>H</code>: Heads (多头注意力机制的头数)
+*   <code>D</code>: Dimension (每个头的特征维度)</p>
+<p><strong>2. 准备数据 (Data Setup)：</strong>
+代码生成了一堆随机的张量（Tensor）：
+*   <code>q, k, v</code>: 也就是 Attention 机制里的 Query, Key, Value。
+*   <code>beta</code>: 这是一个特殊的参数，通常用于 Delta Rule 或 RNN 中控制遗忘或更新的门控信号。
+*   <code>h0</code>: 初始状态（Initial state），类似 RNN 的初始记忆。
+*   注意：<code>.requires_grad_(True)</code> 表示我们要对这些变量求导，测试反向传播。</p>
+<p><strong>3. 运行两种算法 (The Comparison)：</strong>
+*   <strong>选手 A (<code>tri</code>)</strong>: <code>chunk_delta_rule</code>。这是<strong>待测试对象</strong>。它通常使用“分块（Chunk）”技术并行加速计算。
+*   <strong>选手 B (<code>ref</code>)</strong>: <code>fused_recurrent_delta_rule</code>。这是<strong>参考答案</strong>。它通常是用循环（Recurrent）的方式一步步算，虽然慢但逻辑清晰，不易出错。</p>
+<p><strong>4. 验证正向传播 (Forward Check)：</strong>
+<code>assert_close(" o", ref, tri, 0.005)</code>
+这行代码在问：选手 A 算出的输出 <code>o</code> 和选手 B 算出的输出 <code>o</code>，是不是一样？</p>
+<p><strong>5. 验证反向传播 (Backward Check)：</strong>
+代码执行了 <code>.backward()</code>。
+*   在深度学习中，光结果对不行，<strong>梯度（Gradient）</strong>也必须对，否则模型无法训练。
+*   代码对比了 <code>dq</code>, <code>dk</code>, <code>dv</code>, <code>dbeta</code> 等所有输入变量的梯度。
+*   如果 <code>ref_dq</code> 和 <code>tri_dq</code> 很接近，说明新算法的梯度计算也是正确的。</p>
+<h4>Step 3: 变长序列测试 (<code>test_chunk_varlen</code>)</h4>
+<p>在实际应用中，我们处理的句子长度是不一样的（有的句子长，有的短）。
+*   <strong>Packed Sequence</strong>: 为了高效，我们通常把一堆长短不一的句子拼成一条长长的线。
+*   <code>cu_seqlens</code> (Cumulative Sequence Lengths): 这是一个记录“切割点”的数组。比如 <code>[0, 5, 12]</code> 表示第一个句子是 index 0~5，第二个是 5~12。
+*   <strong>观点</strong>：这个测试是为了确保 <code>chunk_delta_rule</code> 能够正确处理这种“拼盘”数据，不会把第一个句子的信息错误地泄露给第二个句子。</p>
+<h4>Step 4: 内核归一化测试 (<code>test_l2_in_kernel</code>)</h4>
+<p>这是一个很具体的性能优化测试。</p>
+<ul>
+<li><strong>背景</strong>：通常我们需要对 $Q$ 和 $K$ 做 L2 归一化（Normalize）。</li>
+<li><strong>常规做法</strong>：先在 Python 里用 <code>F.normalize</code> 算好，再传给算子。</li>
+<li><strong>优化做法</strong>：直接把原始数据传给算子，让算子在 GPU 核心（Kernel）内部顺便把归一化做了。这样可以少读写一次内存，速度更快。</li>
+<li><strong>测试逻辑</strong>：<ol>
+<li>手动 <code>F.normalize</code> 后传入算子 vs.</li>
+<li>传入原始数据并开启 <code>use_qk_l2norm_in_kernel=True</code>。</li>
+<li>对比两者结果是否一致。</li>
+</ol>
+</li>
+</ul>
+<h3>📝 总结 (Summary)</h3>
+<p>这个文件的核心观点可以概括为一句话：</p>
+<blockquote>
+<p><strong>“我要发布一个新的 Delta Rule 算法（Chunk 版本），我通过生成随机数据，把它和标准的循环版本（Recurrent 版本）进行比对。如果它们的输出结果和反向传播的梯度都极其接近，哪怕是在处理变长序列或开启特定优化时也一样，那么我就认为这个新算法是正确的。”</strong></p>
+</blockquote>

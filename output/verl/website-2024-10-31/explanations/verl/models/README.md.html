@@ -1,0 +1,93 @@
+<h1>verl/models/README.md</h1>
+<p>这份文档其实是在指导开发者：<strong>如何把一个 HuggingFace 的模型（比如 Llama, Qwen）移植到 <code>verl</code> 这个框架中，并让它支持高效的并行训练。</strong></p>
+<p>简单来说，HuggingFace 的原版代码虽然通用，但在大规模并行训练（特别是用 PyTorch 原生功能时）效率不够高。<code>verl</code> 想要像 <code>vLLM</code> 那样极致高效，所以需要对模型代码进行“魔改”。</p>
+<p>为了让你好理解，我把这个过程拆解成一个<strong>“模型改造施工队”的 Todo List</strong>，分阶段给你解释：</p>
+<hr />
+<h3>🟢 第一阶段：准备原材料 (搬运)</h3>
+<p><strong>背景</strong>：我们不想从零开始写一个模型，直接拿现成的改最快。</p>
+<ul>
+<li><strong>Todo 1：复制文件</strong><ul>
+<li><strong>原文对应</strong>：<code>Step 1: Copy the model file...</code></li>
+<li><strong>要做什么</strong>：去 HuggingFace 的库里，把你想用的模型（比如 Llama3）的核心代码文件复制过来。</li>
+<li><strong>注意</strong>：只复制模型定义的那个 Python 文件就行，别把杂七杂八的配置全拷过来。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🟡 第二阶段：精简与改造 (核心逻辑修改)</h3>
+<p><strong>背景</strong>：HuggingFace 的代码为了兼容性，里面有很多“废话”和低效的“填充（Padding）”。我们要把它改成“紧凑模式”。</p>
+<ul>
+<li>
+<p><strong>Todo 2：删除推理专用代码</strong></p>
+<ul>
+<li><strong>原文对应</strong>：<code>Remove all the code related to inference (kv cache)</code></li>
+<li><strong>要做什么</strong>：把代码里关于 <code>KV Cache</code> 的部分全删了。</li>
+<li><strong>为什么</strong>：KV Cache 是生成文本（推理）时加速用的，但这里主要讲训练或预填充阶段，不需要它，留着占地儿还碍事。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 3：改造输入格式（Packed Inputs）</strong></p>
+<ul>
+<li><strong>原文对应</strong>：<code>Modify the inputs to include only...</code></li>
+<li><strong>要做什么</strong>：把模型的输入参数改了。<ul>
+<li>以前是：一堆句子长短不一，短的要补 0 (padding) 对齐成矩形。</li>
+<li>现在改成：<strong>把所有句子首尾相连拼成一条长龙</strong>（1D 数组 <code>input_ids</code>）。</li>
+<li>同时传入：<code>cu_seqlens</code>（告诉模型第几个字到第几个字是第一句话，哪是第二句话）。</li>
+</ul>
+</li>
+<li><strong>为什么</strong>：去掉了 Padding（补 0），计算量大幅减少，显存利用率极高。这是 <code>vLLM</code> 和 <code>FlashAttention</code> 的核心技巧。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 4：强制使用 Flash Attention</strong></p>
+<ul>
+<li><strong>原文对应</strong>：<code>Note that this requires using flash attention...</code></li>
+<li><strong>要做什么</strong>：把注意力机制的代码替换成 Flash Attention。</li>
+<li><strong>为什么</strong>：只有 Flash Attention 能完美支持上面说的这种“长龙拼接”的数据格式。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🔵 第三阶段：质检 (测试)</h3>
+<p><strong>背景</strong>：改了这么多核心逻辑，算出来的结果还对吗？必须检查。</p>
+<ul>
+<li><strong>Todo 5：对比测试</strong><ul>
+<li><strong>原文对应</strong>：<code>Step 2.5: Add tests</code></li>
+<li><strong>要做什么</strong>：写一个脚本，输入同样的数据，左边跑你改好的模型，右边跑 HuggingFace 原版模型。</li>
+<li><strong>目标</strong>：两边的输出数值必须几乎一模一样（误差极小），证明你没改坏。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🔴 第四阶段：火力全开 (并行化适配)</h3>
+<p><strong>背景</strong>：大模型一个 GPU 装不下，或者算得太慢，需要多卡并行。这里需要手动告诉 PyTorch 怎么切分模型。</p>
+<ul>
+<li>
+<p><strong>Todo 6：切分模型权重 (Tensor Parallelism - TP)</strong></p>
+<ul>
+<li><strong>原文对应</strong>：<code>Step 3: Add a function to apply tensor parallelism</code></li>
+<li><strong>要做什么</strong>：把巨大的矩阵（比如 4096 x 4096）切成几块，分给不同的 GPU 计算。</li>
+<li><strong>难点</strong>：PyTorch 原生不支持“自动”切分，你需要写代码指定：哪个参数切行，哪个参数切列，算完怎么拼起来。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 7：数据并行 (Data Parallelism - FSDP)</strong></p>
+<ul>
+<li><strong>原文对应</strong>：<code>Step 4: Add a function to apply data parallelism</code></li>
+<li><strong>要做什么</strong>：使用 PyTorch 的 FSDP2 (Fully Sharded Data Parallel) 接口。</li>
+<li><strong>为什么</strong>：当数据量很大时，让不同的 GPU 处理不同的数据，同时把模型参数碎片化存储以节省显存。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 8：流水线并行 (Pipeline Parallelism - PP)</strong></p>
+<ul>
+<li><strong>原文对应</strong>：<code>Step 5: Add a function to apply pipeline parallelism</code></li>
+<li><strong>要做什么</strong>：把模型的第 1-10 层放在 GPU 0，第 11-20 层放在 GPU 1……像工厂流水线一样传递数据。</li>
+<li><strong>现状</strong>：这是 PyTorch 2.4 的新功能（目前还在测试阶段），文档建议参考 <code>torchtitan</code> 库的做法。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这篇文档就是在教你：
+<strong>“别用 HuggingFace 原生的慢代码，把它拷过来，去掉多余的 KV Cache，改成最高效的无 Padding 格式，然后手动加上 PyTorch 原生的多卡切分逻辑，最后做个测试保证没改错。”</strong></p>

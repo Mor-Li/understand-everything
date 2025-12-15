@@ -1,0 +1,132 @@
+<h1>fla/ops/based/naive.py</h1>
+<p>这个文件其实是在实现一种叫做 <strong>Based</strong> 的线性注意力机制（Linear Attention）。</p>
+<p>简单来说，标准的 Transformer 用的是 Softmax 注意力（$e^{QK^T}$），而 <strong>Based</strong> 这个算法为了提升速度和效率，把指数函数 $e^x$ 换成了 <strong>泰勒展开（Taylor Expansion）的前几项</strong>：$1 + x + \frac{1}{2}x^2$。</p>
+<p>这份代码提供了两种实现方式：
+1.  <strong>Parallel (并行版)</strong>：逻辑简单，算出完整的 $N \times N$ 矩阵，容易懂但显存占用大（用来做参考答案）。
+2.  <strong>Chunk (分块版)</strong>：逻辑复杂，把序列切成小块，混合了“注意力”和“RNN”的写法，为了省显存和加速。</p>
+<p>为了让你彻底搞懂，我列了一个 <strong>学习任务清单 (ToDo List)</strong>，我们一步步来拆解。</p>
+<hr />
+<h3>📋 学习任务清单 (Task List)</h3>
+<ul>
+<li><strong>Task 1: 搞懂核心数学公式</strong> (理解“Based”到底在算什么)</li>
+<li><strong>Task 2: 解析 <code>naive_parallel_based</code></strong> (看懂最直观的暴力算法)</li>
+<li><strong>Task 3: 解析 <code>naive_chunk_based</code> 的分块逻辑</strong> (看懂如何切块计算)</li>
+<li><strong>Task 4: 解析 <code>naive_chunk_based</code> 的历史状态累积</strong> (看懂最难的线性部分)</li>
+</ul>
+<hr />
+<h3>🟢 Task 1: 搞懂核心数学公式</h3>
+<p>在看代码之前，你只需要记住这个公式。
+标准的 Attention 算的是：
+$$ \text{Attention}(Q, K, V) = \text{softmax}(QK^T) V $$
+本质上是在算 $e^{QK^T}$。</p>
+<p><strong>Based 算法</strong> 觉得算指数太慢，于是用泰勒展开近似：
+$$ e^x \approx 1 + x + \frac{1}{2}x^2 $$
+所以 Based 的注意力分数矩阵（Score Matrix）就是：
+$$ \text{Score} = 1 + (QK^T) + \frac{1}{2}(QK^T)^2 $$</p>
+<p>记住：<strong>1 + 一次项 + 二次项</strong>。代码里所有的操作都是为了算这个。</p>
+<hr />
+<h3>🟢 Task 2: 解析 <code>naive_parallel_based</code></h3>
+<p>这是最简单的部分，它直接把上面的公式写成了代码。</p>
+<p><strong>代码逐行解读：</strong></p>
+<ol>
+<li><strong>缩放 (Scale)</strong>:
+    <code>python
+    q = q * scale  # 标准操作，Q 除以根号d</code></li>
+<li><strong>计算 $QK^T$</strong>:
+    <code>python
+    attn = q @ k.transpose(-2, -1)  # 算出 N x N 的矩阵</code></li>
+<li><strong>核心公式 (泰勒展开)</strong>:
+    <code>python
+    # 对应公式: 1 + x + 0.5 * x^2
+    attn = 1 + attn + 1/2 * (attn ** 2)</code></li>
+<li><strong>因果遮罩 (Causal Mask)</strong>:
+    <code>python
+    # 变成下三角矩阵，保证只能看前面的词，不能看后面的
+    attn.masked_fill_(~torch.tril(...), 0)</code></li>
+<li><strong>输出与归一化</strong>:
+    <code>python
+    o = attn @ v  # 乘 V
+    z = attn.sum(-1)  # 算分母（归一化因子）
+    return o / (z[..., None] + 1e-6) # 分子除以分母</code></li>
+</ol>
+<p><strong>总结</strong>：这个函数就是暴力算出了 $N \times N$ 的矩阵，虽然简单，但序列长了会爆显存。</p>
+<hr />
+<h3>🟢 Task 3: 解析 <code>naive_chunk_based</code> 的分块逻辑</h3>
+<p>为了解决长序列慢的问题，这个函数把长序列切成了很多小块（Chunk）。
+<strong>逻辑是：</strong>
+*   <strong>块内 (Intra-chunk)</strong>：如果你关注的词和被关注的词在同一个小块里，直接用 Task 2 那种暴力算法（因为块很小，比如 256，算 $N^2$ 很快）。
+*   <strong>块间 (Inter-chunk)</strong>：如果你关注的词在之前的块里，不要回头去算矩阵，而是直接利用之前累积下来的“记忆状态”（类似 RNN）。</p>
+<p><strong>代码片段 1：块内注意力 (Intra-chunk)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 把 Q, K, V 变形，拆成很多个小块 (chunk_size)</span>
+<span class="n">q</span> <span class="o">=</span> <span class="n">rearrange</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="s1">&#39;b h (n c) d -&gt; b h n c d&#39;</span><span class="p">,</span> <span class="n">c</span><span class="o">=</span><span class="n">chunk_size</span><span class="p">)</span>
+<span class="c1"># ... K, V 同理 ...</span>
+
+<span class="c1"># 这里完全就是 Task 2 的逻辑，只是是在小块内部算</span>
+<span class="n">intra_chunk_attn</span> <span class="o">=</span> <span class="n">q</span> <span class="o">@</span> <span class="n">k</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+<span class="n">intra_chunk_attn</span> <span class="o">=</span> <span class="n">intra_chunk_attn</span> <span class="o">+</span> <span class="mi">1</span><span class="o">/</span><span class="mi">2</span> <span class="o">*</span> <span class="p">(</span><span class="n">intra_chunk_attn</span> <span class="o">**</span> <span class="mi">2</span><span class="p">)</span>
+<span class="c1"># ... masked_fill ...</span>
+<span class="n">o</span> <span class="o">=</span> <span class="n">intra_chunk_attn</span> <span class="o">@</span> <span class="n">v</span>
+</code></pre></div>
+
+<p>这一步算出了“当前块内部”的注意力结果。</p>
+<hr />
+<h3>🟢 Task 4: 解析 <code>naive_chunk_based</code> 的历史状态累积</h3>
+<p>这是最难懂的部分。怎么把之前的 $K, V$ 压缩成状态，传给现在的 $Q$ 算？
+因为公式是 $1 + QK^T + \frac{1}{2}Q^2 (K^2)^T$ (简化理解)，我们需要分别维护几组状态。</p>
+<p><strong>代码片段 2：计算分母 (Normalizer Z)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 累积 K 的值 (一阶项)</span>
+<span class="n">k_cumsum</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cumsum</span><span class="p">(</span><span class="n">k</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">2</span><span class="p">)</span>
+<span class="c1"># 累积 K*K 的值 (二阶项)</span>
+<span class="n">kk_cumsum</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cumsum</span><span class="p">(</span><span class="n">k</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">k</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">),</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">3</span><span class="p">)</span>
+
+<span class="c1"># 这里的 z 算的是分母。利用了线性注意力的性质：</span>
+<span class="c1"># sum(Q * K) = Q * sum(K)</span>
+<span class="n">z</span> <span class="o">=</span> <span class="p">(</span><span class="n">q</span> <span class="o">*</span> <span class="n">k_cumsum</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="c1"># 一阶项贡献</span>
+<span class="n">z</span> <span class="o">+=</span> <span class="o">...</span> <span class="c1"># 二阶项贡献</span>
+<span class="n">z</span> <span class="o">+=</span> <span class="o">...</span> <span class="c1"># 零阶项(常数1)贡献</span>
+</code></pre></div>
+
+<p><strong>代码片段 3：计算分子 (Output O) 的历史部分</strong>
+这里利用了线性性质 $Q(K^T V)$。代码里有很多 <code>einsum</code> 和 <code>cumsum</code>，本质是在做前缀和（Prefix Sum）。</p>
+<ol>
+<li>
+<p><strong>零阶项 (Constant term)</strong>:
+    <code>python
+    _o = v.cumsum(-2) # 对应公式里的 "1"，直接累加 V</code></p>
+</li>
+<li>
+<p><strong>二阶项 (Quadratic term)</strong>:
+    对应公式里的 $\frac{1}{2}(QK^T)^2 V$。这就涉及复杂的张量积。
+    <code>python
+    # 算出 K * K * V 的累积量 (压缩成状态)
+    kv = torch.einsum('... k, ... k, ... v -&gt; ...', k, k, v)
+    kv = kv.cumsum(2) 
+    # 让 Q 去查询这个累积的状态
+    o += 0.5 * torch.einsum('... state, ... q, ... q -&gt; ...', kv, q, q)</code></p>
+</li>
+<li>
+<p><strong>一阶项 (Linear term)</strong>:
+    对应公式里的 $(QK^T)V = Q(K^T V)$。
+    <code>python
+    # 算出 K * V 的累积量
+    kv = torch.einsum('... k, ... v -&gt; ...', k, v)
+    kv = kv.cumsum(2)
+    # 让 Q 去查询
+    o += torch.einsum('... state, ... q -&gt; ...', kv, q)</code></p>
+</li>
+</ol>
+<p><strong>总结 Task 4</strong>：
+这部分代码虽然看着乱，核心思想就是：<strong>不要存 $N \times N$ 的矩阵，而是存 $\sum K \cdot V$ 和 $\sum K \cdot K \cdot V$ 这样的累加值</strong>。新的 $Q$ 来了，直接乘这些累加值，就能得到结果。</p>
+<hr />
+<h3>🏁 最终总结</h3>
+<ol>
+<li><strong>Based</strong> 是一个把 $e^x$ 换成 $1+x+0.5x^2$ 的注意力机制。</li>
+<li><code>naive_parallel_based</code> 是<strong>教学版</strong>：直接算矩阵，容易懂，但慢。</li>
+<li><code>naive_chunk_based</code> 是<strong>加速版</strong>：<ul>
+<li>自己块内：用教学版的方法算。</li>
+<li>以前的块：用累加法（前缀和/RNN状态）算，避免重复计算。</li>
+<li>最后把这两部分加起来，除以分母 $Z$。</li>
+</ul>
+</li>
+</ol>
+<p>这个文件通常用来做 <strong>Unit Test（单元测试）</strong>，验证那些写在 CUDA 里的超快版本算出来的结果对不对。所以它叫 <code>naive</code> (朴素版)，因为它写得很直白（虽然 Chunk 版看起来并不直白，但比起 CUDA 还是好懂多了）。</p>

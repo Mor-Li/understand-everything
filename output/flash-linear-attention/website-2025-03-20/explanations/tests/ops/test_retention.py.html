@@ -1,0 +1,108 @@
+<h1>tests/ops/test_retention.py</h1>
+<p>这份代码其实是一个<strong>“质检清单”</strong>（Unit Test，单元测试）。</p>
+<p>它的核心目的只有一个：<strong>验证一种叫“Retention”的新算法（可能是为了加速优化写的）算出来的结果，和标准算法算出来的结果是不是一模一样的。</strong></p>
+<p>如果把写代码比作做数学题，这个文件就是<strong>“对答案”</strong>的过程。</p>
+<p>为了让你更容易理解，我把你当作这个项目的<strong>“首席质检官”</strong>，给你列一个 <strong>Task To-Do List（任务清单）</strong>，带你一步步看懂这个质检流程。</p>
+<hr />
+<h3>任务清单 (Task To-Do List)</h3>
+<h4>✅ Task 1: 制定“评分标准” (准备工具函数)</h4>
+<p>在开始测试之前，你需要定义什么叫“算对了”。因为计算机浮点数计算总有微小的误差，所以不能要求 100% 相等，只要误差极小就行。</p>
+<ul>
+<li><strong>代码对应部分：</strong> <code>get_abs_err</code>, <code>get_err_ratio</code>, <code>assert_close</code></li>
+<li><strong>通俗解释：</strong><ul>
+<li><code>get_abs_err</code>：算出两个结果之间最大的绝对误差。</li>
+<li><code>get_err_ratio</code>：算出相对误差比例。</li>
+<li><code>assert_close</code>：<strong>这是裁判。</strong> 它对比两个结果，如果误差超过设定的 <code>ratio</code>（比如 0.005），就报错（测试失败）；如果误差很小，就打印一条通过的消息。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 2: 测试“分块计算”模式 (Test Chunk Retention)</h4>
+<p>我们要测试一种把长序列切成小块（Chunk）来计算的方法，看它准不准。</p>
+<ul>
+<li><strong>代码对应部分：</strong> <code>def test_chunk(...)</code></li>
+<li><strong>具体步骤：</strong><ol>
+<li><strong>设置参数 (Parametrize)：</strong> <code>pytest</code> 会自动把不同的参数组合（比如 Batch大小=4, 序列长度=300或512, 数据精度=float16或32）填进去，反复运行这个测试。</li>
+<li><strong>伪造数据 (Generate Data)：</strong><ul>
+<li>随机生成 <code>q</code> (Query), <code>k</code> (Key), <code>v</code> (Value)。这些是神经网络的输入数据。</li>
+<li><code>requires_grad_()</code>：告诉 PyTorch 我们要对这些数据求导（模拟训练过程）。</li>
+</ul>
+</li>
+<li><strong>运行“标准答案” (Run Reference)：</strong><ul>
+<li>调用 <code>fused_recurrent_retention</code>。这是我们认为<strong>肯定正确</strong>（或者作为基准）的算法。</li>
+<li>算出结果 <code>ref</code> (Reference Output) 和 <code>ref_ht</code> (Hidden State)。</li>
+<li>执行 <code>.backward()</code>：算出标准答案的<strong>梯度</strong>（Gradients，即 <code>ref_dq</code>, <code>ref_dk</code> 等）。这是为了验证反向传播（AI训练）是否正确。</li>
+</ul>
+</li>
+<li><strong>运行“待测算法” (Run Target)：</strong><ul>
+<li>调用 <code>chunk_retention</code>。这是我们要测试的目标（通常是优化过速度的算法）。</li>
+<li>算出结果 <code>tri</code> (Triton implementation output) 和 <code>tri_ht</code>。</li>
+<li>执行 <code>.backward()</code>：算出待测算法的梯度。</li>
+</ul>
+</li>
+<li><strong>对比打分 (Assert Close)：</strong><ul>
+<li>对比 <code>ref</code> 和 <code>tri</code> (输出结果是否一致？)</li>
+<li>对比 <code>ref_ht</code> 和 <code>tri_ht</code> (中间状态是否一致？)</li>
+<li>对比 <code>dq</code>, <code>dk</code>, <code>dv</code> (梯度方向是否一致？如果不一致，AI就训练不好了)。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 3: 测试“变长序列”模式 (Test Chunk Variable Length)</h4>
+<p>在真实世界里，每个句子的长度是不一样的。Task 2 假设所有句子一样长，Task 3 要测试句子长短不一的情况。</p>
+<ul>
+<li><strong>代码对应部分：</strong> <code>def test_chunk_varlen(...)</code></li>
+<li><strong>具体步骤：</strong><ol>
+<li><strong>切分句子 (Split Sequence)：</strong><ul>
+<li>代码里有一段 <code>offsets = ...</code>。这就像是把一长串数据切成了 N 段，模拟几个长短不一的句子拼在一起。</li>
+</ul>
+</li>
+<li><strong>伪造数据 &amp; 运行对比：</strong><ul>
+<li>流程和 Task 2 几乎一样。</li>
+<li>区别在于调用函数时传入了 <code>cu_seqlens=offsets</code>，告诉算法：“注意，这里面有好几个句子，别把它们混在一起算了。”</li>
+</ul>
+</li>
+<li><strong>对比打分：</strong><ul>
+<li>同样对比输出值、中间状态 <code>h0</code> 和所有的梯度。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 4: 测试“并行计算”模式 (Test Parallel Retention)</h4>
+<p>Retention 机制既可以像 RNN 一样一步步算（Recurrent），也可以像 Transformer 一样一次性并行算完（Parallel）。这里测试并行模式。</p>
+<ul>
+<li><strong>代码对应部分：</strong> <code>def test_parallel(...)</code></li>
+<li><strong>具体步骤：</strong><ol>
+<li><strong>运行“最笨但最稳的答案” (Run Naive)：</strong><ul>
+<li>调用 <code>naive_retention</code>。名字叫 "naive" (朴素)，通常指用最简单的 Python 循环写出来的代码。它跑得慢，但逻辑简单，不容易出错，最适合当标准答案。</li>
+</ul>
+</li>
+<li><strong>运行“待测并行算法” (Run Parallel)：</strong><ul>
+<li>调用 <code>parallel_retention</code>。这是优化过的并行版本。</li>
+</ul>
+</li>
+<li><strong>对比打分：</strong><ul>
+<li>对比输出 <code>o</code> 和梯度 <code>dq</code>, <code>dk</code>, <code>dv</code>。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结：这文件到底在干嘛？</h3>
+<p>如果把 <code>fla</code> 这个库比作一家<strong>汽车工厂</strong>：</p>
+<ol>
+<li><strong><code>naive_retention</code> / <code>fused_recurrent_retention</code></strong> 是<strong>老工程师手工打造的零件</strong>。虽然造得慢，但精度绝对没问题，是“样板”。</li>
+<li><strong><code>chunk_retention</code> / <code>parallel_retention</code></strong> 是<strong>新引进的自动化流水线</strong>。它造得飞快（性能高），但我们担心它造出来的零件有瑕疵。</li>
+<li><strong><code>test_retention.py</code> (这个文件)</strong> 就是<strong>质检员</strong>。它拿着“样板零件”和“流水线零件”，用显微镜（<code>assert_close</code>）对比。<ul>
+<li>如果尺寸一样（前向传播结果一致），</li>
+<li>如果受力点一样（反向传播梯度一致），</li>
+<li><strong>结论：</strong> 新流水线合格，可以上线使用！</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话概括：</strong> 这个文件在验证<strong>高性能版</strong>的 Retention 算法是否和<strong>基础版</strong>算法数学上完全等价。</p>

@@ -1,0 +1,131 @@
+<h1>megatron/core/transformer/moe/moe_layer.py</h1>
+<p>这份代码确实比较硬核，它是 NVIDIA Megatron-Core 库中 <strong>混合专家模型 (Mixture of Experts, MoE)</strong> 的核心实现层。</p>
+<p>为了让你听懂，我们把写这个代码的过程想象成<strong>“建立一家通过分诊台高效运转的超级医院”</strong>。</p>
+<p>普通的 Transformer 层像是一个全科医生，什么病都看（所有数据都过同一个网络）。而 MoE 层像是一个拥有很多<strong>专科专家</strong>的医院，不同的病人（Token/数据）会被分给不同的专家看。</p>
+<p>下面是我们要完成的 <strong>Task To-Do List</strong>，我会一步步对照代码给你讲：</p>
+<h3>📝 Task List: 搭建 MoE 超级医院</h3>
+<ol>
+<li><strong>【规划】确定医院规模与专家分配</strong> (<code>BaseMoELayer.__init__</code>)</li>
+<li><strong>【招聘】雇佣分诊员、专家和运输队</strong> (<code>MoELayer.__init__</code>)</li>
+<li><strong>【流程1：挂号】分诊台判断去哪科</strong> (<code>router</code>)</li>
+<li><strong>【流程2：转运】把病人送到诊室</strong> (<code>token_permutation</code>)</li>
+<li><strong>【流程3：治疗】专家看病</strong> (<code>experts</code>)</li>
+<li><strong>【流程4：出院】把病人接回大厅</strong> (<code>token_unpermutation</code>)</li>
+</ol>
+<hr />
+<h3>Task 1: 【规划】确定医院规模与专家分配</h3>
+<p><strong>代码位置：</strong> <code>class BaseMoELayer</code> -&gt; <code>__init__</code></p>
+<p><strong>任务目标：</strong>
+因为模型太大，我们可能有 8 张显卡（8个院区），但总共有 64 个专家。我们需要计算出<strong>“当前这张显卡（这个院区）”</strong>负责哪几个专家。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 获取总共有多少个并行切分（比如有8张卡在做专家并行）</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">expert_parallel_size</span> <span class="o">=</span> <span class="n">parallel_state</span><span class="o">.</span><span class="n">get_expert_model_parallel_world_size</span><span class="p">()</span>
+
+<span class="c1"># 计算本地（这张卡）负责几个专家</span>
+<span class="c1"># 比如总共64个专家，8张卡，那 num_local_experts = 64 / 8 = 8 个</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">num_local_experts</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">num_moe_experts</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">expert_parallel_size</span>
+
+<span class="c1"># 算出本地专家的编号。比如我是第0号卡，我负责0-7号专家；第1号卡负责8-15号。</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">local_expert_indices</span> <span class="o">=</span> <span class="p">[</span><span class="n">local_expert_indices_offset</span> <span class="o">+</span> <span class="n">i</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">num_local_experts</span><span class="p">)]</span>
+</code></pre></div>
+
+<blockquote>
+<p><strong>观点：</strong> 这一步是为了做<strong>并行化</strong>。专家太多，一张卡放不下，必须切分到多张卡上。</p>
+</blockquote>
+<hr />
+<h3>Task 2: 【招聘】雇佣分诊员、专家和运输队</h3>
+<p><strong>代码位置：</strong> <code>class MoELayer</code> -&gt; <code>__init__</code></p>
+<p><strong>任务目标：</strong>
+实体化三个核心部门：
+1.  <strong>Router (分诊员)</strong>：决定数据去哪个专家。
+2.  <strong>Experts (医生)</strong>：实际的神经网络（MLP）。
+3.  <strong>TokenDispatcher (运输队)</strong>：负责在不同显卡之间搬运数据。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 招聘分诊员：TopKRouter</span>
+<span class="c1"># 它的作用是看一眼数据，选出最合适的 K 个专家（通常是 Top-1 或 Top-2）</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">router</span> <span class="o">=</span> <span class="n">TopKRouter</span><span class="p">(</span><span class="n">config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="p">)</span>
+
+<span class="c1"># 2. 招聘医生：Experts</span>
+<span class="c1"># GroupedMLP 是一种优化手段，把多个专家的计算合并在一起算，速度更快。</span>
+<span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">moe_grouped_gemm</span><span class="p">:</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">experts</span> <span class="o">=</span> <span class="n">GroupedMLP</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">num_local_experts</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="p">)</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">experts</span> <span class="o">=</span> <span class="n">SequentialMLP</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 或者一个一个排队算</span>
+
+<span class="c1"># 3. 组建运输队：TokenDispatcher</span>
+<span class="c1"># 如果专家在别的显卡上，需要通过网络通信把数据发过去。</span>
+<span class="c1"># AllGather 或 AlltoAll 是两种不同的通信策略。</span>
+<span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">moe_token_dispatcher_type</span> <span class="o">==</span> <span class="s2">&quot;allgather&quot;</span><span class="p">:</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">token_dispatcher</span> <span class="o">=</span> <span class="n">MoEAllGatherTokenDispatcher</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<hr />
+<h3>Task 3: 【流程1：挂号】分诊台判断去哪科</h3>
+<p><strong>代码位置：</strong> <code>forward</code> -&gt; <code>custom_forward</code> -&gt; <code>self.router</code></p>
+<p><strong>任务目标：</strong>
+数据（Hidden States）进来了，要给每个 Token 打分，决定它去哪个专家。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 输入 hidden_states (病人)</span>
+<span class="c1"># 输出 probs (去该专家的权重/概率), indices (该专家的ID)</span>
+<span class="n">probs</span><span class="p">,</span> <span class="n">indices</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">router</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+</code></pre></div>
+
+<blockquote>
+<p><strong>观点：</strong> 并不是所有数据都去同一个地方，这是 MoE “稀疏性”的核心。</p>
+</blockquote>
+<hr />
+<h3>Task 4: 【流程2：转运】把病人送到诊室</h3>
+<p><strong>代码位置：</strong> <code>token_dispatcher.token_permutation</code></p>
+<p><strong>任务目标：</strong>
+这是最复杂的一步。
+*   如果专家在<strong>本地</strong>：把数据重新排列，把要去同一个专家的放在一起。
+*   如果专家在<strong>别的显卡</strong>：把数据打包发送到那张显卡（通信）。</p>
+<p>这个过程叫 <strong>Permutation (排列/置换)</strong>。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 输入：原始数据，以及刚才算出来的去向(indices)</span>
+<span class="c1"># 输出：</span>
+<span class="c1"># dispatched_input: 整理好、发送到对应显卡的数据</span>
+<span class="c1"># tokens_per_expert: 每个专家分到了多少个数据（为了后面计算用）</span>
+<span class="p">(</span><span class="n">dispatched_input</span><span class="p">,</span> <span class="n">tokens_per_expert</span><span class="p">)</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">token_dispatcher</span><span class="o">.</span><span class="n">token_permutation</span><span class="p">(</span>
+    <span class="n">hidden_states</span><span class="p">,</span> <span class="n">probs</span><span class="p">,</span> <span class="n">indices</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<hr />
+<h3>Task 5: 【流程3：治疗】专家看病</h3>
+<p><strong>代码位置：</strong> <code>self.experts</code></p>
+<p><strong>任务目标：</strong>
+数据已经到了正确的显卡，并且按专家分好组了。现在开始真正的计算（MLP 前馈网络）。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 输入：整理好的数据</span>
+<span class="c1"># 输出：专家计算后的结果 (expert_output)</span>
+<span class="n">expert_output</span><span class="p">,</span> <span class="n">mlp_bias</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">experts</span><span class="p">(</span><span class="n">dispatched_input</span><span class="p">,</span> <span class="n">tokens_per_expert</span><span class="p">)</span>
+</code></pre></div>
+
+<blockquote>
+<p><strong>观点：</strong> 这里的计算量比普通 Transformer 小，因为虽然专家多，但每个数据只被 1-2 个专家计算，而不是被所有专家计算。</p>
+</blockquote>
+<hr />
+<h3>Task 6: 【流程4：出院】把病人接回大厅</h3>
+<p><strong>代码位置：</strong> <code>token_dispatcher.token_unpermutation</code></p>
+<p><strong>任务目标：</strong>
+专家算完了，数据现在是乱序的（按专家分组的）。我们需要把它<strong>还原</strong>成最开始输入的顺序（按句子顺序），这样下一层网络才能读懂。
+如果数据刚才被发到了别的显卡，这一步也会把它<strong>收回来</strong>。</p>
+<p>这个过程叫 <strong>Un-permutation (逆排列)</strong>。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 输入：专家算完的结果</span>
+<span class="c1"># 输出：还原顺序后的最终结果</span>
+<span class="n">output</span><span class="p">,</span> <span class="n">mlp_bias</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">token_dispatcher</span><span class="o">.</span><span class="n">token_unpermutation</span><span class="p">(</span><span class="n">expert_output</span><span class="p">,</span> <span class="n">mlp_bias</span><span class="p">)</span>
+</code></pre></div>
+
+<hr />
+<h3>总结：这段代码在干嘛？</h3>
+<p>这段代码实现了一个<strong>高效的、分布式的</strong> MoE 层。它的核心观点是：</p>
+<ol>
+<li><strong>分治法</strong>：把巨大的模型拆成很多小专家 (<code>BaseMoELayer</code>)。</li>
+<li><strong>动态路由</strong>：每个数据动态决定去哪 (<code>router</code>)。</li>
+<li><strong>通信管理</strong>：处理显卡之间的数据搬运，把“路由”变成实际的“数据移动” (<code>token_dispatcher</code>)。</li>
+<li><strong>计算优化</strong>：使用 GroupedGEMM 等技术高效执行多个专家的计算 (<code>experts</code>)。</li>
+</ol>
+<p>你现在再看 <code>custom_forward</code> 函数，就会发现它只是把这几个步骤串联起来了：
+<strong>路由(Router) -&gt; 派发(Permutation) -&gt; 计算(Experts) -&gt; 还原(Unpermutation)</strong></p>

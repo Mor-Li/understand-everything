@@ -1,0 +1,97 @@
+<h1>verl/utils/dataset/sft_dataset.py</h1>
+<p>这份代码其实写的是一个<strong>SFT（Supervised Fine-Tuning，有监督微调）</strong>的数据处理流程。</p>
+<p>简单来说，它的作用就是：<strong>把“问题+答案”的文本数据，转换成模型能看懂的“数字矩阵”，并告诉模型“哪部分是你需要学习的”。</strong></p>
+<p>为了让你听懂，我把这个代码做的事情拆解成一个 <strong>“SFT 数据准备任务清单 (Todo List)”</strong>。代码的执行过程，就是按顺序完成下面这 5 件事。</p>
+<hr />
+<h3>📋 SFT 数据准备任务清单</h3>
+<ol>
+<li><strong>[准备工作]</strong>: 找到数据文件，把它们全部读到内存里，准备好翻译工具（Tokenizer）。</li>
+<li><strong>[格式包装]</strong>: 把“原始问题”包装成“聊天格式”（比如加上“用户说：...”），并把“问题”和“答案”拼在一起。</li>
+<li><strong>[翻译与拼接]</strong>: 把文字翻译成数字编号（Token IDs），并把问题和答案连成一条长龙。</li>
+<li><strong>[统一长度]</strong>: 如果太短就补齐（Padding），如果太长就切掉（Truncation），保证所有数据长度一致。</li>
+<li><strong>[设置考点 (关键)]</strong>: 制作一个“掩码 (Mask)”，告诉模型：<strong>“只许背答案，不许背问题”</strong>。</li>
+</ol>
+<hr />
+<h3>🧐 逐步详细讲解</h3>
+<p>现在我们对照代码，一步步看它是怎么完成上面这个 List 的。</p>
+<h4>1. [准备工作]：<code>__init__</code> 和 <code>_read_files_and_tokenize</code></h4>
+<p>这是类的初始化部分。</p>
+<ul>
+<li><strong>代码逻辑</strong>：<ul>
+<li><code>self.tokenizer</code>: 加载分词器（翻译工具）。</li>
+<li><code>_download()</code>: 如果文件在云端（HDFS），先下载到本地。</li>
+<li><code>pd.read_parquet()</code>: 用 Pandas 读取 Parquet 格式的数据文件。</li>
+<li><strong>提取</strong>：把所有的问题（prompt）存成一个列表，所有的答案（response）存成一个列表。</li>
+</ul>
+</li>
+<li><strong>大白话</strong>：就像厨师做饭前，先把菜买回来，洗好切好，分门别类放在两个大盆里（一个放问题，一个放答案），等着后续处理。</li>
+</ul>
+<h4>2. [格式包装]：<code>__getitem__</code> 的前半部分</h4>
+<p>当训练程序需要“第 N 条数据”时，<code>__getitem__</code> 就开始工作了。</p>
+<ul>
+<li><strong>代码逻辑</strong>：
+    <code>python
+    # 把纯文本的问题，包装成对话格式
+    prompt_chat = [{'role': 'user', 'content': prompt}]
+    # 变成字符串，例如 "&lt;|user|&gt; 你的问题 &lt;|end|&gt;\n&lt;|assistant|&gt;"
+    prompt_chat_str = tokenizer.apply_chat_template(...)
+    # 答案后面加上结束符 (EOS)，告诉模型这就讲完了
+    response_chat_str = response + tokenizer.eos_token</code></li>
+<li><strong>大白话</strong>：模型不能只看裸文本。它需要知道哪句话是人说的，哪句话是机器说的。这一步就是给文本穿上“制服”。</li>
+</ul>
+<h4>3. [翻译与拼接]：<code>tokenizer</code> 和 <code>torch.cat</code></h4>
+<ul>
+<li>
+<p><strong>代码逻辑</strong>：
+    ```python
+    # 把文字变成数字 ID
+    prompt_ids = tokenizer(prompt_chat_str, ...)
+    response_ids = tokenizer(response_chat_str, ...)</p>
+<h1>拼接到一起：[问题ID, 答案ID]</h1>
+<p>input_ids = torch.cat((prompt_ids, response_ids), dim=-1)
+<code>``
+*   **大白话**：
+*   电脑不认识中文英文，只认识数字。
+*   比如“你好”变成</code>[101, 204]<code>，“世界”变成</code>[305, 404]<code>。
+*   拼接后变成一条长龙：</code>[101, 204, 305, 404]`（即：你好世界）。</p>
+</li>
+</ul>
+<h4>4. [统一长度]：Padding (填充)</h4>
+<ul>
+<li><strong>代码逻辑</strong>：
+    <code>python
+    # 如果当前长度 &lt; 设定的最大长度 (max_length)
+    if sequence_length &lt; self.max_length:
+        # 用 pad_token_id (通常是0) 填满剩下的位置
+        padded_input_ids = ...
+        input_ids = torch.cat((input_ids, padded_input_ids))</code></li>
+<li><strong>大白话</strong>：模型训练时要求大家整整齐齐。如果你设定的长度是 1024，但这句话只有 10 个字，代码会在后面补上 1014 个“空白占位符”，强行凑够 1024。</li>
+</ul>
+<h4>5. [设置考点 (关键)]：制作 <code>loss_mask</code></h4>
+<p>这是 SFT（有监督微调）里<strong>最重要</strong>的一步。</p>
+<ul>
+<li><strong>代码逻辑</strong>：
+    <code>python
+    loss_mask = attention_mask.clone()
+    # 把 prompt (问题) 部分的 mask 设为 0
+    if prompt_length &gt; 1:
+        loss_mask[:prompt_length - 1] = 0</code></li>
+<li><strong>为什么这么做？</strong><ul>
+<li>SFT 的目的是让模型学会<strong>回答问题</strong>。</li>
+<li>模型看到“1+1=”，它应该预测“2”。</li>
+<li>如果不加 Mask，模型会连着“1+1=”一起背诵。这没意义，因为问题是已知的。</li>
+<li><strong>Loss Mask = 0</strong> 的意思就是：<strong>“这部分算错了也不扣分，不用学”</strong>。</li>
+<li><strong>Loss Mask = 1</strong> 的意思就是：<strong>“这部分是答案，必须背下来，算错了要罚（计算 Loss）”</strong>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结输出 (<code>return</code>)</h3>
+<p>最后，这个脚本把处理好的四个东西打包扔给模型：</p>
+<ol>
+<li><strong><code>input_ids</code></strong>: 整个对话的数字版（问题+答案+填充）。</li>
+<li><strong><code>attention_mask</code></strong>: 告诉模型哪些是真字，哪些是填充的空白（Padding）。</li>
+<li><strong><code>position_ids</code></strong>: 告诉模型每个字排第几号。</li>
+<li><strong><code>loss_mask</code></strong>: <strong>重点</strong>，告诉模型“只计算答案部分的损失”，忽略问题部分。</li>
+</ol>
+<p>这就完成了一个 SFT 数据集的完整使命！</p>

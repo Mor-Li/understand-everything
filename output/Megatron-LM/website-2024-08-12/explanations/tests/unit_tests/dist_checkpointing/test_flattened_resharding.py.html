@@ -1,0 +1,97 @@
+<h1>tests/unit_tests/dist_checkpointing/test_flattened_resharding.py</h1>
+<p>这份代码确实比较晦涩，因为它涉及到 <strong>Megatron-LM</strong>（一个大模型训练框架）中最复杂的底层逻辑之一：<strong>分布式检查点（Distributed Checkpointing）</strong>。</p>
+<p>简单来说，这个文件的目的是测试：<strong>当你改变了模型的并行策略（比如从 2张卡变成了 4张卡并行），能不能正确地保存和读取那些被“拍扁”（Flattened）的数据（通常是优化器状态）。</strong></p>
+<p>为了让你读懂，我制定了一个 <strong>5步学习任务清单 (Task List)</strong>。请按照这个顺序，我们一步步拆解。</p>
+<hr />
+<h3>Task 1: 理解背景概念 (Context)</h3>
+<p>在看代码前，先理解我们在测什么。</p>
+<ul>
+<li><strong>TP/PP/DP</strong>:<ul>
+<li><strong>TP (Tensor Parallel)</strong>: 把一个大的 Tensor 切开，分给不同显卡计算。</li>
+<li><strong>PP (Pipeline Parallel)</strong>: 把模型的不同层分给不同显卡。</li>
+<li><strong>DP (Data Parallel)</strong>: 复制多份模型，处理不同的数据。</li>
+</ul>
+</li>
+<li><strong>Resharding (重分片)</strong>: 比如你本来是用 2个GPU跑模型（TP=2），存了个档。后来你有了 4个GPU（TP=4），你想读档继续训练。这时候由于 Tensor 的切分方式变了，这就叫 Resharding。</li>
+<li><strong>Flattened Tensor (扁平化张量)</strong>: 在大模型训练中（特别是使用 ZeRO 优化器时），为了省显存，参数会被打散成一维的（1D），并且切分到不同的 DP 进程中。这个测试的核心难点就在于：<strong>如何把这些被打散、切碎的一维数据，还原成原本的 N 维数据，并适应新的并行策略。</strong></li>
+</ul>
+<hr />
+<h3>Task 2: 搞懂数据是怎么造出来的 (Helper Function)</h3>
+<p><strong>目标</strong>：阅读 <code>_build_state_dict</code> 函数。
+<strong>解释</strong>：这个函数是整个测试的地基，它造了一个“假”的模型数据。</p>
+<ol>
+<li><strong>造一个全局 Tensor</strong>: 代码里 <code>global_ten</code> 是一个形状为 <code>(8, 5, 40)</code> 的大张量。</li>
+<li><strong>模拟切分 (TP/PP)</strong>:<ul>
+<li><code>local_ten</code> 是当前显卡持有的那一部分数据。</li>
+<li>它在第0维按 TP 切分，在第2维按 PP 切分。</li>
+</ul>
+</li>
+<li><strong>模拟扁平化 (The Tricky Part)</strong>:<ul>
+<li><code>local_flat_ten</code>: 这是模拟优化器状态。它把 <code>local_ten</code> 拍扁成一维。</li>
+<li><strong>关键点</strong>: 它还按 DP (Data Parallel) 进行了切分 (<code>local_dp_slice</code>)。代码里甚至故意加了 <code>jitter</code>（抖动），让每个 DP rank 分到的数据长度不一样（模拟真实情况中除不尽的余数）。</li>
+</ul>
+</li>
+<li><strong>封装</strong>:<ul>
+<li><code>sd_key_unflat</code>: 标准的切分 Tensor。</li>
+<li><code>sd_key_flat</code>: 扁平化后又切碎的 Tensor。</li>
+</ul>
+</li>
+</ol>
+<p><strong>结论</strong>: <code>_build_state_dict</code> 产出的就是一个包含“正常参数”和“被打散的优化器参数”的字典。</p>
+<hr />
+<h3>Task 3: 测试核心功能——变身！ (Test Case 1)</h3>
+<p><strong>目标</strong>: 阅读 <code>test_partition_change_save_load</code> 函数。
+<strong>逻辑</strong>: 这是最直观的功能测试。</p>
+<ol>
+<li><strong>Setup (<code>src_tp_pp</code>)</strong>: 比如先用 TP=2, PP=4 初始化环境。</li>
+<li><strong>Save</strong>: 调用 <code>save(state_dict, ...)</code> 把上面造的数据存到硬盘。</li>
+<li><strong>Change Topology</strong>: 销毁环境，用新的配置 (<code>dest_tp_pp</code>) 比如 TP=2, PP=2 重新初始化。</li>
+<li><strong>Load</strong>: 调用 <code>load(...)</code> 读取存档。<ul>
+<li>这里发生了魔法：Megatron 必须自动计算出，在新的并行策略下，当前显卡需要加载原来存档中的哪一部分数据。</li>
+</ul>
+</li>
+<li><strong>Verify</strong>: 对比 <code>loaded_state_dict</code> 和预期的 <code>expected_state_dict</code> 是否完全一致。</li>
+</ol>
+<p><strong>一句话总结</strong>: 测的是“不管我怎么变并行度，存进去的数据和读出来的数据必须值一样”。</p>
+<hr />
+<h3>Task 4: 深入底层——碎片拼图 (Test Case 2)</h3>
+<p><strong>目标</strong>: 阅读 <code>test_reformulate_nd_flattened_tensors</code> 函数。
+<strong>逻辑</strong>: 这个测试比 Task 3 更深，它测试的是<strong>“拼图逻辑”</strong>是否正确。</p>
+<ul>
+<li><strong>场景</strong>: 我们存的是 <code>flat</code> (一维碎片)，但读的时候，我们可能需要把它还原成 <code>unflat</code> (N维) 的逻辑，或者重新组合。</li>
+<li><strong>Reformulation (重组)</strong>:<ul>
+<li><code>get_reformulation_metadata</code>: 获取重组需要的元数据。</li>
+<li><code>apply_nd_flattened_tensors_reformulation</code>: 这是一个核心算法。它计算出：为了填满我现在需要的这块 Tensor，我需要去读存档里哪些 <code>flat</code> 的碎片。</li>
+</ul>
+</li>
+<li><strong>Assert (断言)</strong>:<ul>
+<li><code>expected_ckpt_offsets_by_rank</code>: 这里硬编码了预期的结果。</li>
+<li>比如 <code>0: [(0, 0, 0), (0, 0, 10)]</code> 意思是：Rank 0 的进程，应该去读存档里偏移量为 0 和 10 的数据块。</li>
+<li>测试代码检查计算出的 <code>keys()</code> (读取计划) 是否和预期的一致。</li>
+</ul>
+</li>
+</ul>
+<p><strong>一句话总结</strong>: 测的是“数学计算对不对”，即“我知道我要去读哪些碎片才能拼出我现在的参数”。</p>
+<hr />
+<h3>Task 5: 只读目录，不读内容 (Test Case 3)</h3>
+<p><strong>目标</strong>: 阅读 <code>test_load_tensor_metadata</code> 函数。
+<strong>逻辑</strong>: 测试元数据（Metadata）的加载。</p>
+<ol>
+<li><strong>保存</strong>: 存一个并行切分的模型。</li>
+<li><strong>加载元数据</strong>: <code>load_tensors_metadata(ckpt_dir)</code>。注意，这里没有加载巨大的 Tensor 数据，只是加载了 JSON 描述文件。</li>
+<li><strong>验证</strong>:<ul>
+<li>检查 <code>flat</code> 和 <code>unflat</code> 对应的 <code>global_shape</code> 是否一致。虽然一个是拍扁存的，一个是N维存的，但它们在元数据里应该都指向同一个全剧形状 <code>(8, 5, 40)</code>。</li>
+</ul>
+</li>
+<li><strong>全量加载</strong>: 最后试着把数据真的读出来，验证 <code>flat</code> 和 <code>unflat</code> 的数值是否一一对应。</li>
+</ol>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>这个文件的逻辑链条是：</p>
+<ol>
+<li><strong>造数据</strong>: 造一种既有 N维形式，又有一维切片形式的数据 (<code>_build_state_dict</code>)。</li>
+<li><strong>测宏观</strong>: 改变 GPU 数量，存盘再读盘，看能不能自动转换成功 (<code>test_partition_change_save_load</code>)。</li>
+<li><strong>测微观</strong>: 检查底层的索引计算逻辑，确保程序知道去哪找那些被拍扁的数据碎片 (<code>test_reformulate_nd_flattened_tensors</code>)。</li>
+<li><strong>测描述</strong>: 确保不读数据只读描述文件时，形状信息是正确的 (<code>test_load_tensor_metadata</code>)。</li>
+</ol>
+<p>这其实是 Megatron-Core 能够支持 <strong>Universal Checkpoint (通用检查点)</strong> 的关键测试，保证了你无论用多少张卡训练，存下来的权重都能在任意数量卡的环境下加载。</p>

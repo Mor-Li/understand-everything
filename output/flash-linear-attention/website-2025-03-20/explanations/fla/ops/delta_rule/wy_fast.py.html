@@ -1,0 +1,80 @@
+<h1>fla/ops/delta_rule/wy_fast.py</h1>
+<p>这份代码确实非常硬核，因为它涉及到 <strong>Linear Attention（线性注意力）</strong> 或 <strong>RNN</strong> 变体中的 <strong>Delta Rule（增量规则）</strong> 的底层 GPU 加速实现。</p>
+<p>简单来说，这段代码是为了<strong>极快地</strong>计算一种特殊的数学更新公式。</p>
+<p>为了让你听懂，我们不用数学公式轰炸你，而是把它想象成一个<strong>“流水线任务清单” (Task Todo List)</strong>。</p>
+<h3>背景知识：我们在做什么？</h3>
+<p>我们在训练一个模型（类似 Mamba 或 RetNet），它需要处理序列数据（比如一句话）。
+传统的 RNN 是一步一步算：<code>看完第1个字 -&gt; 算第1步状态 -&gt; 看第2个字 -&gt; 算第2步状态...</code>。这在 GPU 上太慢了。</p>
+<p>这个文件的目的是：<strong>把这种串行计算变成并行计算</strong>。
+它使用了一种叫 <strong>WY Representation</strong> 的数学技巧，把一堆复杂的加减法更新，打包成矩阵乘法。</p>
+<hr />
+<h3>📋 任务清单 (Task Todo List)</h3>
+<p>假设我们要处理一个长度为 $T$ 的序列，我们把它切成很多小块（Chunk），比如每块长度 32 或 64。
+下面是针对<strong>每一个 Chunk</strong> 需要执行的步骤：</p>
+<h4>✅ Task 1: 准备原材料 (Inputs)</h4>
+<p>我们手头有三个核心变量：
+*   <strong><code>k</code> (Key)</strong>: 键向量。
+*   <strong><code>v</code> (Value)</strong>: 值向量。
+*   <strong><code>beta</code> ($\beta$)</strong>: 更新率/门控，决定我们要保留多少新信息，遗忘多少旧信息。</p>
+<h4>✅ Task 2: 计算“内部纠葛”矩阵 A (Compute Matrix A)</h4>
+<p><strong>对应函数：</strong> <code>fwd_prepare_wy_repr_kernel_chunk32</code> 或 <code>chunk64</code>
+<strong>对应 Python 接口：</strong> <code>fwd_prepare_wy_repr</code></p>
+<ul>
+<li><strong>原来的问题</strong>：在 Delta Rule 中，第 $t$ 步的更新不仅取决于当前输入，还取决于之前存了什么（因为要把旧的减掉一部分）。这意味着第 2 步依赖第 1 步，第 3 步依赖第 2 步...</li>
+<li><strong>现在的做法</strong>：<ol>
+<li>在这个 Chunk 内部（比如 32 步），我们先算出一个 <strong>$32 \times 32$ 的矩阵 A</strong>。</li>
+<li>这个 $A$ 矩阵记录了<strong>在这个 Chunk 内部，每一步对后面所有步的影响系数</strong>。</li>
+<li>代码中有一大段逻辑（<code>blockwise computation of lower triangular matrix's inverse</code>）是在算逆矩阵。这是因为 Delta Rule 的数学公式里有递归的减法，解开这个递归需要求逆。</li>
+<li><strong>结果</strong>：得到了矩阵 <code>A</code>，它捕捉了 Chunk 内部的时间因果关系。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 3: 变身！计算 W 和 U (Recompute W and U)</h4>
+<p><strong>对应函数：</strong> <code>fwd_recompute_w_u_kernel</code>
+<strong>对应 Python 接口：</strong> <code>fwd_recompute_w_u</code></p>
+<ul>
+<li><strong>原来的问题</strong>：原始的 $k$ 和 $v$ 是每一步独立的，没法直接并行相乘来代表整个历史更新。</li>
+<li><strong>现在的做法</strong>：<ol>
+<li>利用刚才算好的“纠葛矩阵” $A$，我们对原始的 $k$ 和 $v$ 进行变换。</li>
+<li>计算公式大致是：<ul>
+<li>$u = A \times (v \cdot \beta)$</li>
+<li>$w = A \times (k \cdot \beta)$</li>
+</ul>
+</li>
+<li><strong>结果</strong>：我们得到了新的变量 <strong><code>w</code></strong> 和 <strong><code>u</code></strong>。</li>
+<li><strong>为什么这么做？</strong> 这一步是核心魔法。一旦有了 $w$ 和 $u$，原本复杂的递归公式 $S_t = S_{t-1} + \beta(v - k^T S_{t-1})k$ 就可以被简化成类似 $S_{new} = S_{old} + \sum u \cdot w^T$ 的形式。这就可以用矩阵乘法瞬间算完了！</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 4: 反向传播 (Backward Pass)</h4>
+<p><strong>对应函数：</strong> <code>bwd_prepare_wy_repr_kernel</code>
+<strong>对应 Python 接口：</strong> <code>bwd_prepare_wy_repr</code></p>
+<ul>
+<li><strong>目标</strong>：模型训练需要算梯度。</li>
+<li><strong>做法</strong>：<ol>
+<li>拿到输出的梯度 <code>dw</code> 和 <code>du</code>。</li>
+<li>沿着刚才的前向路径倒着走一遍。</li>
+<li>利用矩阵 $A$（还要用到它的转置）把梯度传回到 <code>dk</code>, <code>dv</code>, <code>dbeta</code>。</li>
+<li><strong>结果</strong>：算出了原始输入的梯度，以便更新神经网络的权重。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底讲了啥？</h3>
+<p><strong>一句话总结：</strong>
+这是一个<strong>预处理</strong>模块。它把原本必须“串行”计算的 Delta Rule RNN，通过数学变换（计算矩阵 A -&gt; 变换得到 w, u），转化成了可以<strong>并行</strong>处理的形式（WY Representation）。</p>
+<p><strong>核心流程图解：</strong></p>
+<ol>
+<li><strong>输入</strong>：$k, v, \beta$</li>
+<li><strong>Kernel 1 (Prepare)</strong>: 计算 Chunk 内的依赖关系矩阵 $A$（这一步最难，涉及到下三角矩阵求逆）。</li>
+<li><strong>Kernel 2 (Recompute)</strong>: 用 $A$ 把 $k, v$ 混合成 $w, u$。</li>
+<li><strong>输出</strong>：$w, u, A$。</li>
+</ol>
+<p><strong>后续步骤（不在本文件中）：</strong>
+其他的代码文件会拿这里的 $w$ 和 $u$ 去做高效的矩阵乘法，从而完成整个 Attention/RNN 的计算。</p>
+<h3>为什么看不懂？</h3>
+<p>因为这里面用到了 <strong>Triton</strong> 语言（专门写 GPU 内核的 Python DSL），并且充满了为了速度而做的优化：
+*   <code>tl.make_block_ptr</code>: 极其底层的显存块指针操作。
+*   <code>chunk32</code> vs <code>chunk64</code>: 针对不同块大小手写了不同的优化逻辑（比如 64 的时候用了分块求逆技巧）。
+*   <code>tl.dot</code>, <code>tl.where</code>: 向量化的数学运算。</p>
+<p><strong>你只需要知道：它是一个极速的“转换器”，把 $k, v$ 转换成了方便并行计算的 $w, u$。</strong></p>

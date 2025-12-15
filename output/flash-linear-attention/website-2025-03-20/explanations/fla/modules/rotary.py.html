@@ -1,0 +1,98 @@
+<h1>fla/modules/rotary.py</h1>
+<p>这份代码确实比较硬核，因为它不仅仅是实现功能，而是用 <strong>Triton</strong>（一种用于编写高效GPU内核的语言）对 <strong>旋转位置编码 (RoPE)</strong> 进行了极致的性能优化。</p>
+<p>别担心，我们把这个复杂的代码拆解成一个 <strong>“学习任务清单” (To-Do List)</strong>，由浅入深，一步步带你通关。</p>
+<hr />
+<h3>任务清单：从原理到高性能实现</h3>
+<h4>✅ Task 1: 理解核心目标 —— 什么是 RoPE？</h4>
+<p>在看代码前，先明确我们在做什么。
+*   <strong>目标</strong>：给 Transformer 中的 Query (Q) 和 Key (K) 向量加上位置信息。
+*   <strong>方法</strong>：不是简单的相加，而是通过<strong>旋转</strong>。把向量两两分组，在二维平面上旋转一个角度。
+*   <strong>公式</strong>：$x_{new} = x \cdot \cos(\theta) + \text{rotate}(x) \cdot \sin(\theta)$。</p>
+<h4>✅ Task 2: 理解基础数学操作 (<code>rotate_half</code>)</h4>
+<p>看代码开头的 <code>rotate_half</code> 函数。这是旋转操作的基础。
+*   <strong>代码位置</strong>：<code>def rotate_half(x, interleaved=False):</code>
+*   <strong>逻辑</strong>：
+    *   假设一个向量是 <code>[x1, x2]</code>。
+    *   旋转 90 度（数学上的预处理步骤）变成 <code>[-x2, x1]</code>。
+    *   <strong>关键点 <code>interleaved</code></strong>：
+        *   <code>False</code> (默认): 把向量切成前后两半。比如 <code>[0, 1, 2, 3]</code> -&gt; <code>[-2, -3, 0, 1]</code>。
+        *   <code>True</code>: 两两交替。比如 <code>[0, 1, 2, 3]</code> -&gt; <code>[-1, 0, -3, 2]</code>。</p>
+<h4>✅ Task 3: 看懂“慢速”参考实现 (<code>rotary_embedding_ref</code>)</h4>
+<p>这是为了验证逻辑是否正确写的纯 PyTorch 代码，虽然慢，但逻辑清晰。
+*   <strong>代码位置</strong>：<code>def rotary_embedding_ref(...)</code>
+*   <strong>逻辑</strong>：
+    1.  生成 <code>cos</code> 和 <code>sin</code>。
+    2.  直接套用公式：<code>x * cos + rotate_half(x) * sin</code>。
+    *   <strong>重点</strong>：如果你看不懂后面的 Triton 代码，只需要记住：后面的所有代码都是为了<strong>极快地</strong>计算这个函数的结果。</p>
+<h4>✅ Task 4: 进阶 —— 为什么需要 Triton Kernel? (<code>rotary_embedding_kernel</code>)</h4>
+<p>这是文件的核心难点。为什么要写这一大坨代码？
+*   <strong>原因</strong>：PyTorch 原生操作会有多次显存读写（Read X -&gt; Read Cos -&gt; Calc -&gt; Write）。
+*   <strong>Triton 优势</strong>：把所有操作融合在一个 <strong>Kernel（内核）</strong> 里，一次读取，算完直接写入，极大减少显存带宽消耗。</p>
+<h4>✅ Task 5: 拆解 Triton Kernel 的工作流</h4>
+<p>让我们把 <code>rotary_embedding_kernel</code> 拆成几个小步骤看：</p>
+<ul>
+<li>
+<p><strong>Step 5.1: 确定位置 (Grid &amp; Offsets)</strong></p>
+<ul>
+<li>代码：<code>i_t, i_b, i_h = tl.program_id(0), ...</code></li>
+<li>解释：GPU 是并行计算的。这里在计算当前这个线程负责处理哪个 Batch (<code>i_b</code>)、哪个时间步 (<code>i_t</code>)、哪个头 (<code>i_h</code>) 的数据。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 5.2: 处理变长序列 (VarLen)</strong></p>
+<ul>
+<li>代码：<code>if IS_VARLEN: ...</code></li>
+<li>解释：处理像 FlashAttention 那样的变长序列（把所有句子拼在一起），需要通过 <code>cu_seqlens</code> 找到当前句子的起始位置。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 5.3: 加载数据 (Load)</strong></p>
+<ul>
+<li>代码：<code>tl.load(p_x, ...)</code></li>
+<li>解释：从显存中读取 <code>x</code>（输入向量）、<code>cos</code>、<code>sin</code>。</li>
+<li><strong>难点</strong>：<code>if not INTERLEAVED</code> 和 <code>else</code> 分别处理了两种内存布局。为了速度，它尽量保证内存是连续读取的。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 5.4: 执行计算 (Compute)</strong></p>
+<ul>
+<li>代码：
+    <code>python
+    b_o0 = b_x0 * b_cos - b_x1 * b_sin
+    b_o1 = b_x0 * b_sin + b_x1 * b_cos</code></li>
+<li>解释：这就是 Task 1 中的旋转公式复现。<code>b_sin</code> 前面的负号对应了 <code>rotate_half</code> 中的取反操作。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 5.5: 写回结果 (Store)</strong></p>
+<ul>
+<li>代码：<code>tl.store(p_y, b_o0, ...)</code></li>
+<li>解释：把算好的结果写回到显存 <code>y</code> 中。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 6: 封装成 PyTorch 算子 (<code>RotaryEmbeddingFunction</code>)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>class RotaryEmbeddingFunction(torch.autograd.Function):</code></li>
+<li><strong>目的</strong>：让这个 Triton Kernel 能够支持 <strong>反向传播 (Backpropagation)</strong>，这样模型才能训练。</li>
+<li><strong>forward</strong>: 调用刚才写的 Triton kernel 计算前向。</li>
+<li><strong>backward</strong>: 再次调用 Triton kernel，但是计算梯度（注意 <code>conjugate=True</code>，这是数学上的共轭，用于梯度的反向旋转）。</li>
+</ul>
+<h4>✅ Task 7: 包装成神经网络层 (<code>class RotaryEmbedding</code>)</h4>
+<p>最后，这是你在模型里真正调用的类。
+*   <strong>管理缓存 (Cache)</strong>：
+    *   <code>self.inv_freq</code>: 计算频率。
+    *   <code>_update_cos_sin_cache</code>: <strong>这一步很重要</strong>。计算 <code>cos</code> 和 <code>sin</code> 比较慢，所以这个类会根据当前的序列长度 <code>seqlen</code>，预先算好并存起来 (<code>cached</code>)。下次来同样长度的数据，直接查表，不用重算。
+*   <strong>forward 函数</strong>：
+    *   接收 Query <code>q</code> 和 Key <code>k</code>。
+    *   如果长度变了，更新缓存。
+    *   调用 <code>rotary_embedding</code> (也就是调用了 Triton kernel) 对 <code>q</code> 和 <code>k</code> 进行处理。
+    *   支持 <strong>XPos</strong> (Scale base)：这是一种 RoPE 的变体，随着距离衰减，代码里的 <code>scale</code> 相关逻辑就是处理这个的。</p>
+<hr />
+<h3>总结：这段代码讲了啥？</h3>
+<p>简单来说，这个文件做了一件事：
+<strong>“我写了一个极速版的 RoPE（旋转位置编码），它比 PyTorch 原生的快很多，支持变长序列（FlashAttention 格式），并且把它包装好，让你能直接像用 <code>nn.Module</code> 一样用它。”</strong></p>
+<p><strong>建议阅读顺序：</strong>
+1.  先看 <code>rotate_half</code> 搞懂数学逻辑。
+2.  直接跳到最后看 <code>RotaryEmbedding</code> 类，看它怎么管理 <code>cos/sin</code> 缓存。
+3.  如果不做底层优化开发，<strong>Triton kernel 部分可以略读</strong>，知道它是负责“加速计算”的黑盒即可。</p>

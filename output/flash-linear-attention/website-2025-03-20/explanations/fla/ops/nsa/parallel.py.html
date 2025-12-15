@@ -1,0 +1,93 @@
+<h1>fla/ops/nsa/parallel.py</h1>
+<p>这份代码确实非常硬核，因为它不仅仅是普通的PyTorch代码，还包含了大量的 <strong>Triton Kernel</strong>（运行在GPU上的底层高性能代码）。</p>
+<p>简单来说，这个文件实现了一种叫做 <strong>NSA (Native Sparse Attention)</strong> 的注意力机制。</p>
+<p>它的核心思想是：<strong>标准的注意力机制（Attention）要看全图，太慢了。NSA决定只看“重点”区域，加上一点“概览”和一点“邻居”。</strong></p>
+<p>为了让你看懂，我把这个算法的执行流程拆解成一个 <strong>“任务清单 (Todo List)”</strong>。想象你是一个负责阅读理解的AI，你要处理一篇超长的文章（Sequence），你的步骤如下：</p>
+<hr />
+<h3>✅ 任务清单：NSA 注意力机制的执行步骤</h3>
+<h4>1. 第一步：概览全篇 (Compression / Coarse-grained)</h4>
+<p><strong>目标</strong>：文章太长读不完，先每隔一段距离（比如每64个字）把内容压缩一下，看看哪里是重点。
+*   <strong>动作</strong>：
+    *   <strong>压缩 KV</strong>：把 Key 和 Value 按照 <code>block_size</code>（比如64）进行平均池化（Mean Pooling）。原本很长的序列变短了。
+    *   <strong>计算粗糙的注意力</strong>：用 Query 去在这个“压缩版”的 Key 上算注意力分数。
+    *   <strong>产出</strong>：得到了一个模糊的“全局地图”，知道哪些块（Block）大概比较重要。
+*   <strong>对应代码</strong>：
+    *   函数：<code>parallel_nsa_compression</code>
+    *   内核：<code>parallel_nsa_compression_fwd_kernel</code></p>
+<h4>2. 第二步：挑选重点 (Selection / Top-K)</h4>
+<p><strong>目标</strong>：有了“全局地图”，现在要圈出最值得细读的几个段落。
+*   <strong>动作</strong>：
+    *   根据第一步算出来的分数，选出得分最高的 $S$ 个块（Block）。
+    *   记录下这些块的索引（Indices）。
+*   <strong>对应代码</strong>：
+    *   函数：<code>parallel_nsa_topk</code>
+    *   内核：<code>parallel_nsa_kernel_topk</code></p>
+<h4>3. 第三步：精读重点 (Selected Attention / Fine-grained)</h4>
+<p><strong>目标</strong>：回到原文，只去读第二步圈出来的那些段落，这次要一个字一个字地读。
+*   <strong>动作</strong>：
+    *   <strong>稀疏注意力</strong>：Query 不再看所有 Token，只看被选中的那些 Block 里的原始 Token。
+    *   这样计算量大大减少，因为忽略了那些“不重要”的段落。
+*   <strong>对应代码</strong>：
+    *   函数：<code>parallel_nsa_fwd</code>
+    *   内核：<code>parallel_nsa_fwd_kernel</code></p>
+<h4>4. 第三步（补充）：别忘了邻居 (Sliding Window)</h4>
+<p><strong>目标</strong>：虽然挑了远处的重点，但“此时此刻”前后的内容通常也很重要（比如句法关系）。
+*   <strong>动作</strong>：
+    *   不管重点在哪，强制看一眼当前 Token 附近的邻居（比如最近的512个词）。
+    *   这通常直接调用 FlashAttention 的 Sliding Window 模式。
+*   <strong>对应代码</strong>：
+    *   主函数 <code>parallel_nsa</code> 中的 <code>flash_attn_varlen_func</code> 部分。</p>
+<h4>5. 第四步：融合结果 (Gating &amp; Combination)</h4>
+<p><strong>目标</strong>：把上面三个步骤的结果（概览、精读、邻居）加权融合起来。
+*   <strong>动作</strong>：
+    *   利用门控参数（<code>g_cmp</code>, <code>g_slc</code>, <code>g_swa</code>）给三个结果打分并相加。
+    *   $$Output = (精读 \times g_{slc}) + (概览 \times g_{cmp}) + (邻居 \times g_{swa})$$
+*   <strong>对应代码</strong>：
+    *   主函数 <code>parallel_nsa</code> 结尾的 <code>torch.addcmul</code> 等操作。</p>
+<hr />
+<h3>🔍 代码结构导读</h3>
+<p>现在你再回头看文件，就能对应上了：</p>
+<ol>
+<li>
+<p><strong><code>parallel_nsa</code> (文件末尾的主入口)</strong></p>
+<ul>
+<li>这是总指挥。它依次调用下面的子功能。</li>
+<li>先做 <code>mean_pooling</code> (压缩)。</li>
+<li>调用 <code>parallel_nsa_compression</code> (算概览分)。</li>
+<li>调用 <code>parallel_nsa_topk</code> (选块)。</li>
+<li>调用 <code>ParallelNSAFunction.apply</code> (算精读)。</li>
+<li>最后把结果加在一起。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>parallel_nsa_compression_fwd_kernel</code> (Triton内核)</strong></p>
+<ul>
+<li>这是<strong>第一步</strong>的GPU加速实现。它处理的是压缩后的 K 和 V。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>parallel_nsa_kernel_topk</code> (Triton内核)</strong></p>
+<ul>
+<li>这是<strong>第二步</strong>的GPU加速实现。它负责快速排序和筛选，找出 Top-K 的块索引。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>parallel_nsa_fwd_kernel</code> (Triton内核)</strong></p>
+<ul>
+<li>这是<strong>第三步</strong>的GPU加速实现。这是最难写的部分，因为它要根据索引去“跳着”读取显存里的数据（只读选中的块），而不是连续读取。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>_bwd_kernel</code> 系列</strong></p>
+<ul>
+<li>这些带有 <code>bwd</code> (backward) 后缀的函数全是<strong>反向传播</strong>用的，也就是训练模型时计算梯度用的。如果你只是想理解它在干嘛（推理过程），可以完全忽略这些 <code>bwd</code> 函数。</li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p>这个文件的核心就是<strong>为了省显存和加速</strong>。它不让模型看所有的词，而是：
+1.  <strong>粗看</strong>一下全局（Compression）。
+2.  <strong>挑出</strong>重点（TopK）。
+3.  <strong>细看</strong>重点（Selected）。
+4.  <strong>顺带看</strong>一眼周围（Sliding Window）。</p>
+<p>这就是 <strong>NSA (Native Sparse Attention)</strong> 的本质。</p>

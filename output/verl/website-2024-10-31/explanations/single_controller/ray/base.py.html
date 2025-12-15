@@ -1,0 +1,89 @@
+<h1>single_controller/ray/base.py</h1>
+<p>这份代码确实比较抽象，因为它是在 <strong>Ray</strong>（一个分布式计算框架）之上封装的一层“管理逻辑”。</p>
+<p>你可以把这段代码想象成一个 <strong>“包工头”</strong>（Controller），它的工作是指挥一群 <strong>“工人”</strong>（Workers）在不同的 <strong>“工地”</strong>（Nodes/GPUs）上干活。</p>
+<p>为了让你听懂，我把这个文件的逻辑拆解成一个 <strong>“包工头的任务清单 (Todo List)”</strong>，我们一步步来看它是怎么把活派下去的。</p>
+<hr />
+<h3>包工头的 Todo List（核心逻辑）</h3>
+<h4>任务 1：搞定场地和资源 (Resource Management)</h4>
+<p><strong>代码对应：</strong> <code>RayResourcePool</code> 类</p>
+<ul>
+<li><strong>背景</strong>：在干活前，我得先知道我有几台机器，每台机器上有几张 GPU 卡。</li>
+<li><strong>TODO</strong>：<ol>
+<li><strong>清点资源</strong>：看看 <code>process_on_nodes</code>（要在哪些节点上跑）和 <code>max_colocate_count</code>（一个 CPU/GPU 上能挤几个人）。</li>
+<li><strong>占座 (Placement Group)</strong>：这是 Ray 的核心概念。也就是去 Ray 的系统里“预订”位置。<ul>
+<li><em>代码细节</em>：<code>get_placement_groups</code> 方法。它会根据配置，向 Ray 申请说：“给我留 5 个坑位，每个坑位要 1 个 GPU”。如果申请不到，程序就会卡在这里等。</li>
+</ul>
+</li>
+<li><strong>合并资源</strong>：如果我有两堆资源，我可以用 <code>merge_resource_pool</code> 把它们拼成一个大资源池。</li>
+</ol>
+</li>
+</ul>
+<h4>任务 2：确定要干什么活 (Job Definition)</h4>
+<p><strong>代码对应：</strong> <code>RayClassWithInitArgs</code> 类</p>
+<ul>
+<li><strong>背景</strong>：光有场地不行，还得知道招什么工种（比如是做训练的，还是做推理的）。</li>
+<li><strong>TODO</strong>：<ol>
+<li><strong>包装工人</strong>：给我一个 Python 类（<code>cls</code>）和初始化的参数（<code>args</code>, <code>kwargs</code>）。</li>
+<li><strong>准备派单</strong>：<code>__call__</code> 方法是关键。当我要真正创建这个工人的时候，我会告诉 Ray：“用这个类，在这个特定的坑位（<code>placement_group</code>）上，创建一个远程对象（Actor）”。</li>
+</ol>
+</li>
+</ul>
+<h4>任务 3：组建施工队 (Worker Group Creation)</h4>
+<p><strong>代码对应：</strong> <code>RayWorkerGroup</code> 类（这是最核心的类）</p>
+<ul>
+<li><strong>背景</strong>：场地有了，工种定了，现在要正式招募一队人马（比如 8 个 GPU 就要招 8 个工人）。</li>
+<li><strong>TODO</strong>：<ol>
+<li><strong>按坑位招人</strong>：在 <code>_init_with_resource_pool</code> 里，我遍历刚才预订好的所有坑位。</li>
+<li><strong>分配编号 (Rank)</strong>：给每个工人发工牌。<ul>
+<li>你是 0 号（队长），你是 1 号，你是 2 号...</li>
+<li>设置环境变量 <code>WORLD_SIZE</code>（总人数）和 <code>RANK</code>（你的编号）。</li>
+</ul>
+</li>
+<li><strong>确立通讯录</strong>：如果是 0 号（队长），我要拿到它的 IP 和端口 (<code>_master_addr</code>, <code>_master_port</code>)，然后告诉其他所有人：“有事找 0 号”。</li>
+<li><strong>实际创建</strong>：调用任务 2 里的 <code>RayClassWithInitArgs</code>，正式在 Ray 里启动这些进程。</li>
+</ol>
+</li>
+</ul>
+<h4>任务 4：指挥干活 (Execution)</h4>
+<p><strong>代码对应：</strong> <code>RayWorkerGroup</code> 中的 <code>execute_*</code> 系列方法</p>
+<ul>
+<li><strong>背景</strong>：队伍组好了，现在我要发号施令。</li>
+<li><strong>TODO</strong>：<ol>
+<li><strong>全员干活 (Execute All)</strong>：<ul>
+<li><code>execute_all_async(method_name, ...)</code>：我喊一声“开始训练”，所有工人（0 到 N 号）同时执行 <code>method_name</code> 这个函数。</li>
+<li><strong>自动分发数据</strong>：这里有个很聪明的逻辑。如果你给我的参数是一个列表（List），而且长度刚好等于工人数，我会<strong>自动切分</strong>。比如要把 8 个苹果分给 8 个人，我会自动给每人发 1 个，而不是每人发 8 个。</li>
+</ul>
+</li>
+<li><strong>只让队长干活</strong>：<ul>
+<li><code>execute_rank_zero(...)</code>：有些事（比如保存模型、打印日志）只需要一个人做，我就只发给 0 号工人。</li>
+</ul>
+</li>
+<li><strong>同步等待</strong>：带有 <code>_sync</code> 后缀的方法（如 <code>execute_all_sync</code>），意味着发完命令我要等着他们干完，拿到结果我才进行下一步。</li>
+</ol>
+</li>
+</ul>
+<h4>任务 5：省钱合租 (Advanced: Co-location)</h4>
+<p><strong>代码对应：</strong> 文件末尾的 <code>create_colocated_worker_cls</code> 和 <code>WorkerDict</code></p>
+<ul>
+<li><strong>背景</strong>：有时候 Ray 的进程开销太大了，或者我想让两个不同的工种（比如一个负责计算，一个负责通信）住在一个进程里省内存。</li>
+<li><strong>TODO</strong>：<ol>
+<li><strong>拼装</strong>：把多个不同的类（<code>class_dict</code>）强行塞到一个新的类 <code>WorkerDict</code> 里面。</li>
+<li><strong>伪装</strong>：通过 <code>_bind_workers_method_to_parent</code>，把原来那几个类的方法，通过“魔法”绑定到这个新类上。</li>
+<li><strong>效果</strong>：外部看起来是一个 Worker，内部其实住了好几个对象，共享同一个进程和内存。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结：这文件到底是干啥的？</h3>
+<p>这文件是 <strong>“分布式训练/推理的管家”</strong>。</p>
+<p>如果不发这个文件，你写分布式程序需要：
+1.  自己去 Ray 里申请资源。
+2.  自己写循环启动 8 个 Actor。
+3.  自己告诉第 3 个 Actor 它的 Rank 是 3，Master IP 是多少。
+4.  自己写代码去把数据切成 8 份发给他们。</p>
+<p><strong>有了这个文件，你只需要：</strong>
+1.  定义一个资源池（我要 8 张卡）。
+2.  定义一个 Worker 类（我要跑这个模型）。
+3.  创建一个 <code>RayWorkerGroup</code>。
+4.  调用 <code>group.execute_all("train")</code>。</p>
+<p>它帮你屏蔽了底层 Ray 的繁琐调度细节。</p>

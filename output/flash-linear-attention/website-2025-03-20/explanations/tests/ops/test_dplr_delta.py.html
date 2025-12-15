@@ -1,0 +1,81 @@
+<h1>tests/ops/test_dplr_delta.py</h1>
+<p>这份代码确实一上来全是数学符号和张量操作，看着很晕是正常的。</p>
+<p>简单来说，这是一个 <strong>PyTorch 的测试文件（Unit Test）</strong>。它的核心目的是验证一种叫做 <strong>"DPLR Delta Rule"</strong>（一种类似线性Attention或SSM的状态空间模型算法）的<strong>加速版本</strong>写得对不对。</p>
+<p>为了让你读懂，我制定了一个 <strong>“四步走”的学习清单（Todo List）</strong>，我们一步步拆解：</p>
+<hr />
+<h3>✅ Task 1: 搞清楚“我们在测什么？”（核心概念）</h3>
+<p>首先不要看代码细节，先理解这个文件在干嘛。</p>
+<ul>
+<li><strong>背景</strong>：在现代大模型（LLM）研究中，大家都在找比 Transformer 更快、显存占用更小的模型架构。<code>FLA</code> (Fast Linear Attention) 就是这样一个库。</li>
+<li><strong>主角</strong>：<code>DPLR Delta Rule</code>。这是一种具体的算法，你可以把它想象成一个<strong>拥有记忆（State）的黑盒子</strong>。<ul>
+<li>输入：$Q, K, V$（查询、键、值），以及特殊的控制参数 $A, B, GK$（衰减/门控）。</li>
+<li>过程：它会根据输入不断更新内部的“记忆状态” $S$。</li>
+<li>输出：根据记忆状态计算出结果 $O$。</li>
+</ul>
+</li>
+<li><strong>问题</strong>：这个算法如果用普通的 Python <code>for</code> 循环写（也就是文中的 <code>recurrent</code>），运行<strong>非常慢</strong>。所以开发者写了 <strong>CUDA 加速版</strong>（<code>fused</code> 或 <code>chunk</code> 版本）。</li>
+<li><strong>本文件的任务</strong>：<strong>找茬</strong>。它通过对比“慢但绝对正确的代码”和“快但容易写错的代码”，来确保加速版没有 Bug。</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 读懂“标准答案”（Reference 代码）</h3>
+<p>也就是代码中的 <code>recurrent_dplr_delta_rule_ref</code> 函数（第 15-59 行）。这是<strong>真理</strong>，所有加速版都要跟它对齐。</p>
+<p><strong>Todo:</strong>
+1.  <strong>看输入</strong>：<code>q, k, v</code> 是数据，<code>a, b</code> 是更新规则参数，<code>gk</code> 是门控（Gate/Decay，控制记忆遗忘多少）。
+2.  <strong>看核心循环</strong>（第 44-54 行）：
+    *   这是一个时间步（RNN）循环：<code>for i in range(L):</code>
+    *   <strong>记忆读取</strong>：<code>_v2 = ...</code> 和 <code>o[...] = ...</code>。
+    *   <strong>记忆更新</strong>：<code>S</code> 是核心状态（State）。
+        *   <code>S = S * gk...</code>：先让旧记忆衰减（遗忘）。
+        *   <code>S = S + ...</code>：写入新的记忆（基于 $k$ 和 $v$）。
+3.  <strong>结论</strong>：这个函数虽然慢（因为它在 Python 里跑循环），但逻辑最清晰。它是用来生成<strong>标准答案</strong>的。</p>
+<hr />
+<h3>✅ Task 3: 理解“三种形态”（不同的实现方式）</h3>
+<p>文件中出现了三个版本的同一个算法，你需要区分它们：</p>
+<p><strong>Todo:</strong>
+1.  <strong>Recurrent (Ref)</strong>:
+    *   就是 Task 2 讲的那个。
+    *   <strong>特点</strong>：逐个时间步计算，像蜗牛一样慢，但逻辑简单，不易出错。
+    *   <strong>用途</strong>：作为参照物（Ground Truth）。
+2.  <strong>Chunk (Ref &amp; Compiled)</strong>:
+    *   代码：<code>chunk_dplr_delta_rule_ref</code> (第 62 行)。
+    *   <strong>特点</strong>：把长序列切成一块一块（Chunk）来算。块内并行，块间串行。
+    *   <strong>用途</strong>：比 Recurrent 快，比 Fused 慢，用来测试分块逻辑对不对。
+3.  <strong>Fused (Kernel)</strong>:
+    *   代码中被 import 进来的 <code>fused_recurrent_dplr_delta_rule</code>。
+    *   <strong>特点</strong>：底层用 Triton 或 CUDA 写的，极度优化，速度极快，但代码极其难写，最容易出 Bug。
+    *   <strong>用途</strong>：实际生产中用的版本。</p>
+<hr />
+<h3>✅ Task 4: 看懂测试流程（怎么找茬？）</h3>
+<p>现在看下面的 <code>test_...</code> 函数，它们就是具体的“找茬”过程。</p>
+<p><strong>Todo 1: 看 <code>test_ref_equivalence</code> (第 148 行)</strong>
+*   <strong>目的</strong>：<strong>内战</strong>。测试 Python 写的“分块版（Chunk Ref）”和“循环版（Recurrent Ref）”算出来的结果是不是一样。
+*   <strong>逻辑</strong>：
+    1.  随机生成一堆数据 <code>q, k, v...</code>。
+    2.  跑一遍 <code>chunk_..._ref</code> 得到 <code>ref</code>。
+    3.  跑一遍 <code>recurrent_..._ref</code> 得到 <code>tri</code>。
+    4.  <strong>关键句</strong>：<code>assert_close(..., ref, tri, ...)</code>。
+    *   <em>解释</em>：如果这两个结果误差超过 0.001，就报错。说明分块逻辑写错了。</p>
+<p><strong>Todo 2: 看 <code>test_fused_recurrent_fwd</code> (第 212 行)</strong>
+*   <strong>目的</strong>：<strong>挑战</strong>。测试“极速版（Fused）”和“标准答案（Recurrent Ref）”是否一致。
+*   <strong>逻辑</strong>：
+    1.  生成数据。
+    2.  跑慢版本得到 <code>ref</code>。
+    3.  跑快版本（<code>fused_compiled</code>）得到 <code>tri</code>。
+    4.  <code>assert_close</code>：如果不一致，说明你的 CUDA 加速代码写错了。</p>
+<p><strong>Todo 3: 看 <code>test_chunk</code> (第 287 行)</strong>
+*   <strong>目的</strong>：<strong>全方位测试</strong>。不仅测结果（前向传播），还要测<strong>梯度（反向传播）</strong>。
+*   <strong>逻辑</strong>：
+    1.  <code>requires_grad_(True)</code>：开启梯度记录。
+    2.  算出结果后，手动执行 <code>.backward()</code> 算出梯度（<code>dq, dk, dv...</code>）。
+    3.  <strong>关键点</strong>：不仅对比输出 <code>o</code>，还要对比所有参数的梯度 <code>q.grad</code> vs <code>ref_dq</code>。
+    *   <em>解释</em>：有时候结果是对的，但训练时梯度传错了，模型也学不会。这一步非常关键。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件在讲一个故事：</p>
+<blockquote>
+<p>“我写了一个很复杂的数学算法（DPLR Delta Rule），为了跑得快，我写了极其复杂的加速代码。但我怕写出 Bug，所以我写了这个脚本，随机生成各种数据，<strong>让加速代码和最笨但最稳的代码跑比赛</strong>，如果算出来的数哪怕有一点点不一样（<code>assert_close</code> 失败），就说明我的加速代码有问题。”</p>
+</blockquote>
+<p><strong>你现在的阅读顺序建议：</strong>
+1.  先看 <code>test_ref_equivalence</code> 里的 <code>assert_close</code>，明白它在比对两个东西。
+2.  再看 <code>recurrent_dplr_delta_rule_ref</code>，明白它在做一个 $S = S \cdot \text{decay} + \text{update}$ 的操作。
+3.  其他的代码都是为了生成数据、设置参数（比如 <code>B, H, T, D</code> 代表 Batch, Head, Time, Dimension）和调用函数。</p>

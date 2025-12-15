@@ -1,0 +1,82 @@
+<h1>fla/ops/gla/chunk.py</h1>
+<p>这份代码确实非常硬核，它是一个深度优化的底层算子实现。</p>
+<p>简单来说，这个文件实现了 <strong>GLA (Gated Linear Attention)</strong> 模型的 <strong>“分块（Chunkwise）”</strong> 前向（Forward）和后向（Backward）传播算法。它是为了让线性注意力机制（Linear Attention）在 GPU 上跑得极快，同时显存占用更低。</p>
+<p>为了让你看懂，我们把“阅读代码”变成一个<strong>“执行任务”的 To-Do List</strong>。我们将整个复杂的逻辑拆解为 4 个主要步骤。</p>
+<hr />
+<h3>核心思想：分而治之 (Divide and Conquer)</h3>
+<p><strong>背景：</strong>
+标准的 Transformer 计算注意力是 $O(T^2)$，太慢。线性注意力（Linear Attention）是 $O(T)$，通常写成 RNN 形式。但是 RNN 形式在 GPU 上无法并行，训练很慢。</p>
+<p><strong>Chunk GLA 的策略：</strong>
+把长序列（比如长度 2048）切成很多小块（Chunk，比如每块长度 64）。
+1.  <strong>块间（Inter-Chunk）：</strong> 像 RNN 一样串行传递“记忆”（Hidden State $h$）。
+2.  <strong>块内（Intra-Chunk）：</strong> 像标准 Transformer 一样并行计算局部注意力。</p>
+<hr />
+<h3>Task List: 一步步拆解代码逻辑</h3>
+<h4>✅ Task 1: 准备工作 (Setup)</h4>
+<p><strong>目标：</strong> 理解输入是什么，为什么要分块。
+*   <strong>输入：</strong> $Q, K, V$（数据），$g$（门控/衰减系数，GLA 的核心）。
+*   <strong>切分：</strong> 代码中你会看到 <code>BT</code> (Block Time) 或 <code>chunk_size</code>。这代表把长序列切分成长度为 <code>BT</code> 的小段。
+*   <strong>Variable Length 支持：</strong> 代码里有很多 <code>offsets</code> 和 <code>indices</code>，这是为了支持“变长序列打包”（FlashAttention 的做法），即把不同长度的句子拼成一个大张量处理，这里不用深究，知道是处理数据索引的就行。</p>
+<h4>✅ Task 2: 计算“局部”注意力矩阵 A (The Intra-Chunk Attention)</h4>
+<p><strong>目标：</strong> 在每个小块内部，计算 $Q$ 和 $K$ 的交互。
+<strong>对应代码：</strong>
+*   <code>chunk_gla_fwd_intra_gk</code> (Python 函数)
+*   <code>chunk_gla_fwd_A_kernel_...</code> (Triton Kernels)</p>
+<p><strong>原理解析：</strong>
+GLA 的核心公式里有衰减项 $g$。在这一步，代码显式地计算了一个矩阵 <strong>$A$</strong>。
+$A \approx (Q \cdot K^T) \odot \text{Decay}(g)$
+这个 $A$ 矩阵只包含块内的关联。</p>
+<ul>
+<li><strong>Kernel 细节：</strong> 你会发现它把 $A$ 的计算拆成了两个 Kernel (<code>intra_sub_inter</code> 和 <code>intra_sub_intra</code>)。这是为了极致的 GPU 性能优化（分块矩阵乘法），避免显存读写瓶颈，本质上就是算 $Q \times K$。</li>
+</ul>
+<h4>✅ Task 3: 融合“全局”记忆与“局部”结果 (Output Computation)</h4>
+<p><strong>目标：</strong> 算出最终输出 $O$。输出由两部分组成：
+1.  <strong>历史记忆：</strong> 上一个块传过来的状态 $h$ 乘以当前块的 $Q$。
+2.  <strong>当前交互：</strong> 刚才算出来的局部矩阵 $A$ 乘以当前块的 $V$。</p>
+<p><strong>对应代码：</strong>
+*   <code>chunk_gla_fwd_o_gk</code> (Python 函数)
+*   <code>chunk_gla_fwd_kernel_o</code> (Triton Kernel)</p>
+<p><strong>代码逻辑翻译：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 伪代码逻辑</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_chunks</span><span class="p">):</span>
+    <span class="c1"># 1. 这一块的输出 = 局部注意力 + 历史记忆贡献</span>
+    <span class="n">Output</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">A</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">@</span> <span class="n">V</span><span class="p">[</span><span class="n">i</span><span class="p">])</span> <span class="o">+</span> <span class="p">(</span><span class="n">Q</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">@</span> <span class="n">h</span><span class="p">[</span><span class="n">i</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>
+
+    <span class="c1"># 2. 更新历史记忆传给下一块 (这一步在 chunk_fwd_h 中完成，本文件主要负责上面那行)</span>
+    <span class="n">h</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">h</span><span class="p">[</span><span class="n">i</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="p">(</span><span class="n">K</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">T</span> <span class="o">@</span> <span class="n">V</span><span class="p">[</span><span class="n">i</span><span class="p">])</span>
+</code></pre></div>
+
+<p>在这个 Kernel 里，它同时加载了 $Q, V$ 和历史状态 $h$，计算出最终的 $O$。</p>
+<h4>✅ Task 4: 反向传播 (Backward Pass)</h4>
+<p><strong>目标：</strong> 训练模型需要算梯度。
+<strong>对应代码：</strong>
+*   <code>chunk_gla_bwd</code> (Python 函数)
+*   <code>chunk_gla_bwd_kernel_...</code> (一堆 Triton Kernels)</p>
+<p><strong>原理解析：</strong>
+这是最难读的部分。它是前向传播的逆运算。根据链式法则：
+1.  从输出梯度 $dO$ 算出 $dA$ 和 $dV$。
+2.  从 $dA$ 算出 $dQ$ 和 $dK$。
+3.  最麻烦的是算 $dg$ (门控的梯度)，因为它涉及累加的指数运算，需要极其小心的数值处理（Triton Kernel 里有很多 <code>tl.exp</code>, <code>tl.dot</code>）。</p>
+<hr />
+<h3>总结：这个文件到底在干啥？</h3>
+<p>如果把这个文件看作一个工厂流水线：</p>
+<ol>
+<li><strong>原材料：</strong> $Q, K, V, g$。</li>
+<li><strong>工序 1 (Local A)：</strong> 也就是 <code>chunk_gla_fwd_intra_gk</code>。工人们把每个小箱子（Chunk）里的 $Q$ 和 $K$ 拿出来，算出一个局部的关系表 $A$。</li>
+<li><strong>工序 2 (Output)：</strong> 也就是 <code>chunk_gla_fwd_o_gk</code>。工人们看着局部的关系表 $A$ 和 $V$ 结合，同时接收上一道工序传过来的“全局记忆” $h$，组装成最终产品 $O$。</li>
+<li><strong>售后 (Backward)：</strong> 也就是 <code>chunk_gla_bwd</code>。如果产品有误差，逆向追踪是哪个零件（$Q,K,V,g$）出了问题，计算修正量（梯度）。</li>
+</ol>
+<h3>建议阅读顺序</h3>
+<p>不要一行行读 Triton Kernel（那些 <code>tl.load</code>, <code>tl.program_id</code> 会晕死人）。</p>
+<ol>
+<li>先看文件最底部的 <strong><code>chunk_gla</code></strong> 函数。这是用户调用的入口，看它怎么处理参数。</li>
+<li>接着看 <strong><code>ChunkGLAFunction</code></strong> 类。看 <code>forward</code> 方法里怎么依次调用 <code>chunk_gla_fwd</code>。</li>
+<li>看 <strong><code>chunk_gla_fwd</code></strong> 函数。你会看到我上面说的流程：<ul>
+<li>先算 <code>g_cumsum</code> (门控累加)</li>
+<li>调用 <code>chunk_fwd_h</code> (算全局状态，在另一个文件)</li>
+<li>调用 <code>chunk_gla_fwd_intra_gk</code> (算局部 A)</li>
+<li>调用 <code>chunk_gla_fwd_o_gk</code> (算输出 O)</li>
+</ul>
+</li>
+<li>最后，如果你真的需要修改底层算法，再去研究那些 <code>@triton.jit</code> 装饰的 Kernel 函数。</li>
+</ol>

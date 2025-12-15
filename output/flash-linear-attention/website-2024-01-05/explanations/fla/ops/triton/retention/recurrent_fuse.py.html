@@ -1,0 +1,149 @@
+<h1>fla/ops/triton/retention/recurrent_fuse.py</h1>
+<p>这份代码确实比较硬核，它涉及到 <strong>Triton 并行编程</strong>、<strong>RetNet（Retention Network）的算法原理</strong> 以及 <strong>RNN 的循环推理优化</strong>。看不懂是很正常的。</p>
+<p>为了让你能够消化这段代码，我为你制定了一个 <strong>5步走的 Task List</strong>。我们不追求一行行死磕，而是从宏观到微观，把逻辑理顺。</p>
+<hr />
+<h3>📝 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1: 理解核心数学公式</strong> (弄清楚我们在算什么数学题)</li>
+<li><strong>Task 2: 理解并行策略</strong> (弄清楚 Triton 怎么切分任务)</li>
+<li><strong>Task 3: 解析 Forward Kernel 的循环逻辑</strong> (核心代码解读)</li>
+<li><strong>Task 4: 理解 Python 包装层的 "Sum" 操作</strong> (为什么最后要求和)</li>
+<li><strong>Task 5: 略读 Backward Kernel</strong> (反向传播只需了解大概)</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 1: 理解核心数学公式</h4>
+<p>这段代码实现的是 <strong>RetNet (Retention Network)</strong> 中的 <strong>循环 (Recurrent)</strong> 模式。</p>
+<p>在传统的 Transformer (Attention) 中，我们是一次性看所有 token。但在 RetNet 的循环模式下，我们像 RNN 一样，一步一步处理。</p>
+<p><strong>核心公式（简化版）：</strong>
+我们需要维护一个“隐状态”（Memory），记为 $S$ (在代码里叫 <code>h</code>)。</p>
+<ol>
+<li>
+<p><strong>更新状态：</strong>
+    $$S_t = \text{decay} \times S_{t-1} + (K_t^T \cdot V_t)$$</p>
+<ul>
+<li>$S_t$: 当前时刻的记忆矩阵。</li>
+<li>$K_t, V_t$: 当前时刻的 Key 和 Value。</li>
+<li>意思就是：旧的记忆衰减一点点，加上新的知识（$K$和$V$的结合）。</li>
+</ul>
+</li>
+<li>
+<p><strong>计算输出：</strong>
+    $$O_t = Q_t \cdot S_t$$</p>
+<ul>
+<li>$O_t$: 当前时刻的输出。</li>
+<li>$Q_t$: 当前时刻的 Query。</li>
+<li>意思就是：用 Query 去查询当前的记忆矩阵 $S$。</li>
+</ul>
+</li>
+</ol>
+<p><strong>代码里的对应：</strong>
+*   代码里的 <code>h</code> 就是公式里的 $S$。
+*   代码里的 <code>b_b</code> 就是公式里的 <code>decay</code> (衰减率)。</p>
+<hr />
+<h4>Task 2: 理解并行策略 (Triton 的 Grid)</h4>
+<p>这是最难理解的部分。通常 RNN 是不能并行的（必须等 $t-1$ 算完才能算 $t$）。但是 Triton 允许我们在 <strong>空间</strong> 上并行。</p>
+<p><strong>问题：</strong> 隐状态 $S$ 是一个矩阵，尺寸是 $[D_k, D_v]$。如果这两个维度很大，计算会很慢。
+<strong>策略：</strong> 我们把 $S$ 切成很多小块（Block），每个 GPU 线程块（Program）只负责维护 $S$ 的一小块。</p>
+<ul>
+<li><strong>BK</strong>: Key 维度的切块大小 (比如 32)。</li>
+<li><strong>BV</strong>: Value 维度的切块大小 (比如 32)。</li>
+<li><strong>Grid (网格)</strong>: <code>(NV, NK, Batch * Heads)</code><ul>
+<li><code>NV</code>: Value 维度切了多少刀。</li>
+<li><code>NK</code>: Key 维度切了多少刀。</li>
+<li>这意味着：我们启动了好多线程，每个线程只负责计算 $S$ 矩阵中 <code>[BV, BK]</code> 这么大的一小块区域。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>Task 3: 解析 Forward Kernel 的循环逻辑</h4>
+<p>让我们看 <code>fused_recurrent_retention_fwd_kernel</code> 这个函数。</p>
+<p><strong>1. 定位坐标 (Who am I?)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">i_v</span><span class="p">,</span> <span class="n">i_k</span><span class="p">,</span> <span class="n">i_bh</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">1</span><span class="p">),</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li>我是第 <code>i_bh</code> 个句子/头。</li>
+<li>我负责 Key 维度的第 <code>i_k</code> 块。</li>
+<li>我负责 Value 维度的第 <code>i_v</code> 块。</li>
+</ul>
+<p><strong>2. 初始化指针 (Where is my data?)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">p_q</span> <span class="o">=</span> <span class="n">q</span> <span class="o">+</span> <span class="o">...</span> <span class="c1"># 指向我的 Query</span>
+<span class="n">p_k</span> <span class="o">=</span> <span class="n">k</span> <span class="o">+</span> <span class="o">...</span> <span class="c1"># 指向我的 Key</span>
+<span class="n">p_v</span> <span class="o">=</span> <span class="n">v</span> <span class="o">+</span> <span class="o">...</span> <span class="c1"># 指向我的 Value</span>
+<span class="n">p_o</span> <span class="o">=</span> <span class="n">o</span> <span class="o">+</span> <span class="o">...</span> <span class="c1"># 指向我的 Output</span>
+</code></pre></div>
+
+<p>这里利用 stride 计算内存地址，跳过我不关心的部分。</p>
+<p><strong>3. 初始化隐状态 (My small piece of memory)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">h</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">zeros</span><span class="p">([</span><span class="n">BV</span><span class="p">,</span> <span class="n">BK</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+</code></pre></div>
+
+<p>这就是我负责的那一小块 $S$ 矩阵。</p>
+<p><strong>4. 时间循环 (The RNN Loop)</strong>
+这是核心中的核心：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">T</span><span class="p">):</span> <span class="c1"># T 是序列长度，一步步走</span>
+    <span class="c1"># 1. 加载当前时刻的数据</span>
+    <span class="n">_k</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_k</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+    <span class="n">_v</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_v</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+    <span class="n">_q</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_q</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># 2. 更新隐状态 h (对应公式 S = decay * S + K * V)</span>
+    <span class="c1"># _k[None, :] * _v[:, None] 是外积，生成一个 [BV, BK] 的矩阵</span>
+    <span class="n">h</span> <span class="o">=</span> <span class="n">b_b</span> <span class="o">*</span> <span class="n">h</span> <span class="o">+</span> <span class="n">_k</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]</span> <span class="o">*</span> <span class="n">_v</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span>
+
+    <span class="c1"># 3. 计算输出 (对应公式 O = Q * S)</span>
+    <span class="c1"># 注意：这里是分块计算。</span>
+    <span class="n">_o</span> <span class="o">=</span> <span class="n">h</span> <span class="o">*</span> <span class="n">_q</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]</span>  <span class="c1"># 逐元素相乘</span>
+    <span class="n">_o</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">_o</span><span class="p">,</span> <span class="n">axis</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span> <span class="c1"># 沿着 K 维度求和</span>
+
+    <span class="c1"># 4. 存结果</span>
+    <span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">p_o</span><span class="p">,</span> <span class="n">_o</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># 5. 指针移动到下一个时刻 (T+1)</span>
+    <span class="n">p_q</span> <span class="o">+=</span> <span class="n">DK</span>
+    <span class="n">p_k</span> <span class="o">+=</span> <span class="n">DK</span> <span class="o">...</span>
+</code></pre></div>
+
+<p><strong>关键点解释：</strong>
+代码里的计算方式稍微做了一点变形以适应内存布局，但本质就是 $S$ 的更新和 $Q \cdot S$ 的计算。</p>
+<hr />
+<h4>Task 4: 理解 Python 包装层的 "Sum" 操作</h4>
+<p>回到 Python 类的 <code>forward</code> 函数：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 创建一个临时输出 o，形状包含 NK (Key被切分的份数)</span>
+<span class="n">o</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">new_empty</span><span class="p">(</span><span class="n">NK</span><span class="p">,</span> <span class="n">batch_size</span><span class="p">,</span> <span class="n">n_heads</span><span class="p">,</span> <span class="n">seq_len</span><span class="p">,</span> <span class="n">d_head_v</span><span class="p">)</span>
+
+<span class="c1"># ... 运行 kernel ...</span>
+
+<span class="c1"># 这一步非常关键！</span>
+<span class="n">o</span> <span class="o">=</span> <span class="n">o</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>为什么要 Sum？</strong>
+因为我们在 <strong>Task 2</strong> 中把 $K$ 维度切分成了 <code>NK</code> 份。
+数学上，矩阵乘法 $O = Q \cdot S$ 涉及到沿着 $K$ 维度的求和（点积）。
+在 Kernel 里，每个线程只计算了它那一小块 $K$ 对应的部分和。
+所以，回到 Python 层，我们需要把所有切分的块加起来 (<code>sum(0)</code>)，才能得到最终完整的 Output。</p>
+<hr />
+<h4>Task 5: 略读 Backward Kernel (反向传播)</h4>
+<p><code>fused_recurrent_retention_bwd_kernel</code> 是为了训练用的。
+它的逻辑和 Forward 类似，但是方向相反：
+1.  它需要算梯度的更新。
+2.  它包含两个循环：
+    *   第一个循环：正向重算一遍 <code>h</code> (为了拿到中间状态)。
+    *   第二个循环：<strong>反向</strong> (从 $T$ 到 $0$) 遍历，计算 <code>dq</code>, <code>dk</code>, <code>dv</code>。</p>
+<p>这部分非常复杂，包含了“梯度在时间上的回传” (Backpropagation Through Time, BPTT)。如果你只是想用这个算子，通常不需要深究这一块，只需要知道它正确实现了链式法则即可。</p>
+<hr />
+<h3>💡 总结 (这代码到底在干啥)</h3>
+<ol>
+<li><strong>目的</strong>：算 RetNet 的 RNN 模式，省显存（不用存巨大的 Attention Matrix），速度快。</li>
+<li><strong>难点</strong>：$S$ 矩阵太大，一个线程算不过来。</li>
+<li><strong>解法</strong>：用 Triton 把 $S$ 矩阵切碎，分给几百个 GPU 线程同时算。</li>
+<li><strong>流程</strong>：<ul>
+<li>Python 层准备数据，切分 Grid。</li>
+<li>Triton Kernel 内部跑 <code>for</code> 循环，一步步更新自己的那一小块 $S$，并算出部分 $O$。</li>
+<li>Python 层把大家算出来的部分 $O$ 加起来，得到最终结果。</li>
+</ul>
+</li>
+</ol>
+<p>建议你先只看 <code>fwd_kernel</code> 中的 <code>for</code> 循环内部，那是算法的灵魂。弄懂了 <code>h</code> 怎么更新，其他的都是为了并行化做的铺垫。</p>

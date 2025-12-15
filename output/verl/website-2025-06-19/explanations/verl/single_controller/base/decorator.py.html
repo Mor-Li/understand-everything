@@ -1,0 +1,90 @@
+<h1>verl/single_controller/base/decorator.py</h1>
+<p>这份代码确实比较抽象，因为它属于<strong>分布式系统中的“中间件”层</strong>。它不直接做具体的数学计算，而是负责<strong>指挥</strong>：指挥数据怎么切分、任务怎么派发给几百张显卡、结果怎么收回来。</p>
+<p>为了让你看懂，我们假设你是一个<strong>包工头（Controller）</strong>，你手下有一大堆<strong>工人（Worker/GPU）</strong>。</p>
+<p>这份文件就是一本<strong>《派活儿指南》</strong>。</p>
+<p>我们可以把理解这份代码的任务拆解成以下 5 个 TODO List，一步步来：</p>
+<hr />
+<h3>✅ Task 1: 理解核心流程 (Input -&gt; Split -&gt; Run -&gt; Merge)</h3>
+<p>分布式计算的核心逻辑其实就三步，这份代码里所有的函数都在围绕这三步转：</p>
+<ol>
+<li><strong>Dispatch (分发/切分)</strong>: 你手上有 100 块砖（数据），你有 10 个工人。你需要决定是给每个工人 10 块砖（切分），还是给每个工人看同一张图纸（广播）。</li>
+<li><strong>Execute (执行)</strong>: 工人拿到东西后开始干活（运行函数）。</li>
+<li><strong>Collect (收集)</strong>: 工人干完活了，产出了 10 堵墙。你需要把这些墙拼成一栋房子（合并结果）。</li>
+</ol>
+<p><strong>代码对应：</strong>
+*   <code>dispatch_fn</code>: 负责切分参数 <code>args</code> 和 <code>kwargs</code>。
+*   <code>collect_fn</code>: 负责把各个 GPU 返回的结果 <code>output</code> 拼起来。</p>
+<hr />
+<h3>✅ Task 2: 理解“派活儿”的策略 (The <code>Dispatch</code> Enum)</h3>
+<p>代码里定义了一个 <code>class Dispatch(DynamicEnum)</code>，里面有很多模式（如 <code>DP_COMPUTE</code>, <code>MEGATRON_COMPUTE</code>）。这其实就是<strong>不同的切蛋糕方法</strong>。</p>
+<p>请看代码中的几个关键函数，它们代表了不同的场景：</p>
+<ul>
+<li><strong><code>dispatch_one_to_all</code> (广播模式)</strong>:<ul>
+<li><strong>场景</strong>: 你要告诉所有工人：“今天下午 3 点开会”。</li>
+<li><strong>逻辑</strong>: 把同一份数据复制 N 份，发给每一个工人。</li>
+</ul>
+</li>
+<li><strong><code>dispatch_dp_compute</code> (数据并行 Data Parallel)</strong>:<ul>
+<li><strong>场景</strong>: 你有 100 道题，有 10 个学生。</li>
+<li><strong>逻辑</strong>: 把数据切成 N 份（<code>chunk</code>），每人做 1/N。</li>
+<li><strong>代码体现</strong>: <code>_split_args_kwargs_data_proto</code> 函数就是在做这个切分。</li>
+</ul>
+</li>
+<li><strong><code>dispatch_megatron_compute</code> (大模型复杂并行)</strong>:<ul>
+<li><strong>场景</strong>: 训练一个超级大的模型（如 GPT-4）。显卡被分成了不同的小组（TP组、PP组、DP组）。</li>
+<li><strong>逻辑</strong>: 这部分代码最难。它需要根据工人所在的“坐标”（是第几组第几号），精确地把数据分发给特定的显卡。</li>
+<li><strong>代码体现</strong>: 里面用到了 <code>worker_group.get_megatron_rank_info</code>，就是在查工人的户口，决定给什么数据。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 理解“收工”的策略 (The <code>Collect</code> functions)</h3>
+<p>派活儿方式不同，收工方式自然也不同。</p>
+<ul>
+<li><strong><code>collect_all_to_all</code></strong>:<ul>
+<li>大家把结果都交上来，直接把列表返回给你。</li>
+</ul>
+</li>
+<li><strong><code>collect_dp_compute_data_proto</code></strong>:<ul>
+<li>大家各自算了一部分数据，收上来的时候，需要用 <code>concat</code>（拼接）把数据首尾相连，还原成一个完整的长列表。</li>
+</ul>
+</li>
+<li><strong><code>collect_megatron_compute</code></strong>:<ul>
+<li>在大模型训练中，有些结果是重复的（比如 TP 组内的结果可能是一样的）。所以代码里写了 <code>if tp_rank == 0...</code>，意思就是：<strong>只收组长的作业，组员的不要</strong>，避免重复。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 理解特殊的快递盒 (<code>DataProto</code>)</h3>
+<p>代码里频繁出现 <code>DataProto</code> 和 <code>DataProtoFuture</code>。</p>
+<ul>
+<li><strong>这是什么？</strong> 这是一个自定义的数据容器（类似于加强版的 Tensor 或 List）。</li>
+<li><strong>为什么要用它？</strong> 因为普通的 Python List 不好切分。这个容器自带了 <code>.chunk()</code>（切分）和 <code>.concat()</code>（拼接）方法，专门配合上面的 Dispatch 和 Collect 使用。</li>
+<li><strong>代码体现</strong>: <code>_split_args_kwargs_data_proto</code> 函数里全是 <code>arg.chunk(chunks=chunks)</code>，这就是在切这个盒子。</li>
+</ul>
+<hr />
+<h3>✅ Task 5: 理解那个装饰器 (<code>@register</code>)</h3>
+<p>最后看到文件底部的 <code>def register(...)</code> 函数。这是给用户（写算法的人）用的。</p>
+<p><strong>它的作用是打标签。</strong></p>
+<p>当你写一个函数时，你可能不知道底层怎么跑，你只需要贴个条子：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这里的 register 就是文件里的装饰器</span>
+<span class="nd">@register</span><span class="p">(</span><span class="n">dispatch_mode</span><span class="o">=</span><span class="n">Dispatch</span><span class="o">.</span><span class="n">DP_COMPUTE</span><span class="p">,</span> <span class="n">execute_mode</span><span class="o">=</span><span class="n">Execute</span><span class="o">.</span><span class="n">ALL</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">compute_loss</span><span class="p">(</span><span class="n">data</span><span class="p">):</span>
+    <span class="c1"># 具体的计算逻辑</span>
+    <span class="k">pass</span>
+</code></pre></div>
+
+<p><strong>这段代码发生了什么？</strong>
+1.  装饰器给 <code>compute_loss</code> 这个函数贴了个便利贴（<code>MAGIC_ATTR</code>），上面写着：这个函数要用 <strong>数据并行（DP）</strong> 模式跑。
+2.  系统看到这个标签，就会自动去 <code>DISPATCH_MODE_FN_REGISTRY</code> 里查表。
+3.  查到了！DP 模式对应的分发函数是 <code>dispatch_dp_compute</code>，收集函数是 <code>collect_dp_compute</code>。
+4.  于是系统自动帮你把 <code>data</code> 切分，发给 8 张卡，算完后再自动帮你拼起来。</p>
+<hr />
+<h3>总结 (Summary)</h3>
+<p><strong>这个文件的作用就是：</strong></p>
+<ol>
+<li><strong>定义规则</strong>：定义了多种“切分数据”和“合并数据”的标准动作（Dispatch/Collect）。</li>
+<li><strong>建立目录</strong>：用一个字典 (<code>REGISTRY</code>) 把模式名字（如 <code>DP</code>）和具体的动作函数对应起来。</li>
+<li><strong>提供接口</strong>：提供一个 <code>@register</code> 装饰器，让写业务逻辑的人可以轻松指定：“我这个函数要用什么模式在集群上跑”。</li>
+</ol>
+<p><strong>你不需要看懂每一行代码（特别是 Megatron 那些复杂的索引计算），你只需要知道它是一个“自动分发器”即可。</strong></p>

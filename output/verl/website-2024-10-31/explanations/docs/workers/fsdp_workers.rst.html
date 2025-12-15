@@ -1,0 +1,116 @@
+<h1>docs/workers/fsdp_workers.rst</h1>
+<p>这篇文章其实是在介绍一个用于 <strong>RLHF（人类反馈强化学习）训练的底层架构</strong>。</p>
+<p>简单来说，它解决了一个核心矛盾：
+*   <strong>训练（Training）</strong>时，我们需要用 PyTorch FSDP（一种并行训练技术）来处理大规模参数的更新。
+*   <strong>推理（Generation/Rollout）</strong>时，我们需要用 vLLM（一种超快的推理引擎）来快速生成文本。
+*   <strong>问题是</strong>：这两个东西的数据格式（权重切片方式）不一样，怎么把它们结合起来？</p>
+<p>这篇文章就是在讲如何通过代码实现这几个“工人”（Workers）的协作。</p>
+<p>为了让你更容易理解，我把你当作这个项目的<strong>项目经理（PM）</strong>，把文档内容转化成一份 <strong>“任务清单（To-Do List）”</strong>，告诉你系统在一步步干什么。</p>
+<hr />
+<h3>任务清单：构建一个 PPO 训练流水线</h3>
+<h4>Phase 1: 招聘与组建团队 (初始化 Workers)</h4>
+<p>文档中提到的 <code>FSDP Workers</code> 就是我们要招聘的几个核心岗位。</p>
+<ul>
+<li>
+<p><strong>Task 1.1: 组建“身兼多职”的主角 (ActorRolloutRefWorker)</strong></p>
+<ul>
+<li><strong>角色说明</strong>：这是最重要的工人。他既要负责写作文（Actor），又要负责自我反思（Reference），还要负责用 vLLM 快速生成草稿（Rollout）。</li>
+<li><strong>文档对应点</strong>：<code>ActorRolloutRefWorker</code> -&gt; <code>HybridEngine</code>。</li>
+<li><strong>执行动作</strong>：<ul>
+<li>初始化 <code>DataParallelPPOActor</code>：这是穿上“训练装备”的主角，准备好用 FSDP 算法更新大脑。</li>
+<li>初始化 <code>vLLMRollout</code>：这是穿上“极速跑鞋”的主角，准备好用 vLLM 引擎快速生成文本。</li>
+<li><strong>关键技术点</strong>：<code>FSDPVLLMShardingManager</code>。你可以把它理解为一个<strong>更衣室管理员</strong>。它的任务是在“训练模式”和“生成模式”之间，帮模型快速转换权重（Resharding）。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 1.2: 组建“评论员”和“打分员” (CriticWorker &amp; RewardWorker)</strong></p>
+<ul>
+<li><strong>角色说明</strong>：<ul>
+<li><strong>RewardWorker</strong>：负责给写出的作文打分（好/坏）。</li>
+<li><strong>CriticWorker</strong>：负责预估当前的局势（Value Function），辅助训练。</li>
+</ul>
+</li>
+<li><strong>文档对应点</strong>：<code>CriticWorker</code> 和 <code>RewardWorker</code>。</li>
+<li><strong>执行动作</strong>：初始化模型，Critic 还需要初始化优化器（因为它是需要被训练更新的），Reward 模型通常只推理不训练。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>Phase 2: 开始干活 (训练循环 Step-by-Step)</h4>
+<p>当系统启动后，这些 Workers 会按照以下顺序执行任务。文档中列出的代码片段（<code>@register...</code>）就是指挥这些工人干活的指令。</p>
+<ul>
+<li>
+<p><strong>Task 2.1: 生成数据 (Generate Sequences)</strong></p>
+<ul>
+<li><strong>指令</strong>：<code>generate_sequences(self, prompts: DataProto)</code></li>
+<li><strong>发生了什么</strong>：<ol>
+<li><strong>变身</strong>：主角模型通过“更衣室管理员”把权重切换到 vLLM 模式。</li>
+<li><strong>生成</strong>：根据提示词（Prompts），快速写出一段回复。</li>
+<li><strong>计算概率</strong>：主角变回 FSDP 训练模式，计算刚才写出的那段话的对数概率（Log Prob），这是为了后续计算 Loss 用的。</li>
+</ol>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 2.2: 计算参考标准 (Compute Reference Log Prob)</strong></p>
+<ul>
+<li><strong>指令</strong>：<code>compute_ref_log_prob(self, data: DataProto)</code></li>
+<li><strong>发生了什么</strong>：<ul>
+<li>为了防止模型“学歪了”（忘掉了原本的知识），我们需要一个“参考模型”（Reference Model）。</li>
+<li>它会对刚才生成的文本也算一遍概率，用来计算 KL 散度（一种惩罚项，确保新模型不要偏离旧模型太远）。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 2.3: 评估与打分 (Compute Values &amp; Rewards)</strong></p>
+<ul>
+<li><strong>指令</strong>：<code>compute_values</code> 和 <code>compute_rm_score</code></li>
+<li><strong>发生了什么</strong>：<ul>
+<li>Critic 模型预估当前状态的价值。</li>
+<li>Reward 模型给生成的文本打一个最终分数。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 2.4: 更新模型 (Update Actor &amp; Critic)</strong></p>
+<ul>
+<li><strong>指令</strong>：<code>update_actor</code> 和 <code>update_critic</code></li>
+<li><strong>发生了什么</strong>：<ul>
+<li>这是 PPO 算法的核心。根据刚才的生成内容、参考概率、评分和价值预估，计算 Loss。</li>
+<li>利用 FSDP 进行反向传播，<strong>修改主角（Actor）和评论员（Critic）的大脑权重</strong>。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>Phase 3: 总结复盘 (优缺点分析)</h4>
+<p>文档开头的 <strong>Pros</strong> 和 <strong>Cons</strong> 是对这套方案的总结。</p>
+<ul>
+<li>
+<p><strong>优点 (Pros)</strong>：</p>
+<ul>
+<li><strong>兼容性好</strong>：想换个新模型（比如从 Llama 换到 Qwen）？只要写个简单的权重转换器（<code>dtensor_weight_loader</code>），或者如果用 HuggingFace 标准格式，甚至不需要改代码就能直接跑。</li>
+<li><strong>逻辑简单</strong>：前向传播和后向传播的代码组织得很清晰，适合搞算法研究。</li>
+</ul>
+</li>
+<li>
+<p><strong>缺点 (Cons)</strong>：</p>
+<ul>
+<li><strong>太大的模型带不动</strong>：文档提到，对于 70B 或 405B 这种超大模型，这套方案的扩展性（Scalability）不如 Megatron-LM。</li>
+<li><strong>换衣服太慢</strong>：<code>Actor</code> 和 <code>Rollout</code> 之间切换（Resharding overhead）是有时间成本的。每次训练一步都要“换衣服”，如果模型太大，这个时间会比 Megatron 方案更长。</li>
+</ul>
+</li>
+<li>
+<p><strong>局限性 (HybridShard)</strong>：</p>
+<ul>
+<li>目前不支持 FSDP 的 <code>HybridShard</code> 策略（这是一种更高级的切片方式，适合超大规模集群）。</li>
+</ul>
+</li>
+</ul>
+<h3>总结一句话</h3>
+<p>这篇文档介绍了一个<strong>“方便好用但上限不是最高”</strong>的 PPO 训练后端，它通过在 PyTorch FSDP（训练用）和 vLLM（推理用）之间来回切换权重，实现了高效的 RLHF 训练流程。</p>

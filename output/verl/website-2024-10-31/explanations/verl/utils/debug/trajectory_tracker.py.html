@@ -1,0 +1,132 @@
+<h1>verl/utils/debug/trajectory_tracker.py</h1>
+<p>完全没问题。这段代码看起来复杂，主要是因为它涉及到了<strong>分布式计算（Ray）</strong>和<strong>远程存储（HDFS）</strong>。</p>
+<p>简单来说，这是一个<strong>“为了调试而设计的自动存档工具”</strong>。</p>
+<p>想象你在玩一个非常复杂的游戏（训练AI模型），你需要时不时按一下“保存”，把当前的游戏进度（Tensor数据）存到一个远程的云端硬盘里，以便以后拿出来分析哪里玩错了。</p>
+<p>为了让你听懂，我把理解这段代码的过程拆解成一个 <strong>Task List (任务清单)</strong>，我们一步步来打勾。</p>
+<hr />
+<h3>📋 任务清单：理解 Trajectory Tracker</h3>
+<ol>
+<li><strong>Task 1：搞懂目标</strong> —— 为什么要写这个东西？</li>
+<li><strong>Task 2：搞懂核心角色</strong> —— 谁负责干活？（Ray Actor）</li>
+<li><strong>Task 3：搞懂数据包装</strong> —— 怎么把数据打包？（IO &amp; Serialization）</li>
+<li><strong>Task 4：搞懂存储地</strong> —— 存在哪？（HDFS）</li>
+<li><strong>Task 5：搞懂开关</strong> —— 怎么控制它？（环境变量）</li>
+</ol>
+<hr />
+<h3>🟢 Task 1：搞懂目标（为什么要写这个东西？）</h3>
+<p><strong>背景</strong>：在大规模模型训练中，程序跑在很多台机器上。如果中间出错了，或者你想对比每一步的数据，你不能直接 <code>print()</code> 出来，因为数据量太大（全是巨大的矩阵/Tensor）。</p>
+<p><strong>代码目的</strong>：
+这段代码提供了一个功能：<strong>在代码的任何地方插入一行命令，就能把当前的中间结果（Tensor）偷偷保存到远程硬盘上，而且不影响主程序的运行速度。</strong></p>
+<hr />
+<h3>🟢 Task 2：搞懂核心角色（谁负责干活？）</h3>
+<p>如果不使用多线程/分布式，保存文件会“卡住”主程序（I/O阻塞）。
+这段代码引入了一个<strong>“后台秘书”</strong>，也就是 <code>TrajectoryTracker</code> 类。</p>
+<ul>
+<li><strong><code>@ray.remote</code></strong>: 这行代码给类加了“魔法”。意思是这个类不是在当前进程跑，而是作为一个独立的进程（甚至在另一台机器上）跑。</li>
+<li><strong><code>TrajectoryTracker</code> 类</strong>: 这就是那个“秘书”。<ul>
+<li>它的工作是：接收主程序扔过来的数据包，然后自己慢慢地把它们写到硬盘里。</li>
+<li><strong><code>self.handle = deque()</code></strong>: 这是一个任务清单。秘书把正在保存的任务记在小本本上，防止主程序退出时还有文件没存完。</li>
+<li><strong><code>dump</code> 方法</strong>: 主程序调用这个，相当于把文件扔给秘书就走了，不用等。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🟢 Task 3：搞懂数据包装（怎么把数据打包？）</h3>
+<p>数据在内存里是 PyTorch 的 Tensor，不能直接“飞”到硬盘里，得先打包成二进制流。</p>
+<ul>
+<li><strong><code>io.BytesIO</code></strong>: 这是一个在内存里的“虚拟文件”。</li>
+<li><strong><code>torch.save(data, buffer)</code></strong>: 把 Tensor 数据压缩打包，塞进这个虚拟文件里。</li>
+<li><strong>为什么要这么做？</strong> 因为 Ray（分布式框架）在传输数据时，传二进制字节流是最通用的。</li>
+</ul>
+<p><strong>流程是这样的</strong>：
+<code>dump_data</code> 函数里：
+1. 创建一个空包裹 (<code>buffer</code>).
+2. 把数据塞进去 (<code>torch.save</code>).
+3. 把包裹扔给远程秘书 (<code>tracker.dump.remote</code>).</p>
+<hr />
+<h3>🟢 Task 4：搞懂存储地（存在哪？）</h3>
+<p>数据最终不是存在你运行代码的电脑上，而是 <strong>HDFS</strong>（Hadoop Distributed File System，一种在大数据领域常用的分布式文件系统）。</p>
+<ul>
+<li><strong><code>save_to_hdfs</code> 函数</strong>: 这是真正干苦力的搬运工。<ol>
+<li>拿到数据包 (<code>data: io.BytesIO</code>).</li>
+<li>在本地创建一个临时文件 (<code>tempfile</code>).</li>
+<li>把数据写入临时文件。</li>
+<li>把临时文件上传到 HDFS 云端 (<code>copy(local_filepath, hdfs_dir)</code>).</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>🟢 Task 5：搞懂开关（怎么控制它？）</h3>
+<p>这种保存数据的操作很占硬盘和带宽，肯定不能一直开着。</p>
+<ul>
+<li><strong>环境变量 (<code>os.getenv</code>)</strong>: 代码里大量使用了这个。<ul>
+<li><code>VERL_ENABLE_TRACKER</code>: <strong>总开关</strong>。设为 '1' 才开启，否则 <code>dump_data</code> 直接返回，啥也不干。</li>
+<li><code>VERL_TRACKER_HDFS_DIR</code>: <strong>存储路径</strong>。告诉代码存在云端的哪个文件夹。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🧩 总结：全流程回顾</h3>
+<p>现在我们把代码串起来，讲一个故事：</p>
+<ol>
+<li>
+<p><strong>初始化</strong>:</p>
+<ul>
+<li>程序启动，检查环境变量 <code>VERL_ENABLE_TRACKER</code> 是否为 '1'。</li>
+<li>如果是，<code>get_trajectory_tracker()</code> 会在后台雇佣一个秘书（<strong>TrajectoryTracker Actor</strong>）。</li>
+</ul>
+</li>
+<li>
+<p><strong>记录数据 (<code>dump_data</code>)</strong>:</p>
+<ul>
+<li>你的训练代码跑到了某一步，产生了一个巨大的 Tensor <code>data</code>。</li>
+<li>你调用 <code>dump_data(data, "step_1_result")</code>。</li>
+<li>代码迅速把 <code>data</code> 打包成二进制包 (<code>buffer</code>)。</li>
+<li>代码把包扔给秘书，然后立刻继续往下跑（不卡顿）。</li>
+</ul>
+</li>
+<li>
+<p><strong>后台保存</strong>:</p>
+<ul>
+<li>秘书（<code>TrajectoryTracker</code>）接到了包。</li>
+<li>秘书安排一个搬运工（<code>save_to_hdfs</code>）去干活。</li>
+<li>搬运工把包写成文件，上传到 HDFS。</li>
+</ul>
+</li>
+<li>
+<p><strong>收尾</strong>:</p>
+<ul>
+<li>程序跑完了，调用 <code>tracker.wait_for_hdfs()</code>。</li>
+<li>这是在问秘书：“活儿都干完了吗？”。如果还有文件没传完，主程序就在这儿等着，直到全部上传完毕。</li>
+</ul>
+</li>
+</ol>
+<h3>💡 核心代码对应</h3>
+<ul>
+<li>
+<p><strong>我是主程序，我要存数据</strong>:
+    <code>python
+    def dump_data(data, name):
+        # ... 打包数据 ...
+        # 把数据扔给后台进程
+        ray.get(tracker.dump.remote(buffer, name))</code></p>
+</li>
+<li>
+<p><strong>我是后台秘书，我负责接收</strong>:
+    <code>python
+    @ray.remote
+    class TrajectoryTracker():
+        def dump(self, data, name):
+            # 安排具体的保存任务
+            self.handle.append(save_to_hdfs.remote(...))</code></p>
+</li>
+<li>
+<p><strong>我是搬运工，我负责写硬盘</strong>:
+    <code>python
+    @ray.remote
+    def save_to_hdfs(...):
+        # 写入本地临时文件 -&gt; 上传 HDFS
+        copy(local_filepath, hdfs_dir)</code></p>
+</li>
+</ul>
+<p>现在再看代码，是不是清晰多了？这就是一个<strong>异步的、分布式的、用于调试的数据保存工具</strong>。</p>

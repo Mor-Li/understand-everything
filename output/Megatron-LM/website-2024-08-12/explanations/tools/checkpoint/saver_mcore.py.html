@@ -1,0 +1,99 @@
+<h1>tools/checkpoint/saver_mcore.py</h1>
+<p>这份代码确实比较晦涩，因为它涉及到了 <strong>Megatron-Core (M-Core)</strong> 的底层架构、<strong>模型并行（Tensor Parallel/Pipeline Parallel/Expert Parallel）</strong> 的切分逻辑，以及权重的转换。</p>
+<p>简单来说，这个脚本是一个 <strong>“搬运工 + 组装工”</strong>。它的任务是从一个数据源（Loader，通过 <code>queue</code> 传来）接收原始的模型权重，然后根据你设定的并行度（比如你想用多少张卡跑），把这些权重切分成小块，塞进 Megatron-Core 定义的模型结构里，最后保存成 <code>.pt</code> 格式的 Checkpoint 文件。</p>
+<p>为了让你看懂，我把它想象成一个 <strong>“流水线装配任务”</strong>，列一个 <strong>Todo List</strong> 来逐步拆解：</p>
+<hr />
+<h3>🛠️ 任务清单 (Task Todo List)</h3>
+<h4>1. 准备阶段：搭建工作台 (Setup Environment)</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>save_checkpoint</code> 函数开头，以及 <code>import</code> 部分。</li>
+<li><strong>任务</strong>:<ul>
+<li>[ ] <strong>加载工具库</strong>: 引入 PyTorch 和 Megatron 的核心库（如果找不到 Megatron 路径会报错）。</li>
+<li>[ ] <strong>建立通信管道</strong>: 设置一个 <code>queue</code>（队列），用来从上游（Loader）接收数据。</li>
+<li>[ ] <strong>伪造身份</strong>: 因为 Megatron 的保存函数通常是在训练脚本里运行的，这里为了单独运行保存功能，脚本通过修改 <code>sys.argv</code> 和 <code>os.environ</code>，<strong>假装</strong>自己是一个正在运行的训练任务，从而骗过 Megatron 的参数校验 (<code>validate_args</code>)。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 读取蓝图：确定模型规格 (Configuration)</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>md = queue_get()</code> 以及后续的参数处理。</li>
+<li><strong>任务</strong>:<ul>
+<li>[ ] <strong>接收元数据</strong>: 从队列里拿到 <code>md</code> (metadata)，这里面写着模型的“蓝图”：有多少层？隐藏层多大？用什么激活函数？</li>
+<li>[ ] <strong>确定并行策略</strong>: 决定要把模型切得多碎。<ul>
+<li><code>target_tensor_parallel_size</code> (TP): 单层网络拆分到几张卡？</li>
+<li><code>target_pipeline_parallel_size</code> (PP): 层与层之间拆分到几张卡？</li>
+<li><code>target_expert_parallel_size</code> (EP): 如果是 MoE 模型，专家怎么分？</li>
+</ul>
+</li>
+<li>[ ] <strong>初始化空模型</strong>: 调用 <code>model_provider</code>，在内存里创建出一堆 <strong>“空的模型壳子”</strong>。这些壳子现在的权重是随机的或者是空的，等待被填入。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 核心任务：组装模型 (Assembly Line)</h4>
+<p>这个阶段是代码最长、最复杂的部分。它像切蛋糕一样处理权重。</p>
+<p><strong>3.1 铺设地基：处理 Embeddings (词向量)</strong>
+*   <strong>代码位置</strong>: <code># Embeddings</code> 注释下方。
+*   <strong>任务</strong>:
+    *   [ ] <strong>接收数据</strong>: 从队列拿到 <code>word embeddings</code> 和 <code>position embeddings</code>。
+    *   [ ] <strong>对齐词表</strong>: 如果原始词表大小不是 64 或 128 的倍数（为了加速），需要用 <code>pad_weight</code> 给词表补零（Padding）。
+    *   [ ] <strong>切分蛋糕 (TP)</strong>: 词向量矩阵很大，需要根据 TP 大小切开 (<code>torch.chunk</code>)。
+    *   [ ] <strong>填入模型</strong>: 使用 <code>setter.set_embeddings</code> 把切好的权重填入对应的模型壳子。</p>
+<p><strong>3.2 盖楼：逐层搭建 Transformer Layer (The Loop)</strong>
+*   <strong>代码位置</strong>: <code>for pp_rank ...</code> 和 <code>for layer_id ...</code> 的双重循环。
+*   <strong>任务</strong>:
+    *   [ ] <strong>循环每一层</strong>: 按照总层数，一层一层地从队列里拿数据 (<code>queue_get</code>).
+    *   [ ] <strong>分类权重</strong>: 拿到数据后，区分出哪些是 Attention 的权重 (QKV)，哪些是 MLP 的权重，哪些是 LayerNorm。
+    *   [ ] <strong>精细切割 (Chunking)</strong>: 这是最难懂的地方 (<code>chunk_weight</code> 函数)。
+        *   <strong>Row Parallel</strong>: 把矩阵按行切（比如 MLP 的第二层）。
+        *   <strong>Column Parallel</strong>: 把矩阵按列切（比如 QKV 矩阵）。
+        *   <strong>Expert Parallel</strong>: 如果是 MoE 模型，还要把专家（Experts）分给不同的卡。
+    *   [ ] <strong>填入组件 (Setter)</strong>:
+        *   代码开头定义的 <code>MCoreLocalSetter</code>, <code>MCoreTESetter</code> 等类，就是<strong>“安装说明书”</strong>。
+        *   它们告诉程序：把切好的 <code>qkv_weight</code> 放到 <code>model.self_attention.linear_qkv.weight</code> 这个属性里去。
+    *   [ ] <strong>处理 Bias</strong>: 如果有偏置项，也做同样的切分和填入。</p>
+<p><strong>3.3 封顶：处理最终层 (Final Layers)</strong>
+*   <strong>代码位置</strong>: 循环结束后，处理 <code>final norm</code>, <code>output layer</code>, <code>pooler</code> 等。
+*   <strong>任务</strong>:
+    *   [ ] <strong>Final Norm</strong>: 最后一层的归一化参数。
+    *   [ ] <strong>Output Layer</strong>: 如果模型有独立的输出层（不是共享 Embedding），需要切分并填入。
+    *   [ ] <strong>LM Head / Binary Head</strong>: 针对 GPT 或 BERT 不同的任务头进行组装。</p>
+<h4>4. 打包出货：保存文件 (Save to Disk)</h4>
+<ul>
+<li><strong>代码位置</strong>: 最后的 <code>save_checkpoint(...)</code> 调用。</li>
+<li><strong>任务</strong>:<ul>
+<li>[ ] <strong>保存</strong>: 调用 Megatron 原生的保存函数，把内存里填好权重的模型对象，写入硬盘。</li>
+<li>[ ] <strong>清理</strong>: 这一部分保存完了，就把内存释放掉 (<code>models[...]=None</code>)，防止内存爆炸，然后继续处理下一部分的流水线（Pipeline）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>关键概念解释 (帮你读懂代码细节)</h3>
+<ol>
+<li>
+<p><strong><code>Setter</code> 类 (代码最上面的几个 Class)</strong></p>
+<ul>
+<li>你可以把它们看作 <strong>“适配器”</strong>。</li>
+<li>Megatron 的代码一直在变，不同的实现（比如 <code>Local</code> 实现 vs <code>TransformerEngine</code> 实现）里，模型权重的变量名可能不一样。</li>
+<li><code>MCoreSetter</code> 屏蔽了这些差异，提供统一的接口 <code>set_layer</code>，负责把权重塞到正确的位置。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>chunk_weight</code> 函数</strong></p>
+<ul>
+<li>这是 <strong>模型并行 (Tensor Parallelism)</strong> 的核心。</li>
+<li>假设一个矩阵是 <code>[1024, 1024]</code>，TP=2（用两张卡）。</li>
+<li>这个函数会把它切成两个 <code>[512, 1024]</code> 或者 <code>[1024, 512]</code> 的矩阵，分别给 GPU0 和 GPU1。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>queue_get</code></strong></p>
+<ul>
+<li>这说明这个脚本不是独立运行的。它是一个 <strong>消费者</strong>。</li>
+<li>通常有一个 <strong>生产者</strong> 脚本（Loader），负责读取 HuggingFace 的权重或者其他格式的权重，把它们整理成统一的字典格式，扔进队列。</li>
+<li>这个 Saver 脚本只负责：<strong>拿字典 -&gt; 切分 -&gt; 塞入 MCore 结构 -&gt; 保存</strong>。</li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p>这个文件的核心逻辑就是：
+<strong>接收原始权重 -&gt; 按照并行度切菜（切矩阵） -&gt; 按照 M-Core 的图纸装盘（填入模型对象） -&gt; 端上桌（保存文件）。</strong></p>

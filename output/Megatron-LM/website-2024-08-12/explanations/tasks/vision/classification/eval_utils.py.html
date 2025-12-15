@@ -1,0 +1,61 @@
+<h1>tasks/vision/classification/eval_utils.py</h1>
+<p>这段代码确实写得比较“绕”，因为它不是普通的PyTorch代码，而是基于 <strong>Megatron-LM</strong> 框架的分布式训练代码。Megatron为了支持超大模型（模型并行、流水线并行），把很多简单的操作（比如前向传播）封装得很深。</p>
+<p>简单来说，<strong>这个文件的作用就是：给验证集（Validation Set）打分，算一算模型分类的准确率是多少。</strong></p>
+<p>我们可以把这个过程想象成一个 <strong>“阅卷老师”</strong> 的工作流程。为了让你看懂，我把它拆解成一个 <strong>Task To-Do List</strong>，每一步对应代码里的一段逻辑：</p>
+<hr />
+<h3>📋 阅卷老师的任务清单 (Task To-Do List)</h3>
+<h4>Task 1: 准备考场和试卷 (准备数据)</h4>
+<p><strong>代码位置：</strong> <code>accuracy_func_provider</code> 函数的前半部分。
+*   <strong>动作</strong>：
+    1.  获取配置参数（<code>args</code>），看看图片要裁切多大（<code>crop_size</code>）。
+    2.  找到验证集图片的路径（<code>val_data_path</code>）。
+    3.  定义怎么处理图片：调整大小、居中裁剪、转成Tensor、标准化（<code>transforms.Compose</code>）。
+    4.  把图片加载进来，打包成册（<code>build_data_loader</code>）。
+*   <strong>通俗解释</strong>：把考试卷子（验证集图片）打印好，装订成册，准备发给学生（模型）做。</p>
+<h4>Task 2: 制定阅卷规则 (定义入口函数)</h4>
+<p><strong>代码位置：</strong> <code>accuracy_func_provider</code> 函数的后半部分 (<code>metrics_func</code>)。
+*   <strong>动作</strong>：
+    1.  定义一个叫 <code>metrics_func</code> 的函数。
+    2.  这个函数一旦被调用，就会去执行核心任务 <code>calculate_correct_answers</code>。
+    3.  算完后，打印一行字：<code>epoch: x | correct / total = ...</code>。
+*   <strong>通俗解释</strong>：这是给训练主程序留的一个接口。主程序说“该考试了”，就调这个接口。</p>
+<h4>Task 3: 宣布考试开始 (进入评估模式)</h4>
+<p><strong>代码位置：</strong> <code>calculate_correct_answers</code> 函数的开头。
+*   <strong>动作</strong>：
+    1.  <code>get_forward_backward_func()</code>：获取Megatron特有的前向传播工具（因为模型可能被切分在不同显卡上，不能直接调 <code>model()</code>，得用这个工具）。
+    2.  <code>model.eval()</code>：告诉模型现在是考试模式，不要进行Dropout（随机丢弃神经元）等训练时的骚操作。</p>
+<h4>Task 4: 学生答题 (模型前向传播)</h4>
+<p><strong>代码位置：</strong> <code>correct_answers_forward_step</code> (定义在 <code>calculate_correct_answers</code> 内部)。
+*   <strong>动作</strong>：
+    1.  从数据加载器里拿出一批图片（<code>images</code>）和正确答案（<code>labels</code>）。
+    2.  <code>output_tensor = model(images)</code>：让模型看图，输出预测结果（Logits）。
+    3.  <strong>注意</strong>：这里并没有算Loss（损失），而是返回了预测结果和一个用来“批改”的函数（<code>loss_func</code>）。</p>
+<h4>Task 5: 老师批改 (比对答案)</h4>
+<p><strong>代码位置：</strong> <code>loss_func</code> (定义在 <code>calculate_correct_answers</code> 内部)。
+*   <strong>动作</strong>：
+    1.  拿到模型的输出 <code>logits</code>。
+    2.  <code>predicted = torch.argmax(logits, dim=-1)</code>：找出概率最大的那个类别作为模型的答案。
+    3.  <code>corrects = (predicted == labels)</code>：把模型答案和标准答案比对。对就是1，错就是0。
+    4.  记录 <code>total</code> (这批考了多少题) 和 <code>correct</code> (答对了多少题)。</p>
+<h4>Task 6: 循环监考 (遍历所有数据)</h4>
+<p><strong>代码位置：</strong> <code>calculate_correct_answers</code> 中间的 <code>with torch.no_grad():</code> 循环。
+*   <strong>动作</strong>：
+    1.  <code>for _, batch in enumerate(dataloader)</code>：一页一页翻卷子。
+    2.  <code>forward_backward_func(...)</code>：利用Megatron的并行机制，执行上面的 <strong>Task 4</strong> 和 <strong>Task 5</strong>。
+    3.  把每一批的 <code>total</code> 和 <code>correct</code> 累加起来，记在心里。</p>
+<h4>Task 7: 汇总全班成绩 (分布式汇总)</h4>
+<p><strong>代码位置：</strong> <code>calculate_correct_answers</code> 的最后部分 (<code>if mpu.is_pipeline_last_stage():</code>)。
+*   <strong>动作</strong>：
+    1.  因为是多张显卡并行计算（数据并行），每张卡只批改了一部分卷子。
+    2.  <code>torch.distributed.all_reduce(...)</code>：这是一个通信操作。把所有显卡上算出来的 <code>correct</code> 和 <code>total</code> 加在一起。
+    3.  比如：显卡A算对10个，显卡B算对20个 -&gt; 汇总后大家都知道一共算对了30个。</p>
+<h4>Task 8: 恢复上课状态 (恢复训练模式)</h4>
+<p><strong>代码位置：</strong> <code>calculate_correct_answers</code> 倒数几行。
+*   <strong>动作</strong>：
+    1.  <code>model.train()</code>：考试结束，告诉模型切回训练模式，准备接着学新知识。
+    2.  返回最终的正确数和总数。</p>
+<hr />
+<h3>总结一下</h3>
+<p>这个文件其实就干了一件事：
+<strong>在多张显卡上并行地跑一遍验证集，统计一共预测对了多少张图，然后把结果加起来返回给主程序打印准确率。</strong></p>
+<p>之所以你看着晕，是因为它用了 <code>forward_backward_func</code> 这种Megatron特有的并行调度器，以及把 <code>loss_func</code> 和 <code>forward_step</code> 嵌套定义在了函数里面。</p>

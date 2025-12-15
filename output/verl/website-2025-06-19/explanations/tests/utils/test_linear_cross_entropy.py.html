@@ -1,0 +1,49 @@
+<h1>tests/utils/test_linear_cross_entropy.py</h1>
+<p>这份代码其实是一个<strong>测试脚本（Benchmark &amp; Test）</strong>。它的核心目的是为了验证一个新的、高度优化的算法（即文中的 <code>linear_cross_entropy</code> kernel）是否正确，并且测试它比传统的 PyTorch 写法快了多少、省了多少内存。</p>
+<p>为了让你更容易理解，我把这份代码要做的事情拆解成一个<strong>任务清单（Task List）</strong>。你可以想象自己是这个功能的开发者，为了证明你的新算法很牛，你需要按顺序完成以下步骤：</p>
+<hr />
+<h3>任务清单：如何验证一个高性能的 PPO 损失函数计算层</h3>
+<h4>Task 1: 定义“我们要算什么？”（确立基准）</h4>
+<p>首先，你需要明确在强化学习（PPO算法）中，我们需要算两个核心指标：
+1.  <strong>Logprobs (对数概率/交叉熵):</strong> 模型预测正确 token 的概率是多少（用于算 Loss）。
+2.  <strong>Entropy (熵):</strong> 模型输出的分布有多“混乱”（用于鼓励模型探索）。</p>
+<p>代码中的 <code>run_torch_entropy</code> 函数就是<strong>标准答案</strong>（基准）。
+*   <strong>做法：</strong> 用最普通的 PyTorch 写法：先做矩阵乘法算 Logits -&gt; 再除以温度系数 -&gt; 再算 Softmax -&gt; 最后算熵和 CrossEntropy。
+*   <strong>缺点：</strong> 这种写法虽然逻辑清晰，但是中间变量（Logits）非常占显存，而且速度慢。</p>
+<h4>Task 2: 邀请参赛选手（不同的实现方式）</h4>
+<p>为了证明新写的 Kernel 厉害，你找来了四个选手进行同台竞技：
+1.  <strong>Torch (基准):</strong> 上面说的 <code>run_torch_entropy</code>，慢但绝对正确。
+2.  <strong>VeRL Original:</strong> <code>run_verl_original_entropy</code>，VeRL 库里原本的旧实现。
+3.  <strong>VeRL Fused:</strong> <code>run_verl_torch_fused_entropy</code>，用 <code>torch.compile</code> 优化过的版本。
+4.  <strong>Kernel (主角):</strong> <code>linear_cross_entropy</code>，这是<strong>本次测试的主角</strong>。它是一个底层 CUDA 算子，试图把“矩阵乘法”和“算 Loss”融合在一起做，不把巨大的 Logits 矩阵存下来，从而极大地节省显存和时间。</p>
+<h4>Task 3: 准备考题（生成测试数据）</h4>
+<p>代码中的 <code>TestLinearCrossEntropy</code> 类负责这一步。
+*   <strong><code>generate_hyper</code>:</strong> 设定不同的考卷难度。比如 <code>test_case_idx=0</code> 是大词表（Vocab 15万），<code>test_case_idx=4</code> 是长序列（Token 8192）。
+*   <strong><code>generate_forward_inputs</code>:</strong> 随机生成假的神经网络输出（<code>hidden</code>）和权重（<code>weight</code>），以及正确答案（<code>labels</code>）。</p>
+<h4>Task 4: 验证前向传播（算得对不对？）</h4>
+<p>这是 <code>verify_correctness</code> 函数的前半部分。
+*   <strong>动作：</strong> 让4位选手分别拿着同样的输入去计算 <code>logprobs</code> 和 <code>entropy</code>。
+*   <strong>计时：</strong> 记录每位选手花了多少毫秒（Latency）。
+*   <strong>比对：</strong> 使用 <code>torch.testing.assert_close</code>。
+    *   必须保证：<strong>主角（Kernel）算出来的结果 == 基准（Torch）算出来的结果</strong>。
+    *   如果结果不一样，说明优化写由于Bug，测试直接失败。</p>
+<h4>Task 5: 验证反向传播（梯度对不对？）</h4>
+<p>这是 <code>verify_correctness</code> 函数的后半部分。仅仅算对结果没用，训练模型需要<strong>梯度（Gradients）</strong>。
+*   <strong>动作：</strong> 随机生成一个梯度的种子（<code>g_entropy</code>, <code>g_logprobs</code>），调用 <code>.backward()</code> 或者 <code>torch.autograd.grad</code>。
+*   <strong>比对：</strong> 检查主角算出来的梯度（<code>d_kernel_hidden</code>, <code>d_kernel_weight</code>）是否和基准算出来的梯度一致。
+*   <strong>意义：</strong> 如果梯度算错，模型训练就会发散（崩溃）。</p>
+<h4>Task 6: 性能大比拼（算得快不快？）</h4>
+<p>在 <code>verify_correctness</code> 运行结束后，代码会打印出一个性能报告：
+*   <strong>Forward pass time:</strong> 前向传播谁最快？
+*   <strong>Backward pass time:</strong> 反向传播谁最快？
+*   <strong>预期结果：</strong> 主角（Kernel）应该比 Torch 快很多。</p>
+<h4>Task 7: 查显存水表（省不省内存？）</h4>
+<p>这是 <code>check_storage</code> 函数做的事。
+*   <strong>痛点：</strong> 在大模型训练中，显存（VRAM）通常是最紧缺的资源。普通的 PyTorch 写法会把 <code>[batch, seq_len, vocab_size]</code> 这么大的 Logits 矩阵存下来，非常占地。
+*   <strong>动作：</strong> 分别运行每种方法，并用 <code>torch.cuda.max_memory_allocated()</code> 记录显存峰值。
+*   <strong>预期结果：</strong> 主角（Kernel）应该能<strong>巨幅</strong>降低显存占用，因为它采用了“融合算子（Fused Kernel）”技术，不显式存储中间的大矩阵。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件的逻辑就是：
+<strong>造数据 -&gt; 跑基准 -&gt; 跑新算法 -&gt; 比对结果(必须一致) -&gt; 比对梯度(必须一致) -&gt; 比对速度(越快越好) -&gt; 比对显存(越小越好)。</strong></p>
+<p>如果你看到输出结果中，Kernel 方法的 <strong>Latency 最低</strong>，<strong>Memory 最少</strong>，且 <strong>Assert Close 通过</strong>，那就说明这个优化是成功的。</p>

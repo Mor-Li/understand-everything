@@ -1,0 +1,60 @@
+<h1>recipe/prime/prime_fsdp_workers.py</h1>
+<p>这份代码看起来确实很复杂，因为它涉及到了<strong>大模型分布式训练</strong>中最硬核的部分（FSDP、序列并行、显存管理）。</p>
+<p>简单来说，这个文件定义了一个<strong>打工仔（Worker）</strong>，它的专职工作是管理和训练一个<strong>奖励模型（Reward Model, RM）</strong>。在强化学习（RLHF）的流程中，这个模型负责给AI生成的答案打分。</p>
+<p>为了让你听懂，我把这个Worker的工作流程拆解成一个 <strong>“入职任务清单 (To-Do List)”</strong>。我们来看看为了训练这个大模型，它一步步都需要干什么。</p>
+<hr />
+<h3>任务清单：PRIME 奖励模型工人的日常</h3>
+<h4>✅ Task 1: 安排工位与团队分工 (初始化环境)</h4>
+<p><strong>对应代码：</strong> <code>__init__</code> 方法
+<strong>发生了什么：</strong>
+1.  <strong>打卡报到</strong>：初始化分布式环境 (<code>torch.distributed</code>)，确认有多少张显卡（GPU）一起干活。
+2.  <strong>划分小组</strong>：
+    *   <strong>FSDP (Fully Sharded Data Parallel)</strong>：模型太大了，一张卡放不下。这里决定把模型切碎，每个人拿一部分参数（切分显存）。
+    *   <strong>Ulysses (尤利西斯)</strong>：这是一种处理<strong>超长文本</strong>的技术。如果输入的文章特别长，单张卡算不过来，就把文章切成几段，分给不同的卡同时算（序列并行）。
+    *   <strong>Device Mesh</strong>：这就是“座位表”，规定哪几张卡是一组，负责切模型；哪几张卡是一组，负责切长文本。</p>
+<h4>✅ Task 2: 组装生产工具 (构建模型与优化器)</h4>
+<p><strong>对应代码：</strong> <code>_build_reward_ref_model_optimizer</code> 和 <code>init_model</code> 方法
+<strong>发生了什么：</strong>
+1.  <strong>领原材料</strong>：从硬盘或网络加载模型的权重文件（HuggingFace格式）。
+2.  <strong>魔改工具 (Monkey Patch)</strong>：为了跑得快，给模型打补丁（比如用 Flash Attention，或者针对长文本的优化）。
+3.  <strong>双模并行</strong>：
+    *   它其实加载了<strong>两个模型</strong>：
+        *   <code>reward_module</code>：<strong>主角</strong>，我们要训练的奖励模型。
+        *   <code>ref_module</code>：<strong>参照物</strong>（Reference Model），通常是冻结不动的，用来做对比，防止主角训练跑偏。
+4.  <strong>切分工具 (FSDP Wrap)</strong>：按照 Task 1 的规划，把这两个巨大的模型切碎，塞进各个显卡的显存里。
+5.  <strong>准备调参器</strong>：设置优化器（AdamW）和学习率调度器（LR Scheduler），用来更新模型参数。</p>
+<h4>✅ Task 3: 质量检测 (计算奖励分数 - 推理阶段)</h4>
+<p><strong>对应代码：</strong> <code>compute_rm_score</code> 方法
+<strong>场景：</strong> 强化学习生成了一批数据，现在需要这个Worker给这些数据打分。
+<strong>发生了什么：</strong>
+1.  <strong>搬运器材</strong>：如果为了省显存把模型卸载到了CPU，现在赶紧搬回GPU (<code>load_fsdp_model_to_gpu</code>)。
+2.  <strong>处理长文本</strong>：利用 <code>ulysses_sharding_manager</code> 把超长的数据切分好。
+3.  <strong>打分</strong>：运行模型的前向传播（Forward），算出分数 (<code>rm_scores</code>)。
+4.  <strong>计算指标</strong>：顺便算一下 DPO Accuracy（一种准确率指标），看看模型判断得准不准。
+5.  <strong>清理现场</strong>：算完了，如果显存紧张，就把模型参数踢回 CPU (<code>offload</code>)，把结果传回 CPU。</p>
+<h4>✅ Task 4: 自我提升 (更新模型 - 训练阶段)</h4>
+<p><strong>对应代码：</strong> <code>update_rm</code> 方法
+<strong>场景：</strong> 根据打分结果和真实数据的差异，修改模型参数，让它变聪明。
+<strong>发生了什么：</strong>
+1.  <strong>准备工作</strong>：同样先把模型和优化器搬到 GPU 上。
+2.  <strong>核心训练</strong>：
+    *   调用 <code>self.rm.update_rm(data)</code>。
+    *   这里面会发生：<strong>算Loss（误差） -&gt; 反向传播（Backprop） -&gt; 梯度计算</strong>。
+3.  <strong>参数修正</strong>：<code>self.reward_lr_scheduler.step()</code>，根据梯度修改模型里的参数。
+4.  <strong>记录日志</strong>：记录现在的学习率是多少，准确率变了没。
+5.  <strong>收工</strong>：把模型踢回 CPU，释放显存。</p>
+<h4>✅ Task 5: 每日存档 (保存/加载检查点)</h4>
+<p><strong>对应代码：</strong> <code>save_checkpoint</code> 和 <code>load_checkpoint</code> 方法
+<strong>发生了什么：</strong>
+1.  <strong>存档</strong>：训练很久怕断电，需要把模型存成文件。因为模型是切碎在不同卡上的，FSDP 需要一种特殊的机制把它们整合或者分块存起来。
+2.  <strong>读档</strong>：从上次断掉的地方继续训练。</p>
+<hr />
+<h3>总结：这个文件到底是干啥的？</h3>
+<p>这就好比一个<strong>流水线车间主任</strong>的说明书。
+*   他负责管理<strong>两个大机器</strong>（Reward Model 和 Reference Model）。
+*   他知道怎么把大机器拆散了分给多个工人（GPU）一起扛（<strong>FSDP</strong>）。
+*   他知道怎么处理特别长的订单（<strong>Ulysses 序列并行</strong>）。
+*   他既能<strong>质检</strong>（compute score），也能<strong>维修升级机器</strong>（update model）。
+*   他还懂得<strong>省钱</strong>（Offload），不用的时候就把机器搬去廉价仓库（CPU内存），用的时候再搬进车间（GPU显存）。</p>
+<p><strong>代码里的 <code>PRIME</code> 是什么？</strong>
+PRIME 应该就是这个项目所使用的特定算法名称（可能是某种改进的在线强化学习算法），这个 Worker 是专门为 PRIME 算法中的“奖励模型训练环节”定制的。</p>

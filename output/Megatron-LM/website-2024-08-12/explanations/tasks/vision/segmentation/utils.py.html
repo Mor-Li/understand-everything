@@ -1,0 +1,110 @@
+<h1>tasks/vision/segmentation/utils.py</h1>
+<p>这段代码的核心逻辑其实就一件事：<strong>如何用一个只能吃小图片模型，去处理一张很大的图片。</strong></p>
+<p>术语叫做<strong>“滑动窗口推理”（Sliding Window Inference）</strong>。</p>
+<p>想象你手里有一个巨大的拼图（大图片），但你的桌子（显存/模型输入）只有一本书那么大。你必须把大拼图切成一块块小图，处理完后再拼回去。</p>
+<p>为了让你更容易理解，我把这个过程拆解成一个 <strong>Task List (任务清单)</strong>，我们一步步来完成这个任务：</p>
+<hr />
+<h3>Task 1: 理解核心难题</h3>
+<ul>
+<li><strong>现状</strong>：你的模型（AI）胃口是固定的（比如一次只能看 <code>512x512</code> 像素的图）。</li>
+<li><strong>问题</strong>：现在来了一张 <code>1024x2048</code> 的大图。</li>
+<li><strong>策略</strong>：不能缩放（会丢失细节），只能<strong>切片</strong>。</li>
+<li><strong>难点</strong>：切片如果切得刚刚好，边缘连接处可能会预测不准。所以我们通常会<strong>切得有重叠（Overlap）</strong>，就像贴瓷砖时多留一点边。</li>
+</ul>
+<hr />
+<h3>Task 2: 负责“切图”的工头 —— <code>slidingcrops</code> 函数</h3>
+<p>这个函数是处理流程的第一步。</p>
+<ul>
+<li>
+<p><strong>Todo 1: 确定切多大，怎么切</strong></p>
+<ul>
+<li>代码读取 <code>args.img_h</code> (裁剪大小) 和 <code>args.seg_stride</code> (步长)。</li>
+<li><strong>步长 (Stride)</strong> &lt; <strong>裁剪大小 (Crop Size)</strong>：这意味着切出来的图会有重叠区域。</li>
+<li><em>代码对应</em>：计算 <code>h_step_num</code> 和 <code>w_step_num</code>，决定横着切几刀，竖着切几刀。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 2: 开始切片 (Slicing)</strong></p>
+<ul>
+<li>它用两个 <code>for</code> 循环（<code>yy</code> 和 <code>xx</code>）在图片上滑动。</li>
+<li>每次切下一块 <code>img_sub</code> 和对应的掩码 <code>mask_sub</code>。</li>
+<li><em>代码对应</em>：<code>img_sub = img[:, :, sy: ey, sx: ex]</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 3: 处理“边角料” (Padding)</strong></p>
+<ul>
+<li>当你切到图片的最右边或最下边时，剩下的部分可能不够切一个完整的 <code>512x512</code>。</li>
+<li>这时候必须<strong>补齐</strong>（Padding），通常填黑边或者特定数值，凑够尺寸。</li>
+<li><em>代码对应</em>：<code>torch.nn.functional.pad(...)</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 4: 记账 (Logging)</strong></p>
+<ul>
+<li>这步最关键！切完不能乱扔。你得记下来每一块小图原本属于大图的<strong>哪个坐标位置</strong>。</li>
+<li><em>代码对应</em>：<code>slices_info.append([sy, ey, sx, ex, sub_h, sub_w])</code>。这一行记下了“起始坐标、结束坐标、实际有效宽高”。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 2 总结</strong>：把一张大图，变成了一堆小图（Batch size 变大了），并记下了它们的坐标。</p>
+</li>
+</ul>
+<hr />
+<h3>Task 3: AI 模型干活 (代码中未体现，但在两函数之间)</h3>
+<ul>
+<li>中间发生的事情：你把 <code>slidingcrops</code> 输出的那堆小图扔给 AI 模型。</li>
+<li>AI 输出了每一张小图的<strong>预测结果 (Preds)</strong> 和 <strong>概率图 (Probs)</strong>（即 AI 对每个像素是猫还是狗的自信程度）。</li>
+</ul>
+<hr />
+<h3>Task 4: 负责“拼图”的工头 —— <code>slidingjoins</code> 函数</h3>
+<p>这个函数是最难懂的部分，负责把 AI 处理完的碎片拼回大图。</p>
+<ul>
+<li>
+<p><strong>Todo 1: 准备一张大画布</strong></p>
+<ul>
+<li>根据原始大图的尺寸 <code>(h, w)</code>，创建全空的画布：<ul>
+<li><code>total_preds</code>: 存最终预测结果。</li>
+<li><code>total_max_probs</code>: 存该位置目前的最高置信度（后面解释为什么要这个）。</li>
+<li><em>代码对应</em>：<code>torch.zeros(..., device='cuda')</code>。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 2: 逐个碎片还原</strong></p>
+<ul>
+<li>遍历之前切出来的每一块小结果。</li>
+<li>读取 <code>slices_info</code>，找到这块碎片应该贴在画布的哪个位置。</li>
+<li><em>代码对应</em>：<code>sy, ey, sx, ex... = slices_info[i]</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 3: 解决“重叠冲突” (核心逻辑)</strong></p>
+<ul>
+<li>还记得 Task 1 说的吗？我们切图是有<strong>重叠</strong>的。</li>
+<li>这意味着：画布上的同一个像素点，可能被两张甚至四张小图覆盖。</li>
+<li><strong>冲突</strong>：小图 A 说这个点是“天空”，小图 B 说这个点是“云”，听谁的？</li>
+<li><strong>裁判机制 (Max Voting)</strong>：谁的<strong>概率 (Probability)</strong> 更高，就听谁的。</li>
+<li><em>代码详解</em>：<ol>
+<li><code>curr_max_probs</code>: 画布上当前已有的概率。</li>
+<li><code>local_max_probs</code>: 手里这块新碎片的概率。</li>
+<li><code>torch.maximum(...)</code>: 比较两者，留下概率更大的那个数值。</li>
+<li><code>torch.where(...)</code>: 如果新碎片的概率 &gt; 画布旧概率，就用新碎片的预测结果覆盖旧的；否则保持不变。</li>
+</ol>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 4 总结</strong>：把碎片拼回去，如果遇到重叠区域，保留“最自信”的那个预测结果。</p>
+</li>
+</ul>
+<hr />
+<h3>总结 Checklist</h3>
+<p>如果不看代码，只看逻辑，这个文件就在做这三件事：</p>
+<ol>
+<li>✅ <strong>Sliding Crops</strong>: 把大图按固定步长切成小块（含重叠），并记录坐标。</li>
+<li>(模型预测): 对小块进行预测。</li>
+<li>✅ <strong>Sliding Joins</strong>: 把预测好的小块拼回去。在重叠区域，<strong>谁概率大听谁的</strong>。</li>
+</ol>
+<p>这就好比你用手机拍全景照片，手机会自动把多张照片边缘重叠的部分拼起来，保留最清晰的部分，组成一张完整的长图。</p>

@@ -1,0 +1,152 @@
+<h1>verl/models/llama/megatron/checkpoint_utils/llama_saver.py</h1>
+<p>这份代码确实比较硬核，因为它涉及到<strong>深度学习分布式训练</strong>中最复杂的底层逻辑：如何把分散在几十甚至几百张显卡上的“碎片化”模型参数，重新拼凑成一个完整的模型文件。</p>
+<p>为了让你看懂，我们可以把这个过程想象成<strong>“拼图回收任务”</strong>。</p>
+<h3>核心背景：为什么要写这个文件？</h3>
+<p>在使用 Megatron-LM 训练大模型（如 Llama）时，为了放下巨大的模型，我们使用了两种切分技术：
+1.  <strong>TP (Tensor Parallel - 张量并行)</strong>：把一个大的矩阵（比如 $4096 \times 4096$）切成几块，分给不同的显卡算。
+2.  <strong>PP (Pipeline Parallel - 流水线并行)</strong>：把模型的层（比如一共 32 层）切分，显卡 A 存 0-7 层，显卡 B 存 8-15 层...</p>
+<p><strong>这个脚本 (<code>llama_saver.py</code>) 的作用是：</strong> 训练结束或保存时，由主进程（Rank 0）充当“组长”，指挥所有显卡把各自手里的“碎片”交上来，组长负责把它们<strong>拼回</strong>原本完整的形状，最后生成一个可以在单卡上加载的 HuggingFace 格式权重字典 (<code>state_dict</code>)。</p>
+<hr />
+<h3>任务清单 (Todo List)</h3>
+<p>为了看懂代码，我们可以把这个脚本的工作流程拆解为以下几个步骤：</p>
+<ol>
+<li><strong>准备工作</strong>：确认显卡排位，解包模型。</li>
+<li><strong>定义工具</strong>：制造“抓取工具”，用来从其他显卡把数据抓到主进程。</li>
+<li><strong>收集 Embedding 层</strong>：拼凑词表向量。</li>
+<li><strong>循环收集 Transformer 层 (核心)</strong>：<ul>
+<li>找到每一层到底在哪张显卡上。</li>
+<li>拼凑 Attention 部分 (Q, K, V, Output)。</li>
+<li>拼凑 MLP 部分 (Gate, Up, Down)。</li>
+<li>拼凑 LayerNorm。</li>
+</ul>
+</li>
+<li><strong>收集输出层</strong>：拼凑最后的 LM Head。</li>
+<li><strong>收尾</strong>：转换数据类型，清理显存。</li>
+</ol>
+<hr />
+<h3>逐步代码讲解</h3>
+<h4>1. 准备工作 (Setup)</h4>
+<p>代码开头的一大段逻辑（<code>merge_megatron_ckpt_llama</code> 函数的前半部分）都是在做身份确认。</p>
+<ul>
+<li><strong>你需要知道</strong>：<code>mpu.get_...</code> 这些函数是在问当前显卡：“我是谁？我在哪？”</li>
+<li><strong>解包模型</strong>：<code>unwrap_model</code> 是为了剥离掉 PyTorch DDP 的外壳，拿到最原始的模型对象。</li>
+</ul>
+<h4>2. 定义工具 (Helper Functions)</h4>
+<p>这是代码里最难懂但最重要的部分，定义了三个内部函数（闭包），专门用来“隔空取物”。</p>
+<ul>
+<li>
+<p><strong>工具 A: <code>_broadcast_tensor</code> (简单搬运)</strong></p>
+<ul>
+<li><strong>场景</strong>：LayerNorm 的参数没有被切分（TP不切 Norm），只是可能不在主进程手里（因为 PP）。</li>
+<li><strong>逻辑</strong>：如果东西在显卡 A，显卡 A 就把它广播出来，主进程（Rank 0）接收并存起来。</li>
+</ul>
+</li>
+<li>
+<p><strong>工具 B: <code>_broadcast_tp_shard_tensor</code> (拼凑切片)</strong></p>
+<ul>
+<li><strong>场景</strong>：比如 MLP 的 <code>down_proj</code> 矩阵被横着切成了两半。</li>
+<li><strong>逻辑</strong>：<ol>
+<li>主进程创建一个空的“大桶”（buffer）。</li>
+<li>循环遍历所有持有切片的显卡。</li>
+<li>每张卡把自己那部分发过来。</li>
+<li>主进程用 <code>torch.concat</code> 把它们粘起来，还原成大矩阵。</li>
+</ol>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>工具 C: <code>_broadcast_tp_shard_tensor_qkv</code> / <code>gate_up</code> (复杂拼凑)</strong></p>
+<ul>
+<li><strong>场景</strong>：Megatron 为了加速，把 Q、K、V 三个矩阵合并成了一个大矩阵存着。但是 HuggingFace 的格式要求 Q、K、V 分开存。</li>
+<li><strong>逻辑</strong>：<ol>
+<li>先把分散在各卡上的大矩阵拼回来。</li>
+<li><strong>切蛋糕</strong>：在主进程里，按照 hidden size 把大矩阵切几刀，分离出 Q、K、V。</li>
+<li>分别存入字典。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<h4>3. 收集 Embedding 层</h4>
+<div class="codehilite"><pre><span></span><code>    <span class="k">if</span> <span class="n">dp_rank</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="c1"># ...</span>
+        <span class="n">_broadcast_tp_shard_tensor</span><span class="p">(</span>
+            <span class="n">gpt_model_module</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">embed_tokens</span><span class="o">.</span><span class="n">weight</span> <span class="k">if</span> <span class="n">pp_rank</span> <span class="o">==</span> <span class="mi">0</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="s2">&quot;model.embed_tokens.weight&quot;</span><span class="p">,</span>
+            <span class="n">src_pp_rank</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="c1"># Embedding 层一定在流水线的第一张卡(Rank 0)上</span>
+        <span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：Embedding 矩阵通常很大，是被 TP 切分的。这里调用工具 B，从流水线的第一阶段（<code>src_pp_rank=0</code>）把切片收集回来拼好。</li>
+</ul>
+<h4>4. 循环收集 Transformer 层 (核心循环)</h4>
+<p>这是代码中最长的 <code>for layer in range(config.num_hidden_layers):</code> 循环。</p>
+<ul>
+<li>
+<p><strong>第一步：定位 (Where is it?)</strong>
+    <code>python
+    layer_map = _megatron_calc_layer_map(config)
+    # ...
+    src_pp_rank, src_virtual_pp_rank, src_layer_idx = layer_map[layer]</code>
+    因为用了 PP（流水线并行），第 30 层可能不在本地，而是在第 4 张显卡上。这个 <code>layer_map</code> 就是一张地图，告诉程序去哪张卡找第 N 层的数据。</p>
+</li>
+<li>
+<p><strong>第二步：收集 Attention (Q, K, V)</strong>
+    <code>python
+    _broadcast_tp_shard_tensor_qkv(
+        sync_layer.self_attn.qkv_proj.weight,
+        f"{layer_name}.self_attn.q_proj.weight", # 目标名字 Q
+        f"{layer_name}.self_attn.k_proj.weight", # 目标名字 K
+        f"{layer_name}.self_attn.v_proj.weight", # 目标名字 V
+        src_pp_rank=src_pp_rank,
+    )</code>
+    这里用了工具 C。Megatron 存的是 <code>qkv_proj</code>，我们要把它还原并拆解成 HF 格式的 <code>q_proj</code>, <code>k_proj</code>, <code>v_proj</code>。</p>
+</li>
+<li>
+<p><strong>第三步：收集 MLP (Gate, Up)</strong>
+    Llama 的 MLP 比较特殊，有一个 SwiGLU 结构，包含 Gate 和 Up 两个投影层。Megatron 也是把它们拼在一起存的。
+    <code>python
+    _broadcast_tp_shard_tensor_gate_up(
+        sync_layer.mlp.gate_up_proj.weight,
+        f"{layer_name}.mlp.gate_proj.weight",
+        f"{layer_name}.mlp.up_proj.weight",
+        src_pp_rank=src_pp_rank,
+    )</code>
+    同样是把拼在一起的权重拉回来，拆成 <code>gate_proj</code> 和 <code>up_proj</code>。</p>
+</li>
+<li>
+<p><strong>第四步：收集其他简单层</strong>
+    对于 <code>input_layernorm</code>、<code>post_attention_layernorm</code> 等，直接用工具 A (<code>_broadcast_tensor</code>) 拿回来即可，不需要拼接。</p>
+</li>
+</ul>
+<h4>5. 收集 Final Norm 和 LM Head</h4>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># Final Layernorm</span>
+    <span class="n">_broadcast_tensor</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">src_pp_rank</span><span class="o">=</span><span class="n">pp_size</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="c1"># 最后一层 Norm 肯定在流水线的最后一张卡</span>
+
+    <span class="c1"># LM Head (输出层)</span>
+    <span class="n">_broadcast_tp_shard_tensor</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">src_pp_rank</span><span class="o">=</span><span class="n">pp_size</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：模型的最后几层（归一化层和预测词的 Head 层）肯定位于流水线的末端（<code>pp_size - 1</code>）。Head 层也是大矩阵，需要拼凑（TP Shard）。</li>
+</ul>
+<h4>6. 收尾 (Finalize)</h4>
+<div class="codehilite"><pre><span></span><code>    <span class="k">if</span> <span class="n">torch</span><span class="o">.</span><span class="n">distributed</span><span class="o">.</span><span class="n">get_rank</span><span class="p">()</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="c1"># ...</span>
+        <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">state_dict</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="k">if</span> <span class="n">dtype</span> <span class="o">!=</span> <span class="n">v</span><span class="o">.</span><span class="n">dtype</span><span class="p">:</span>
+                <span class="n">state_dict</span><span class="p">[</span><span class="n">k</span><span class="p">]</span> <span class="o">=</span> <span class="n">v</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">dtype</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">state_dict</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：所有拼图都完成了，存在 <code>state_dict</code> 字典里。最后确认一下数据类型（比如转成 float16 或 bfloat16），然后把这个巨大的字典返回。外部程序拿到这个字典后，就可以直接 <code>torch.save()</code> 保存成 <code>.bin</code> 或 <code>.safetensors</code> 文件了。</li>
+</ul>
+<h3>总结</h3>
+<p>这段代码看起来乱，是因为它在处理 <strong>“分布式存储”到“单机存储”的映射</strong>。</p>
+<ul>
+<li><strong>Megatron 里的样子</strong>：权重被横切、竖切（TP），还被按层分发到不同机器（PP），而且为了计算快，把 QKV、GateUp 这种矩阵都粘在一起了。</li>
+<li><strong>我们想要的样子 (HuggingFace)</strong>：完整的矩阵，每一层都在一起，Q/K/V 是独立的 key。</li>
+</ul>
+<p>这个脚本就是负责做这个<strong>繁琐的搬运和拆解工作</strong>的苦力。</p>

@@ -1,0 +1,74 @@
+<h1>recipe/prime/config/prime_trainer.yaml</h1>
+<p>这份配置文件 (<code>prime_trainer.yaml</code>) 实际上是一个<strong>训练大模型（LLM）的“食谱”</strong>，专门用于一种叫做 <strong>PRIME</strong> 的强化学习训练方法。</p>
+<p>你可以把它想象成我们在训练一个“学生”（Actor模型），而这个文件定义了：用什么教材（Data）、怎么考试（Rollout）、谁来评分（Reward Model）、以及怎么根据分数改进（Algorithm）。</p>
+<p>为了让你看懂，我把这个复杂的配置拆解成一个 <strong>“训练任务 To-Do List”</strong>，按顺序一步步执行，你就能理解它的逻辑了。</p>
+<hr />
+<h3>📋 任务清单：PRIME 训练流程拆解</h3>
+<h4>✅ Task 1: 确定基础规则 (Inheritance)</h4>
+<p><strong>目标</strong>：不要从零开始，先继承一套标准的训练流程，然后修改其中的关键点。
+*   <strong>配置项</strong>：
+    <code>yaml
+    defaults:
+      - ppo_trainer  # 继承 PPO 算法的默认设置</code>
+*   <strong>解读</strong>：PRIME 是基于 <strong>PPO</strong> (Proximal Policy Optimization，一种经典的强化学习算法) 修改而来的。就像做菜，我们先拿来“红烧肉”的通用菜谱，然后改成“PRIME版红烧肉”。</p>
+<h4>✅ Task 2: 筛选“教材” (Data Filtering)</h4>
+<p><strong>目标</strong>：不要给模型太简单或太难的问题，只选那些“跳一跳够得着”的题目。
+*   <strong>配置项</strong>：
+    <code>yaml
+    data:
+      filter_accuracy: True
+      accuracy_lower_bound: 0.2  # 正确率下限
+      accuracy_upper_bound: 0.8  # 正确率上限
+      oversample_factor: 4.0</code>
+*   <strong>解读（核心观点）</strong>：
+    *   <strong>难度控制</strong>：如果一个问题模型之前做对的概率低于 20%（太难）或高于 80%（太简单），就<strong>扔掉不练</strong>。PRIME 认为训练应该集中在模型处于“懂与不懂之间”的边界数据上，这样效率最高。
+    *   <strong>多采样（Oversample）</strong>：多采 4 倍的数据，从中挑出符合上述难度要求的。</p>
+<h4>✅ Task 3: 学生“刷题” (Actor Rollout)</h4>
+<p><strong>目标</strong>：让模型针对同一个问题，多写几个不同的答案，方便对比好坏。
+*   <strong>配置项</strong>：
+    <code>yaml
+    actor_rollout_ref:
+      rollout:
+        n: 4  # 每个问题生成 4 个回答</code>
+*   <strong>解读</strong>：
+    *   <strong>探索性</strong>：对于一道题，让模型生成 4 种不同的解法。这就像老师说：“这道题你给我想 4 种解题思路。”
+    *   <strong>技术细节</strong>：<code>hybrid_engine: True</code> 是为了加速生成过程。</p>
+<h4>✅ Task 4: 老师“阅卷” (Reward Model - 核心部分)</h4>
+<p><strong>目标</strong>：这是 PRIME 最独特的地方。这里定义了一个非常细致的评分系统，甚至评分老师自己也在学习。
+*   <strong>配置项</strong>：
+    <code>yaml
+    reward_model:
+      prime_granularity: token  # 细粒度：按 Token（字/词）给分
+      model:
+        update: before  # 在训练 Actor 之前，先更新 Reward Model
+        optim: { ... }  # 居然给 Reward Model 配了优化器！</code>
+*   <strong>解读（核心观点）</strong>：
+    *   <strong>过程奖励 (Token-level)</strong>：普通的 PPO 通常只看结果（做没做对）。PRIME 要求<strong>每写一个字/词都要评分</strong> (<code>prime_granularity: token</code>)。这就像老师不只看答案，还盯着你的每一个解题步骤打分。
+    *   <strong>在线更新 (Online Update)</strong>：注意 <code>optim</code> 和 <code>update: before</code>。这意味着<strong>评分老师（Reward Model）也在同步进化</strong>！在每一轮训练中，Reward Model 会先根据当前的数据调整自己的参数，变得更准，然后再去指导学生（Actor）。这是 PRIME 的精髓。</p>
+<h4>✅ Task 5: 计算最终得分 (Algorithm)</h4>
+<p><strong>目标</strong>：综合“标准答案”和“老师评分”来决定模型该怎么改。
+*   <strong>配置项</strong>：
+    <code>yaml
+    algorithm:
+      adv_estimator: rloo     # 一种估计优势的算法
+      kl_ctrl:
+        kl_coef: 0.000        # KL 惩罚系数设为 0
+      reward_gt_coef: 5       # 结果对错的权重
+      reward_dpo_coef: 5      # 偏好学习的权重</code>
+*   <strong>解读</strong>：
+    *   <strong>RLOO</strong>：这是一种比传统 PPO 更适合大语言模型的算法变体，专门处理上面提到的“一题多解”（Task 3 中的 <code>n: 4</code>）。
+    *   <strong>混合奖励</strong>：最终的分数由两部分组成：
+        1.  <strong>GT (Ground Truth)</strong>：这道题到底做对没？（权重 5）
+        2.  <strong>DPO (Direct Preference)</strong>：这个回答比其他回答好在哪里？（权重 5）
+    *   <strong>KL = 0</strong>：通常 RLHF 会限制模型不要偏离原模型太远（KL 惩罚）。这里设为 0，说明 PRIME 允许模型<strong>放飞自我</strong>去探索，只要能拿到高分（做对题）。</p>
+<hr />
+<h3>总结：这篇配置在讲什么故事？</h3>
+<p>如果把这个配置翻译成一段话，它在说：</p>
+<blockquote>
+<p>“我们要训练一个大模型。为了提高效率，我们只练那些<strong>难度适中</strong>的题目。</p>
+<p>训练时，让模型对每道题<strong>多写几个答案</strong>。</p>
+<p>然后，我们派出一个<strong>非常严格且会自我进化的老师（Reward Model）</strong>，他不仅看答案对错，还会盯着每一个字（Token）打分。</p>
+<p>最重要的是，这个老师在给学生打分前，自己会先根据最新的情况<strong>补补课（Update）</strong>，确保评分标准是最新的。</p>
+<p>最后，我们结合<strong>结果对错</strong>和<strong>对比偏好</strong>来更新模型，并且不限制模型的探索范围（KL=0），让它尽情去寻找最优解。”</p>
+</blockquote>
+<p>这就是 <strong>PRIME</strong> 方法的核心逻辑。</p>

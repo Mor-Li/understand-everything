@@ -1,0 +1,81 @@
+<h1>examples/data_preprocess/full_hh_rlhf.py</h1>
+<p>这段代码其实就是一个<strong>“数据搬运工”和“数据加工厂”</strong>。</p>
+<p>它的核心任务是：把一个原始的开源数据集（<code>Dahoas/full-hh-rlhf</code>），加工成三种不同的格式，分别喂给大模型训练的三个不同阶段（SFT、RM、RL）。</p>
+<p>为了让你容易理解，我把这个脚本的工作拆解成一个 <strong>“To-Do List”（任务清单）</strong>，带你一步步看它是怎么完成的。</p>
+<hr />
+<h3>📋 任务总览：数据加工流水线</h3>
+<p>我们要训练一个类似于 ChatGPT 的模型，通常需要三步走。这个脚本就是为这三步准备数据的：</p>
+<ol>
+<li><strong>Task 1: 准备 SFT（有监督微调）数据</strong> —— 也就是“教科书”，教模型怎么说话。</li>
+<li><strong>Task 2: 准备 RM（奖励模型）数据</strong> —— 也就是“判卷标准”，教裁判员（Reward Model）分辨好坏。</li>
+<li><strong>Task 3: 准备 RL（强化学习）数据</strong> —— 也就是“考题”，给模型出题，让它自己生成答案并接受评分。</li>
+<li><strong>Task 4: 保存与分发</strong> —— 把处理好的数据存成 Parquet 文件，放到指定文件夹。</li>
+</ol>
+<hr />
+<h3>🔍 逐步详解</h3>
+<h4>Task 1: 准备 SFT 数据 (函数 <code>generate_sft_dataset</code>)</h4>
+<p><strong>目标</strong>：把数据变成简单的“一问一答”格式。
+<strong>代码逻辑</strong>：
+1.  <strong>加载数据</strong>：从 HuggingFace 下载 <code>Dahoas/full-hh-rlhf</code> 数据集。
+2.  <strong>提取对话</strong>：原始数据里每一条都包含“Prompt（问题）”、“Chosen（好回答）”和“Rejected（坏回答）”。
+3.  <strong>拆解重组（Flatten）</strong>：
+    *   代码把“问题 + 好回答”作为一条训练数据。
+    *   代码把“问题 + 坏回答”<strong>也</strong>作为了一条训练数据（<em>注：这比较独特，通常 SFT 只用好回答，但这里作者为了增加数据量，把坏回答也当成了普通对话语料</em>）。
+4.  <strong>最终格式</strong>：变成只有两列的表格：<code>prompt</code>（问题） 和 <code>response</code>（回答）。</p>
+<blockquote>
+<p><strong>通俗理解</strong>：不管好坏，只要是人说的话，都拿来给模型看，让它先学会怎么顺畅地造句。</p>
+</blockquote>
+<h4>Task 2: 准备 RM 数据 (函数 <code>generate_rm_dataset</code>)</h4>
+<p><strong>目标</strong>：把数据变成“三元组”格式，用来训练裁判。
+<strong>代码逻辑</strong>：
+1.  <strong>切分数据集</strong>：
+    *   前 75% 的数据拿来训练（Training）。
+    *   后 25% 的数据拿来验证（Validation/Test），看看裁判学得咋样。
+2.  <strong>保留比较关系</strong>：
+    *   不同于 SFT，这里必须保留对比。
+    *   每一条数据包含：<code>prompt</code>（问题）、<code>chosen</code>（好回答）、<code>rejected</code>（坏回答）。
+3.  <strong>最终格式</strong>：三列的表格。</p>
+<blockquote>
+<p><strong>通俗理解</strong>：这就像给老师准备的“标准答案”和“错误答案”对照表。告诉模型：“对于这个问题，Chosen 比 Rejected 好”，模型学会这个就能当裁判了。</p>
+</blockquote>
+<h4>Task 3: 准备 RL 数据 (函数 <code>generate_rl_dataset</code>)</h4>
+<p><strong>目标</strong>：只提取“题目”，不需要答案。因为在强化学习阶段，答案要由模型自己生成。
+<strong>代码逻辑</strong>：
+1.  <strong>加载数据</strong>：加载原始训练集。
+2.  <strong>包装数据结构</strong>：这是代码中最复杂的一块（<code>make_map_fn</code>）。因为这个脚本是为 <code>Verl</code>（字节跳动的一个强化学习框架）服务的，所以数据必须包装成特定的 JSON 格式：
+    *   <code>prompt</code>: 变成 <code>[{"role": "user", "content": "..."}]</code> 的聊天格式。
+    *   <code>ability</code>: 标记为 "alignment"（对齐）。
+    *   <code>reward_model</code>: 甚至把原来的真实回答放进去作为参考（虽然注释说 <code>should not be used</code>，可能只是为了占位或评估）。
+    *   <code>extra_info</code>: 加上数据索引 ID。
+3.  <strong>最终格式</strong>：包含复杂嵌套字典的 Parquet 文件。</p>
+<blockquote>
+<p><strong>通俗理解</strong>：这就像是打印了一张“空白试卷”。只有题目（Prompt），留出空白让模型在训练时自己填空，然后用 Task 2 训练出来的裁判给它打分。</p>
+</blockquote>
+<h4>Task 4: 主程序入口 (<code>if __name__ == '__main__':</code>)</h4>
+<p><strong>目标</strong>：根据你的命令，决定执行上面哪一个 Task。
+<strong>代码逻辑</strong>：
+1.  <strong>接收参数</strong>：通过 <code>argparse</code> 接收命令行参数 <code>--split</code>。
+    *   如果你输入 <code>--split sft</code>，它就跑 Task 1。
+    *   如果你输入 <code>--split rm</code>，它就跑 Task 2。
+    *   如果你输入 <code>--split rl</code>，它就跑 Task 3。
+2.  <strong>路径处理</strong>：处理你是要把文件存在本地（Local）还是存到云端存储（HDFS）。</p>
+<hr />
+<h3>💡 总结</h3>
+<p>如果你要运行这个脚本，你只需要关心你想做哪一步：</p>
+<ul>
+<li>想做 <strong>SFT（微调）</strong>？<ul>
+<li>运行：<code>python full_hh_rlhf.py --split sft</code></li>
+<li>结果：得到一堆问答对。</li>
+</ul>
+</li>
+<li>想做 <strong>RM（训练奖励模型）</strong>？<ul>
+<li>运行：<code>python full_hh_rlhf.py --split rm</code></li>
+<li>结果：得到一堆“好坏对比”的数据，且分好了训练集和测试集。</li>
+</ul>
+</li>
+<li>想做 <strong>RL（PPO强化学习）</strong>？<ul>
+<li>运行：<code>python full_hh_rlhf.py --split rl</code></li>
+<li>结果：得到一堆包装得很复杂的 Prompt 题目。</li>
+</ul>
+</li>
+</ul>

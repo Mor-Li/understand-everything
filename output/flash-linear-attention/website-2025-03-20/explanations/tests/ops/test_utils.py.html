@@ -1,0 +1,86 @@
+<h1>tests/ops/test_utils.py</h1>
+<p>这个文件 <code>tests/ops/test_utils.py</code> 其实是一个<strong>测试脚本</strong>（Unit Test）。它的核心目的是：<strong>验证 <code>fla</code> 这个库里写的一些自定义算子（Operator），计算结果是否和 PyTorch 原生的标准算法一致。</strong></p>
+<p>通常开发者写这些测试是为了保证：自己手写的（可能是为了加速而用 CUDA/Triton 写的）函数是算对的。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“学习与验证任务清单 (To-Do List)”</strong>。我们可以把这个文件看作是开发者在做完算子后，为了验收成果而列出的 6 个检查任务。</p>
+<p>在此之前，先通过一个“字典”了解一下变量名的含义：
+*   <strong>B</strong>: Batch size (批次大小)
+*   <strong>H</strong>: Number of Heads (注意力头的数量)
+*   <strong>T</strong>: Sequence Length (序列长度，比如句子的单词数)
+*   <strong>D</strong>: Head Dimension (每个头的维度)
+*   <strong>C</strong>: Chunk Size (分块的大小)
+*   <strong>offsets</strong>: 变长序列的分割点（用来处理没有 Padding 的数据）</p>
+<hr />
+<h3>任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>[热身任务]</strong> 理解“反向累加和”的逻辑 (<code>reversed_cumsum</code>)。</li>
+<li><strong>[基础任务]</strong> 验证“全局累加和”算子 (<code>chunk_global_cumsum</code>) 是否正确。</li>
+<li><strong>[进阶任务]</strong> 验证“变长序列（Packed Sequence）”的全局累加和是否正确。</li>
+<li><strong>[变体任务]</strong> 验证“反向”的全局累加和是否正确。</li>
+<li><strong>[分块任务]</strong> 验证“局部（块内）累加和”算子 (<code>chunk_local_cumsum</code>) 是否正确。</li>
+<li><strong>[池化任务]</strong> 验证“分块平均池化”算子 (<code>mean_pooling</code>) 及其<strong>反向传播（梯度）</strong>是否正确。</li>
+</ol>
+<hr />
+<h3>逐步讲解</h3>
+<h4>1. [热身任务] 理解 <code>reversed_cumsum</code></h4>
+<p><strong>代码位置：</strong> 文件开头的 <code>reversed_cumsum</code> 函数。
+<strong>观点/逻辑：</strong>
+PyTorch 自带 <code>cumsum</code> (前缀和)，比如 <code>[1, 2, 3]</code> -&gt; <code>[1, 3, 6]</code>。
+但是有些模型（如线性 Attention 的反向 pass）需要“后缀和”（从后往前加）。
+这个函数是用 PyTorch 拼凑出来的“标准答案”：
+*   公式逻辑：<code>当前位置的后缀和 = 总和 - 当前位置之前的累加和 + 当前元素</code>。
+*   <strong>目的：</strong> 用作后续测试的“标准答案 (Reference)”。</p>
+<h4>2. [基础任务] 验证“全局累加和” (<code>test_global_cumsum</code>)</h4>
+<p><strong>代码位置：</strong> <code>test_global_cumsum</code> 函数。
+<strong>场景：</strong> 给你一个形状为 <code>[B, H, T]</code> 或 <code>[B, T, H]</code> 的张量。
+<strong>步骤：</strong>
+1.  <strong>生成数据 (<code>s</code>)</strong>：造一个随机张量。
+2.  <strong>计算标准答案 (<code>ref</code>)</strong>：直接调用 PyTorch 的 <code>.cumsum()</code>。这是绝对正确的。
+3.  <strong>计算待测函数 (<code>tri</code>)</strong>：调用 <code>fla.ops.utils.chunk_global_cumsum</code>。这是开发者自己写的高效算子。
+4.  <strong>比对 (<code>assert_close</code>)</strong>：比较 <code>ref</code> 和 <code>tri</code> 的数值是否几乎一样。
+<strong>观点：</strong> 确保自定义的加速算子在普通形状下，结果和官方算子一致。</p>
+<h4>3. [进阶任务] 验证“变长序列” (<code>test_global_cumsum_varlen</code>)</h4>
+<p><strong>代码位置：</strong> <code>test_global_cumsum_varlen</code> 函数。
+<strong>场景：</strong> 在处理大模型训练时，为了不浪费显存，我们通常不使用 Padding（补零），而是把几句话拼成一个超长的一维长条。
+*   比如：句子A长度5，句子B长度3。拼在一起长度8。
+*   <code>offsets</code> (偏移量) 记录了每句话的起点和终点：<code>[0, 5, 8]</code>。
+<strong>步骤：</strong>
+1.  <strong>生成数据</strong>：造一个巨大的 <code>1 x Total_Length x H</code> 的张量，并生成随机的切分点 <code>offsets</code>。
+2.  <strong>计算标准答案 (<code>ref</code>)</strong>：写一个 Python 循环，利用 <code>offsets</code> 把每句话切出来，单独做 <code>cumsum</code>，然后再拼回去。
+3.  <strong>计算待测函数 (<code>tri</code>)</strong>：调用支持变长的 <code>chunk_global_cumsum</code>，传入 <code>offsets</code>。
+<strong>观点：</strong> 验证算子是否能正确处理这种“拼盘”数据，不能让句子A的累加和“溢出”加到句子B上去。</p>
+<h4>4. [变体任务] 验证“反向”全局累加和 (<code>test_global_reversed_cumsum</code>)</h4>
+<p><strong>代码位置：</strong> <code>test_global_reversed_cumsum</code> 及其变长版本。
+<strong>步骤：</strong>
+逻辑和上面完全一样，唯一的区别是：
+*   <strong>标准答案</strong>：使用任务1里定义的 <code>reversed_cumsum</code>。
+*   <strong>待测函数</strong>：调用 <code>chunk_global_cumsum(..., reverse=True)</code>。
+<strong>观点：</strong> 验证算子是否支持从后往前累加（这对某些 RNN/SSM 模型很重要）。</p>
+<h4>5. [分块任务] 验证“局部累加和” (<code>test_local_cumsum</code>)</h4>
+<p><strong>代码位置：</strong> <code>test_local_cumsum</code> 函数。
+<strong>场景：</strong> 有时候我们不需要从头加到尾，只需要在小窗口（Chunk）里累加。
+*   输入：<code>[1, 1, 1, 1, 1, 1]</code>，Chunk大小 <code>C=3</code>。
+*   期望输出：<code>[1, 2, 3 | 1, 2, 3]</code> （注意第4个数重新从1开始加）。
+<strong>步骤：</strong>
+1.  <strong>计算标准答案 (<code>ref</code>)</strong>：用 Python 循环，每隔 <code>C</code> 个数切一段，做完 <code>cumsum</code> 再拼起来。
+2.  <strong>计算待测函数 (<code>tri</code>)</strong>：调用 <code>chunk_local_cumsum</code>。
+<strong>观点：</strong> 验证算子是否能正确地在每个小块内部进行独立计算。</p>
+<h4>6. [池化任务] 验证“分块平均池化” (<code>test_mean_pooling</code>)</h4>
+<p><strong>代码位置：</strong> <code>test_mean_pooling</code> 函数。
+<strong>场景：</strong> 把序列切成小块，算出每块的平均值。
+<strong>关键点：</strong> 这里不仅验证了<strong>结果</strong>，还验证了<strong>梯度（反向传播）</strong>。
+<strong>步骤：</strong>
+1.  <strong>前向传播对比</strong>：
+    *   <code>ref</code>: 切片 -&gt; <code>.mean()</code> -&gt; 拼接。
+    *   <code>tri</code>: 调用 <code>mean_pooling</code>。
+    *   比对 <code>ref</code> 和 <code>tri</code> 的值。
+2.  <strong>反向传播对比 (Backward)</strong>：
+    *   造一个梯度的“种子” <code>do</code>。
+    *   <code>ref.backward(do)</code>: 让 PyTorch 自动求导算出输入 <code>x</code> 的梯度 <code>ref_dx</code>。
+    *   <code>tri.backward(do)</code>: 让自定义算子求导算出输入 <code>x</code> 的梯度 <code>tri_dx</code>。
+    *   比对 <code>ref_dx</code> 和 <code>tri_dx</code>。
+<strong>观点：</strong> 自定义算子不仅要算出的数是对的，它在神经网络训练反向传播时，传回去的梯度也必须是对的，否则模型没法训练。</p>
+<h3>总结</h3>
+<p>这篇代码实际上就是在说：</p>
+<blockquote>
+<p>“嘿，我写了一套支持<strong>全局/局部</strong>、<strong>正向/反向</strong>、<strong>定长/变长</strong>的累加和与池化算子。为了证明我是对的，我把它们和 PyTorch 最朴素（但最慢）的写法进行了 360 度无死角的比对，结果完全一致。”</p>
+</blockquote>

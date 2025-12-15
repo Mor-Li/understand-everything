@@ -1,0 +1,59 @@
+<h1>verl/utils/experimental/torch_functional.py</h1>
+<p>这份代码的核心目的是为了<strong>省显存</strong>。</p>
+<p>在训练大语言模型（LLM）进行强化学习（PPO算法）时，通常需要计算两个东西：<strong>Token的对数概率（Log Probs）</strong> 和 <strong>熵（Entropy）</strong>。</p>
+<p>如果按照常规做法，需要把所有 <code>hidden_states</code>（隐藏层状态）乘以 <code>vocab_weights</code>（词表权重），生成一个巨大的 <code>[Batch, Sequence_Length, Vocab_Size]</code> 的张量（Logits）。对于 7B 以上的模型，词表通常很大（比如 32k 或 128k），这个中间结果会瞬间撑爆显存。</p>
+<p>这份代码通过<strong>手动实现反向传播</strong>和<strong>切片（Chunking）计算</strong>，避免了显存爆炸。</p>
+<p>下面我列一个 <strong>Task List（任务清单）</strong>，带你一步步看懂它是怎么完成这个目标的：</p>
+<hr />
+<h3>Task 1: 定义基本数学运算（Forward - 前向传播）</h3>
+<p><strong>目标</strong>：计算 PPO 需要的两个数值：<code>token_log_probs</code>（你选的那个词的概率）和 <code>entropy</code>（当前分布的混乱程度）。
+<strong>对应函数</strong>：<code>_fused_linear_for_ppo_fwd</code></p>
+<ol>
+<li><strong>算 Logits</strong>：用 <code>hidden_states</code> 乘以 <code>vocab_weights</code>，算出下一个词的预测分数。</li>
+<li><strong>转概率</strong>：计算 Softmax 和 Log Softmax。</li>
+<li><strong>提取目标概率</strong>：用 <code>gather</code> 函数，只把 <code>input_ids</code> 对应的那个词的概率拿出来（其他的几万个词的概率这里不需要存下来）。</li>
+<li><strong>算熵</strong>：计算当前概率分布的熵（用于 PPO 的正则化，防止模型过早收敛）。</li>
+<li><strong>返回</strong>：只返回 <code>token_log_probs</code> 和 <code>entropy</code>，丢弃巨大的 Logits 以节省空间。</li>
+</ol>
+<h3>Task 2: 手写梯度计算（Backward - 反向传播）</h3>
+<p><strong>目标</strong>：因为我们为了省显存，没有保留前向传播时的计算图，所以必须<strong>手动推导公式</strong>来计算梯度。
+<strong>对应函数</strong>：<code>_fused_linear_for_ppo_bwd</code></p>
+<ol>
+<li><strong>重算 Logits</strong>：因为前向传播没存 Logits，这里利用保存下来的输入（<code>hidden_states</code>）<strong>重新计算一遍</strong> Logits（用时间换空间）。</li>
+<li><strong>算梯度来源 1（dlog_probs）</strong>：如果 PPO 损失函数传回了对数概率的梯度，根据公式计算它对 Logits 的梯度贡献。</li>
+<li><strong>算梯度来源 2（dentropy）</strong>：如果损失函数传回了熵的梯度，根据熵的导数公式计算它对 Logits 的梯度贡献。</li>
+<li><strong>链式法则</strong>：把 Logits 的梯度传回给 <code>hidden_states</code> 和 <code>vocab_weights</code>。</li>
+</ol>
+<h3>Task 3: 显存优化的大管家（Chunking - 切片处理）</h3>
+<p><strong>目标</strong>：把长序列切成小块，一块一块地算，永远不把完整的“大矩阵”放进显存。
+<strong>对应类</strong>：<code>FusedLinearForPPOFunction</code> (继承自 <code>torch.autograd.Function</code>)</p>
+<p><strong>Step 3.1: 前向传播 (<code>forward</code> 静态方法)</strong>
+1.  <strong>准备空容器</strong>：申请两块较小的内存，用来存最终结果（<code>log_probs</code> 和 <code>entropy</code>）。
+2.  <strong>切片循环 (Chunking Loop)</strong>：
+    *   比如序列长度是 4096，设定 <code>chunk_size=512</code>。
+    *   <strong>Loop 1</strong>: 取第 0-512 个 token，调用 Task 1 的函数计算，把结果填入容器。
+    *   <strong>Loop 2</strong>: 取第 512-1024 个 token，计算，填入...
+    *   ...直到算完。
+3.  <strong>保存现场</strong>：保存 <code>hidden_states</code> 和 <code>input_ids</code> 等原始输入（供反向传播用），但不保存中间巨大的 Logits。</p>
+<p><strong>Step 3.2: 反向传播 (<code>backward</code> 静态方法)</strong>
+1.  <strong>准备空梯度</strong>：给 <code>hidden_states</code> 和 <code>vocab_weights</code> 申请全零的梯度张量。
+2.  <strong>切片循环 (Chunking Loop)</strong>：
+    *   同样把梯度切成小块（0-512, 512-1024...）。
+    *   <strong>Loop</strong>: 取出一小块对应的输入和上层传来的梯度，调用 Task 2 的函数计算这一小块的梯度。
+    *   <strong>累加</strong>：把算出来的梯度加到总梯度张量上。
+3.  <strong>返回梯度</strong>：把最终算好的梯度返回给 PyTorch 引擎。</p>
+<h3>Task 4: 包装成积木（Module Wrapper）</h3>
+<p><strong>目标</strong>：让这个复杂的优化代码看起来像一个普通的 PyTorch 层，方便在模型里调用。
+<strong>对应类</strong>：<code>FusedLinearForPPO</code> (继承自 <code>torch.nn.Module</code>)</p>
+<ol>
+<li><strong>初始化</strong>：设置 <code>chunk_size</code>（比如一次算多少个token）。</li>
+<li><strong>Forward 接口</strong>：把输入数据整理一下（比如把 input_ids 转成 int64），然后直接调用 Task 3 写好的那个 Function。</li>
+</ol>
+<hr />
+<h3>总结：为什么要写这个文件？</h3>
+<p>如果不写这个文件，直接用 PyTorch 原生的 <code>F.linear</code> + <code>F.cross_entropy</code>：
+*   <strong>显存占用</strong>：极大。因为 PyTorch 会自动保存整个 <code>[Batch, Seq, Vocab]</code> 的 Logits 图用于求导。
+*   <strong>结果</strong>：OOM (Out Of Memory) 错误。</p>
+<p>用了这个文件：
+*   <strong>显存占用</strong>：极小。显存占用只取决于 <code>chunk_size</code>（切片大小），与序列总长度无关。
+*   <strong>代价</strong>：计算速度稍微慢一点点（因为反向传播时重算了一次 Logits），但能让你训练本来跑不起来的大模型。</p>

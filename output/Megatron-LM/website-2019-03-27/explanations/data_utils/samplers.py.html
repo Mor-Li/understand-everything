@@ -1,0 +1,89 @@
+<h1>data_utils/samplers.py</h1>
+<p>这份代码确实写得比较绕，因为它处理的是<strong>分布式训练（Distributed Training）</strong>中非常底层的<strong>数据分发</strong>逻辑，而且还加入了一些处理“剩余数据”的特殊逻辑。</p>
+<p>为了让你看懂，我们把这个代码想象成一个<strong>“发牌员”</strong>的培训手册。你的任务是写一个发牌员程序，负责给多张桌子（多个GPU）发牌（数据）。</p>
+<p>我们将这个复杂的逻辑拆解为一个 <strong>5步走的 To-Do List</strong>，每一步我们解决一个问题：</p>
+<hr />
+<h3>📋 任务清单：构建一个分布式发牌员</h3>
+<h4>✅ Task 1: 搞清楚“我是谁”和“我要发多少牌” (<code>__init__</code>)</h4>
+<p>在分布式训练中，每个进程（GPU）都有一个编号（Rank）和总进程数（World Size）。
+*   <strong>目标</strong>：初始化发牌员，记录下总共有多少人要牌，我是第几号发牌员（其实大家都是镜像，只是领的任务不同）。
+*   <strong>代码对应</strong>：
+    <code>python
+    def __init__(self, ... rank=-1, world_size=2, ...):
+        # ...
+        self.rank = rank          # 我是第几号 GPU
+        self.world_size = world_size # 总共有多少个 GPU
+        # 注意：这里的 self.batch_size 是【全局】的总批次大小 (Global Batch Size)</code></p>
+<h4>✅ Task 2: 凑齐一大把牌 (<code>__iter__</code> 的前半部分)</h4>
+<p>普通的 <code>DistributedSampler</code> 是先把整个数据集切分好，每人拿一部分。
+<strong>但这个类的逻辑不同</strong>：它先不管三七二十一，从原本的数据源（<code>sampler</code>）里不停地拿数据，直到凑满一个<strong>全局大Batch</strong>。
+*   <strong>目标</strong>：一直从数据源里取索引（index），存到一个列表 <code>batch</code> 里，直到列表长度等于 <code>self.batch_size</code>。
+*   <strong>代码对应</strong>：
+    <code>python
+    batch = []
+    # data_iterator 就是从源头拿数据的生成器
+    for idx in self.data_iterator(self.sampler, ...):
+        batch.append(idx)
+        # 如果凑够了一大把牌（比如全局需要16张）
+        if len(batch) == self.batch_size:
+            # ---&gt; 进入 Task 3</code></p>
+<h4>✅ Task 3: 切蛋糕——只拿属于我的那一块 (<code>_batch</code> 方法)</h4>
+<p>这是这个类最核心的逻辑。
+假设总共有 2 个 GPU (<code>world_size=2</code>)，全局 Batch 是 16。
+此时 <code>batch</code> 列表里有 16 个数据。
+*   <strong>Rank 0 (1号GPU)</strong> 应该拿前 8 个。
+*   <strong>Rank 1 (2号GPU)</strong> 应该拿后 8 个。
+*   <strong>目标</strong>：计算切片的 <code>start</code> 和 <code>end</code>，把属于我的那部分切出来，扔给模型去训练（<code>yield</code>）。
+*   <strong>代码对应</strong>：
+    ```python
+    # 在 <strong>iter</strong> 中调用：
+    tbatch = self._batch(batch) 
+    yield tbatch # 交出数据</p>
+<div class="codehilite"><pre><span></span><code><span class="gh">#</span> _batch 函数的具体实现：
+def _batch(self, batch):
+    # 计算我的起始位置：比如我是 rank 0，start就是0
+    start = self.rank <span class="gs">* self.batch_size // self.world_size</span>
+<span class="gs">    # 计算我的结束位置：比如我是 rank 0，end就是 8</span>
+<span class="gs">    end = (self.rank + 1) *</span> self.batch_size // self.world_size
+    # 切片返回
+    return batch[start:end]
+```
+</code></pre></div>
+
+<h4>✅ Task 4: 处理“最后一点剩饭” (<code>wrap_last</code> 逻辑)</h4>
+<p>训练数据往往不能被 Batch Size 整除。比如最后还剩 5 个数据，但是我们需要 16 个才能凑成一个 Batch。
+普通做法是直接丢掉（<code>drop_last=True</code>）。
+<strong>但这个类的野心很大</strong>：如果开启了 <code>wrap_last=True</code>，它不想浪费，它要去<strong>下一轮（Next Epoch）</strong>的开头借数据来补齐！
+*   <strong>目标</strong>：如果最后剩下的数据不够，就重置数据迭代器，从头开始拿数据，直到补齐这个 Batch。
+*   <strong>代码对应</strong>：
+    <code>python
+    # 如果 batch 没凑满，而且允许 wrap_last
+    if self.wrap_last:
+        # 下面这几行就是在算还需要借多少数据，并记录偏移量
+        self.sampler.wrap_around -= (self.batch_size)
+        # ...
+        # 再次循环数据源，从头开始拿数据补齐 batch
+        for i, idx in enumerate(self.data_iterator(self.sampler, wrap_around=True)):
+            batch.append(idx)
+            if len(batch) == self.batch_size:
+                break # 终于补齐了
+        yield self._batch(batch) # 再次切分发货</code></p>
+<h4>✅ Task 5: 记住借了多少，下次还 (<code>data_iterator</code> 和 <code>wrap_around</code>)</h4>
+<p>既然 Task 4 里我们从下一轮借了数据，那么下次正式开始新一轮训练时，前面那些已经被借走的数据就不能再用了，否则数据就重复了。
+*   <strong>目标</strong>：记录一个 <code>wrap_around</code> 变量，表示“跳过开头多少个数据”。
+*   <strong>代码对应</strong>：
+    <code>python
+    def data_iterator(self, _iter, wrap_around=False):
+        for i, idx in enumerate(_iter):
+            # 如果 i 小于我们要跳过的数量，就 continue 跳过
+            if i &lt; self.wrap_around % self.batch_size:
+                continue
+            yield idx</code></p>
+<hr />
+<h3>💡 总结一下文中的核心观点</h3>
+<p>这个脚本其实就讲了一件事：</p>
+<p><strong>“与其让每个 GPU 自己去数据集里乱找数据，不如我们先凑齐一个完整的、巨大的全局 Batch，然后再像切蛋糕一样，每个人分自己那一块。”</strong></p>
+<p>这样做的好处是：
+1.  <strong>灵活性</strong>：它可以包裹任意类型的 Sampler（随机的、顺序的、带权重的）。
+2.  <strong>数据利用率</strong>：通过 <code>wrap_last</code> 机制，它实现了“无缝循环”，即使一个 Epoch 结束了，最后剩下的数据也能和下一个 Epoch 开头的数据拼在一起训练，保证每次训练的模型看到的 Batch Size 都是严格一致的（这对某些对 Batch Size 敏感的模型很重要）。</p>
+<p><strong>简单说：它是一个强迫症发牌员，必须保证每次发出去的牌数量完全一致，不够就从下一副牌里拆出来补。</strong></p>

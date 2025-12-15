@@ -1,0 +1,107 @@
+<h1>fla/ops/titans/naive.py</h1>
+<p>这份代码确实非常硬核，因为它实现的是 <strong>Titans</strong> 架构（一种最新的神经网络记忆模块，类似于 Google 的 Neural Memory 或 TTT - Test-Time Training）。</p>
+<p>简单来说，这段代码实现了一个<strong>“在推理过程中还能不断学习和更新权重的层”</strong>。</p>
+<p>为了让你看懂，我为你制定了一个 <strong>5步走的 To-Do List</strong>。我们将从宏观概念深入到代码细节。</p>
+<hr />
+<h3>✅ Task 1: 理解核心概念（这是在干什么？）</h3>
+<p>首先，不要把它当成普通的 Attention。你要把它想象成一个<strong>“即时学习器”</strong>。</p>
+<ul>
+<li><strong>传统模型 (Transformer):</strong> 权重 $W$ 训练完就固定了，推理时不再改变。</li>
+<li><strong>Titans 模型 (这段代码):</strong> 它维护一个<strong>记忆矩阵 $M$</strong>（你可以把它看作是一个动态变化的权重矩阵）。每读入一个新的 token，它就会根据这个 token 的信息，算出误差，然后<strong>即时更新</strong> $M$。</li>
+</ul>
+<p><strong>核心公式（代码里的注释写了）：</strong>
+1.  $M_t = (1 - \alpha_t) * M_{t-1} + S_t$
+    *   含义：当前的长期记忆 = 旧记忆衰减一点点 + 新的短期更新量 $S$。
+2.  $S_t = \eta_t * S_{t-1} - \theta_t * \nabla l(M_{t-1}; x_t)$
+    *   含义：短期更新量 = 旧的更新量衰减（动量） - <strong>梯度的反方向</strong>。
+    *   <strong>关键点：</strong> 这里出现了 $\nabla$ (梯度)。这意味着它在<strong>前向传播（Forward）的过程中，手动算了一次梯度下降</strong>来更新记忆。</p>
+<hr />
+<h3>✅ Task 2: 搞清楚变量对应的角色（谁是谁？）</h3>
+<p>在看函数之前，先看输入参数代表什么。</p>
+<ul>
+<li><strong><code>q, k, v</code></strong>: 传统的 Attention 输入。</li>
+<li><strong><code>M</code> (Memory)</strong>: 这里的核心状态，形状是 <code>[D, D]</code> 的矩阵。它既存储历史信息，又充当线性层的权重。</li>
+<li><strong><code>S</code> (Surprise/State)</strong>: 类似于优化器里的“动量”（Momentum），用于平滑梯度的更新。</li>
+<li><strong><code>theta</code> ($\theta$)</strong>: 学习率（Learning Rate）。控制根据当前数据更新多少记忆。</li>
+<li><strong><code>alpha</code> ($\alpha$)</strong>: 遗忘率（Decay）。控制旧的记忆 $M$ 忘掉多少。</li>
+<li><strong><code>eta</code> ($\eta$)</strong>: 动量系数。控制 $S$ 保留多少之前的状态。</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 研读 <code>titans_linear</code> 函数（慢速、直观的循环版）</h3>
+<p>这是最容易理解的部分，因为它是一个 <code>for</code> 循环，模拟了时间步 $t$ 一步步走的过程。</p>
+<p><strong>代码逻辑拆解：</strong></p>
+<ol>
+<li><strong>初始化：</strong> <code>M_prev</code> (记忆) 和 <code>S_prev</code> (动量) 初始化为 0。</li>
+<li><strong>循环 <code>for t in range(T)</code>：</strong><ul>
+<li><strong>第一步：计算预测误差（梯度计算）</strong><ul>
+<li><code>km = k_t @ M_prev_nabla</code>: 用旧记忆去预测当前的 Key。</li>
+<li><code>reconstruction_target = v_t - k_t</code>: 目标是重建 Value。</li>
+<li><code>grad = ...</code>: 算出预测错了多少（这就是梯度）。</li>
+<li><code>v_new</code>: 基于梯度处理后的更新向量。</li>
+</ul>
+</li>
+<li><strong>第二步：更新短期状态 $S$</strong><ul>
+<li><code>S_t = eta_t * S_prev - ...</code>: 动量衰减，并加上新的梯度信息。</li>
+</ul>
+</li>
+<li><strong>第三步：更新长期记忆 $M$</strong><ul>
+<li><code>M_t = (1 - alpha_t) * M_prev + S_t</code>: 记忆衰减，并并入短期状态。</li>
+</ul>
+</li>
+<li><strong>第四步：利用新记忆输出</strong><ul>
+<li><code>output_t = q_t @ M_t</code>: 用更新后的记忆 $M_t$ 处理 Query，得到输出。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<p><strong>总结 Task 3：</strong> 这是一个在一个 Layer 内部实现的“迷你梯度下降”循环。</p>
+<hr />
+<h3>✅ Task 4: 研读辅助函数（为并行化做数学准备）</h3>
+<p><code>titans_linear</code> 用了 <code>for</code> 循环，速度太慢（无法并行）。为了加速，我们需要把循环变成矩阵乘法（Chunkwise Parallelization）。
+文件开头的几个函数 <code>cal_n</code>, <code>cal_f</code>, <code>cal_G</code>, <code>combine_params</code> 都是在做<strong>数学公式的展开</strong>。</p>
+<ul>
+<li><strong>问题：</strong> $M_t$ 依赖 $M_{t-1}$，这怎么并行？</li>
+<li><strong>解决：</strong> 类似于 $y_t = a \cdot y_{t-1} + x_t$，展开后 $y_t$ 是所有历史 $x$ 的加权和。</li>
+<li><strong><code>combine_params</code></strong>: 它的作用是算出从 $t=0$ 到 $t=chunk_size$ 期间，$\alpha, \eta, \theta$ 这些参数累积起来的总系数。<ul>
+<li><code>beta</code>: 累积的遗忘门（$\prod (1-\alpha)$）。</li>
+<li><code>m</code>: 累积的动量门。</li>
+<li><code>n</code>: 交叉项的累积。</li>
+</ul>
+</li>
+<li><strong><code>cal_G</code> / <code>cal_n</code></strong>: 这些是在构建巨大的<strong>因果掩码矩阵（Causal Mask Matrices）</strong>。它们决定了在一个 Chunk（块）内部，第 $i$ 个 token 对第 $j$ 个 token 有多大的影响。</li>
+</ul>
+<p><strong>总结 Task 4：</strong> 这些函数在预计算“权重衰减”和“前缀和”，为了让 GPU 能一次性算出一整个 Chunk 的结果，而不是写 <code>for</code> 循环。</p>
+<hr />
+<h3>✅ Task 5: 研读 <code>chunk_titans_linear</code>（高速、分块版）</h3>
+<p>这是实际工程中会跑的代码。它结合了“并行计算”和“循环更新”。</p>
+<p><strong>逻辑拆解：</strong></p>
+<ol>
+<li><strong>分块 (Reshape):</strong> 把长序列 <code>T</code> 切成很多小块 <code>Chunk</code>。</li>
+<li><strong>块间循环 (Loop over chunks):</strong><ul>
+<li>虽然不能全并行，但我们可以以 Chunk 为单位进行循环。</li>
+</ul>
+</li>
+<li><strong>块内并行 (Inside the loop):</strong><ul>
+<li>调用 <code>combine_params</code>：一次性算出这个块内所有的衰减系数矩阵 <code>G</code>, <code>beta</code>, <code>n</code> 等。</li>
+<li><code>Attn = ... * G</code>: 计算块内的注意力分数（这里利用了刚才算的 G 矩阵）。</li>
+<li><strong>核心更新：</strong><ul>
+<li><code>output_t = beta @ q_i @ M_prev + ...</code>:
+    这里的输出 = (旧记忆的残留贡献) + (当前块内新产生的信息贡献)。</li>
+<li><code>M_t = ...</code>: 算出这个块结束时，最终的 $M$ 长什么样，传给下一个块用。</li>
+</ul>
+</li>
+<li>这完全避免了在 Chunk 内部写 <code>for</code> 循环，利用了 GPU 的矩阵乘法加速。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🚀 总结：这个文件到底在讲啥？</h3>
+<p><strong>一句话总结：</strong>
+这是一个名为 <strong>Titans</strong> 的线性注意力机制的参考实现。它通过在推理时根据输入数据<strong>动态计算梯度并更新内部记忆矩阵 $M$</strong>，让模型具有更强的“短期记忆”能力。</p>
+<p><strong>文件结构总览：</strong>
+1.  <strong><code>cal_n</code>, <code>cal_f</code>, <code>combine_params</code></strong>: 数学工具人。负责把递归公式展开成矩阵形式，方便并行计算。
+2.  <strong><code>titans_linear</code></strong>: <strong>慢速版</strong>。用 Python 循环一步步模拟，方便你理解原理和调试逻辑。
+3.  <strong><code>chunk_titans_linear</code></strong>: <strong>加速版</strong>。把序列切块，块内并行运算，块间串行传递记忆。这是 Linear Attention 常见的加速手段（Chunkwise Parallel Form）。
+4.  <strong><code>chunk_titans_linear_ref</code></strong>: 包装器。负责处理 Padding 和模式选择。</p>
+<p>现在，你可以试着回去只看 <code>titans_linear</code> 函数，把它当成一个带有“自我修正”功能的 RNN 来看，就会好懂很多了。</p>

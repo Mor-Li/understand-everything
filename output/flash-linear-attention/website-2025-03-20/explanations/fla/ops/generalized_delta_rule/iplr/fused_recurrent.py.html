@@ -1,0 +1,139 @@
+<h1>fla/ops/generalized_delta_rule/iplr/fused_recurrent.py</h1>
+<p>这份代码确实非常硬核，因为它涉及到<strong>深度学习底层算子优化（Triton）</strong>、<strong>线性注意力机制（Linear Attention）</strong>以及<strong>循环神经网络（RNN）的变体</strong>。看不懂是很正常的。</p>
+<p>为了让你理解，我把这个任务拆解成一个 <strong>“学习清单（Todo List）”</strong>，我们一步一步来攻克它。</p>
+<hr />
+<h3>✅ Task 1：搞清楚这是在干什么（大背景）</h3>
+<p>首先，不要看代码细节，先看这个文件是用来做什么的。</p>
+<ul>
+<li><strong>背景</strong>：在大模型（LLM）领域，除了Transformer，还有一类叫 RWKV、Mamba 或者 RetNet 的模型。它们试图用 RNN 的方式（一步步推理）来达到 Transformer 的效果。</li>
+<li><strong>核心机制</strong>：这类模型的核心是一个<strong>巨大的“记忆矩阵”（Hidden State，代码里的 <code>h</code>）</strong>。<ul>
+<li>每读入一个词（token），模型就更新一下记忆矩阵。</li>
+<li>根据当前的记忆矩阵，预测下一个词。</li>
+</ul>
+</li>
+<li><strong>文件目的</strong>：这个脚本是用 <strong>OpenAI Triton</strong> 语言编写的，目的是在 GPU 上<strong>极速</strong>地执行这个“更新记忆 + 预测”的过程。</li>
+<li><strong>关键词</strong>：<code>Fused</code>（融合，指把很多步操作合在一起做以加速）、<code>Recurrent</code>（循环，指时间步 t 依赖 t-1）、<code>IPLR Delta Rule</code>（一种具体的数学更新公式）。</li>
+</ul>
+<hr />
+<h3>✅ Task 2：理解数学公式（核心逻辑）</h3>
+<p>代码里所有的 <code>q, k, v, a, b</code> 都是数学公式里的变量。我们把注释里的公式翻译成人话。</p>
+<p><strong>公式逻辑：</strong>
+想象你在记笔记（写日记）。
+1.  <strong>$S_{t-1}$</strong>：你昨天的记忆（状态矩阵）。
+2.  <strong>$k_t, v_t$</strong>：今天新发生的事情（新的键值对信息）。
+3.  <strong>$a_t, b_t$</strong>：这是这个算法特有的。它们决定了<strong>如何遗忘昨天的事情</strong>以及<strong>如何把新事情融合进去</strong>（这是一种低秩更新，Low-Rank Update）。</p>
+<p><strong>代码实现的公式（简化版）：</strong>
+1.  <strong>更新记忆 ($h$)</strong>：
+    $$h_{new} = h_{old} + (h_{old} \cdot a) \cdot b^T + k \cdot v^T$$
+    *   意思是：新的记忆 = 旧记忆 + (根据 $a, b$ 对旧记忆做的某种变形) + (新输入的信息 $k, v$)。
+2.  <strong>计算输出 ($o$)</strong>：
+    $$o_t = h_{new} \cdot q_t$$
+    *   意思是：根据最新的记忆，结合当前的查询 ($q$)，得到输出。</p>
+<hr />
+<h3>✅ Task 3：拆解代码变量（变量字典）</h3>
+<p>现在我们对照代码里的 <code>fused_recurrent_fwd_kernel</code> 函数，看看参数都是啥：</p>
+<ul>
+<li><strong>输入数据</strong>：<ul>
+<li><code>q</code> (Query): 查询向量，想从记忆里检索什么。</li>
+<li><code>k</code> (Key), <code>v</code> (Value): 写入记忆的新内容。</li>
+<li><code>a</code>, <code>b</code>: 控制记忆更新/遗忘的门控向量（这是 IPLR Delta Rule 的特色）。</li>
+</ul>
+</li>
+<li><strong>记忆状态</strong>：<ul>
+<li><code>h0</code>: 初始记忆状态（比如上一段话留下的记忆）。</li>
+<li><code>ht</code>: 最终记忆状态（这段话读完后剩下的记忆）。</li>
+</ul>
+</li>
+<li><strong>中间变量</strong>：<ul>
+<li><code>ha</code>: 这是一个临时变量，存下来为了反向传播（训练）时算梯度用的。</li>
+</ul>
+</li>
+<li><strong>维度</strong>：<ul>
+<li><code>B</code>: Batch size (批次大小)</li>
+<li><code>H</code>: Head (多头注意力的头数)</li>
+<li><code>T</code>: Sequence length (句子长度)</li>
+<li><code>K</code>, <code>V</code>: 特征维度大小</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 4：一步步“跑”一遍前向传播（Forward Kernel）</h3>
+<p>让我们假装自己是 GPU，跑一遍 <code>fused_recurrent_fwd_kernel</code> 里的核心循环。</p>
+<p><strong>代码片段：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这里的循环是按时间步 T 进行的，也就是从句子的第1个字读到最后1个字</span>
+<span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">T</span><span class="p">):</span>
+    <span class="c1"># 1. 加载当前时刻的数据</span>
+    <span class="n">b_k</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_k</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span> 
+    <span class="n">b_v</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_v</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+    <span class="n">b_q</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_q</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+    <span class="n">b_a</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_a</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+    <span class="n">b_b</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_b</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># 2. 计算记忆更新 (对应公式 h_new = h + (h*a)*b + k*v)</span>
+    <span class="c1"># 先算 h * a，存到 tmp 里</span>
+    <span class="n">tmp</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">b_h</span> <span class="o">*</span> <span class="n">b_a</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:],</span> <span class="n">axis</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span> 
+    <span class="c1"># 再更新 b_h (也就是 h)</span>
+    <span class="c1"># b_h += tmp * b + k * v</span>
+    <span class="n">b_h</span> <span class="o">+=</span> <span class="p">(</span><span class="n">tmp</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">*</span> <span class="n">b_b</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]</span> <span class="o">+</span> <span class="n">b_k</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]</span> <span class="o">*</span> <span class="n">b_v</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">])</span>
+
+    <span class="c1"># 3. 计算输出 (对应公式 o = h * q)</span>
+    <span class="n">_o</span> <span class="o">=</span> <span class="n">b_h</span> <span class="o">*</span> <span class="n">b_q</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]</span>
+    <span class="n">_o</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">_o</span><span class="p">,</span> <span class="n">axis</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+
+    <span class="c1"># 4. 把结果写回显存</span>
+    <span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">p_o</span><span class="p">,</span> <span class="n">_o</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+    <span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">p_ha</span><span class="p">,</span> <span class="n">tmp</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span> <span class="c1"># 存下中间结果给反向传播用</span>
+
+    <span class="c1"># 5. 指针移动到下一个时间步</span>
+    <span class="n">p_q</span> <span class="o">+=</span> <span class="o">...</span> 
+    <span class="o">...</span>
+</code></pre></div>
+
+<p><strong>通俗解释：</strong>
+1.  <strong>Load</strong>: GPU 抓取当前字对应的 $q, k, v, a, b$。
+2.  <strong>Update</strong>: 这是一个累加过程。<code>b_h</code> 就像一个在大锅里不断熬煮的汤。每一步，我们都往里加点佐料 ($k, v$)，同时根据 $a, b$ 搅动一下这锅汤（改变之前的味道）。
+3.  <strong>Output</strong>: 舀一勺汤出来给用户喝 ($o$)。
+4.  <strong>Loop</strong>: 继续处理下一个字。</p>
+<hr />
+<h3>✅ Task 5：理解为什么要写得这么复杂（优化原因）</h3>
+<p>你可能会问：<em>“为什么要用 Triton 写？用 PyTorch 的 <code>for</code> 循环写不行吗？”</em></p>
+<p><strong>原因：IO 瓶颈（Memory Wall）。</strong></p>
+<ul>
+<li>
+<p><strong>PyTorch 写法</strong>：</p>
+<ol>
+<li>读取 $h_{t-1}, k, v$ 到 GPU 核心。</li>
+<li>算出 $h_t$，<strong>写回</strong> GPU 显存。</li>
+<li>读取 $h_t, q$，算出 $o_t$，<strong>写回</strong> GPU 显存。</li>
+<li>下一轮循环，<strong>再次读取</strong> $h_t$...</li>
+<li><em>问题</em>：数据在 GPU 的计算核心（SRAM）和 显存（HBM）之间疯狂搬运，速度极慢。</li>
+</ol>
+</li>
+<li>
+<p><strong>Triton 写法（Fused/融合）</strong>：</p>
+<ol>
+<li>把 $h$ 放在 GPU 的计算核心（SRAM/寄存器）里，<strong>死都不放回去</strong>。</li>
+<li>循环 $T$ 次，每次只读取极小的 $q,k,v$。</li>
+<li>$h$ 一直在核心里更新。</li>
+<li>直到所有字处理完，才把最终的 $h$ 写回去（如果需要的话）。</li>
+<li><em>优势</em>：极大地减少了读写显存的次数，速度快几十倍。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 6：关于 Backward Kernel（反向传播）</h3>
+<p>文件里还有一大块 <code>fused_recurrent_bwd_kernel</code>。</p>
+<ul>
+<li><strong>这是啥？</strong> 这是为了训练模型用的。</li>
+<li><strong>干嘛的？</strong> 神经网络训练需要计算梯度（Gradients）。因为我们前向传播是手写的 Triton 代码，PyTorch 的自动求导（Autograd）推导不出来这个复杂过程的梯度，所以开发者必须<strong>手写反向传播的计算逻辑</strong>。</li>
+<li><strong>逻辑</strong>：基本上是前向传播的逆运算，从最后一个时间步往回推，算出 $q, k, v, a, b$ 应该怎么调整才能让误差变小。</li>
+<li><strong>初学者建议</strong>：直接跳过。只要知道它是为了支持 <code>loss.backward()</code> 就行。</li>
+</ul>
+<hr />
+<h3>总结：这个文件讲了啥？</h3>
+<p><strong>一句话总结：</strong>
+这是一个为某种线性 RNN 模型（IPLR 变体）编写的<strong>高性能 GPU 加速算子</strong>，它在一个内核函数中完成了整个序列的<strong>记忆更新</strong>和<strong>输出计算</strong>，避免了显存的频繁读写。</p>
+<p><strong>你的阅读顺序建议：</strong>
+1.  看最下面的 <code>fused_recurrent_iplr_delta_rule</code> 函数：这是给用户调用的接口，看输入输出注释。
+2.  看 <code>fused_recurrent_fwd_kernel</code> 中的 <code>for</code> 循环：这是算法的数学核心。
+3.  忽略 <code>bwd</code> kernel 和具体的指针计算细节（那些 <code>offsets</code>, <code>HEAD_FIRST</code> 都是工程实现的细节处理）。</p>

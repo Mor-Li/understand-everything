@@ -1,0 +1,128 @@
+<h1>fla/ops/generalized_delta_rule/dplr/chunk_h_fwd.py</h1>
+<p>这份代码确实非常硬核，因为它是用 <strong>Triton</strong> 编写的高性能深度学习算子。Triton 是专门用来给 GPU 写底层并行计算逻辑的语言，比普通的 PyTorch 代码难懂得多。</p>
+<p>这份文件的核心目的是：<strong>在一个序列模型（比如 Linear Attention 或 Mamba 变体）中，利用“分块（Chunking）”技术，高效地计算隐藏状态 $h$ 的前向传播。</strong></p>
+<p>为了让你听懂，我把阅读这份代码的任务拆解成一个 <strong>“通关任务清单” (Todo List)</strong>。我们一步一步来解锁。</p>
+<hr />
+<h3>🗺️ 任务清单：从宏观到微观</h3>
+<ol>
+<li><strong>Task 1: 搞懂背景</strong> —— 我们到底在算什么？（数学逻辑）</li>
+<li><strong>Task 2: 搞懂数据流</strong> —— 输入和输出是什么？</li>
+<li><strong>Task 3: 搞懂并行策略</strong> —— 为什么要分块 (Chunk)？</li>
+<li><strong>Task 4: 核心循环拆解</strong> —— 状态 $h$ 是怎么一步步更新的？</li>
+<li><strong>Task 5: 细节攻坚</strong> —— 那些奇怪的 <code>block_ptr</code> 和 <code>mask</code> 是干嘛的？</li>
+</ol>
+<hr />
+<h3>✅ Task 1: 搞懂背景 —— 我们在算什么？</h3>
+<p>这就好比你在做一个<strong>循环神经网络 (RNN)</strong>。
+RNN 的核心逻辑是：<strong>“记住过去，更新现在”</strong>。
+公式通常长这样：
+$$ h_t = h_{t-1} \times \text{衰减} + \text{新的输入信息} $$</p>
+<ul>
+<li>$h_{t-1}$: 上一步的记忆。</li>
+<li>$\text{衰减}$: 遗忘一部分旧记忆（代码中的 <code>gk</code> 相关）。</li>
+<li>$\text{新的输入信息}$: 当前时刻 $t$ 发生的事（代码中的 $k, v, w, u$ 算出来的）。</li>
+</ul>
+<p><strong>这份代码的目标：</strong> 算出每一个时间块（Chunk）结束时的那个 $h$ 状态。</p>
+<hr />
+<h3>✅ Task 2: 搞懂数据流 —— 输入和输出</h3>
+<p>看 Python 函数 <code>chunk_dplr_fwd_h</code> 的参数，把它们想象成食材：</p>
+<ul>
+<li><strong>输入 (Ingredients):</strong><ul>
+<li><code>h0</code> (Initial State): 初始记忆（如果有的话）。</li>
+<li><code>kg</code>, <code>bg</code>: 键 (Key) 和相关的门控信号。</li>
+<li><code>v</code>, <code>w</code>, <code>u</code>: 值 (Value) 和更新规则相关的投影矩阵。</li>
+<li><code>gk</code>: 全局衰减率 (Global Decay)，决定忘掉多少过去的信息。</li>
+</ul>
+</li>
+<li><strong>输出 (Dish):</strong><ul>
+<li><code>h</code>: 这是一个巨大的 Tensor，保存了每个时间块结束时的记忆状态。</li>
+<li><code>v_new</code>: 计算过程中产生的一个中间修正值（基于 Delta Rule）。</li>
+<li><code>final_state</code>: 跑完整个序列后最终剩下的记忆。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 搞懂并行策略 —— 为什么要分块？</h3>
+<p>普通的 RNN 必须一步一步算（$t=1$, 然后 $t=2$...），太慢了，GPU 没法并行。
+<strong>Chunking（分块）</strong> 是为了加速：</p>
+<ol>
+<li>把长序列（比如长度 4096）切成很多小块（比如每块 64 长度，即 <code>BT=64</code>）。</li>
+<li><strong>块内并行</strong>：在一个块内部，用矩阵乘法快速算出“增量”。</li>
+<li><strong>块间串行</strong>：算完块 1 的 $h$，传给块 2，再传给块 3...</li>
+</ol>
+<p><strong>代码对应：</strong>
+Triton Kernel 里的 <code>NT</code> 就是块的数量。代码主体是一个 <code>for i_t in range(NT):</code> 的循环，意思就是<strong>“一个块接一个块地更新 $h$”</strong>。</p>
+<hr />
+<h3>✅ Task 4: 核心循环拆解 —— 状态 $h$ 是怎么更新的？</h3>
+<p>这是最难的部分，我们看 <code>chunk_dplr_fwd_kernel_h</code> 里面的那个大 <code>for</code> 循环。</p>
+<h4>步骤 4.1: 加载上一个状态</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 如果是第一个块，且有初始状态 h0，就加载它。</span>
+<span class="c1"># 否则，b_h 一开始是 0。</span>
+<span class="c1"># 随着循环进行，b_h 保存的就是“上一个块结束时的 h”。</span>
+</code></pre></div>
+
+<h4>步骤 4.2: 计算当前块内的变化 (Intra-chunk computation)</h4>
+<p>你会看到里面还有一个小循环 <code>for i_c in range(...)</code>:
+这是因为显存（SRAM）太小了，即使是 64 长度的块，有时也要再切碎一点算。</p>
+<p>在小循环里，它做了两件大事：
+1.  <strong>计算修正后的 V (<code>v_new</code>)</strong>:
+    <code>python
+    # b_w * b_h + b_u
+    # 这里用当前的记忆 h 去修正输入 u，得到 v2
+    b_v2 = tl.dot(b_w, b_h.to(b_w.dtype)) + tl.load(p_u, ...)</code>
+2.  <strong>累加当前块的信息 (<code>b_hc</code>)</strong>:
+    <code>python
+    # 这一步是在算：这个块里到底积累了多少新信息？
+    # 类似于 K * V 的操作
+    b_hc += tl.dot(b_kg, b_v)
+    b_hc += tl.dot(b_bg, b_v2)</code></p>
+<h4>步骤 4.3: 跨块更新 (Inter-chunk recurrence)</h4>
+<p>小循环结束后，我们有了两样东西：
+1.  <code>b_h</code>: 上一个块传过来的老记忆。
+2.  <code>b_hc</code>: 当前这个块里新产生的信息总和。</p>
+<p>现在要合并它们：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 加载衰减率 (decay)</span>
+<span class="n">b_g_last</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">gk</span> <span class="o">+</span> <span class="o">...</span><span class="p">)</span>
+
+<span class="c1"># 2. 老记忆衰减： h_old = h_old * exp(decay)</span>
+<span class="c1"># 这一步就是“遗忘”</span>
+<span class="n">b_h</span> <span class="o">*=</span> <span class="n">exp</span><span class="p">(</span><span class="n">b_g_last</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">])</span>
+
+<span class="c1"># 3. 加上新信息： h_new = h_old + h_current_chunk</span>
+<span class="n">b_h</span> <span class="o">+=</span> <span class="n">b_hc</span>
+</code></pre></div>
+
+<p><strong>这就完成了一次 RNN 的更新！</strong></p>
+<h4>步骤 4.4: 保存</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 把算好的当前块的 h 存回显存</span>
+<span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">p_h</span><span class="p">,</span> <span class="n">b_h</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<hr />
+<h3>✅ Task 5: 细节攻坚 —— Triton 的“黑魔法”</h3>
+<p>代码里有很多 <code>tl.make_block_ptr</code>，这是什么？</p>
+<ul>
+<li><strong>问题</strong>：GPU 显存是一维的，但矩阵是二维的。怎么快速把一块 $64 \times 64$ 的矩阵切出来搬到计算单元（SRAM）里？</li>
+<li><strong>旧方法</strong>：算一大堆 <code>stride</code>（步长）和 <code>offset</code>（偏移量），很容易写错。</li>
+<li><strong>新方法 (<code>block_ptr</code>)</strong>：这是 Triton 的高级功能。你告诉它：“我的大矩阵在内存里长这样，我要切这一小块”，它自动帮你生成指针，不仅代码整洁，而且加载速度极快。</li>
+</ul>
+<p><strong>代码里的 <code>HEAD_FIRST</code> 是什么？</strong>
+这是内存布局的两种格式：
+*   <code>HEAD_FIRST</code>: <code>[Batch, Head, Time, Dim]</code> (B, H, T, D)
+*   否则: <code>[Batch, Time, Head, Dim]</code> (B, T, H, D)
+Triton 需要根据不同的布局调整读取内存的跳跃方式。</p>
+<hr />
+<h3>总结：这段代码讲了个什么故事？</h3>
+<p>想象你在写日记（$h$ 是你的记忆）：</p>
+<ol>
+<li><strong>准备</strong>：你把一个月（序列 $T$）分成了 4 周（Chunks）。</li>
+<li><strong>循环</strong>：你开始从第一周回顾。</li>
+<li><strong>块内计算</strong>：在这一周里，发生了很多事（$k, v, u$）。你根据这周开始时的记忆（$h$），结合这周发生的新事，整理出了这周的“总结”（$b_{hc}$）。</li>
+<li><strong>状态更新</strong>：<ul>
+<li>你先忘掉一些太久远的事情（<code>b_h *= decay</code>）。</li>
+<li>然后把这周的“总结”加进脑子里（<code>b_h += b_{hc}</code>）。</li>
+</ul>
+</li>
+<li><strong>存储</strong>：你把现在的记忆状态写在日记本边缘（存入 <code>h</code>），然后带着这个记忆进入下一周。</li>
+</ol>
+<p>这就是 <code>chunk_h_fwd.py</code> 做的事情：<strong>高效地并行计算每一段“日记”结束时的记忆状态。</strong></p>

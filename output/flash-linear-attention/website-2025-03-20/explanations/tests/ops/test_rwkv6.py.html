@@ -1,0 +1,95 @@
+<h1>tests/ops/test_rwkv6.py</h1>
+<p>没问题，这个文件确实包含了很多深度学习框架（PyTorch）和测试框架（Pytest）的术语，如果不是专门做底层算子开发的，看起来会非常晕。</p>
+<p>简单来说，这个文件的<strong>核心目的</strong>是：<strong>“对答案”</strong>。</p>
+<p>它在测试一个新的算法实现（叫 <code>chunk_rwkv6</code>，可能是为了加速而写的），为了证明它是对的，它需要和另一个已知正确的、标准的算法实现（叫 <code>fused_recurrent_rwkv6</code>）进行比对。如果两者的输出结果和反向传播的梯度几乎一模一样，测试就通过。</p>
+<p>下面我为你列一个<strong>Task To-Do List</strong>，把代码的逻辑拆解成几个步骤，然后一步步给你讲。</p>
+<hr />
+<h3>📋 任务清单 (Task To-Do List)</h3>
+<ol>
+<li><strong>准备工具 (Helper Functions)</strong>: 定义好“怎么算误差”和“怎么判断两个数是否相等”的尺子。</li>
+<li><strong>设定测试场景 (Parametrization)</strong>: 设定各种不同的输入形状（比如数据量大小、维度大小），确保算法在各种情况下都能跑通。</li>
+<li><strong>造假数据 (Data Generation)</strong>: 随机生成一堆输入数据（Q, K, V, W, U 等），模拟神经网络的输入。</li>
+<li><strong>跑“标准答案” (Run Reference)</strong>: 用已知正确的慢速/标准方法跑一遍，拿到结果和梯度。</li>
+<li><strong>跑“待测答案” (Run Target)</strong>: 用我们要测试的新方法（Chunk模式）跑一遍，拿到结果和梯度。</li>
+<li><strong>对比结果 (Assertion)</strong>: 比较步骤4和步骤5的结果。如果误差极小，则测试通过；否则报错。</li>
+<li><strong>进阶测试 (Variable Length)</strong>: 重复上述步骤，但这次测试更复杂的“变长序列”情况（模拟真实对话中句子长短不一的场景）。</li>
+</ol>
+<hr />
+<h3>🧐 详细步骤讲解</h3>
+<h4>Step 1: 准备工具 (Helper Functions)</h4>
+<p>代码最开头定义的几个函数，是用来做数学检查的。</p>
+<ul>
+<li><code>get_abs_err(x, y)</code>: 计算绝对误差。就是看 $x$ 和 $y$ 最大差了多少。</li>
+<li><code>get_err_ratio(x, y)</code>: 计算相对误差比例。</li>
+<li><code>assert_close(...)</code>: <strong>这是裁判</strong>。它会调用上面两个函数，如果误差超过了允许的范围（<code>ratio</code>），它就会让程序报错（Assert Fail），并打印出差了多少。</li>
+</ul>
+<h4>Step 2: 设定测试场景 (Parametrization)</h4>
+<p>看到 <code>@pytest.mark.parametrize</code> 了吗？这是 Pytest 的功能。
+它的意思是：“不要只测一次，要用不同的参数组合测很多次”。</p>
+<ul>
+<li><code>B</code>: Batch size (一次处理多少条数据)。</li>
+<li><code>T</code>: Time steps (序列长度，比如一句话有多少个字)。</li>
+<li><code>H</code>: Heads (多头注意力的头数)。</li>
+<li><code>D</code>: Dimension (每个头的维度大小)。</li>
+<li><code>dtype</code>: 数据类型 (如 bfloat16)。</li>
+</ul>
+<p>代码会把这些参数像排列组合一样全部试一遍，保证算法在 $T=130$ 时能用，在 $T=2048$ 时也能用。</p>
+<h4>Step 3: 造假数据 (Data Generation)</h4>
+<p>进入 <code>test_chunk</code> 函数内部：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">q</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">k</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">v</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="o">...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>Q, K, V, W, U</strong>: 这些是 RWKV6 模型的核心参数。代码用 <code>torch.randn</code> 生成了全是随机数的矩阵。</li>
+<li><strong>requires_grad=True</strong>: 这很重要。这告诉 PyTorch：“我要训练这些参数，请记住它们的计算过程，以便通过反向传播算梯度”。</li>
+<li><strong>head_first</strong>: 这是一个数据排布格式（是 [Batch, Head, Time] 还是 [Batch, Time, Head]），代码根据这个参数生成不同形状的张量。</li>
+</ul>
+<h4>Step 4: 跑“标准答案” (Run Reference)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">ref</span><span class="p">,</span> <span class="n">ref_ht</span> <span class="o">=</span> <span class="n">fused_recurrent_rwkv6</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="p">((</span><span class="n">ref</span> <span class="o">*</span> <span class="n">do</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+</code></pre></div>
+
+<ul>
+<li>这里调用了 <code>fused_recurrent_rwkv6</code>。在测试逻辑里，这通常被视为<strong>Baseline (基准)</strong>或者 Ground Truth。它是基于 RNN（循环神经网络）模式的实现，通常计算结果最精确，但可能速度较慢（串行计算）。</li>
+<li><strong><code>.backward()</code></strong>: 这行代码模拟了神经网络的“训练”过程。它计算了梯度。</li>
+<li><strong>保存结果</strong>: 代码把算出来的输出 (<code>ref</code>) 和各个参数的梯度 (<code>q.grad</code>, <code>k.grad</code> 等) 都存到了 <code>ref_dq</code>, <code>ref_dk</code> 变量里，并把原来的梯度清空 (<code>None</code>)，为下一步做准备。</li>
+</ul>
+<h4>Step 5: 跑“待测答案” (Run Target)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">tri</span><span class="p">,</span> <span class="n">tri_ht</span> <span class="o">=</span> <span class="n">chunk_rwkv6</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="p">((</span><span class="n">tri</span> <span class="o">*</span> <span class="n">do</span><span class="p">)</span><span class="o">.</span><span class="n">sum</span><span class="p">())</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+</code></pre></div>
+
+<ul>
+<li>这里调用了 <code>chunk_rwkv6</code>。这是<strong>本次测试的主角</strong>。Chunk 模式通常是一种并行优化的算法，速度更快，但实现复杂容易出错。</li>
+<li>同样，它也跑了一遍前向计算 (<code>tri</code>) 和反向传播 (<code>.backward()</code>)。</li>
+<li>结果保存在 <code>tri_dq</code>, <code>tri_dk</code> 等变量里。</li>
+</ul>
+<h4>Step 6: 对比结果 (Assertion)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">assert_close</span><span class="p">(</span><span class="s1">&#39;  o&#39;</span><span class="p">,</span> <span class="n">ref</span><span class="p">,</span> <span class="n">tri</span><span class="p">,</span> <span class="mf">0.004</span><span class="p">)</span>
+<span class="n">assert_close</span><span class="p">(</span><span class="s1">&#39; dq&#39;</span><span class="p">,</span> <span class="n">ref_dq</span><span class="p">,</span> <span class="n">tri_dq</span><span class="p">,</span> <span class="mf">0.005</span><span class="p">)</span>
+<span class="o">...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>核心逻辑</strong>: 如果 <code>chunk_rwkv6</code> 写得对，那么它的输出 <code>tri</code> 应该等于标准答案 <code>ref</code>。</li>
+<li>不仅输出要一样，算出来的梯度 (<code>dq</code> vs <code>ref_dq</code>) 也必须一样。</li>
+<li><code>0.004</code> / <code>0.005</code>: 这是允许的误差范围（容忍度）。因为浮点数计算总会有微小的精度损失，所以只要误差小于 0.5% 左右通常就算通过。</li>
+</ul>
+<h4>Step 7: 进阶测试 (Variable Length)</h4>
+<p>代码下半部分的 <code>test_chunk_varlen</code> 函数。</p>
+<ul>
+<li><strong>背景</strong>: 在处理自然语言时，一句话长，一句话短。通常我们会把它们拼在一起处理（VarLen / Packed Sequence）。</li>
+<li><strong>Offsets</strong>: 代码里生成了一个 <code>offsets</code> 变量，用来标记每一句话在长序列中的起始和结束位置。</li>
+<li><strong>逻辑</strong>: 这个测试函数重复了 Step 3-6 的过程，但是专门测试 <code>chunk_rwkv6</code> 在处理这种长短不一的数据时，是否依然能和标准答案保持一致。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这篇文章其实就是个<strong>质检员</strong>。</p>
+<ul>
+<li><strong>左手</strong>拿着一本教科书（<code>fused_recurrent</code>，标准的循环模式）。</li>
+<li><strong>右手</strong>拿着一个新发明的计算器（<code>chunk</code>，分块并行模式）。</li>
+<li><strong>任务</strong>：输入一堆随机数字，看左手算出来的结果和右手算出来的是不是一样。如果一样，说明新计算器（代码）没写出的Bug，可以发布使用。</li>
+</ul>

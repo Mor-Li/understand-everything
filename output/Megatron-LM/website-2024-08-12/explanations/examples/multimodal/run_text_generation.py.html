@@ -1,0 +1,81 @@
+<h1>examples/multimodal/run_text_generation.py</h1>
+<p>这份代码确实涉及了很多深度学习（特别是Megatron框架）的工程细节，乍一看很乱。但其实它的逻辑非常清晰，就是一个<strong>“视觉-语言模型（VLM）的推理（Inference）脚本”</strong>。</p>
+<p>简单来说，这个脚本的作用是：<strong>给模型看一张图（和一句话），让模型生成一段文字回答。</strong></p>
+<p>为了让你看懂，我们将这个脚本的工作流程拆解为一个 <strong>Task Todo List</strong>，然后一步步讲解。</p>
+<hr />
+<h3>📋 视觉语言模型推理 Task Todo List</h3>
+<p>要把这个程序跑起来，代码内部其实是在按顺序执行以下任务：</p>
+<ol>
+<li><strong>【准备工作】设定规则</strong>：决定我们要跑什么任务（是看图说话？还是回答问题？），模型参数是多少（温度、Top-k等）。</li>
+<li><strong>【唤醒大脑】加载模型</strong>：初始化Megatron环境，把训练好的模型权重（Checkpoint）加载到显存里。</li>
+<li><strong>【准备食材】数据读取</strong>：根据不同的任务（TextVQA, Captioning, MMMU等），从硬盘里读取图片路径和对应的问题。</li>
+<li><strong>【食材加工】图片预处理</strong>：把图片裁剪、缩放、归一化，变成模型能看懂的数字矩阵（Tensor）。</li>
+<li><strong>【定义思考方式】自定义前向传播</strong>：告诉模型在生成文字时，不仅要看之前的字，还要看刚才处理好的图片。</li>
+<li><strong>【开始生成】推理循环</strong>：把图片和问题喂给模型，让模型逐字生成答案。</li>
+<li><strong>【记录结果】保存文件</strong>：把模型生成的答案写到输出文件中。</li>
+</ol>
+<hr />
+<h3>💡 逐步详细讲解</h3>
+<p>下面我按照上面的 List，对应代码中的具体部分给你讲解。</p>
+<h4>1. 【准备工作】设定规则</h4>
+<p><strong>对应代码：</strong> <code>add_text_generation_args(parser)</code> 函数
+<strong>讲解：</strong>
+这就好比考试前的阅读考生须知。代码定义了一堆参数：
+*   <code>--task</code>: 你要干嘛？是 <code>captioning</code>（给图片写描述），还是 <code>VQAv2</code>（视觉问答），还是 <code>MMMU</code>（多模态理解）？
+*   <code>--temperature</code>, <code>--top_p</code>: 控制模型生成的随机性（是严谨一点还是发散一点）。
+*   <code>--input-image-path</code>: 图片放在哪？
+*   <code>--output-path</code>: 结果存到哪？</p>
+<h4>2. 【唤醒大脑】加载模型</h4>
+<p><strong>对应代码：</strong> <code>main()</code> 函数中的前半部分
+<strong>讲解：</strong>
+*   <code>initialize_megatron(...)</code>: 启动引擎，配置分布式环境（如果用多张卡的话）。
+*   <code>model = get_model(...)</code>: 构建模型的骨架。
+*   <code>load_checkpoint(...)</code>: 把训练好的“脑细胞连接强度”（权重文件）填入骨架，让模型变聪明。
+*   <code>model.eval()</code>: 告诉模型现在是“考试模式”（推理），不是“学习模式”（训练）。</p>
+<h4>3. 【准备食材】数据读取</h4>
+<p><strong>对应代码：</strong> <code>generate_samples(model)</code> 函数中的 <code>if args.task == ...</code> 判断块
+<strong>讲解：</strong>
+因为不同的数据集格式不一样，所以代码里写了一堆 <code>if-else</code>：
+*   <strong>如果是 <code>TextVQA</code> 或 <code>VQAv2</code></strong>：通常是读一个 JSON 文件，里面写着 <code>{ "image": "1.jpg", "question": "图里有几只猫?" }</code>。代码会解析这个列表。
+*   <strong>如果是 <code>captioning</code></strong>：通常直接读取文件夹里所有的图片文件，因为不需要问题（默认问题就是“描述这张图”）。
+*   <strong>如果是 <code>MMMU</code></strong>：这是一个很复杂的评测集，代码甚至调用了 HuggingFace 的库来下载和处理数据。</p>
+<p>这一步结束时，我们得到了一个待处理的列表：<code>images</code>（图片数据）和 <code>questions</code>（对应的提示词）。</p>
+<h4>4. 【食材加工】图片预处理</h4>
+<p><strong>对应代码：</strong> <code>preprocess_image(...)</code> 函数
+<strong>讲解：</strong>
+模型是很挑剔的，它看不懂任意尺寸的 JPG 图片。
+*   <strong>Resize</strong>: 必须把图片缩放到特定大小（比如 336x336 或其他配置）。
+*   <strong>Normalize</strong>: 减去均值，除以方差（代码里的 <code>pixel_mean</code>, <code>pixel_std</code>）。这是为了让图片数据的数学分布更适合神经网络计算。
+*   <strong>Pad</strong>: 如果图片长宽比不对，还要补黑边（Pad），凑成正方形。</p>
+<h4>5. 【定义思考方式】自定义前向传播 (核心难点)</h4>
+<p><strong>对应代码：</strong> <code>class VLMForwardStep(ForwardStep)</code>
+<strong>讲解：</strong>
+这是最容易看不懂的地方。
+普通的语言模型（LLM）生成文字时，输入只有文字。但这里是 <strong>VLM</strong>。
+*   这个类继承了 <code>ForwardStep</code>，它重写了 <code>_forward</code> 方法。
+*   <strong>关键点</strong>：<code>self.model(self._images, tokens, ...)</code>。
+*   它强制模型在计算的时候，<strong>同时接收</strong> <code>_images</code>（刚才处理好的图片）和 <code>tokens</code>（文字）。
+*   逻辑是：在生成第一个字之前，模型内部会先把图片变成一堆“视觉Token”，拼在文字Token前面。</p>
+<h4>6. 【开始生成】推理循环</h4>
+<p><strong>对应代码：</strong> <code>generate_samples</code> 函数里的 <code>while idx &lt; num_samples:</code> 循环
+<strong>讲解：</strong>
+这里是流水线作业：
+1.  <strong>构建 Prompt</strong>：
+    *   如果是 <code>captioning</code>，提示词写死为 "Give a short and clear explanation..."。
+    *   如果是 <code>VQAv2</code>，提示词是 "Given the image, answer..." + 具体问题。
+2.  <strong>调用 API</strong>：
+    *   <code>generate_and_post_process(...)</code>：这是 Megatron 封装好的函数。它会拿着我们定义的 <code>VLMForwardStep</code>（带图片的计算方式），根据提示词，一个词一个词地往后蹦（Generate），直到达到长度限制或模型输出“结束符”。
+3.  <strong>后处理</strong>：
+    *   模型输出的是一串数字 ID，这里会把它解码回人类能看的文字。
+    *   对于选择题（如 MMMU），还会把生成的文字解析成选项（A, B, C, D）。</p>
+<h4>7. 【记录结果】保存文件</h4>
+<p><strong>对应代码：</strong> <code>generate_and_write_samples(model)</code>
+<strong>讲解：</strong>
+*   这是一个生成器（Generator）的用法。
+*   每当 <code>generate_samples</code> 产出一个结果，这里就立马打开文件 <code>f.write(...)</code> 写入一行 JSON。
+*   这样做的好处是：如果跑了一半程序崩了，前面的结果已经保存下来了，不用重跑。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件的核心逻辑就是：
+<strong>“读取配置 -&gt; 加载模型 -&gt; 循环读取图片和问题 -&gt; 把图片处理成数学矩阵 -&gt; 连同问题一起塞给模型 -&gt; 模型吐出答案 -&gt; 存盘”。</strong></p>
+<p>你之所以觉得难懂，可能是因为里面夹杂了太多为了兼容不同数据集（VQA, MMMU等）的“脏活累活”代码，以及 Megatron 特有的分布式处理逻辑。如果只看主干，它就是一个标准的推理脚本。</p>

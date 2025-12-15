@@ -1,0 +1,104 @@
+<h1>megatron/core/packed_seq_params.py</h1>
+<p>这份代码看起来虽然只有短短几行，但它背后涉及到大模型训练中一个非常硬核且核心的优化技术：<strong>变长序列处理（Variable Length Sequences）</strong> 或者叫 <strong>Sequence Packing（序列打包）</strong>。</p>
+<p>之所以看不懂，是因为它全是“元数据”（Metadata），是用来告诉底层 GPU 算子（比如 FlashAttention）如何处理数据的。</p>
+<p>为了让你听懂，我制定了 <strong>5 个 Task</strong> 的学习清单，咱们一步步来通关：</p>
+<hr />
+<h3>📋 学习清单 (Todo List)</h3>
+<ol>
+<li><strong>Task 1：理解“为什么要打包” (The Why)</strong> —— 告别 Padding 的浪费。</li>
+<li><strong>Task 2：理解“打包后的样子” (The Shape)</strong> —— 什么是 <code>thd</code> 格式。</li>
+<li><strong>Task 3：核心难点 <code>cu_seqlens</code> (The Logic)</strong> —— 怎么告诉 GPU 哪里是句子的头和尾。</li>
+<li><strong>Task 4：对应代码字段 (The Code)</strong> —— 逐行解释代码里的变量。</li>
+<li><strong>Task 5：总结 (The Summary)</strong> —— 这到底是个啥。</li>
+</ol>
+<hr />
+<h3>🟢 Task 1：理解“为什么要打包” (The Why)</h3>
+<p><strong>传统做法（Padding）：</strong>
+假设你是一个快递员（GPU），你要运送箱子（Batch）。
+*   客户A寄了一根笔（长度 5）。
+*   客户B寄了一把吉他（长度 100）。
+为了整齐，你必须用两个一样大的箱子（长度都按 100 算）。
+*   结果：装笔的箱子里塞了 95% 的泡沫填充物（Padding）。
+*   <strong>后果：GPU 在计算这些泡沫（Padding 0），浪费了巨大的算力。</strong></p>
+<p><strong>优化做法（Packing）：</strong>
+*   你把笔和吉他拿出来，<strong>首尾相连</strong>，拼成一个长条。
+*   中间不留空隙。
+*   <strong>后果：没有泡沫了，GPU 满负荷运转，效率极高。</strong></p>
+<blockquote>
+<p>这个 <code>PackedSeqParams</code> 类，就是为了描述这种“首尾相连”的数据状态。</p>
+</blockquote>
+<hr />
+<h3>🟢 Task 2：理解“打包后的样子” (The Shape)</h3>
+<p>代码注释里提到了 <code>thd</code> 格式。这是什么意思？</p>
+<ul>
+<li><strong>普通数据形状</strong>：<code>[Batch Size, Sequence Length, Hidden Size]</code><ul>
+<li>这是一个方方正正的立方体，因为有 Padding 强行对齐。</li>
+</ul>
+</li>
+<li><strong>打包数据形状</strong>：<code>[Total Tokens, Hidden Size]</code><ul>
+<li>这里没有 Batch 的概念了，所有句子的单词都压扁在第一维（T - Total tokens）。这就是注释里的 <code>thd</code> (Total_tokens, Head_num, Head_dim) 的 T 的含义。</li>
+</ul>
+</li>
+</ul>
+<p><strong>问题来了：</strong> 如果把所有句子拼成一条长龙，Attention 机制会“看串行”。比如处理“我爱吃苹果”的时候，不小心看到了下一句“今天天气不错”。</p>
+<p><strong>解决办法：</strong> 我们需要一个“说明书”，告诉 GPU 哪一段属于第一句，哪一段属于第二句。</p>
+<hr />
+<h3>🟢 Task 3：核心难点 <code>cu_seqlens</code> (The Logic)</h3>
+<p>这是代码里最重要的变量：<code>cu_seqlens</code>。全称是 <strong>Cumulative Sequence Lengths（累积序列长度）</strong>。</p>
+<p>假设我们将 3 个句子打包在一起：
+1.  句子 A 长度：2 (Hello World)
+2.  句子 B 长度：3 (I like AI)
+3.  句子 C 长度：1 (Bye)</p>
+<p><strong>它是怎么记录的？</strong>
+它不是记录 <code>[2, 3, 1]</code>，而是记录<strong>切分点的坐标</strong>（前缀和）。</p>
+<ul>
+<li>第 0 个切分点：<strong>0</strong> (起点)</li>
+<li>第 1 个切分点：0 + 2 = <strong>2</strong> (句子A结束，句子B开始)</li>
+<li>第 2 个切分点：2 + 3 = <strong>5</strong> (句子B结束，句子C开始)</li>
+<li>第 3 个切分点：5 + 1 = <strong>6</strong> (终点)</li>
+</ul>
+<p>所以，<code>cu_seqlens</code> 的 Tensor 内容是：<strong><code>[0, 2, 5, 6]</code></strong>。</p>
+<blockquote>
+<p><strong>为什么要这样？</strong>
+底层的 C++/CUDA 代码（如 FlashAttention）拿到这个数组，就能瞬间知道：
+*   第 1 个句子是 <code>data[0:2]</code>
+*   第 2 个句子是 <code>data[2:5]</code>
+*   第 3 个句子是 <code>data[5:6]</code></p>
+</blockquote>
+<hr />
+<h3>🟢 Task 4：对应代码字段 (The Code)</h3>
+<p>现在回头看代码，就一目了然了：</p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">PackedSeqParams</span><span class="p">:</span>
+    <span class="c1"># 告诉底层算子，输入的 Tensor 是什么排布格式（比如 &#39;thd&#39; 就是上面说的压扁格式）</span>
+    <span class="n">qkv_format</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span> 
+
+    <span class="c1"># 【核心】Query 的累积长度数组。</span>
+    <span class="c1"># 就像 Task 3 里的 [0, 2, 5, 6]。</span>
+    <span class="c1"># GPU 靠它知道 Query 里的每个句子从哪开始，到哪结束。</span>
+    <span class="n">cu_seqlens_q</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span> 
+
+    <span class="c1"># Key/Value 的累积长度数组。</span>
+    <span class="c1"># 通常和 q 一样，但在某些特殊情况（如推理缓存、GQA）可能不同。</span>
+    <span class="n">cu_seqlens_kv</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span> 
+
+    <span class="c1"># 这批数据里，最长的那个句子有多长？</span>
+    <span class="c1"># 比如 Task 3 里最长的是句子 B (3)。</span>
+    <span class="c1"># 作用：GPU 分配显存时，需要知道最大可能的开销。</span>
+    <span class="n">max_seqlen_q</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span> 
+
+    <span class="c1"># 同上，Key/Value 的最大长度。</span>
+    <span class="n">max_seqlen_kv</span><span class="p">:</span> <span class="n">Tensor</span> <span class="o">=</span> <span class="kc">None</span> 
+</code></pre></div>
+
+<hr />
+<h3>🟢 Task 5：总结 (The Summary)</h3>
+<p><strong>一句话解释：</strong>
+这个类是一个<strong>“数据包说明书”</strong>。</p>
+<p><strong>完整场景：</strong>
+当 Megatron-LM 为了省显存和提速，把一堆长短不一的句子<strong>拼成</strong>一条长龙喂给 GPU 时，GPU 是一脸懵逼的。</p>
+<p>这时候，你需要把 <code>PackedSeqParams</code> 递给 GPU（具体是递给 Transformer Engine 或 FlashAttention 的算子），告诉它：</p>
+<blockquote>
+<p>“嘿，老兄，虽然给你的是一条长龙，但请按照 <code>cu_seqlens</code> 里的坐标把它切开分别做 Attention，别搞串了。哦对了，里面最长的一段是 <code>max_seqlen</code> 这么长，注意内存别溢出。”</p>
+</blockquote>
+<p>这就是这个文件的全部意义。</p>

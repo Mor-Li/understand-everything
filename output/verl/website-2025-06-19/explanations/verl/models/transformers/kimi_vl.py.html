@@ -1,0 +1,139 @@
+<h1>verl/models/transformers/kimi_vl.py</h1>
+<p>这份代码确实非常硬核，因为它融合了两个非常前沿且复杂的技术点：
+1.  <strong>Kimi/DeepSeek 架构特有的 MLA (Multi-Head Latent Attention)</strong>：一种为了省显存把 KV 压缩的技术。
+2.  <strong>Ulysses Sequence Parallelism (尤利西斯序列并行)</strong>：一种为了训练超长文本（比如 200k token）把序列切分到不同显卡上的并行技术。</p>
+<p>别担心，我们用<strong>“列 To-Do List”</strong>的方式，把这段代码想象成一个流水线工人（GPU）在处理任务，一步步拆解给你看。</p>
+<hr />
+<h3>核心任务目标</h3>
+<p><strong>目标</strong>：计算“注意力机制”（Attention），但是因为输入的文本太长（比如一本书），单张显卡装不下，或者显存不够，所以需要用特殊的技巧（压缩 + 并行）来算。</p>
+<h3>📝 任务 To-Do List (流水线步骤)</h3>
+<ol>
+<li><strong>[准备原料] 生成 Q, K, V 向量</strong><ul>
+<li><em>难点</em>：这里不是普通的生成，而是用了“低秩压缩”（LoRA/MLA）的方式生成，为了省显存。</li>
+</ul>
+</li>
+<li><strong>[切分原料] 拆分“位置无关”和“位置相关”的数据</strong><ul>
+<li><em>难点</em>：Kimi 的架构把向量拆成了两半，一半负责存内容（NoPE），一半负责存位置（RoPE）。</li>
+</ul>
+</li>
+<li><strong>[大挪移] 尤利西斯并行 (Ulysses Communication) —— 关键步骤！</strong><ul>
+<li><em>场景</em>：如果开启了多卡并行，大家手里的数据是“一小段文本的所有头”。</li>
+<li><em>动作</em>：大家交换数据，变成“完整文本的一部分头”。</li>
+</ul>
+</li>
+<li><strong>[贴标签] 加上旋转位置编码 (RoPE)</strong><ul>
+<li><em>动作</em>：给负责位置的那部分向量加上位置信息。</li>
+</ul>
+</li>
+<li><strong>[核心加工] 算 Flash Attention</strong><ul>
+<li><em>动作</em>：计算 Query 和 Key 的相似度，提取 Value。</li>
+</ul>
+</li>
+<li><strong>[大挪移归位] 尤利西斯反向并行</strong><ul>
+<li><em>动作</em>：把数据换回来，变回“一小段文本的所有头”。</li>
+</ul>
+</li>
+<li><strong>[出货] 输出投影</strong><ul>
+<li><em>动作</em>：整理形状，输出最终结果。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🔍 逐步代码对照讲解</h3>
+<h4>1. [准备原料] 生成 Q, K, V</h4>
+<p>代码对应部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 处理 Query (Q)</span>
+<span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">q_lora_rank</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">q</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">q_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="c1"># 这是一个特殊的压缩结构，先降维再升维，这是 MLA 架构的特征</span>
+    <span class="n">q</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">q_b_proj</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">q_a_layernorm</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">q_a_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)))</span>
+
+<span class="c1"># 处理 Key/Value (KV) - 也是先压缩再解压</span>
+<span class="n">compressed_kv</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_a_proj_with_mqa</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+<span class="c1"># ... 切分 compressed_kv ...</span>
+<span class="n">kv</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_b_proj</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> 
+</code></pre></div>
+
+<p><strong>解读</strong>：
+普通的 Transformer 是直接 <code>x * W = Q</code>。这里 Kimi 为了处理长文本不爆显存，用了 <strong>MLA</strong> 架构。你可以理解为先把数据“压缩打包”传进去，算的时候再“解压”出来。</p>
+<h4>2. [切分原料] 拆分 NoPE 和 RoPE</h4>
+<p>代码对应部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">k_nope</span><span class="p">,</span> <span class="n">value_states</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="n">kv</span><span class="p">,</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">qk_nope_head_dim</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">v_head_dim</span><span class="p">],</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+<span class="c1"># ...</span>
+<span class="n">q_nope</span><span class="p">,</span> <span class="n">q_pe</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">qk_nope_head_dim</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">qk_rope_head_dim</span><span class="p">],</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解读</strong>：
+*   <strong>NoPE (No Position Embedding)</strong>：这部分向量只负责存“语义内容”，不加位置信息。
+*   <strong>RoPE (Rotary Position Embedding)</strong>：这部分向量专门用来加“位置信息”。
+这也是 Kimi/DeepSeek 架构的特色，为了让位置编码更精准且省资源。</p>
+<h4>3. [大挪移] 尤利西斯并行 (Ulysses) —— 全文最难点</h4>
+<p>代码对应部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">ulysses_sp_size</span> <span class="o">=</span> <span class="n">get_ulysses_sequence_parallel_world_size</span><span class="p">()</span>
+<span class="k">if</span> <span class="n">ulysses_sp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span> <span class="c1"># 如果开启了并行</span>
+    <span class="c1"># ... (省略 repeat_kv 代码)</span>
+
+    <span class="c1"># 核心魔法：All-to-All 通信</span>
+    <span class="n">q</span> <span class="o">=</span> <span class="n">gather_seq_scatter_heads</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">seq_dim</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span> <span class="n">head_dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+    <span class="n">k_pe</span> <span class="o">=</span> <span class="n">gather_seq_scatter_heads</span><span class="p">(</span><span class="n">k_pe</span><span class="p">,</span> <span class="n">seq_dim</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span> <span class="n">head_dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+    <span class="n">k_nope</span> <span class="o">=</span> <span class="n">gather_seq_scatter_heads</span><span class="p">(</span><span class="n">k_nope</span><span class="p">,</span> <span class="n">seq_dim</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span> <span class="n">head_dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+    <span class="n">value_states</span> <span class="o">=</span> <span class="n">gather_seq_scatter_heads</span><span class="p">(</span><span class="n">value_states</span><span class="p">,</span> <span class="n">seq_dim</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span> <span class="n">head_dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解读</strong>：
+假设你在处理一本 1000 页的书，有 4 个人（4张显卡）。
+*   <strong>并行前（Sequence Parallel）</strong>：每人手里拿 250 页书，但每人都要负责管所有的“注意力头”（比如 8 个头）。
+    *   <em>问题</em>：算 Attention 需要看全书（1000页），但我手里只有 250 页，没法算。
+*   <strong>并行操作 (<code>gather_seq_scatter_heads</code>)</strong>：大家停下来交换数据。
+*   <strong>并行后</strong>：每人手里拿到了 <strong>完整的 1000 页书</strong>，但是每个人只负责管 <strong>2 个头</strong>（一共 8 个头，4人分）。
+    *   <em>结果</em>：现在每个人都有全书了，可以算 Attention 了！</p>
+<h4>4. [贴标签] 加上 RoPE</h4>
+<p>代码对应部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">cos</span><span class="p">,</span> <span class="n">sin</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">rotary_emb</span><span class="p">(</span><span class="n">value_states</span><span class="p">,</span> <span class="n">seq_len</span><span class="o">=</span><span class="n">full_q_len</span><span class="p">)</span>
+<span class="n">q_pe</span><span class="p">,</span> <span class="n">k_pe</span> <span class="o">=</span> <span class="n">apply_rotary_pos_emb</span><span class="p">(</span><span class="n">q_pe</span><span class="p">,</span> <span class="n">k_pe</span><span class="p">,</span> <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">,</span> <span class="n">position_ids</span><span class="p">)</span>
+
+<span class="c1"># 把 NoPE (内容) 和 RoPE (位置) 拼回去变成完整的 Query 和 Key</span>
+<span class="n">query_states</span> <span class="o">=</span> <span class="o">...</span> 
+<span class="n">query_states</span><span class="p">[:,</span> <span class="p">:,</span> <span class="p">:,</span> <span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">qk_nope_head_dim</span><span class="p">]</span> <span class="o">=</span> <span class="n">q_nope</span>
+<span class="n">query_states</span><span class="p">[:,</span> <span class="p">:,</span> <span class="p">:,</span> <span class="bp">self</span><span class="o">.</span><span class="n">qk_nope_head_dim</span> <span class="p">:]</span> <span class="o">=</span> <span class="n">q_pe</span>
+<span class="c1"># Key 同理...</span>
+</code></pre></div>
+
+<p><strong>解读</strong>：
+有了完整的序列长度（full_q_len），现在可以给负责位置的那部分向量（<code>q_pe</code>, <code>k_pe</code>）打上位置标签了。</p>
+<h4>5. [核心加工] Flash Attention</h4>
+<p>代码对应部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">attn_output</span> <span class="o">=</span> <span class="n">_flash_attention_forward</span><span class="p">(</span>
+    <span class="n">query_states</span><span class="p">,</span>
+    <span class="n">key_states</span><span class="p">,</span>
+    <span class="n">value_states</span><span class="p">,</span>
+    <span class="c1"># ...</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解读</strong>：
+这就是标准的计算过程：<code>Softmax(Q * K^T) * V</code>。因为前面做了“大挪移”，现在每张卡拥有完整的序列长度，所以可以直接算，不需要管其他卡。</p>
+<h4>6. [大挪移归位] 尤利西斯反向</h4>
+<p>代码对应部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">ulysses_sp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+    <span class="n">attn_output</span> <span class="o">=</span> <span class="n">gather_heads_scatter_seq</span><span class="p">(</span><span class="n">attn_output</span><span class="p">,</span> <span class="n">head_dim</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span> <span class="n">seq_dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解读</strong>：
+算完了，现在每人手里拿着“完整 1000 页书的 2 个头的结果”。
+但是 Transformer 的下一层（MLP层）通常期望输入是“250 页书的所有 8 个头”。
+所以，大家再交换一次数据（反向操作）：
+*   <strong>操作</strong>：把“头”还给别人，把属于自己的“页数”拿回来。
+*   <strong>结果</strong>：变回每人 250 页，8 个头。</p>
+<h4>7. [出货] 输出</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">attn_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">o_proj</span><span class="p">(</span><span class="n">attn_output</span><span class="p">)</span>
+<span class="k">return</span> <span class="n">attn_output</span><span class="p">,</span> <span class="kc">None</span><span class="p">,</span> <span class="kc">None</span>
+</code></pre></div>
+
+<p><strong>解读</strong>：
+最后过一个线性层 <code>o_proj</code>，任务完成。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件的核心逻辑就是：
+<strong>“为了算 Kimi 这种超长文本模型，先把数据切碎（MLA压缩），然后利用尤利西斯并行（Ulysses），让多张显卡通过‘交换序列和头’的方式，实现了对超长序列的 Attention 计算。”</strong></p>

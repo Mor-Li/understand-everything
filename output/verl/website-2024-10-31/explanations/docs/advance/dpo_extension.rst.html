@@ -1,0 +1,96 @@
+<h1>docs/advance/dpo_extension.rst</h1>
+<p>这份文档主要是在讲：<strong>如果你想用 veRL 框架来实现一个新的强化学习算法（比如 DPO），你应该怎么做。</strong></p>
+<p>它的核心思想是：<strong>“单进程控制，多进程计算”</strong>。简单说，就是有一个“大脑”（主控脚本）负责发号施令，指挥一群“肌肉”（分布在各个GPU上的进程）去干苦力，然后大脑再把结果收回来。</p>
+<p>为了让你更容易理解，我把文档内容拆解成一个 <strong>“三步走”的 Task List</strong>，每一步都对应文档中的一个 Step。</p>
+<hr />
+<h3>核心任务清单 (Todo List)</h3>
+<h4>任务一：定义“肌肉” —— 封装计算任务 (Step 1)</h4>
+<p><strong>目标</strong>：确定你的算法里哪些步骤是需要消耗大量 GPU 算力的，把它们写成独立的“工人”类。</p>
+<ul>
+<li><strong>背景</strong>：在大模型训练里，生成文本（Generate）、算概率（LogProb）、更新参数（Update）都很费显卡，需要多卡并行。</li>
+<li><strong>你需要做的事</strong>：<ol>
+<li><strong>识别角色</strong>：比如在 DPO 算法里，你需要三个角色：<ul>
+<li><strong>生成器 (Sample Generator)</strong>：负责产出文本。</li>
+<li><strong>参考模型 (Reference Policy)</strong>：负责给数据打个底（算参考概率）。</li>
+<li><strong>Actor 模型 (DPO Actor)</strong>：负责主要的训练更新。</li>
+</ul>
+</li>
+<li><strong>写代码封装</strong>：使用 <code>ray</code> 库把这些模型封装成 Worker。<ul>
+<li><em>文档技巧</em>：虽然是多卡运行，但你只需要写一份代码（SPMD），框架会让它在每张卡上跑起来。</li>
+<li><em>例子</em>：文档里的 <code>SampleGenerator</code> 类，里面有个 <code>generate_sequences</code> 方法；<code>DPOActor</code> 类，里面有个 <code>update</code> 方法。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>任务二：建立“神经” —— 搞定数据分发与回收 (Step 2)</h4>
+<p><strong>目标</strong>：解决“大脑”怎么把数据喂给“肌肉”，以及怎么把“肌肉”干完的活收回来的问题。</p>
+<ul>
+<li><strong>背景</strong>：你的主控脚本（大脑）手里有一批数据，但你有 16 张显卡（肌肉）。你不能把所有数据给每一张卡，你需要把数据<strong>切分 (Split/Dispatch)</strong>，算完后再<strong>拼接 (Merge/Collect)</strong>。</li>
+<li><strong>你需要做的事</strong>：<ol>
+<li><strong>使用 <code>RayWorkerGroup</code></strong>：这是 veRL 提供的一个容器，把上面定义的“肌肉”装进去，变成一个组。</li>
+<li><strong>配置分发规则</strong>：<ul>
+<li><em>笨办法</em>：手动写代码把数据切成 N 份，分别发给 N 个 Worker，收到结果再 <code>torch.cat</code> 拼起来。</li>
+<li><em>veRL 的办法（推荐）</em>：文档里提到了一个 <strong>装饰器 (<code>@register</code>)</strong>。你只要在函数头上加个装饰器，告诉它“这是数据并行（DP）”，框架就会自动帮你完成“切分数据 -&gt; 发送 -&gt; 计算 -&gt; 收集 -&gt; 拼接”这一整套繁琐动作。</li>
+<li><em>代码体现</em>：<code>@register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)</code>。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>任务三：激活“大脑” —— 串联主循环 (Step 3)</h4>
+<p><strong>目标</strong>：写最后的主控逻辑，像搭积木一样把流程跑通。</p>
+<ul>
+<li><strong>背景</strong>：肌肉和神经都好了，现在需要一个主函数来指挥。</li>
+<li><strong>你需要做的事</strong>：<ol>
+<li><strong>初始化资源</strong>：创建刚才定义的那些 <code>WorkerGroup</code>（生成器组、参考模型组、Actor组）。</li>
+<li><strong>写 <code>for</code> 循环</strong>：按照 DPO 的算法逻辑调用它们。<ul>
+<li><em>文档中的 DPO 流程</em>：<ol>
+<li><code>sample_gen.generate_sequences(data)</code>：让生成器造句。</li>
+<li>(中间可能有打分和配对步骤)。</li>
+<li><code>ref_policy.infer(data)</code>：让参考模型算一下概率。</li>
+<li><code>dpo_policy.update(data)</code>：让 Actor 模型根据数据更新参数。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结：Online DPO 实例解析</h3>
+<p>文档最后用 Online DPO 举了个具体例子，按照上面的逻辑就是：</p>
+<ol>
+<li>
+<p><strong>准备阶段</strong>：</p>
+<ul>
+<li>定义了 <code>SampleGenerator</code>（负责推理生成）。</li>
+<li>定义了 <code>ReferencePolicy</code>（负责算 LogProb）。</li>
+<li>定义了 <code>DPOActor</code>（负责算 Loss 和反向传播）。</li>
+<li><em>注意</em>：这些类都继承自 <code>Worker</code> 并被 <code>@ray.remote</code> 装饰。</li>
+</ul>
+</li>
+<li>
+<p><strong>连接阶段</strong>：</p>
+<ul>
+<li>使用 <code>RayWorkerGroup</code> 把这些类实例化，分配 GPU 资源（比如 <code>process_on_nodes=[8] * 2</code> 表示两台机器共16张卡）。</li>
+<li>利用 veRL 的装饰器机制，使得主控脚本调用 <code>worker_group.generate_sequences(data)</code> 这一行代码时，底层自动完成了 16 张卡的数据分发和并行计算。</li>
+</ul>
+</li>
+<li>
+<p><strong>运行阶段 (Main Loop)</strong>：</p>
+<ul>
+<li>代码逻辑非常清晰：
+    <code>python
+    for data in dataloader:
+        # 1. 产出数据
+        data = sample_gen.generate_sequences(data)
+        # 2. (省略) 打分、构造成对数据(Pairwise)
+        # 3. 算参考概率
+        data.batch['ref_log_prob'] = ref_policy.infer(data)
+        # 4. 真正训练
+        dpo_policy.update(data)</code></li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话总结</strong>：这篇文档教你如何利用 veRL 提供的<strong>通信封装</strong>（自动切分/合并数据）和<strong>资源封装</strong>（RayWorkerGroup），让你只需要像写单机代码一样，就能写出多机多卡的复杂 RL 训练流程。</p>

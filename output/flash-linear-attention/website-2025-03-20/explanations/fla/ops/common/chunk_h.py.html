@@ -1,0 +1,114 @@
+<h1>fla/ops/common/chunk_h.py</h1>
+<p>这份代码确实非常硬核，它是 <strong>FLA (Fast Linear Attention)</strong> 库的核心底层实现，是用 <strong>OpenAI Triton</strong> 语言编写的 GPU加速代码。</p>
+<p>简单来说，这个文件的作用是：<strong>高效地计算线性注意力（Linear Attention）或 循环神经网络（RNN）中的“隐藏状态”（Hidden State, $h$）。</strong></p>
+<p>为了让你看懂，我们抛开复杂的代码语法，用<strong>任务清单（Todo List）</strong>和<strong>分步讲解</strong>的方式来拆解它。</p>
+<hr />
+<h3>核心背景：它在算什么？</h3>
+<p>想象你在处理一个长文本序列。
+*   <strong>传统 Attention</strong> 是把所有词两两对比（$N^2$ 复杂度，慢）。
+*   <strong>Linear Attention / RNN</strong> 是维护一个记忆桶（Hidden State $h$）。读一个词，更新一下桶里的记忆。
+*   <strong>公式逻辑</strong>：
+    $$h_{new} = h_{old} \times \text{衰减(decay)} + (k \times v)$$
+    也就是：旧的记忆忘掉一点点，加上新的 $k$（键）和 $v$（值）的信息。</p>
+<p>这个文件就是具体执行这个“<strong>遗忘旧的 + 累加新的</strong>”过程的 GPU 算子。</p>
+<hr />
+<h3>任务清单 (Task Todo)</h3>
+<p>假设你就是那个 GPU 线程，你的老板（CPU）给了你这个任务。你的工作流程如下：</p>
+<h4><strong>任务一：前向传播 (Forward) - 算出记忆 $h$</strong></h4>
+<ol>
+<li><strong>准备工作</strong>：找到属于我的那个句子（Batch）和那个头（Head）。</li>
+<li><strong>初始化</strong>：拿一个空桶（$h=0$），或者如果老板给了初始状态（$h_0$），就把它装进桶里。</li>
+<li><strong>时间循环（Time Loop）</strong>：把长句子切成一小块一小块（Chunk）。<ul>
+<li><em>Step 3.1</em>: 读入这一块的 $k$ (Key) 和 $v$ (Value)。</li>
+<li><em>Step 3.2</em>: 看看这一块有没有“衰减指令”（$g, gk, gv$）。如果有，先把桶里的旧水倒掉一点（乘以 decay）。</li>
+<li><em>Step 3.3</em>: 把这一块的 $k$ 和 $v$ 乘起来，倒进桶里（Accumulate）。</li>
+<li><em>Step 3.4</em>: 把当前桶里的状态（$h$）存到显存里，供后面使用。</li>
+</ul>
+</li>
+<li><strong>收尾</strong>：如果需要，把最后时刻桶里的状态（$h_t$）交上去。</li>
+</ol>
+<h4><strong>任务二：反向传播 (Backward) - 算出梯度 $dh$</strong></h4>
+<ol>
+<li><strong>准备工作</strong>：拿到最终时刻的梯度（$dh_t$）放入梯度桶。</li>
+<li><strong>时间倒流（Reverse Time Loop）</strong>：从句子的最后一块往回走。<ul>
+<li><em>Step 2.1</em>: 读入这一块的 $q$ (Query) 和 $do$ (Output Gradient)。</li>
+<li><em>Step 2.2</em>: 根据衰减率，反向调整梯度桶里的值。</li>
+<li><em>Step 2.3</em>: 算出这一块对 $h$ 的贡献，更新梯度桶。</li>
+</ul>
+</li>
+<li><strong>收尾</strong>：把初始状态的梯度（$dh_0$）交上去。</li>
+</ol>
+<hr />
+<h3>详细步骤讲解 (Step-by-Step Explanation)</h3>
+<p>现在我们对应代码中的关键部分来讲解。</p>
+<h4>1. 核心概念：Chunking (分块)</h4>
+<p>代码里有一个 <code>BT</code> (Block Time) 和 <code>BS</code> (Block Size)。
+*   <strong>为什么这么做？</strong> 逐个词处理（RNN模式）太慢，一次处理整个句子（Transformer模式）显存不够。
+*   <strong>折中方案</strong>：把句子切成长度为 <code>BT</code>（比如 64）的小块。块内部并行计算，块与块之间串行传递状态 $h$。</p>
+<h4>2. 前向传播函数：<code>chunk_fwd_kernel_h</code></h4>
+<p>这是计算记忆状态的核心函数。</p>
+<ul>
+<li>
+<p><strong>输入参数</strong>:</p>
+<ul>
+<li><code>k, v</code>: 键和值，信息的来源。</li>
+<li><code>h</code>: 用来存计算出的中间状态。</li>
+<li><code>g, gk, gv</code>: <strong>衰减门控（Gates）</strong>。这是这篇代码最复杂的地方。<ul>
+<li><code>g</code>: 标量衰减（整个矩阵一起忘）。</li>
+<li><code>gk</code>: 针对 $K$ 维度的向量衰减。</li>
+<li><code>gv</code>: 针对 $V$ 维度的向量衰减。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>代码逻辑拆解</strong>:</p>
+<ul>
+<li><strong>定位</strong>: <code>i_k, i_v, i_nh</code> 确定当前线程负责矩阵的哪一块（分块矩阵乘法）。</li>
+<li><strong>加载初始状态</strong>:
+    <code>python
+    if USE_INITIAL_STATE:
+        # 从 h0 加载数据到 b_h
+        b_h = tl.load(...)</code></li>
+<li><strong>循环 (核心)</strong>: <code>for i_t in range(NT):</code> (遍历所有时间块)<ul>
+<li><strong>保存状态</strong>: 在计算新东西之前，先把当前的 <code>b_h</code> 存下来（这是为了给 Attention 步骤用的）。
+    <code>python
+    tl.store(p_h, b_h...)</code></li>
+<li><strong>加载数据</strong>: 加载当前块的 <code>b_k</code> 和 <code>b_v</code>。</li>
+<li><strong>计算衰减 (Decay)</strong>:
+    这里有三个 <code>if</code> (<code>USE_G</code>, <code>USE_GK</code>, <code>USE_GV</code>)。
+    逻辑是：<code>b_h *= tl.exp(decay_term)</code>。
+    <em>通俗解释</em>：在把新的 $k, v$ 加进来之前，先把之前的记忆 $h$ 乘以一个衰减系数（比如 0.9），模拟遗忘过程。同时，当前的 $k, v$ 也要根据它们在块内的位置进行衰减处理。</li>
+<li><strong>累加 (Update)</strong>:
+    <code>python
+    b_h += tl.dot(b_k, b_v)</code>
+    这是最关键的一行：<strong>新记忆 = 旧记忆 + (K 乘 V)</strong>。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>3. 反向传播函数：<code>chunk_bwd_kernel_dh</code></h4>
+<p>这是为了训练模型用的，计算梯度。</p>
+<ul>
+<li><strong>逻辑</strong>: 和前向传播几乎完全相反。<ul>
+<li>循环是倒着的：<code>range(NT - 1, -1, -1)</code>。</li>
+<li>它利用链式法则，计算 $h$ 状态需要怎么变化才能让 Loss 变小。</li>
+<li>计算核心是：<code>b_dh += tl.dot(b_q, b_do)</code>。这里用到了 $Q$ 和 $dO$（输出的梯度）来回溯 $h$ 的梯度。</li>
+</ul>
+</li>
+</ul>
+<h4>4. Python 包装函数：<code>chunk_fwd_h</code> 和 <code>chunk_bwd_dh</code></h4>
+<p>这两个函数是给 PyTorch 调用的接口。
+*   它们负责计算 Grid 大小（启动多少个 GPU 线程块）。
+*   处理 <code>head_first</code> 这种维度排列问题（是 <code>[B, H, T, D]</code> 还是 <code>[B, T, H, D]</code>）。
+*   处理变长序列 (<code>offsets</code>)，比如一个 Batch 里有的句子长 100，有的长 50，Triton 需要知道每个句子的边界。</p>
+<hr />
+<h3>总结：这段代码到底牛在哪里？</h3>
+<p>这段代码实现了一个<strong>带有多重衰减机制的线性 Attention 状态更新</strong>。</p>
+<ol>
+<li><strong>支持多种遗忘机制</strong>：不仅支持普通的遗忘（<code>g</code>），还支持针对特征维度的精细遗忘（<code>gk</code>, <code>gv</code>）。这对应了像 <strong>GLA (Gated Linear Attention)</strong> 这样的先进模型架构。</li>
+<li><strong>显存优化</strong>：它不需要像 Transformer 那样生成巨大的 Attention Matrix ($N \times N$)，而是维护一个小的状态矩阵 $h$ ($K \times V$)。</li>
+<li><strong>Triton 加速</strong>：通过手动管理内存加载（<code>tl.make_block_ptr</code>）和计算流水线，比直接写 PyTorch 快得多。</li>
+</ol>
+<p><strong>一句话概括</strong>：这是一个极其高效的“记忆桶”维护器，它一边读数据，一边按规则遗忘旧数据、存入新数据，是现代高效大模型（如 Mamba, GLA 等）底层的核心算子。</p>

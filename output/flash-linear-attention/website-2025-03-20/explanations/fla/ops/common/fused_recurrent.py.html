@@ -1,0 +1,89 @@
+<h1>fla/ops/common/fused_recurrent.py</h1>
+<p>这份代码确实非常硬核，因为它不是普通的PyTorch模型代码，而是<strong>Triton Kernel</strong>代码。Triton是一种专门用于编写高性能GPU内核的语言（类似CUDA，但更像Python）。</p>
+<p>这份文件的核心目的是：<strong>手动实现一个跑在GPU上的“线性注意力（Linear Attention）”或“循环神经网络（RNN）”算子，为了极致的速度和显存效率。</strong></p>
+<p>为了让你读懂，我制定了一个<strong>“从宏观到微观，从概念到代码”的学习任务清单（Todo List）</strong>。</p>
+<hr />
+<h3>🟢 Level 1: 搞懂它在算什么数学公式 (概念篇)</h3>
+<p><strong>Task 1: 理解核心公式</strong>
+不要看代码，先看这个算子想干什么。这是一个线性RNN。
+传统的Attention是 $O = \text{softmax}(QK^T)V$，复杂度是 $O(T^2)$。
+这个算子实现的是 $O(T)$ 复杂度的线性递归：
+1.  <strong>状态更新</strong>：$H_t = H_{t-1} \cdot \text{Decay} + K_t^T V_t$
+    *   (当前的记忆 = 之前的记忆 $\times$ 衰减系数 + 新的信息)
+2.  <strong>输出计算</strong>：$O_t = H_t Q_t$
+    *   (输出 = 当前记忆 $\times$ 查询向量)</p>
+<p><strong>Task 2: 理解变量含义</strong>
+*   <code>q</code>, <code>k</code>, <code>v</code>: 标准的 Attention 输入。
+*   <code>g</code>, <code>gk</code>, <code>gv</code>: 这些是 <strong>Gate (门控)</strong> 或 <strong>Decay (衰减)</strong>。
+    *   如果是标准线性Attention，这些可能不存在。
+    *   但这代码里加了 <code>exp(g)</code>，意味着记忆会随着时间衰减（遗忘机制）。
+*   <code>h0</code>, <code>ht</code>: <code>h0</code>是初始状态（上文的记忆），<code>ht</code>是跑完这轮后的最终状态（留给下文用）。</p>
+<hr />
+<h3>🟡 Level 2: 搞懂 Triton 的并行逻辑 (架构篇)</h3>
+<p>Triton 代码难读是因为它要手动管理<strong>并行（Parallelism）</strong>和<strong>内存指针（Pointers）</strong>。</p>
+<p><strong>Task 3: 理解网格 (Grid) 和 分块 (Tiling)</strong>
+GPU 有成千上万个核，不能让一个核算完所有数据。
+代码里的装饰器 <code>@triton.jit</code> 下面的函数是给<strong>一个</strong> GPU 线程块 (Block) 跑的。
+*   <strong>维度划分</strong>：
+    *   <code>i_nh</code>: 处理哪个 Batch (B) 和哪个 Head (H)。
+    *   <code>i_k</code>, <code>i_v</code>: 这里的 Hidden Size (比如 128) 太大了，被切成了小块 <code>BK</code> 和 <code>BV</code> (比如 64)。
+*   <strong>结论</strong>：每个线程块只负责计算一部分 K 和一部分 V 的特征维度。</p>
+<p><strong>Task 4: 理解内存指针 (Pointers)</strong>
+在 Python 里你习惯了 <code>tensor[i]</code>。在 Triton 里，你需要计算内存地址的<strong>偏移量 (Offset)</strong>。
+*   代码中大量的 <code>p_q = q + ...</code> 就是在算：当前这个线程块，应该去显存的哪个地址开始读取数据。
+*   <code>offsets</code>: 处理变长序列用的（比如一句话长10，一句话长20，拼在一起训练）。</p>
+<hr />
+<h3>🟠 Level 3: 逐行拆解 Forward Kernel (核心逻辑篇)</h3>
+<p>现在看 <code>fused_recurrent_fwd_kernel</code> 函数。这是前向传播。</p>
+<p><strong>Task 5: 初始化阶段</strong>
+*   <code>tl.program_id(...)</code>: 我是谁？我负责哪块数据？
+*   <code>p_q</code>, <code>p_k</code>... calculation: 算出数据的起始内存地址。
+*   <code>b_h = tl.zeros(...)</code>: 初始化一个全零的隐状态矩阵 $H$（或者从 <code>h0</code> 加载）。</p>
+<p><strong>Task 6: 核心循环 (The Loop)</strong>
+这是整个文件的灵魂。找到 <code>for _ in range(0, T):</code> 这行。
+这意味着：<strong>沿着序列长度 T，一步一步往前走</strong>。</p>
+<p>Inside the loop (伪代码翻译):
+1.  <strong>Load</strong>: <code>b_q</code>, <code>b_k</code>, <code>b_v</code> = 从当前指针位置加载当前时刻 $t$ 的数据。
+2.  <strong>Decay (衰减)</strong>:
+    *   如果有 <code>USE_G</code> / <code>USE_GK</code>: <code>b_h = b_h * tl.exp(b_g)</code>。
+    *   这就是 $H_{t-1} \times \text{Decay}$ 的步骤。让旧记忆衰减。
+3.  <strong>Update (写入新记忆)</strong>:
+    *   <code>b_h += b_k * b_v</code>。
+    *   这就是 $+ K_t^T V_t$。把当前时刻的信息写入记忆矩阵。
+4.  <strong>Compute Output (计算输出)</strong>:
+    *   <code>b_o = b_h * b_q</code>。
+    *   利用更新后的记忆和 Query 计算输出。
+5.  <strong>Store (存回显存)</strong>:
+    *   <code>tl.store(p_o, b_o)</code>。把结果写回全局显存。
+6.  <strong>Advance Pointers (指针移动)</strong>:
+    *   <code>p_q += ... H * K</code>。
+    *   所有指针往前挪一步，准备处理 $t+1$ 时刻的数据。</p>
+<hr />
+<h3>🔴 Level 4: 辅助功能与反向传播 (进阶篇)</h3>
+<p><strong>Task 7: 理解 Backward Kernel (<code>fused_recurrent_bwd_kernel</code>)</strong>
+*   这是为了训练（Training）用的。
+*   也就是求导。逻辑和 Forward 几乎一样，但是是<strong>反着算</strong>或者是根据链式法则算梯度 (<code>dq</code>, <code>dk</code>, <code>dv</code>)。
+*   不要深究具体的梯度公式，只要知道它是在算 Loss 对 Q/K/V/G 的导数即可。</p>
+<p><strong>Task 8: Python Wrapper (<code>fused_recurrent_fwd</code>)</strong>
+*   这是给 PyTorch 调用的接口。
+*   它负责计算 Grid 的大小（需要启动多少个 GPU 线程块）。
+*   它负责申请输出张量 <code>o</code> 的显存。</p>
+<p><strong>Task 9: Autograd Function (<code>FusedRecurrentFunction</code>)</strong>
+*   继承自 <code>torch.autograd.Function</code>。
+*   <code>forward</code>: 调用 Triton 的前向 kernel。
+*   <code>backward</code>: 调用 Triton 的反向 kernel。
+*   这就是为什么你可以直接对这个操作的结果用 <code>.backward()</code>。</p>
+<hr />
+<h3>总结：这段代码到底在讲啥？</h3>
+<p><strong>一句话总结</strong>：
+这是一个<strong>手写的高性能 GPU 算子</strong>，实现了一个<strong>带门控（Gated）的线性 RNN</strong>。</p>
+<p><strong>它的执行流程是</strong>：
+1.  把 Batch 和 Head 拆分给不同的 GPU 核心。
+2.  在每个核心内部，维护一个隐状态矩阵 $H$。
+3.  沿着时间轴 $T$ 循环：
+    *   让 $H$ 衰减（遗忘）。
+    *   把当前的 $K$ 和 $V$ 乘进去更新 $H$（记忆）。
+    *   用当前的 $Q$ 去读 $H$ 得到输出 $O$。
+4.  全程在 GPU 的 SRAM（高速缓存）里完成，不用频繁读写显存，所以<strong>速度极快，显存占用极低</strong>。</p>
+<p><strong>如果你想修改或使用它</strong>：
+你只需要关注最后的 <code>fused_recurrent</code> 函数接口，传入 Q, K, V 即可，不需要看懂里面的 Triton 指针运算，除非你要修改底层的数学逻辑。</p>

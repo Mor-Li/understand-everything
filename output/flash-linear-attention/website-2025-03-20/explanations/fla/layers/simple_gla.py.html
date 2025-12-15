@@ -1,0 +1,66 @@
+<h1>fla/layers/simple_gla.py</h1>
+<p>这份代码实现的是 <strong>Simple GLA (Gated Linear Attention)</strong>。</p>
+<p>为了让你听懂，我们不用复杂的数学公式，而是把这个层（Layer）看作一个<strong>“信息加工流水线”</strong>。</p>
+<p>想象你是一台计算机，你的任务是处理一句话（比如“我爱吃苹果”），你需要理解这句话里每个字之间的关系。</p>
+<p>下面是一份<strong>“流水线任务清单 (Todo List)”</strong>，我们一步步把数据变成结果：</p>
+<hr />
+<h3>📋 任务清单：Simple GLA 数据加工流程</h3>
+<h4>Task 1: 原料准备 (投影 / Projections)</h4>
+<p><strong>目标</strong>：把输入的原始特征（hidden_states）转换成我们需要的组件：Q, K, V 和门控信号。
+*   <strong>代码位置</strong>：<code>__init__</code> 中的 <code>self.q_proj</code>, <code>self.k_proj</code>, <code>self.v_proj</code> 以及 <code>forward</code> 开头。
+*   <strong>解释</strong>：
+    *   就像做菜前要切菜一样。输入的向量不能直接用，要通过全连接层（Linear）变成三个主要部分：
+        *   <strong>Q (Query)</strong>: 我在找什么？
+        *   <strong>K (Key)</strong>: 我有什么特征？
+        *   <strong>V (Value)</strong>: 我具体的内容是什么？
+    *   <strong>特殊点</strong>：这里还多算了一个 <strong><code>gk</code></strong> (Gate for Keys)，这是 GLA 的核心，用来决定“我们要记住多少过去的信息”。</p>
+<h4>Task 2: 局部预热 (短卷积 / Short Convolution)</h4>
+<p><strong>目标</strong>：在看全文之前，先看看每个字“周围”的字（比如看前后 4 个字）。
+*   <strong>代码位置</strong>：<code>self.use_short_conv</code> 判断块内的 <code>self.q_conv1d</code>, <code>self.k_conv1d</code>, <code>self.v_conv1d</code>。
+*   <strong>解释</strong>：
+    *   标准的 Transformer 直接算全局关系，容易忽略邻居。
+    *   这里加了一个 <strong>1D 卷积</strong>。这就好比你在读长文章之前，先快速扫一眼每个词旁边的词组（比如看到“吃”，就顺便看看后面是不是“苹果”）。
+    *   这能增强模型对<strong>局部信息</strong>的捕捉能力。</p>
+<h4>Task 3: 调整记忆门阀 (Gating Setup)</h4>
+<p><strong>目标</strong>：处理 <code>gk</code>，决定信息的“遗忘率”。
+*   <strong>代码位置</strong>：<code>gk = F.logsigmoid(gk) / self.gate_logit_normalizer</code>
+*   <strong>解释</strong>：
+    *   GLA 的核心是“线性注意力”，它像一个滚动的雪球（RNN）。
+    *   <code>gk</code> 就是控制这个雪球滚动的<strong>摩擦力</strong>。
+    *   如果 <code>gk</code> 很大，说明这个信息很重要，要一直记着；如果 <code>gk</code> 很小，说明这个信息没用，滚两下就忘掉（Decay）。
+    *   代码里用了 <code>logsigmoid</code> 把数值压缩到合适的范围。</p>
+<h4>Task 4: 核心混合 (Core Attention Kernel)</h4>
+<p><strong>目标</strong>：这是最关键的一步！把 Q, K, V 和 gk 扔进大锅里炒，算出注意力结果。
+*   <strong>代码位置</strong>：<code>chunk_simple_gla</code> 或 <code>fused_recurrent_simple_gla</code>。
+*   <strong>解释</strong>：
+    *   <strong>Mode选择</strong>：
+        *   <code>chunk</code> (分块模式): 训练时用。把长句子切成小块并行处理，速度极快。
+        *   <code>fused_recurrent</code> (循环模式): 推理（生成文字）时用。像 RNN 一样一个字一个字处理，省显存。
+    *   <strong>原理</strong>：
+        *   传统的 Attention 是 $O(N^2)$，字越多越慢。
+        *   这里的 GLA 是 $O(N)$，<strong>线性复杂度</strong>。它利用 <code>gk</code> 动态地把 K 和 V 压缩成一个“状态（State）”，然后 Q 再去这个状态里查信息。
+    *   这一步结束后，你已经得到了包含上下文信息的向量 <code>o</code>。</p>
+<h4>Task 5: 缓存管理 (KV Cache Update)</h4>
+<p><strong>目标</strong>：如果是生成模式，要把当前的状态存下来，给下一个字用。
+*   <strong>代码位置</strong>：<code>if past_key_values is not None:</code> 这一块。
+*   <strong>解释</strong>：
+    *   你读了“我爱吃”，现在要预测“苹”。
+    *   你需要把“我爱吃”产生的卷积状态 (<code>conv_state</code>) 和 RNN 状态 (<code>recurrent_state</code>) 存进缓存。
+    *   下次预测“果”的时候，不需要重读“我爱吃”，直接接着缓存算就行。</p>
+<h4>Task 6: 最终修饰 (Output Gating &amp; Norm)</h4>
+<p><strong>目标</strong>：对结果进行归一化，并用另一个门控信号筛选一次，最后输出。
+*   <strong>代码位置</strong>：<code>g = self.g_proj(hidden_states)</code> ... <code>self.g_norm_swish_gate</code> ... <code>self.o_proj(o)</code>
+*   <strong>解释</strong>：
+    *   <strong>Output Gate (g)</strong>: 就像一个过滤器，最后决定要把多少注意力结果放出去。
+    *   <strong>RMSNorm</strong>: 调整数据的数值分布，防止数字过大或过小（炸梯度）。
+    *   <strong>Output Projection (<code>o_proj</code>)</strong>: 把数据形状变回原来的大小，以便传给下一层。</p>
+<hr />
+<h3>总结：这段代码在干嘛？</h3>
+<p>简单来说，<code>SimpleGatedLinearAttention</code> 是一个<strong>比传统 Transformer 更快、更省内存</strong>的注意力层。</p>
+<p><strong>它的核心逻辑是：</strong>
+1.  <strong>转化</strong>：把输入变 Q/K/V。
+2.  <strong>局部增强</strong>：用卷积先抓取邻近词的关系。
+3.  <strong>线性记忆</strong>：用一个“衰减门 (<code>gk</code>)”控制记忆，把历史信息压缩成一个状态，而不是记录所有历史的成对关系（这是它快的原因）。
+4.  <strong>输出</strong>：整理数据传给下一层。</p>
+<p><strong>为什么叫 "Simple"?</strong>
+因为它简化了原始 GLA 的一些复杂设计（比如把门控从元素级变成了头级 head-wise），在保持效果的同时，让计算在 GPU 上跑得更快。</p>

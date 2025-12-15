@@ -1,0 +1,96 @@
+<h1>fla/ops/delta_rule/fused_recurrent.py</h1>
+<p>这份代码确实非常硬核，它是用 <strong>Triton</strong> 语言编写的高性能 GPU 算子，属于深度学习底层优化的范畴。</p>
+<p>简单来说，这段代码实现了一种特殊的 <strong>线性注意力机制（Linear Attention）</strong> 或者说 <strong>RNN</strong> 的变体，叫做 <strong>"Delta Rule" (增量规则)</strong>。它的目的是让模型像 Transformer 一样强，但推理速度像 RNN 一样快。</p>
+<p>为了让你看懂，我们将这个过程拆解成一个 <strong>学习任务清单 (TODO List)</strong>，从概念到代码实现一步步来。</p>
+<hr />
+<h3>任务清单 (TODO List)</h3>
+<h4>✅ Task 1: 理解核心概念 —— "这是什么数学公式？"</h4>
+<p>不要看代码，先看它在算什么。
+普通的线性 Attention (或 RNN) 维护一个记忆矩阵 $H$。
+每一步进来新的 Key ($k$) 和 Value ($v$)，通常更新规则是直接累加：
+$$H_{new} = H_{old} + k^T v$$
+<strong>Delta Rule (这篇代码的核心)</strong> 认为直接加太粗暴了，应该先计算现有记忆 $H$ 和当前 $k$ 的冲突，减去冲突后再更新。
+它做的其实是：
+1.  <strong>检索冲突</strong>：$v_{conflict} = H_{old} \cdot k$
+2.  <strong>计算增量</strong>：$v_{delta} = v - v_{conflict}$ (这就是 Delta)
+3.  <strong>更新记忆</strong>：$H_{new} = H_{old} + k^T \cdot v_{delta}$
+4.  <strong>输出</strong>：$o = H_{new} \cdot q$</p>
+<p><strong>一句话总结</strong>：这段代码就是在一个 <code>for</code> 循环里，在 GPU 上极速执行上述 4 个步骤。</p>
+<hr />
+<h4>✅ Task 2: 理解文件结构 —— "这几个函数是干嘛的？"</h4>
+<p>文件里主要有三个部分，你可以把它们看作三个层级：</p>
+<ol>
+<li><strong>最底层 (Triton Kernels)</strong>:<ul>
+<li><code>fused_recurrent_delta_rule_fwd_kernel</code>: <strong>前向传播</strong>。也就是模型推理时算结果用的。</li>
+<li><code>fused_recurrent_delta_rule_bwd_kernel</code>: <strong>反向传播</strong>。也就是模型训练时算梯度用的（这是最难写的，因为要倒着推导）。</li>
+</ul>
+</li>
+<li><strong>中间层 (Function)</strong>:<ul>
+<li><code>FusedRecurrentFunction</code>: 把上面两个 Triton 内核包装成 PyTorch 能识别的函数，告诉 PyTorch 什么时候调前向，什么时候调反向。</li>
+</ul>
+</li>
+<li><strong>最上层 (User API)</strong>:<ul>
+<li><code>fused_recurrent_delta_rule</code>: 给用户（你）调用的接口。处理一下输入形状检查、参数默认值等。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 3: 深入前向传播 Kernel —— "代码在循环里做了什么？"</h4>
+<p>让我们聚焦 <code>fused_recurrent_delta_rule_fwd_kernel</code> 这个函数。这是逻辑的核心。</p>
+<p><strong>步骤 3.1: 准备工作</strong>
+代码开头的一大堆 <code>i_v, i_k...</code> 和 <code>p_q, p_k...</code> 是在计算 <strong>指针地址</strong>。
+*   因为 GPU 是并行计算的，这里每个线程块负责处理一个 Head 或者一部分特征。它需要知道去显存的哪里读数据。</p>
+<p><strong>步骤 3.2: 核心循环 (对应 Task 1 的公式)</strong>
+找到代码中的 <code>for _ in range(0, T):</code>，这是时间步的循环。请看代码中的这几行：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 加载当前时刻的数据</span>
+<span class="n">b_k</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_k</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+<span class="n">b_v</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_v</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+<span class="n">b_q</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p_q</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span> <span class="o">*</span> <span class="n">scale</span>
+
+<span class="c1"># 2. 【核心】计算冲突 (v_minus)</span>
+<span class="c1"># b_h 是当前的记忆矩阵。这里计算 b_h * k</span>
+<span class="n">b_v_minus</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">b_h</span> <span class="o">*</span> <span class="n">b_k</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:],</span> <span class="n">axis</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+
+<span class="c1"># 3. 【核心】应用 Delta Rule (v = v - v_minus)</span>
+<span class="c1"># 这一步就是 Delta Rule 的名字由来：更新值 = 原始值 - 记忆中已有的投影</span>
+<span class="n">b_v</span> <span class="o">-=</span> <span class="n">b_v_minus</span> 
+
+<span class="c1"># ... (中间省略了 beta 的门控机制，就是乘个系数 b_v *= b_beta) ...</span>
+
+<span class="c1"># 4. 更新记忆矩阵 (H_new = H_old + k * v_new)</span>
+<span class="n">b_h</span> <span class="o">+=</span> <span class="n">b_k</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]</span> <span class="o">*</span> <span class="n">b_v</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span>
+
+<span class="c1"># 5. 计算输出 (o = H * q)</span>
+<span class="n">b_o</span> <span class="o">=</span> <span class="n">b_h</span> <span class="o">*</span> <span class="n">b_q</span><span class="p">[</span><span class="kc">None</span><span class="p">,</span> <span class="p">:]</span>
+<span class="n">b_o</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">b_o</span><span class="p">,</span> <span class="n">axis</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+<span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">p_o</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span> <span class="c1"># 保存结果</span>
+</code></pre></div>
+
+<p><strong>解读</strong>：这个循环就是把数学公式翻译成了 Triton 指令。<code>b_h</code> 就像一个累加器，随着时间 $T$ 的推移不断更新。</p>
+<hr />
+<h4>✅ Task 4: 理解反向传播 (Bwd) —— "怎么算梯度？"</h4>
+<p><code>fused_recurrent_delta_rule_bwd_kernel</code> 是最复杂的。
+*   <strong>逻辑</strong>：它需要把前向传播的过程 <strong>倒过来</strong> 走一遍。
+*   <strong>代码特征</strong>：
+    *   指针计算里有 <code>+ (T - 1) * ...</code>，说明是从最后一个时间步开始读数据。
+    *   循环是 <code>for _ in range(T):</code>，但实际上是指针在递减 (<code>p_q -= ...</code>)。
+    *   它计算的是 <code>dk</code> (Key的梯度), <code>dv</code> (Value的梯度) 等。
+*   <strong>看不懂也没关系</strong>：通常只有算法研究员需要修改这里。你只需要知道它利用链式法则，把误差从最后一步传回第一步。</p>
+<hr />
+<h4>✅ Task 5: 理解 Python 包装层 —— "数据怎么流动的？"</h4>
+<p>看最后的 <code>fused_recurrent_delta_rule</code> 函数。
+*   <strong>输入</strong>：<code>q, k, v</code> (数据), <code>beta</code> (衰减系数), <code>initial_state</code> (初始记忆)。
+*   <strong>处理变长序列</strong>：注意 <code>cu_seqlens</code> 参数。
+    *   在训练大模型时，一个 Batch 里可能有好几个长短不一的句子。
+    *   如果用 Padding（补零）会浪费计算。
+    *   这个函数支持 <code>offsets</code> (或 <code>cu_seqlens</code>)，把所有句子拼成一条长龙，然后告诉内核每条龙的头尾在哪里，内核就会在到达句子边界时重置记忆 <code>h</code>。</p>
+<hr />
+<h3>总结：这段代码在讲什么？</h3>
+<p><strong>一句话：</strong>
+这是一个<strong>手写的高性能算子</strong>，用于计算一种<strong>带有“减法更新机制”的 RNN</strong>。</p>
+<p><strong>它的具体观点/逻辑：</strong>
+1.  <strong>Fused (融合)</strong>: 不要用 PyTorch 写 <code>for</code> 循环，太慢。把整个时间轴的循环写在一个 GPU Kernel 里，一次性跑完。
+2.  <strong>Recurrent (循环)</strong>: 这是一个时间序列模型，时刻 $t$ 的状态依赖于 $t-1$。
+3.  <strong>Delta Rule (增量规则)</strong>: 相比传统的 $K^T V$ 累加，它引入了减法项，这在数学上等价于一种更高级的矩阵逆更新，能让模型“记住”和“遗忘”得更精准。</p>
+<p><strong>如果你要使用它：</strong>
+只需要关注 <code>fused_recurrent_delta_rule</code> 这个函数的输入输出即可，把它当做一个黑盒的 Layer，输入 $Q, K, V$，输出 $O$。</p>

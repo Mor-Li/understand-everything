@@ -1,0 +1,151 @@
+<h1>tests/unit_tests/tensor_parallel/test_random.py</h1>
+<p>这份代码确实比较底层，它属于 <strong>Megatron-LM</strong>（一个用于训练超大模型的库）的核心组件测试。</p>
+<p>这份代码主要测试的是：<strong>在多显卡并行训练（Tensor Parallel）时，如何精确控制“随机数生成器”（RNG, Random Number Generator）。</strong></p>
+<p>为了让你看懂，我制定了一个 <strong>5步走的 To-Do List</strong>。我们将从基本概念出发，一步步拆解这份代码。</p>
+<h3>📝 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1: 理解背景</strong> —— 为什么训练大模型需要“管理”随机数？</li>
+<li><strong>Task 2: 认识管家</strong> —— 解析 <code>CudaRNGStatesTracker</code>（随机状态追踪器）。</li>
+<li><strong>Task 3: 并行初始化</strong> —— 解析 <code>model_parallel_cuda_manual_seed</code>（并行环境下的种子设置）。</li>
+<li><strong>Task 4: 显存优化技术</strong> —— 解析 <code>checkpoint</code>（激活重算技术）。</li>
+<li><strong>Task 5: 全局回顾</strong> —— 串联所有知识点。</li>
+</ol>
+<hr />
+<h3>Task 1: 理解背景 —— 为什么需要管理随机数？</h3>
+<p>在深度学习中，很多操作是随机的（比如初始化权重、Dropout 丢弃神经元）。
+*   <strong>单卡训练</strong>：我们只需要设定一个 <code>seed</code> (种子)，每次跑的结果就一样了。
+*   <strong>多卡并行训练</strong>：这就复杂了。
+    *   有时候我们需要所有卡生成<strong>一样</strong>的随机数（比如初始化模型参数，大家得同步）。
+    *   有时候我们需要每张卡生成<strong>不一样</strong>的随机数（比如 Dropout，每张卡丢弃的神经元应该不同，增加鲁棒性）。</p>
+<p><strong>结论</strong>：我们需要一个“管家”来记录和切换不同的随机数生成状态。这就是代码中 <code>CudaRNGStatesTracker</code> 的作用。</p>
+<hr />
+<h3>Task 2: 认识管家 —— <code>test_cuda_rng_states_tracker</code></h3>
+<p>这个函数测试的是那个“管家”类。让我们逐行“翻译”它的逻辑：</p>
+<ol>
+<li>
+<p><strong>初始化管家</strong>：
+    <code>python
+    rng_tracker = CudaRNGStatesTracker()</code></p>
+<ul>
+<li><em>解释</em>：雇佣了一个管家。</li>
+</ul>
+</li>
+<li>
+<p><strong>存取状态</strong>：
+    <code>python
+    rng_tracker.set_states({"state1":1234})
+    assert(rng_tracker.get_states()["state1"] == 1234)</code></p>
+<ul>
+<li><em>解释</em>：告诉管家，“state1”这个场景（比如初始化权重）用的随机种子是 1234。检查一下，管家确实记住了。</li>
+</ul>
+</li>
+<li>
+<p><strong>重置与添加</strong>：
+    <code>python
+    rng_tracker.reset() # 管家失忆了，清空所有记录
+    rng_tracker.add("state2", seed) # 告诉管家新任务 "state2"</code></p>
+</li>
+<li>
+<p><strong>防止重复添加（报错测试）</strong>：
+    <code>python
+    with pytest.raises(Exception):
+        assert(rng_tracker.add("state3", seed)) # 这里的逻辑有点怪，通常add不该报错，除非逻辑规定一次只能add一个或者重名？
+                                                # (根据源码，这里可能是测试add的某些限制，比如种子必须唯一或名字冲突)</code></p>
+<ul>
+<li><em>解释</em>：这段测试代码在验证 <code>add</code> 函数的健壮性，确保你不能非法添加状态。</li>
+</ul>
+</li>
+<li>
+<p><strong>核心功能：Fork (切换场景)</strong>：
+    <code>python
+    rng_tracker.fork("state2")</code></p>
+<ul>
+<li><em>解释</em>：这是最重要的一句。意思是<strong>“现在开始，把当前的 CUDA 随机数生成器切换到 'state2' 对应的状态”</strong>。如果不切换，CUDA 就一直沿用默认的随机流。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>Task 3: 并行初始化 —— <code>test_model_parallel_cuda_manual_seed</code></h3>
+<p>这个函数测试的是：在多张显卡（模型并行）的环境下，如何设置种子。</p>
+<ol>
+<li>
+<p><strong>模拟并行环境</strong>：
+    <code>python
+    Utils.initialize_model_parallel(4, 2)</code></p>
+<ul>
+<li><em>解释</em>：假装我们现在有 4 张卡，并行度配置好了。</li>
+</ul>
+</li>
+<li>
+<p><strong>设置并行种子</strong>：
+    <code>python
+    model_parallel_cuda_manual_seed(0)</code></p>
+<ul>
+<li><em>解释</em>：这是 Megatron 的核心函数。它会根据你当前是第几张显卡，智能地设置种子。</li>
+<li><em>逻辑</em>：它通常会设置两个种子：<ul>
+<li>一个是<strong>全局种子</strong>（所有卡一样，用于同步）。</li>
+<li>一个是<strong>局部种子</strong>（每张卡不一样，用于 Dropout 等）。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>验证管家是否这就位</strong>：
+    <code>python
+    rng_tracker = get_cuda_rng_tracker()
+    assert(rng_tracker.get_states()['model-parallel-rng'] is not None)</code></p>
+<ul>
+<li><em>解释</em>：检查管家手里是不是多了一个叫 <code>'model-parallel-rng'</code> 的状态记录。如果是，说明初始化成功。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>Task 4: 显存优化技术 —— <code>test_checkpoint</code></h3>
+<p>这是最难懂的部分。<code>checkpoint</code> (检查点/激活重算) 是一种<strong>省显存</strong>的技术。</p>
+<ul>
+<li><strong>原理</strong>：为了省显存，前向传播（Forward）时算出的一些中间结果，我不存下来。等反向传播（Backward）需要用到时，我再<strong>重新算一遍</strong>。</li>
+<li><strong>问题</strong>：如果中间结果计算包含了“随机操作”（比如 Dropout），重新算一遍时，随机数必须和第一次<strong>一模一样</strong>，否则梯度就乱了。</li>
+<li><strong>解决</strong>：<code>checkpoint</code> 函数会自动保存当时的随机数生成器状态，重算时恢复它。</li>
+</ul>
+<p>代码解析：</p>
+<ol>
+<li>
+<p><strong>定义一个简单函数</strong>：
+    <code>python
+    def test_forward(*input):
+        return input[0]+input[1]</code></p>
+<ul>
+<li><em>解释</em>：这就模拟一个神经网络层，做个加法。</li>
+</ul>
+</li>
+<li>
+<p><strong>基础测试</strong>：
+    <code>python
+    checkpoint(test_forward, None, torch.ones(16), torch.ones(16)*2)</code></p>
+<ul>
+<li><em>解释</em>：测试 <code>checkpoint</code> 能不能正常运行这个加法函数。<code>1+2=3</code>，断言结果要是 3。</li>
+</ul>
+</li>
+<li>
+<p><strong>并行环境下的测试</strong>：
+    <code>python
+    Utils.initialize_model_parallel()
+    input1 = torch.ones((4,4))
+    checkpoint(test_forward, True, input1, torch.ones((4,4))*2)</code></p>
+<ul>
+<li><em>解释</em>：在开启模型并行的情况下，测试 <code>checkpoint</code>。</li>
+<li>这里的 <code>True</code> 或者是 <code>None</code> 参数，通常控制是否使用特定的随机数分布策略。</li>
+<li>最后一行 <code>assert</code> 检查输入数据 <code>input1</code> 有没有被意外修改（或者是检查输出是否在 GPU 上且数值正确）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>Task 5: 总结 (Summary)</h3>
+<p>这三个测试函数其实讲了一个完整的故事：</p>
+<ol>
+<li><strong><code>test_cuda_rng_states_tracker</code></strong>: 测试<strong>底层工具</strong>。确保我们有一个能存取、切换随机数状态的“管家”。</li>
+<li><strong><code>test_model_parallel_cuda_manual_seed</code></strong>: 测试<strong>初始化</strong>。确保在大模型训练开始前，不同显卡的随机种子被正确设置（有的相同，有的不同），并交给了“管家”管理。</li>
+<li><strong><code>test_checkpoint</code></strong>: 测试<strong>应用场景</strong>。在最需要控制随机性的“激活重算”技术中，验证这套机制能不能保证计算结果的一致性。</li>
+</ol>
+<p><strong>简单一句话概括：</strong>
+这个文件在测试 <strong>“Megatron 库能不能在多显卡环境下，完美控制随机数生成，以保证模型训练既能省显存（Checkpointing），又能结果正确。”</strong></p>

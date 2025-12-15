@@ -1,0 +1,73 @@
+<h1>tools/openwebtext/filter_ngrams.py</h1>
+<p>这篇代码确实比较硬核，因为它涉及到大模型训练中一个非常关键的步骤：<strong>“数据去污染”（Data Decontamination）</strong>。</p>
+<p>简单来说，我们在训练大模型时，<strong>绝不希望</strong>模型在训练数据里“偷看”到未来考试（测试集）的题目和答案。如果模型背下了答案，它的评分就会虚高，但实际能力并没有那么强。</p>
+<p>这个脚本的任务就是：<strong>拿着“考试题库”（测试集），去“复习资料”（训练集）里搜查，把所有长得像考试题的内容统统挖掉。</strong></p>
+<p>为了让你听懂，我把这个脚本的工作流程拆解成一个 <strong>4步走的 Task List（待办清单）</strong>：</p>
+<hr />
+<h3>核心概念：什么是 N-gram？</h3>
+<p>在看清单前，先理解一个词 <code>N-gram</code>。
+*   如果 N=13，就是“连续的13个单词”。
+*   代码认为：如果训练集里有连续13个单词和测试集一模一样，那就是“作弊泄露”了，必须删掉。</p>
+<hr />
+<h3>Task List：代码执行步骤详解</h3>
+<h4>🛑 第一阶段：建立“嫌疑人名单” (收集测试集特征)</h4>
+<p><strong>任务：</strong> 找出所有可能泄露的句子片段。</p>
+<ol>
+<li><strong>加载测试集任务 (<code>process_task</code>)</strong>：<ul>
+<li>代码会加载各种著名的评测数据集（比如 SQuAD, LAMBADA, Race, CoQA 等）。这些就是我们要防止模型偷看的“考卷”。</li>
+</ul>
+</li>
+<li><strong>提取 N-grams (<code>compute_tasks_ngrams</code>)</strong>：<ul>
+<li>把这些考卷里的文字，切成一段一段的词组（默认为 13个词一组）。</li>
+<li><strong>结果</strong>：得到了一个巨大的字典 <code>ngrams</code>，里面全是考卷里的原话。我们可以把它看作<strong>“嫌疑人黑名单”</strong>。</li>
+</ul>
+</li>
+</ol>
+<h4>📊 第二阶段：排除“大众脸” (基于频率过滤)</h4>
+<p><strong>任务：</strong> 别误删了常用语。</p>
+<ul>
+<li><strong>问题</strong>：考卷里可能有“I love you”或者“The sky is blue”这种话。如果我们在训练集里把所有包含这些话的文档都删了，那训练集就被毁了。</li>
+<li><strong>做法 (<code>get_ngrams_below_threshold</code>)</strong>：<ol>
+<li>扫描一遍巨大的<strong>训练数据集</strong>。</li>
+<li>统计“嫌疑人黑名单”里的每一句话在训练集里出现了几次。</li>
+<li><strong>关键判断</strong>：<ul>
+<li>如果一句话出现了几万次（比如常用语），那它肯定不是泄露，而是通用英语，<strong>保留，不删</strong>。</li>
+<li>如果一句话只出现了几次（比如少于 10 次），那它极有可能是特有的考题泄露，<strong>标记为必须删除</strong>。</li>
+</ul>
+</li>
+<li><strong>结果</strong>：得到了一个精简后的 <code>ngrams_below_threshold</code>（真正的“必杀名单”）。</li>
+</ol>
+</li>
+</ul>
+<h4>✂️ 第三阶段：做手术 (精准切除)</h4>
+<p><strong>任务：</strong> 在训练数据中切除泄露内容。</p>
+<p>现在开始正式处理训练数据 (<code>clean_ngrams_below_threshold</code>)：</p>
+<ol>
+<li><strong>多进程扫描</strong>：利用多核 CPU 并行读取训练数据。</li>
+<li><strong>查找并切分 (<code>check_and_clean_text</code> &amp; <code>split_text</code>)</strong>：<ul>
+<li>一旦发现文档里包含了“必杀名单”里的句子：</li>
+<li><strong>切一刀</strong>：把这个句子挖掉。</li>
+<li><strong>扩大范围</strong>：不仅挖掉这个句子，为了保险起见，连这个句子前后各 200 个字符（<code>remove_char_each_side</code>）也一起挖掉。</li>
+<li>这就把原本的一篇长文档，切成了两段（或者更多段）。</li>
+</ul>
+</li>
+</ol>
+<h4>🧹 第四阶段：打扫战场 (过滤垃圾数据)</h4>
+<p><strong>任务：</strong> 扔掉切得太碎或太短的文档。</p>
+<p>手术做完了，会产生很多碎片，代码会进行最后的清洗：</p>
+<ol>
+<li><strong>太短的不要</strong>：如果切剩下的片段少于 200 个字符（<code>filter_text_char_len</code>），这数据没训练价值了，<strong>扔掉</strong>。</li>
+<li><strong>太碎的不要</strong>：如果一篇文章因为含有很多泄露内容，被切成了超过 10 段（<code>splits_count</code>），说明这篇文章本身可能就是考题合集，<strong>整篇扔掉</strong>。</li>
+<li><strong>保存结果</strong>：把剩下干净的、没看过考题的数据，保存到新的 JSON 文件里，加上新的 ID。</li>
+</ol>
+<hr />
+<h3>总结一下代码逻辑</h3>
+<ol>
+<li><strong>Input 1</strong>: 各种考试真题（SQuAD, LAMBADA...）。</li>
+<li><strong>Input 2</strong>: 你的庞大训练数据（OpenWebText, CC...）。</li>
+<li><strong>Step 1</strong>: 把真题切成词组（N-grams）。</li>
+<li><strong>Step 2</strong>: 看看这些词组在训练数据里是不是<strong>罕见</strong>（罕见=大概率是泄露；常见=常用语）。</li>
+<li><strong>Step 3</strong>: 把训练数据里包含这些“罕见真题词组”的地方挖掉，并把文档切开。</li>
+<li><strong>Output</strong>: 一份“去过污染”的、干净的训练数据集。</li>
+</ol>
+<p>这就是这个脚本全部在做的事情。</p>

@@ -1,0 +1,121 @@
+<h1>fla/ops/triton/gla/chunk_fuse.py</h1>
+<p>这份代码确实非常硬核，因为它结合了 <strong>线性注意力机制 (Linear Attention)</strong> 的数学原理和 <strong>Triton/CUDA</strong> 的底层硬件优化。看不懂是很正常的。</p>
+<p>为了让你理解，我们先把复杂的代码逻辑拆解成一个 <strong>“任务清单” (To-Do List)</strong>，把这个算法想象成一个流水线工作。</p>
+<h3>核心背景：这是在干什么？</h3>
+<p>这段代码实现的是 <strong>Gated Linear Attention (GLA)</strong> 的一种高效计算方式，叫做 <strong>Chunkwise（分块）</strong> 计算。</p>
+<ul>
+<li><strong>普通 Transformer</strong>：看整本书（所有 token 都要两两交互），内存爆炸。</li>
+<li><strong>Linear Attention (RNN 模式)</strong>：像人读书一样，读一个字，更新一下脑子里的记忆（Hidden State），再读下一个字。省内存，但 GPU 这种擅长并行计算的硬件不喜欢（因为要串行）。</li>
+<li><strong>Chunkwise (本文的方法)</strong>：折中方案。把书分成很多“段落”（Chunk）。<ul>
+<li><strong>段落内 (Intra-chunk)</strong>：这一段落里的字，大家两两交互（并行计算，GPU 喜欢）。</li>
+<li><strong>段落间 (Inter-chunk)</strong>：读完这一段，把精华总结成一个“记忆状态”，传给下一段（串行/递归）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>任务清单 (Task To-Do List)</h3>
+<p>我们将代码逻辑拆分为以下几个步骤，你可以对照着代码看：</p>
+<h4>✅ Task 1: 准备原材料 (Inputs)</h4>
+<p><strong>代码位置：</strong> <code>FusedChunkGLAFunction.forward</code> 的开头。
+<strong>解释：</strong>
+我们需要四个核心张量：
+1.  <strong>Q (Query)</strong>: 我现在想查询什么？
+2.  <strong>K (Key)</strong>: 这里的关键词是什么？
+3.  <strong>V (Value)</strong>: 这里的内容是什么？
+4.  <strong>G (Gate/Log-Decay)</strong>: <strong>这是 GLA 的核心</strong>。它是一个“遗忘门”。它决定了我们在往后读的时候，要忘掉多少之前的记忆。代码里 <code>g</code> 是对数形式的累积衰减率。</p>
+<h4>✅ Task 2: 搞定“段落间”的记忆传递 (Inter-chunk)</h4>
+<p><strong>代码位置：</strong> <code>FusedChunkGLAFunction.forward</code> 中调用 <code>fused_chunk_gla_fwd_kernel</code> 的部分。
+<strong>解释：</strong>
+这是最难的部分，也是 Triton Kernel (<code>fused_chunk_gla_fwd_kernel</code>) 做的事情。
+*   <strong>目标</strong>：计算之前的段落（历史记忆）对当前段落的影响。
+*   <strong>动作</strong>：
+    1.  启动 GPU 核心。
+    2.  维护一个记忆矩阵 $H$（代码里的 <code>b_h</code>）。
+    3.  <strong>循环</strong>：对于每一个 Chunk（段落）：
+        *   先用当前的 $Q$ 去读记忆 $H$，算出历史对当前输出的贡献。（<code>b_o = tl.dot(b_q, b_h)</code>）
+        *   然后，用当前的 $K$ 和 $V$ 更新记忆 $H$，把当前段落的信息写进脑子里。（<code>b_h += tl.dot(b_k, b_v)</code>）
+        *   <em>注意：</em> 这里面还夹杂着 <code>g</code> (decay)，意味着在存入记忆和读取记忆时，旧的信息会按比例衰减（变得模糊）。</p>
+<h4>✅ Task 3: 搞定“段落内”的详细阅读 (Intra-chunk)</h4>
+<p><strong>代码位置：</strong> <code>FusedChunkGLAFunction.forward</code> 后半部分，调用 <code>cuda_cal_A</code> 的地方。
+<strong>解释：</strong>
+Triton kernel 只管了“记忆传递”，但同一个 Chunk 内部的 Token 还没互相交互呢。
+*   <strong>目标</strong>：计算当前 Chunk 内部 Q 和 K 的注意力。
+*   <strong>动作</strong>：
+    1.  代码把 Q, K, V 切分成小块（rearrange）。
+    2.  调用一个写好的 CUDA 函数 <code>cuda_cal_A</code>。这个函数算的是一个局部的注意力矩阵 $A$。
+    3.  $O_{local} = A \times V$。这就像是标准的 Attention，但是范围很小，只在 Chunk 内部算。</p>
+<h4>✅ Task 4: 合并结果 (Combine)</h4>
+<p><strong>代码位置：</strong> <code>o.add_(o2)</code>
+<strong>解释：</strong>
+最终的输出 = <strong>历史记忆的贡献</strong> (Task 2 的结果) + <strong>当前段落内的交互</strong> (Task 3 的结果)。</p>
+<hr />
+<h3>逐步代码解读 (中文翻译版)</h3>
+<p>现在我们带着这个逻辑再看一眼代码的关键部分：</p>
+<h4>1. Python 前向传播 (<code>forward</code>)</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 准备数据，计算缩放比例</span>
+<span class="n">batch_size</span><span class="p">,</span> <span class="n">n_heads</span><span class="p">,</span> <span class="n">seq_len</span><span class="p">,</span> <span class="n">d_head_qk</span> <span class="o">=</span> <span class="n">q</span><span class="o">.</span><span class="n">shape</span>
+<span class="n">scale</span> <span class="o">=</span> <span class="n">d_head_qk</span> <span class="o">**</span> <span class="o">-</span><span class="mf">0.5</span>
+
+<span class="c1"># 2. 准备运行 Inter-chunk (段落间) 计算</span>
+<span class="c1"># 设置 Block Size (BT=16)，也就是一个 Chunk 的长度</span>
+<span class="n">BT</span> <span class="o">=</span> <span class="mi">16</span> 
+
+<span class="c1"># 预处理 Gate (g)，把它变成累积和的形式，方便后续做减法算出衰减量</span>
+<span class="n">g</span> <span class="o">=</span> <span class="n">rearrange</span><span class="p">(</span><span class="n">g</span><span class="p">,</span> <span class="s1">&#39;b h (n c) d -&gt; b h n c d&#39;</span><span class="p">,</span> <span class="n">c</span><span class="o">=</span><span class="n">BT</span><span class="p">)</span>
+<span class="n">g</span> <span class="o">=</span> <span class="n">g</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">.</span><span class="n">cumsum</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">q</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+<span class="n">g</span> <span class="o">=</span> <span class="n">rearrange</span><span class="p">(</span><span class="n">g</span><span class="p">,</span> <span class="s1">&#39;b h n c d -&gt; b h (n c) d&#39;</span><span class="p">)</span>
+
+<span class="c1"># 3. 启动 Triton Kernel (做 Inter-chunk 递归)</span>
+<span class="c1"># 这步跑完，o 里面装的是“历史记忆对当前的贡献”</span>
+<span class="n">fused_chunk_gla_fwd_kernel</span><span class="p">[</span><span class="n">grid</span><span class="p">](</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">g</span><span class="p">,</span> <span class="n">o</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+<span class="c1"># 4. 运行 Intra-chunk (段落内) 计算</span>
+<span class="c1"># 把数据切成小块</span>
+<span class="n">q2</span> <span class="o">=</span> <span class="n">rearrange</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+<span class="n">k2</span> <span class="o">=</span> <span class="n">rearrange</span><span class="p">(</span><span class="n">k</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+<span class="c1"># 调用 CUDA 算局部注意力矩阵 A</span>
+<span class="k">if</span> <span class="n">q</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">:</span>
+    <span class="n">A</span> <span class="o">=</span> <span class="n">cuda_cal_A_bf16</span><span class="o">.</span><span class="n">forward</span><span class="p">(</span><span class="n">q2</span><span class="p">,</span> <span class="n">k2</span><span class="p">,</span> <span class="n">g2</span><span class="p">)</span> <span class="o">*</span> <span class="n">scale</span>
+<span class="c1"># 算出局部输出 o2</span>
+<span class="n">o2</span> <span class="o">=</span> <span class="n">A</span> <span class="o">@</span> <span class="n">v2</span> 
+
+<span class="c1"># 5. 相加</span>
+<span class="n">o</span><span class="o">.</span><span class="n">add_</span><span class="p">(</span><span class="n">o2</span><span class="p">)</span> <span class="c1"># 最终结果</span>
+</code></pre></div>
+
+<h4>2. Triton Kernel (<code>fused_chunk_gla_fwd_kernel</code>)</h4>
+<p>这个 Kernel 是为了在 GPU 上极速执行那个“循环更新记忆”的过程。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 初始化记忆状态 b_h (全0)</span>
+<span class="n">b_h</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">zeros</span><span class="p">([</span><span class="n">BK</span><span class="p">,</span> <span class="n">BV</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+
+<span class="c1"># 循环：遍历每一个 Chunk (时间步 T)</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">tl</span><span class="o">.</span><span class="n">cdiv</span><span class="p">(</span><span class="n">T</span><span class="p">,</span> <span class="n">BT</span><span class="p">)):</span>
+    <span class="c1"># 1. 加载当前 Chunk 的 K, V, Q, G</span>
+    <span class="n">b_k</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="n">b_v</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="n">b_q</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># 2. 处理衰减率 (Decay)</span>
+    <span class="c1"># 这里的数学原理是：exp(g_current - g_past) = decay</span>
+
+    <span class="c1"># 3. 计算输出 (Query 读 记忆)</span>
+    <span class="c1"># b_h 是上一个时间步传下来的记忆</span>
+    <span class="n">b_o</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_q</span><span class="p">,</span> <span class="n">b_h</span><span class="p">)</span> 
+
+    <span class="c1"># 4. 更新记忆 (写入 Key 和 Value)</span>
+    <span class="c1"># 先把旧记忆衰减一下</span>
+    <span class="n">b_h</span> <span class="o">*=</span> <span class="n">decay</span> 
+    <span class="c1"># 再把当前的新知识 (K * V) 加进去</span>
+    <span class="n">b_h</span> <span class="o">+=</span> <span class="n">tl</span><span class="o">.</span><span class="n">dot</span><span class="p">(</span><span class="n">b_k</span><span class="p">,</span> <span class="n">b_v</span><span class="p">)</span> 
+
+    <span class="c1"># 5. 保存结果到显存</span>
+    <span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">p_o</span><span class="p">,</span> <span class="n">b_o</span><span class="p">)</span>
+</code></pre></div>
+
+<h3>总结一下它的“骚操作”</h3>
+<ol>
+<li><strong>混合计算</strong>：它没有完全用 Triton 写，也没有完全用 CUDA。它把<strong>递归部分</strong>（难并行，依赖循环）交给了 Triton 的 block 级循环处理，把<strong>局部注意力部分</strong>（易并行，矩阵乘法）交给了 CUDA 库函数。</li>
+<li><strong>On-the-fly (即时计算)</strong>：注意看注释 <code>on-the-fly computation without materializing hidden statets</code>。意思是它不需要把巨大的注意力矩阵 $S$ 或者完整的 RNN 状态全部存下来，而是算完就扔，只保留必要的梯度。这样显存占用极小。</li>
+<li><strong>分块 (Chunking)</strong>：这是为了在 GPU 的并行能力（一次算一大块）和 RNN 的线性复杂度（随序列长度线性增长）之间找平衡。</li>
+</ol>
+<p><strong>简单来说：这段代码就是一个“一边读历史书一边做笔记，同时还能快速理解当前段落”的高效算法实现。</strong></p>

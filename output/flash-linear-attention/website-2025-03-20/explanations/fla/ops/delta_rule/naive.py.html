@@ -1,0 +1,101 @@
+<h1>fla/ops/delta_rule/naive.py</h1>
+<p>这份代码确实非常硬核，涉及到了<strong>线性注意力机制（Linear Attention）</strong>和<strong>递归神经网络（RNN）</strong>的底层数学优化。</p>
+<p>简单来说，这个文件实现了一种叫 <strong>"Delta Rule"</strong> 的算法。它的核心目的是：<strong>让模型像 RNN 一样拥有记忆（State），但又能像 Transformer 一样并行训练。</strong></p>
+<p>为了让你看懂，我为你制定了一个 <strong>4步走的学习 To-Do List</strong>。我们不要一口气看完，而是由浅入深，先看懂逻辑，再看懂优化。</p>
+<hr />
+<h3>📋 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1：搞懂核心概念 (什么是 Delta Rule?)</strong> —— 对应函数 <code>delta_rule_recurrence</code></li>
+<li><strong>Task 2：理解这一步在算什么 (数学本质)</strong> —— 细读 <code>recurrence</code> 中的循环体</li>
+<li><strong>Task 3：为什么要分块? (性能优化)</strong> —— 对应函数 <code>delta_rule_chunkwise</code></li>
+<li><strong>Task 4：如何并行化? (训练加速)</strong> —— 对应函数 <code>delta_rule_parallel</code></li>
+</ol>
+<hr />
+<h3>🚀 Task 1: 搞懂核心概念 (什么是 Delta Rule?)</h3>
+<p><strong>目标</strong>：忽略后面复杂的函数，只看第一个函数 <code>delta_rule_recurrence</code>。这是算法的“原始形态”，最容易理解。</p>
+<p><strong>背景知识</strong>：
+传统的 Attention 是 $O(N^2)$ 复杂度，太慢。这个算法试图维护一个<strong>记忆矩阵 $S$</strong> (State)，每读入一个词，就更新一下记忆。</p>
+<p><strong>代码解读</strong>：
+看 <code>delta_rule_recurrence</code> 函数：
+*   <strong>输入</strong>：<code>q, k, v</code> (输入的序列), <code>beta</code> (学习率/遗忘门), <code>initial_state</code> (初始记忆)。
+*   <strong>变量 $S$</strong>：这就是“记忆”。代码里 <code>S = torch.zeros(...)</code> 初始化了一个空的记忆。
+*   <strong>循环</strong>：<code>for i in range(l):</code> 这就是 RNN 的特征，一个词一个词地处理。</p>
+<p><strong>你的任务</strong>：
+想象你是一个抄写员：
+1.  <code>q</code> 是你的查询需求。
+2.  <code>k</code> 是索引（Key）。
+3.  <code>v</code> 是内容（Value）。
+4.  <code>S</code> 是你的笔记本。</p>
+<hr />
+<h3>🧠 Task 2: 理解这一步在算什么 (数学本质)</h3>
+<p><strong>目标</strong>：看懂 <code>delta_rule_recurrence</code> 里的 <code>for</code> 循环内部发生了什么。这是 "Delta Rule" 名字的由来。</p>
+<p><strong>代码片段分析</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 提取当前时刻的 k, q, v</span>
+<span class="n">_k</span> <span class="o">=</span> <span class="n">k</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span>
+<span class="n">_q</span> <span class="o">=</span> <span class="n">q</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span>
+<span class="n">_v</span> <span class="o">=</span> <span class="n">v</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+
+<span class="c1"># 2. 计算 Delta (核心中的核心！)</span>
+<span class="c1"># 原理：先用当前的 Key 去查现在的记忆 S，看看能预测出什么值。</span>
+<span class="c1"># 然后用真实的 _v 减去 预测值，得到“误差”或“增量” (Delta)。</span>
+<span class="n">_v</span> <span class="o">=</span> <span class="n">_v</span> <span class="o">-</span> <span class="p">(</span><span class="n">S</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span> <span class="o">*</span> <span class="n">_k</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">])</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">)</span> 
+
+<span class="c1"># 3. 应用 Beta (权重/学习率)</span>
+<span class="n">_v</span> <span class="o">=</span> <span class="n">_v</span> <span class="o">*</span> <span class="n">beta_i</span>
+
+<span class="c1"># 4. 更新记忆 S</span>
+<span class="c1"># 原理：把新的知识 (Key 和 算出来的 Delta _v) 写入笔记本 S</span>
+<span class="n">S</span> <span class="o">=</span> <span class="n">S</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span> <span class="o">+</span> <span class="n">_k</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">*</span> <span class="n">_v</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">)</span>
+
+<span class="c1"># 5. 输出</span>
+<span class="c1"># 原理：用 Query 去查更新后的笔记本 S，得到输出</span>
+<span class="n">o</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">einsum</span><span class="p">(</span><span class="s1">&#39;bhd,bhdm-&gt;bhm&#39;</span><span class="p">,</span> <span class="n">_q</span><span class="p">,</span> <span class="n">S</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>通俗解释</strong>：
+普通的线性 Attention 直接把 $K$ 和 $V$ 乘进去。而 <strong>Delta Rule</strong> 说：“如果我的记忆 $S$ 已经包含了这个知识，我就不重复记了；我只记录<strong>新的部分（Delta）</strong>。”
+这就是那句 <code>_v = _v - ...</code> 的含义。</p>
+<hr />
+<h3>⚡ Task 3: 为什么要分块? (性能优化)</h3>
+<p><strong>目标</strong>：理解 <code>delta_rule_chunkwise</code>。</p>
+<p><strong>痛点</strong>：
+Task 1 中的 <code>for i in range(l)</code> 循环虽然逻辑清晰，但在 GPU 上<strong>非常慢</strong>。Python 的循环是 GPU 的天敌。</p>
+<p><strong>解决方案</strong>：
+把长序列切成小块（Chunk）。
+*   <strong>块内 (Intra-chunk)</strong>：试图用矩阵运算并行计算（消除循环）。
+*   <strong>块间 (Inter-chunk)</strong>：依然像 RNN 一样把记忆 $S$ 传递给下一个块。</p>
+<p><strong>代码难点解读</strong>：
+你会在 <code>chunkwise</code> 函数里看到这一段极其抽象的代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 构造一个因果掩码矩阵</span>
+<span class="n">mask</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">triu</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> 
+<span class="c1"># 这是一个非常复杂的数学技巧</span>
+<span class="n">attn</span> <span class="o">=</span> <span class="o">-</span><span class="p">(</span><span class="n">k_beta</span> <span class="o">@</span> <span class="n">k</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">2</span><span class="p">))</span><span class="o">.</span><span class="n">masked_fill</span><span class="p">(</span><span class="n">mask</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+<span class="c1"># ... 计算逆矩阵或级数展开 ...</span>
+<span class="n">attn</span> <span class="o">=</span> <span class="n">attn</span> <span class="o">+</span> <span class="n">torch</span><span class="o">.</span><span class="n">eye</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> 
+</code></pre></div>
+
+<p><strong>这一步在干嘛？</strong>
+它在用矩阵数学模拟 Task 2 里的那个 <code>for</code> 循环。
+在数学上，递归公式 $v_t = v_t - k_t S_{t-1}$ 可以被写成一个矩阵求逆的形式 $(I - \text{tri}(...))^{-1}$。
+<strong>你不需要完全看懂推导，只需要知道：这里是为了把“串行循环”变成“并行矩阵乘法”。</strong></p>
+<hr />
+<h3>🚀 Task 4: 终极形态 (并行化)</h3>
+<p><strong>目标</strong>：大概理解 <code>delta_rule_parallel</code>。</p>
+<p><strong>场景</strong>：
+在<strong>训练</strong>阶段，我们已经有了所有的输入 $Q, K, V$。我们不想像机器人一样一步步走，我们想一眼看完所有数据。</p>
+<p><strong>逻辑</strong>：
+这个函数试图将整个 Delta Rule 转化成一种全局的 Attention 矩阵计算。
+*   它计算了一个巨大的 <code>A</code> 矩阵（Attention Matrix）。
+*   但是这个 <code>A</code> 矩阵不像 Transformer 那样简单的是 $Q \times K^T$。
+*   它包含了 Delta Rule 特有的“减去旧记忆”的数学逻辑。</p>
+<p>代码里的 <code>BM</code>, <code>BN</code> 是为了在显存有限的情况下，分块计算这个巨大的矩阵（Blockwise Parallel）。</p>
+<hr />
+<h3>💡 总结 (Takeaway)</h3>
+<p>如果让我用一句话总结这个文件：
+<strong>这是一个为了让 Transformer 拥有 RNN 式的高效推理能力，而特意设计的“只记录增量信息”的注意力机制算法。</strong></p>
+<ul>
+<li><code>naive.py</code> 这个文件名暗示了这是<strong>参考实现</strong>（跑得慢，但逻辑对）。</li>
+<li>真正的生产环境代码通常会用 CUDA (C++) 重写 Task 3 和 Task 4 的逻辑。</li>
+</ul>
+<p><strong>建议阅读顺序</strong>：
+死磕 <code>delta_rule_recurrence</code>。只要看懂了 <code>_v = _v - (S * k)</code> 这一行，你就看懂了这个算法的灵魂。其他的全是为加速服务的数学魔术。</p>

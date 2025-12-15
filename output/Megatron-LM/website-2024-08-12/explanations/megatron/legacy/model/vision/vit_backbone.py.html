@@ -1,0 +1,122 @@
+<h1>megatron/legacy/model/vision/vit_backbone.py</h1>
+<p>这份代码实现的是 <strong>Vision Transformer (ViT)</strong> 的骨干网络（Backbone）。简单来说，就是把 Transformer 这个原本用来处理文本（NLP）的模型，拿来处理图像（CV）。</p>
+<p>为了让你看懂，我们可以把整个代码的逻辑想象成一个<strong>“流水线工厂”的 To-Do List</strong>。这张清单描述了<strong>一张图片是如何一步步被处理成计算机能理解的特征向量的</strong>。</p>
+<p>下面是按照代码执行逻辑整理的 <strong>Task To-Do List</strong>：</p>
+<hr />
+<h3>📋 Task To-Do List：一张图片的“变形记”</h3>
+<h4>Task 1: 切分图片 (Patchify)</h4>
+<ul>
+<li><strong>目标</strong>：Transformer 只能处理序列（像句子里的单词），不能直接处理二维图片。</li>
+<li><strong>动作</strong>：把一张大图切成无数个小方块（Patch）。</li>
+<li><strong>代码位置</strong>：<code>forward</code> 函数里的 <code>einops.rearrange</code>。</li>
+<li><strong>通俗解释</strong>：就像把一张拼图切成一块块碎片。</li>
+</ul>
+<h4>Task 2: 转换格式 (Linear Projection)</h4>
+<ul>
+<li><strong>目标</strong>：把切好的小方块（像素点）转换成数学向量（Embedding）。</li>
+<li><strong>动作</strong>：用一个线性层（Linear Layer）把每个小方块拉直并映射到高维空间。</li>
+<li><strong>代码位置</strong>：<code>self.linear_encoder</code>。</li>
+<li><strong>通俗解释</strong>：把每一块拼图的画面内容，翻译成一串数字代码。</li>
+</ul>
+<h4>Task 3: 插入“班长” (CLS Token)</h4>
+<ul>
+<li><strong>目标</strong>：我们需要一个特殊的标记来代表整张图片的信息，用于最后的分类。</li>
+<li><strong>动作</strong>：在切好的方块序列最前面，强行加塞一个（或一组）可学习的特殊向量，叫 Class Token。</li>
+<li><strong>代码位置</strong>：<code>self.cls_token</code> 和 <code>torch.cat</code>。</li>
+<li><strong>通俗解释</strong>：就像一个班级排队，最前面站个班长，最后老师问话（分类）只问班长，因为经过交流，班长已经知道了所有人的情况。<ul>
+<li><em>注：这里代码里 <code>CLASS_TOKEN_LENGTH = 8</code>，说明它用了8个token来做这个“班长”，通常标准ViT是1个。</em></li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 贴上座位号 (Position Embedding)</h4>
+<ul>
+<li><strong>目标</strong>：Transformer 自身不知道方块原本在图片的左上角还是右下角。</li>
+<li><strong>动作</strong>：给每个向量加上一个代表位置的参数。</li>
+<li><strong>代码位置</strong>：<code>self.position_embeddings</code>。</li>
+<li><strong>通俗解释</strong>：拼图打散了就拼不回去了，所以要在每块拼图背面写上编号（如“第1行第3列”），防止乱序。</li>
+</ul>
+<h4>Task 5: 大脑思考 (Transformer Layers)</h4>
+<ul>
+<li><strong>目标</strong>：让所有的方块（包括班长）互相“交流”，提取特征。</li>
+<li><strong>动作</strong>：输入进 <code>ParallelTransformer</code>。这是核心的 Self-Attention 机制。</li>
+<li><strong>代码位置</strong>：<code>self.transformer</code>。</li>
+<li><strong>通俗解释</strong>：这是核心“黑盒”。方块们在里面开会，比如“我是狗耳朵”方块和“我是狗尾巴”方块发现彼此有关联，就把信息汇总给“班长”。</li>
+</ul>
+<h4>Task 6: 整理输出 (Post Process)</h4>
+<ul>
+<li><strong>目标</strong>：把处理完的数据整理好格式送出去。</li>
+<li><strong>动作</strong>：调整张量维度（Transpose），或者只取出“班长”Token。</li>
+<li><strong>代码位置</strong>：<code>forward</code> 函数最后的 <code>hidden_states</code> 处理。</li>
+</ul>
+<hr />
+<h3>🔍 代码分块详细解读</h3>
+<p>现在我们对照上面的 List，来看看代码里的具体实现：</p>
+<h4>1. <code>VitMlpHead</code> 类 (分类头)</h4>
+<p>这是流水线的<strong>最后一步</strong>（通常接在 Backbone 之后）。
+*   <strong>功能</strong>：拿到 Transformer 处理完的特征（通常是 CLS token），过一个简单的神经网络（Linear -&gt; Tanh -&gt; Linear），最后输出分类结果（比如是猫还是狗）。</p>
+<h4>2. <code>twod_interpolate_position_embeddings_hook</code> (难点：位置编码插值)</h4>
+<p>这是一个<strong>高级补丁工具</strong>。
+*   <strong>问题</strong>：你在 224x224 的图片上训练好了模型（位置编码是固定的）。突然，你想预测一张 384x384 的大图。切出来的方块变多了，原本的“座位号”不够用了，或者位置对不上了。
+*   <strong>解决</strong>：这个函数会把原本的位置编码矩阵像图片一样进行<strong>拉伸或缩放（Interpolate）</strong>，让它适配新的图片尺寸。
+*   <strong>逻辑</strong>：
+    1.  检查 <code>state_dict</code> 里的权重。
+    2.  计算现在的方块数量和权重的数量是否一致。
+    3.  如果不一致，把 1D 的位置编码变回 2D 网格。
+    4.  用 <code>F.interpolate</code> 进行双线性插值（拉伸）。
+    5.  变回 1D，加载进去。</p>
+<h4>3. <code>VitBackbone</code> 类 (核心骨架)</h4>
+<p><strong><code>__init__</code> (准备工作)</strong>
+*   <code>self.patch_dim</code>: 定义方块大小。
+*   <code>self.cls_token</code>: 初始化“班长”向量（全0或随机）。
+*   <code>self.linear_encoder</code>: 准备 Task 2 的转换器。
+*   <code>self.position_embeddings</code>: 准备 Task 4 的座位号。
+*   <code>self.transformer</code>: 准备 Task 5 的大脑（调用了 Megatron 的 Transformer 模块）。</p>
+<p><strong><code>forward</code> (流水线开动)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="nb">input</span><span class="p">):</span>
+    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">pre_process</span><span class="p">:</span>
+        <span class="c1"># Task 1: 切图 + 重排</span>
+        <span class="c1"># b=batch, c=channel, h/w=height/width, p1/p2=patch_size</span>
+        <span class="n">rearranged_input</span> <span class="o">=</span> <span class="n">einops</span><span class="o">.</span><span class="n">rearrange</span><span class="p">(</span>
+            <span class="nb">input</span><span class="p">,</span>
+            <span class="s2">&quot;b c (h p1) (w p2) -&gt; b (h w) (p1 p2 c)&quot;</span><span class="p">,</span> <span class="o">...</span>
+        <span class="p">)</span>
+
+        <span class="c1"># Task 2: 线性投影 (像素 -&gt; 向量)</span>
+        <span class="n">encoder_output</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">linear_encoder</span><span class="p">(</span><span class="n">rearranged_input</span><span class="p">)</span>
+
+        <span class="c1"># Task 3: 加塞“班长” (CLS Token)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">class_token</span><span class="p">:</span>
+            <span class="c1"># 把班长复制多份(适配batch size)并拼接到序列最前面</span>
+            <span class="n">concatenated_tokens</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">((</span><span class="n">cls_tokens</span><span class="p">,</span> <span class="n">encoder_output</span><span class="p">),</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+
+        <span class="c1"># Task 4: 加上位置编码</span>
+        <span class="n">token_embeddings</span> <span class="o">=</span> <span class="n">concatenated_tokens</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">position_embeddings</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+        <span class="c1"># 调整格式适应 Transformer (Sequence Length 在第一维)</span>
+        <span class="n">token_embeddings</span> <span class="o">=</span> <span class="n">token_embeddings</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">embedding_dropout</span><span class="p">(</span><span class="n">token_embeddings</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">hidden_states</span> <span class="o">=</span> <span class="nb">input</span>
+
+    <span class="c1"># Task 5: 核心 Transformer 运算</span>
+    <span class="n">hidden_states</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">transformer</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+
+    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">post_process</span><span class="p">:</span>
+        <span class="c1"># Task 6: 格式还原</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">single_token_output</span><span class="p">:</span>
+            <span class="c1"># 如果只需要分类，只拿第0个位置(也就是班长)</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">hidden_states</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="c1"># 否则返回整个序列</span>
+            <span class="n">hidden_states</span> <span class="o">=</span> <span class="n">hidden_states</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+
+    <span class="k">return</span> <span class="n">hidden_states</span>
+</code></pre></div>
+
+<h3>总结</h3>
+<p>你只需要记住：这个文件就是把<strong>图片</strong>切碎，变成<strong>一串数字</strong>，加上<strong>位置标记</strong>，然后扔进 <strong>Transformer</strong> 里去算。</p>
+<ul>
+<li><code>VitMlpHead</code> 是最后用来分类的。</li>
+<li><code>VitBackbone</code> 是主干网络。</li>
+<li>那个复杂的 <code>hook</code> 函数只是为了防止图片尺寸变了导致模型报错而做的“自动缩放”补丁。</li>
+</ul>

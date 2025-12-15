@@ -1,0 +1,113 @@
+<h1>docs/algo/grpo.md</h1>
+<p>完全没问题。这篇文档介绍的是 <strong>GRPO (Group Relative Policy Optimization)</strong>，这是最近非常火（特别是 DeepSeek-R1 背后的核心技术之一）的一种强化学习算法。</p>
+<p>之所以难懂，是因为它假设你懂 PPO（传统的强化学习算法）。</p>
+<p>为了让你轻松理解，我把学习这份文档拆解成一个 <strong>“由浅入深的学习任务清单 (To-Do List)”</strong>。我们像通关游戏一样，一步步解锁它的概念。</p>
+<hr />
+<h3>🟢 任务一：搞懂核心理念 (为什么要有 GRPO？)</h3>
+<p><strong>背景：</strong> 以前的算法（如 PPO）需要两个模型：
+1.  <strong>Actor（演员）：</strong> 负责做动作（比如写代码、回答问题）。
+2.  <strong>Critic（评论家）：</strong> 负责打分，告诉演员这一步做得好不好。</p>
+<p><strong>痛点：</strong> 训练两个模型太贵了！尤其是那个“评论家”模型，非常占显存，计算量大。</p>
+<p><strong>GRPO 的解决方案：</strong>
+*   <strong>核心思想：</strong> 开除“评论家” (Critic-less)。
+*   <strong>替代方案：</strong> 让“演员”自己生成好几个答案，然后<strong>自己跟自己比</strong>。
+    *   <em>比喻：</em> 以前是老师（Critic）改卷子；现在是老师太忙了，让全班同学（Group）针对同一道题写答案，算出平均分。比平均分高的就是好答案，比平均分低的就是差答案。</p>
+<blockquote>
+<p><strong>✅ 任务一总结：</strong> GRPO 省钱、省显存，因为它不需要额外的 Critic 模型，而是通过“一组”答案的内部比较来学习。</p>
+</blockquote>
+<hr />
+<h3>🟡 任务二：拆解 GRPO 的工作流程 (它是怎么转起来的？)</h3>
+<p>文档中提到了四个步骤，我们把它翻译成人话：</p>
+<ol>
+<li>
+<p><strong>Group Sampling (小组采样/生成)：</strong></p>
+<ul>
+<li>给模型一个题目（Prompt）。</li>
+<li>让模型一口气生成 <strong>N 个</strong> 不同的回答（比如 N=8）。这 N 个回答就组成了一个“Group”。</li>
+<li><em>文档对应：</em> <code>actor_rollout.ref.rollout.n</code> (设为大于1的值)。</li>
+</ul>
+</li>
+<li>
+<p><strong>Reward Assignment (奖励分配)：</strong></p>
+<ul>
+<li>给这 N 个回答打分。通常用规则打分（比如数学题答案对不对？代码能不能跑通？）。</li>
+<li>注意：这里不需要神经网络来打分，通常是外部环境给分。</li>
+</ul>
+</li>
+<li>
+<p><strong>Baseline Calculation (基准线计算)：</strong></p>
+<ul>
+<li>算出这 N 个回答的<strong>平均分</strong>。这个平均分就是“基准线 (Baseline)”。</li>
+</ul>
+</li>
+<li>
+<p><strong>Policy Update (策略更新/学习)：</strong></p>
+<ul>
+<li><strong>相对优势：</strong> 拿每个回答的分数减去平均分。</li>
+<li><strong>奖惩：</strong><ul>
+<li>分数 &gt; 平均分：鼓励模型以后多按这个套路写。</li>
+<li>分数 &lt; 平均分：惩罚模型，以后少这么写。</li>
+</ul>
+</li>
+<li><em>文档对应：</em> 这就是 "Relative Rewards"（相对奖励）的意思。</li>
+</ul>
+</li>
+</ol>
+<blockquote>
+<p><strong>✅ 任务二总结：</strong> 流程就是：<strong>生成一堆 -&gt; 算平均分 -&gt; 谁高谁受表扬，谁低谁受批评</strong>。</p>
+</blockquote>
+<hr />
+<h3>🟠 任务三：理解配置参数 (怎么设置？)</h3>
+<p>文档中间那一大段代码配置，其实就是在告诉程序怎么执行上面的流程。挑最重要的看：</p>
+<ul>
+<li>
+<p><strong><code>actor_rollout.ref.rollout.n</code></strong>:</p>
+<ul>
+<li><strong>含义：</strong> 就是上面的 N。</li>
+<li><strong>操作：</strong> 必须设为 &gt;1。如果是 1 就没法算平均分了，GRPO 就失效了。</li>
+<li><strong>建议：</strong> DeepSeek 论文里通常设为 64 或更多，但在小显存上可以设小一点（比如 4 或 8）。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>algorithm.adv_estimator: grpo</code></strong>:</p>
+<ul>
+<li><strong>含义：</strong> 告诉框架，别用 GAE（PPO 用的计算方法），要用 GRPO 的算法。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>actor_rollout_ref.actor.use_kl_loss: True</code></strong>:</p>
+<ul>
+<li><strong>含义：</strong> 防止模型“学傻了”或者“太放飞自我”。</li>
+<li><strong>解释：</strong> 我们希望模型变聪明，但不要完全变成另一个物种。KL Loss 用来约束模型，让它在训练过程中不要偏离原始模型太远。PPO 通常把这个放在奖励里扣分，但 GRPO 直接把它加在 Loss（损失函数）里。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>micro_batch_size</code></strong>:</p>
+<ul>
+<li><strong>含义：</strong> 这只是为了防止显存爆炸（OOM），不影响算法逻辑。显存不够就调小这个。</li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<p><strong>✅ 任务三总结：</strong> 关键是把采样数 <code>n</code> 设大，把算法选为 <code>grpo</code>，并开启 <code>kl_loss</code>。</p>
+</blockquote>
+<hr />
+<h3>🔴 任务四：进阶知识 (什么是 DrGRPO？)</h3>
+<p>文档最后提到了一个 <strong>DrGRPO</strong>，这是 GRPO 的升级版/补丁版。</p>
+<ul>
+<li><strong>GRPO 的 Bug：</strong> 有人发现，GRPO 容易产生“废话文学”。因为是组内比较，模型发现只要回答得<strong>长一点</strong>，好像更容易得分（优化偏差）。</li>
+<li><strong>DrGRPO 的修复：</strong> 它修改了分数的计算方式（用标准差归一化等数学技巧），消除了这种“越长越好”的错误偏见。</li>
+</ul>
+<blockquote>
+<p><strong>✅ 任务四总结：</strong> 如果你发现模型开始疯狂输出废话，可以尝试开启 DrGRPO 模式（配置里把 <code>norm_adv_by_std_in_grpo</code> 关掉，改用特定的 Loss 聚合方式）。</p>
+</blockquote>
+<hr />
+<h3>📝 最终复习清单</h3>
+<p>如果你要给别人讲这个文档，只需要按这个顺序：</p>
+<ol>
+<li><strong>省钱：</strong> GRPO 不用 Critic 模型，比 PPO 轻量。</li>
+<li><strong>内卷：</strong> 它通过让模型一次生成一组（Group）答案，算平均分，搞内部竞争（Relative Policy）。</li>
+<li><strong>配置：</strong> 只要把采样数 <code>n</code> 设多点，把算法开关打开就行。</li>
+<li><strong>避坑：</strong> 为了防止模型为了得分而凑字数，可以使用 DrGRPO 变体。</li>
+</ol>
+<p>希望这个 List 能帮你读懂这篇文档！</p>

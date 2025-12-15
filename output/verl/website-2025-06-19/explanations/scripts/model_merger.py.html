@@ -1,0 +1,88 @@
+<h1>scripts/model_merger.py</h1>
+<p>这份代码确实比较复杂，涉及到了大模型分布式训练后最关键的一步：<strong>模型合并（Model Merging）</strong>。</p>
+<p>简单来说，在大模型训练时，因为模型太大（比如 70B 参数），单张显卡放不下，我们通常把模型“切碎”了放在几十甚至几百张显卡上训练。训练完后，我们需要把这些碎块重新“拼”回一个完整的模型，才能拿去用（比如在 HuggingFace 上发布）。</p>
+<p>为了让你读懂这份代码，我把它想象成一个 <strong>“模型拼图工程师”的工作清单（To-Do List）</strong>。</p>
+<p>请按照下面这个 List，一步步看它是怎么工作的：</p>
+<hr />
+<h3>任务清单：模型拼图工程师的一天</h3>
+<h4>✅ Task 1: 搞清楚我们要拼什么 (配置阶段)</h4>
+<p><strong>代码对应：</strong> <code>ModelMergerConfig</code> 类 和 <code>main()</code> 函数
+*   <strong>背景：</strong> 你的老板（用户）会通过命令行告诉你：“我要合并一个模型，它是用 FSDP 切的，还是用 Megatron 切的？原文件在哪？拼好后放哪？”
+*   <strong>动作：</strong>
+    *   读取命令行参数（<code>argparse</code>）。
+    *   确定是执行 <code>merge</code>（合并保存）还是 <code>test</code>（测试合并对不对）。
+    *   确定后端是 <code>fsdp</code> 还是 <code>megatron</code>（这两种切法完全不同，拼法也不同）。</p>
+<h4>✅ Task 2: 准备标准底座 (加载配置)</h4>
+<p><strong>代码对应：</strong> <code>BaseModelMerger</code> 类
+*   <strong>背景：</strong> 在拼图之前，你需要知道完整的图长什么样（比如每一层叫什么名字，维度是多少）。
+*   <strong>动作：</strong>
+    *   利用 <code>AutoConfig</code> 读取 HuggingFace 的配置文件。
+    *   如果是 <code>BaseModelMerger</code>，它定义了一些通用工具，比如“怎么把拼好的模型存盘”、“怎么上传到 HuggingFace”。</p>
+<h4>✅ Task 3: 开始拼图 (核心逻辑 - 分支 A)</h4>
+<p><strong>如果用户用的是 FSDP (Fully Sharded Data Parallel) 模式</strong>
+<strong>代码对应：</strong> <code>FSDPModelMerger</code> 类</p>
+<ul>
+<li><strong>子任务 3.1: 看看碎成了多少块</strong><ul>
+<li>代码去文件夹里找类似 <code>rank_0.pt</code> 的文件，算出 <code>world_size</code>（总共有多少个分片）。</li>
+</ul>
+</li>
+<li><strong>子任务 3.2: 把碎块捡回来 (多线程加载)</strong><ul>
+<li><strong>难点：</strong> 模型文件很大，一个一个读太慢。</li>
+<li><strong>动作：</strong> 使用 <code>ThreadPoolExecutor</code>（多线程）并发地把所有显卡上的碎片文件（<code>rank_0</code>, <code>rank_1</code>...）读到内存里。</li>
+</ul>
+</li>
+<li><strong>子任务 3.3: 智能拼接 (处理 DTensor)</strong><ul>
+<li><strong>原理：</strong> FSDP 的切分方式很灵活，有时是按行切，有时按列切，有时只是参数分片。</li>
+<li><strong>动作：</strong> 代码利用 <code>DTensor</code>（分布式张量）的元数据，自动识别这个参数是怎么切的，然后用 <code>torch.cat</code> 或者 <code>_merge_by_placement</code> 把它们按正确的顺序粘在一起。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 开始拼图 (核心逻辑 - 分支 B)</h4>
+<p><strong>如果用户用的是 Megatron 模式 (最麻烦的部分)</strong>
+<strong>代码对应：</strong> <code>MegatronModelMerger</code> 类</p>
+<ul>
+<li><strong>子任务 4.1: 翻译名字 (Name Mapping)</strong><ul>
+<li><strong>痛点：</strong> Megatron 框架内部给参数起的名字（比如 <code>linear_fc1</code>）和 HuggingFace 标准的名字（比如 <code>gate_up_proj</code>）不一样。</li>
+<li><strong>动作：</strong> 代码里有一个巨大的字典 <code>self.params_mapping</code>，专门负责把“方言”翻译成“普通话”。</li>
+</ul>
+</li>
+<li><strong>子任务 4.2: 处理张量并行 (Tensor Parallelism)</strong><ul>
+<li><strong>原理：</strong> Megatron 喜欢把一个大矩阵切成几份。比如 QKV 矩阵，它可能把 Q 切一部分，K 切一部分。</li>
+<li><strong>动作：</strong> <code>_merge_across_tp</code> 函数。<ul>
+<li>如果是 <code>Gate</code> 和 <code>Up</code> 投影层：它要把切开的块拼回去。</li>
+<li>如果是 <code>QKV</code> 注意力层：这最复杂，它要把分散在不同卡上的 Q、K、V 拆出来，重新排列组合，再拼成一个完整的大的 QKV 矩阵。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>子任务 4.3: 遍历所有层</strong><ul>
+<li>Megatron 是分层存储的，代码需要一层一层（Layer by Layer）、一个流水线阶段（Pipeline Rank）一个阶段地去把参数捞出来合并。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 处理“外挂”装备 (LoRA 处理)</h4>
+<p><strong>代码对应：</strong> <code>save_lora_adapter</code> 函数
+*   <strong>背景：</strong> 有时候我们不只训练了底座，还微调了一个 LoRA（一种轻量级外挂参数）。
+*   <strong>动作：</strong>
+    *   检查参数名字里有没有 <code>lora_</code>。
+    *   如果有，把这些 LoRA 参数单独剥离出来。
+    *   把 LoRA 保存成 <code>adapter_model.safetensors</code>，这样以后可以单独加载，不用混在主模型里。</p>
+<h4>✅ Task 6: 打包发货 (保存与上传)</h4>
+<p><strong>代码对应：</strong> <code>save_hf_model_and_tokenizer</code> 和 <code>upload_to_huggingface</code>
+*   <strong>动作：</strong>
+    *   把内存里拼好的巨大 <code>state_dict</code>（参数字典）塞进一个标准的 HuggingFace 模型骨架里。
+    *   调用 <code>model.save_pretrained</code> 保存成大家通用的 <code>.safetensors</code> 或 <code>.bin</code> 文件。
+    *   顺便把 <code>tokenizer</code>（分词器）也存好。
+    *   如果用户要求，直接调用 API 上传到 HuggingFace Hub。</p>
+<hr />
+<h3>总结一下这段代码的逻辑流：</h3>
+<ol>
+<li><strong>Input</strong>: 一堆乱七八糟的 <code>pytorch_model_rank_xx.pt</code> 文件（看不懂的碎片）。</li>
+<li><strong>Process</strong>:<ul>
+<li>如果是 <strong>FSDP</strong>：按切片规则把张量 <code>cat</code>（拼接）起来。</li>
+<li>如果是 <strong>Megatron</strong>：先把变量名翻译成标准名，再把矩阵按行或按列拼起来（特别注意 QKV 的重组）。</li>
+</ul>
+</li>
+<li><strong>Output</strong>: 一个标准的、整洁的 HuggingFace 模型文件夹（可以直接用 <code>AutoModel.from_pretrained</code> 加载）。</li>
+</ol>
+<p><strong>你现在可以试着只看 <code>FSDPModelMerger</code> 或 <code>MegatronModelMerger</code> 中的 <code>merge_and_save</code> 方法，那里就是整个流水线的总指挥。</strong></p>

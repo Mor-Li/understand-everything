@@ -1,0 +1,55 @@
+<h1>tests/functional_tests/shell_test_utils/restart_jet_log_jobs.sh</h1>
+<p>没问题，这段代码乍一看确实挺乱的，因为它混合了 API 调用、JSON 处理（jq）和一些循环逻辑。</p>
+<p>简单来说，这个脚本是一个<strong>自动化的“重启助手”</strong>。它的主要目的是：<strong>在一个复杂的 CI/CD 流水线中，找到特定的日志收集任务（Jobs），把它们重启一遍，然后乖乖等到它们跑完。</strong></p>
+<p>我们可以把这个脚本看作是一个<strong>“任务清单（Todo List）”</strong>执行者。为了让你看懂，我把这个脚本的逻辑拆解成 5 个主要的 To-Do 任务，并一步步解释它是怎么做的。</p>
+<hr />
+<h3>📝 脚本执行的 To-Do List</h3>
+<h4>✅ 任务 1：准备工作（安检）</h4>
+<p><strong>目标</strong>：确保我有“通行证”（API Token）和“目标地图”（Pipeline ID）。
+*   <strong>代码位置</strong>：脚本开头到 <code>CI_PIPELINE_ID=$1</code> 这一块。
+*   <strong>解释</strong>：
+    *   脚本检查你有没有输入参数（你需要告诉它从哪个流水线 ID 开始）。
+    *   检查环境变量 <code>RW_API_TOKEN</code> 是否存在。这是访问 GitLab API 的“钥匙”，没有钥匙就直接报错退出。</p>
+<h4>✅ 任务 2：寻宝（找到真正的目标流水线）</h4>
+<p><strong>目标</strong>：你给的 ID 只是入口，真正的任务藏在“孙子”辈的流水线里，脚本需要顺藤摸瓜找到它。
+*   <strong>代码位置</strong>：从 <code># Fetch Elastic logs</code> 到 <code>JET_PIPELINE_ID=...</code>。
+*   <strong>解释</strong>：
+    *   <strong>第一跳</strong>：用你给的 ID (<code>CI_PIPELINE_ID</code>) 去问 GitLab：“你的下游（Downstream）流水线是谁？” -&gt; 得到 <code>DOWNSTREAM_PIPELINE_ID</code>（这是儿子）。
+    *   <strong>第二跳</strong>：再用儿子的 ID 去问 GitLab：“你的下游是谁？” -&gt; 得到 <code>JET_PIPELINE_ID</code>（这是孙子）。
+    *   <strong>为什么这么做？</strong>：通常在大厂（如 Nvidia）的 CI 系统里，流水线是嵌套的。主流水线触发测试流水线，测试流水线触发 JET（特定硬件测试）流水线。脚本要操作的是最里面的那个。</p>
+<h4>✅ 任务 3：筛选（在一堆任务中找到要重启的那些）</h4>
+<p><strong>目标</strong>：拿到所有任务清单，挑出名字里带“3 logs_after”的特定任务。
+*   <strong>代码位置</strong>：<code>collect_jet_jobs</code> 函数 和 <code>LAST_STAGE_TEST_JOBS=...</code> 这一块。
+*   <strong>解释</strong>：
+    *   <strong>收集所有任务</strong>：调用 <code>collect_jet_jobs</code>。因为任务可能成百上千，GitLab API 一次只给 100 个，所以这里写了个 <code>while</code> 循环（翻页），把所有页面的任务拼成一个大名单。
+    *   <strong>过滤（Filter）</strong>：这是最关键的一步。脚本用 <code>jq</code> 工具在名单里筛选：
+        1.  名字必须包含 <code>"3 logs_after"</code>（看来是专门负责收集日志的收尾任务）。
+        2.  名字<strong>不能</strong>以 <code>"build/"</code> 开头。
+        3.  拿到这些任务的“重试链接”（<code>retry_url</code>）。</p>
+<h4>✅ 任务 4：执行重启（疯狂点击 Retry 按钮）</h4>
+<p><strong>目标</strong>：对着刚才筛选出来的任务，挨个发送“重启”指令。
+*   <strong>代码位置</strong>：<code>for retry_url in ...</code> 循环块。
+*   <strong>解释</strong>：
+    *   脚本遍历刚才找到的每一个 <code>retry_url</code>。
+    *   使用 <code>curl -X POST</code> 命令，相当于在网页上帮你点了一下“Retry”按钮。
+    *   每点一个，就在屏幕上打印一下进度（比如 <code>(1 / 5) Retried ... successfully</code>）。</p>
+<h4>✅ 任务 5：监控（盯着它们跑完）</h4>
+<p><strong>目标</strong>：不能重启完就跑，要等到所有任务都变绿（或变红），也就是不再是“进行中”的状态。
+*   <strong>代码位置</strong>：脚本最后的 <code>while true</code> 循环。
+*   <strong>解释</strong>：
+    *   定义了一个 <code>count_active_jobs</code> 函数：它会重新拉取任务列表，数一数有多少任务的状态是 <code>running</code>（跑着呢）或者 <code>pending</code>（排队呢）。
+    *   <strong>死循环等待</strong>：
+        *   只要活跃任务数不等于 0，脚本就说：“还有任务在跑，我睡 15 秒再来看看”（<code>sleep 15</code>）。
+        *   一旦活跃任务数为 0，说明都跑完了，脚本结束退出。</p>
+<hr />
+<h3>总结一下</h3>
+<p><strong>这个脚本的故事是这样的：</strong></p>
+<blockquote>
+<p>“嘿，给我一个主流水线 ID。我有 API 钥匙。
+我先查它的子流水线，再查孙子流水线（JET Pipeline）。
+然后我把孙子流水线里所有任务拉出来，找到那些名字里带 ‘3 logs_after’ 的日志任务。
+我把这些日志任务全部重启一遍。
+然后我就坐在旁边每隔 15 秒看一眼，直到它们全部跑完为止。”</p>
+</blockquote>
+<p><strong>为什么要用这个脚本？</strong>
+通常是因为 CI 系统里，测试跑完了，但负责上传日志的步骤（logs_after）可能因为网络波动或者超时失败了。人工去网页上一个个点 Retry 太累了，所以写个脚本自动把这些收尾工作重跑一遍，确保日志都被收集上来。</p>

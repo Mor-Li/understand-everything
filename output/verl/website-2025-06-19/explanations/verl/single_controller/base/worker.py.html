@@ -1,0 +1,106 @@
+<h1>verl/single_controller/base/worker.py</h1>
+<p>这份代码确实涉及了很多分布式训练（Distributed Training）和 Ray 框架的底层细节，如果对这些背景不熟悉，读起来会非常晦涩。</p>
+<p>你可以把这个 <code>Worker</code> 类想象成一个<strong>大型工厂里的“流水线工人”</strong>。这个文件就是工人的<strong>入职手册和操作规范</strong>。</p>
+<p>为了让你听懂，我把这个工人的生命周期拆解成一个 <strong>To-Do List（任务清单）</strong>。我们一步步来看，这个代码是如何让一个工人准备好，并开始干活的。</p>
+<hr />
+<h3>任务清单 Task List：一个分布式 Worker 的一生</h3>
+<h4>Task 1: 搞清楚“我是谁，我在哪” (分布式基本概念)</h4>
+<blockquote>
+<p><strong>对应代码：</strong> <code>DistRankInfo</code>, <code>DistGlobalInfo</code> dataclasses</p>
+</blockquote>
+<p>在分布式训练里，有几十上百个 GPU 同时在跑，每个 Worker 需要知道自己的坐标。
+*   <strong>观点：</strong> 代码开头定义的这两个类，就是工人的工牌。
+*   <strong>解释：</strong>
+    *   <code>tp_rank</code> (Tensor Parallel): 我负责模型切片的哪一部分？
+    *   <code>dp_rank</code> (Data Parallel): 我负责处理哪一批数据？
+    *   <code>pp_rank</code> (Pipeline Parallel): 我是流水线上的第几道工序？
+    *   这部分代码只是定义数据结构，方便后续工人互相确认身份。</p>
+<h4>Task 2: 入职前的准备 —— 寻找组织 (Ray Actor 初始化)</h4>
+<blockquote>
+<p><strong>对应代码：</strong> <code>__new__</code>, <code>_configure_before_init</code>, <code>WorkerHelper</code></p>
+</blockquote>
+<p>这是最难懂的部分。在 Python 里，<code>__new__</code> 在 <code>__init__</code> 之前执行。这里用了一个特殊的技巧来处理 <strong>Ray</strong>（一个分布式计算框架）的初始化。</p>
+<ul>
+<li><strong>观点：</strong> 工人还没正式初始化（<code>__init__</code>）之前，必须先建立通讯网络。</li>
+<li><strong>步骤解析：</strong><ol>
+<li><strong>判断身份：</strong> 代码检查环境变量 <code>RANK</code>。</li>
+<li><strong>如果是 0 号员工 (Rank 0 - Leader)：</strong><ul>
+<li>调用 <code>WorkerHelper</code> 里的方法，查一下自己的 IP 地址 (<code>_get_node_ip</code>)。</li>
+<li>找一个没被占用的端口 (<code>_get_free_port</code>)。</li>
+<li><strong>关键点：</strong> 0 号员工不仅要干活，还要充当“通讯基站”。它会创建一个“注册中心 (<code>register_center</code>)”，把自己的 IP 和端口写进去。</li>
+</ul>
+</li>
+<li><strong>如果是普通员工 (Rank &gt; 0)：</strong><ul>
+<li>去 Ray 的系统里找到那个“注册中心”。</li>
+<li>向注册中心报到：“我是 Rank X，我在 Node Y 上”。</li>
+</ul>
+</li>
+<li><strong>目的：</strong> 确保所有人都能连上 0 号员工，形成一个网络拓扑（Master-Worker 结构）。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 3: 硬件分配 —— 抢占工位 (GPU 设置)</h4>
+<blockquote>
+<p><strong>对应代码：</strong> <code>_setup_env_cuda_visible_devices</code></p>
+</blockquote>
+<p>你入职了，也连上内网了，现在要坐在电脑前准备干活。但是这台服务器上插了 8 张显卡，哪张是归你的？</p>
+<ul>
+<li><strong>观点：</strong> 必须严格控制每个 Worker 能看到的显卡，防止多人抢一张卡导致冲突。</li>
+<li><strong>步骤解析：</strong><ul>
+<li>代码里写了很复杂的逻辑来检查 <code>CUDA_VISIBLE_DEVICES</code> (Nvidia) 和 <code>HIP/ROCR</code> (AMD) 环境变量。</li>
+<li><strong>核心逻辑：</strong> 如果 Ray 已经帮你分配好了（<code>ray_noset_visible_devices</code>），那就用 Ray 分配的。否则，代码会根据你的 <code>LOCAL_RANK</code>（你在本机是第几个）来锁定对应的 GPU。</li>
+<li>这保证了当你调用 <code>torch.cuda.current_device()</code> 时，你拿到的是正确的、独占的显卡。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 正式入职 —— 填写档案 (初始化环境变量)</h4>
+<blockquote>
+<p><strong>对应代码：</strong> <code>__init__</code>, <code>_configure_with_store</code></p>
+</blockquote>
+<p>现在硬件选好了，网络通了，开始执行标准的初始化流程。</p>
+<ul>
+<li><strong>观点：</strong> 将环境变量（Environment Variables）同步到 Python 对象的属性中，方便后续代码调用。</li>
+<li><strong>步骤解析：</strong><ul>
+<li>读取 <code>WORLD_SIZE</code>（总共有多少人）、<code>RANK</code>（我是第几号）、<code>MASTER_ADDR</code>（老大在哪）。</li>
+<li><code>_configure_with_store</code> 函数做了一件很“Hack”的事情：它把这些环境变量塞进了 <code>self.__dict__</code>。</li>
+<li>这意味着以后你在代码里写 <code>self.rank</code> 或者 <code>self.world_size</code>，就能直接取到这些值，而不用每次都去查 <code>os.environ</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 5: 等待指令 —— 干活 (执行与装饰器)</h4>
+<blockquote>
+<p><strong>对应代码：</strong> <code>@register</code>, <code>execute_with_func_generator</code>, <code>execute_func_rank_zero</code></p>
+</blockquote>
+<p>工人准备就绪，坐在工位上发呆，等待“中央控制器”（Controller）发号施令。</p>
+<ul>
+<li><strong>观点：</strong> Worker 本身不知道要训练什么模型，它是一个通用的执行器。Controller 会把函数（Function）传给它执行。</li>
+<li><strong>步骤解析：</strong><ul>
+<li><strong><code>@register</code> 装饰器：</strong> 这是为了让外部的 Controller 能远程调用这些方法。</li>
+<li><strong><code>execute_with_func_generator</code>：</strong><ul>
+<li>Controller 传过来一个函数 <code>func</code> 和参数。</li>
+<li>Worker 就在本地运行这个 <code>func(self, *args)</code>。</li>
+<li>这通常用于执行具体的训练步（Train Step）或生成步（Generation Step）。</li>
+</ul>
+</li>
+<li><strong><code>execute_func_rank_zero</code>：</strong><ul>
+<li>有时候只需要 0 号员工干活（比如打印日志、保存模型 checkpoints）。</li>
+<li>这个方法被标记为 <code>Execute.RANK_ZERO</code>，意味着只有 Rank 0 会真正执行，其他人可能只是陪跑或者跳过。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个文件到底在讲啥？</h3>
+<p><strong>一句话总结：</strong>
+这是一个<strong>通用的分布式苦力（Worker）模板</strong>。</p>
+<p><strong>它的核心职责是：</strong>
+1.  <strong>自动组网：</strong> 利用 Ray 和环境变量，自动发现 Master 节点，建立通信。
+2.  <strong>隔离硬件：</strong> 自动设置 GPU 可见性，确保不冲突。
+3.  <strong>听从指挥：</strong> 提供了一个统一的接口（<code>execute_...</code>），让上层的 Controller 可以把任何 Python 函数扔给它，它就在自己的 GPU 上跑起来。</p>
+<p>当你看不懂的时候，就把它当成一个<strong>被远程操控的机器人</strong>的启动脚本：
+1.  启动电源 (<code>__new__</code>)。
+2.  连接 Wi-Fi (<code>_configure_before_init</code>)。
+3.  检查机械臂（GPU）状态 (<code>_setup_env_cuda_visible_devices</code>)。
+4.  加载配置 (<code>__init__</code>)。
+5.  等待以此执行命令 (<code>execute...</code>)。</p>

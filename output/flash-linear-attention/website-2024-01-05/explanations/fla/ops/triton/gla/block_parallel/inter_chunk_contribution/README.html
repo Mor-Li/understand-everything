@@ -1,0 +1,71 @@
+<h1>fla/ops/triton/gla/block_parallel/inter_chunk_contribution</h1>
+<p>这里是 <code>fla/ops/triton/gla/block_parallel/inter_chunk_contribution</code> 目录的 README 文档。</p>
+<p>这个目录是 Gated Linear Attention (GLA) 算法中<strong>最核心、最精妙</strong>的部分之一：<strong>负责“块”与“块”之间的记忆传递</strong>。</p>
+<hr />
+<h3>1. 这个文件夹主要是干什么的？</h3>
+<p><strong>一句话总结：它负责搞定“接力赛”中的交接棒环节。</strong></p>
+<p>为了让模型跑得快，我们把长长的文本切成了很多小段（Chunk）。
+*   <strong>块内计算</strong>：每一段内部大家各算各的（并行，速度快）。
+*   <strong>块间计算（本文件夹的任务）</strong>：第 1 段算完后，生成了一个“记忆包”（State），需要传给第 2 段；第 2 段更新后传给第 3 段……</p>
+<p>这个文件夹里的代码，就是利用 Triton（GPU 编程语言）极速地完成这个<strong>“把上一段的记忆，经过衰减（遗忘），累加到下一段”</strong>的过程。</p>
+<hr />
+<h3>2. 这里的直接文件分别是干什么的？</h3>
+<p>我们可以把这些文件分为三类角色：<strong>总指挥</strong>、<strong>预处理工</strong>、<strong>跑腿员</strong>。</p>
+<h4>👮 总指挥 (The Manager)</h4>
+<ul>
+<li><strong>📄 <code>fn.py</code></strong><ul>
+<li><strong>作用</strong>：这是对外的总接口。</li>
+<li><strong>比喻</strong>：它是<strong>包工头</strong>。当上层模型需要进行“块间记忆传递”时，会调用它。它会检查你的配置（比如有没有衰减门控？是只衰减 Key 还是只衰减 Value？），然后指派下面具体的“跑腿员”去干活。</li>
+</ul>
+</li>
+</ul>
+<h4>🔧 预处理工 (The Pre-processors)</h4>
+<p>在开始传递记忆之前，需要先算出每一段到底要“忘掉”多少东西。
+*   <strong>📄 <code>preprocess_cumsum_gk.py</code></strong>
+    *   <strong>作用</strong>：处理 <strong>Key</strong> 维度的门控（GK）。
+    *   <strong>比喻</strong>：负责计算“钥匙”的折旧率。它会把这一段里所有的遗忘系数累加起来，并把 $Q$ 和 $K$ 向量根据这个折旧率提前调整好。
+*   <strong>📄 <code>preprocess_cumsum_gv.py</code></strong>
+    *   <strong>作用</strong>：处理 <strong>Value</strong> 维度的门控（GV）。
+    *   <strong>比喻</strong>：负责计算“内容”的折旧率。它把这一段里所有的 $V$ 向量，根据遗忘系数折算到段尾，打包成一个紧凑的包。</p>
+<h4>🏃 跑腿员 (The Runners / Scanners)</h4>
+<p>这些是真正干脏活累活的 Triton 内核，负责执行 $S_t = S_{t-1} \times \text{Decay} + \text{New}$ 这个公式。根据配置不同，有不同的优化版本：</p>
+<ul>
+<li><strong>📄 <code>chunk_scan_triton_full.py</code></strong><ul>
+<li><strong>作用</strong>：<strong>全功能版本</strong>。</li>
+<li><strong>场景</strong>：既有 Key 的衰减，又有 Value 的衰减。这是标准的 GLA 模式，计算量最大，但功能最全。</li>
+</ul>
+</li>
+<li><strong>📄 <code>chunk_scan_triton_only_gk.py</code></strong><ul>
+<li><strong>作用</strong>：<strong>仅 Key 衰减版</strong>。</li>
+<li><strong>场景</strong>：如果模型配置里 Value 不衰减，用这个版本更快。</li>
+</ul>
+</li>
+<li><strong>📄 <code>chunk_scan_triton_only_gv.py</code></strong><ul>
+<li><strong>作用</strong>：<strong>仅 Value 衰减版</strong>。</li>
+<li><strong>场景</strong>：如果模型配置里 Key 不衰减，用这个。</li>
+</ul>
+</li>
+<li><strong>📄 <code>chunk_scan_triton_no_decay.py</code></strong><ul>
+<li><strong>作用</strong>：<strong>无衰减版</strong>。</li>
+<li><strong>场景</strong>：完全没有遗忘机制（退化成标准的 Linear Attention）。这就是简单的累加，速度最快。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>3. 子文件夹的作用是什么？</h3>
+<p><em>(注：根据你提供的信息，该目录下没有子文件夹，只有上述文件。如果有隐藏子文件夹，通常是存放编译缓存或测试代码，但在当前上下文中主要关注上述 Python/Triton 脚本)</em></p>
+<hr />
+<h3>4. 高层认知：如何快速理解这部分代码？</h3>
+<p>想象你在读一本很厚的书（长序列）：</p>
+<ol>
+<li>你把书撕成了 <strong>10 章（Chunks）</strong>。</li>
+<li><strong><code>preprocess_...</code> (预处理)</strong>：你快速浏览每一章，算出这一章读完后，你会忘掉多少前面的细节（计算 Decay），并把这一章的重点压缩成一个摘要（Prepare Inputs）。</li>
+<li><strong><code>chunk_scan_...</code> (扫描/传递)</strong>：<ul>
+<li>你读完第 1 章，脑子里有了一个<strong>记忆状态 (State)</strong>。</li>
+<li>你带着这个记忆去读第 2 章。</li>
+<li>但在进入第 2 章前，根据预处理算的“遗忘率”，你忘掉了一些第 1 章的细节（<strong>Decay</strong>），然后把第 2 章的新摘要加进脑子里（<strong>Add</strong>）。</li>
+<li>这个过程在 GPU 上是<strong>并行</strong>发生的：虽然章节顺序是串行的，但记忆矩阵（比如 $128 \times 128$ 大小）被切成了很多 $32 \times 32$ 的小块，每个 GPU 核心只负责维护一小块记忆的传递。</li>
+</ul>
+</li>
+</ol>
+<p><strong>总结：这个文件夹就是一个“带遗忘功能的、分块并行的、记忆状态累加器”。</strong></p>

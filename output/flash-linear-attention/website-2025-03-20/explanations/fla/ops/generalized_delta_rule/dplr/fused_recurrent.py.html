@@ -1,0 +1,140 @@
+<h1>fla/ops/generalized_delta_rule/dplr/fused_recurrent.py</h1>
+<p>这份代码确实涉及了很多底层的高性能计算（CUDA/Triton）和深度学习模型架构（线性注意力/RNN）的概念。如果不熟悉背景，看起来确实像天书。</p>
+<p>为了让你读懂它，我制定了一个 <strong>“学习任务清单 (ToDo List)”</strong>。我们将把理解这份代码拆解为 <strong>5个阶段</strong>，由浅入深。</p>
+<hr />
+<h3>🟢 任务 1：搞懂“它在干什么” (宏观概念)</h3>
+<p><strong>目标</strong>：理解这个文件的功能定位。</p>
+<ol>
+<li>
+<p><strong>它是什么？</strong></p>
+<ul>
+<li>这是一个用于 <strong>推理 (Inference)</strong> 的加速代码。</li>
+<li>它实现了一个 <strong>循环神经网络 (RNN)</strong> 的核心计算步骤。</li>
+<li>虽然名字里有 <code>attention</code> (在库名里)，但它的运行方式是 RNN 模式（一步一步处理），而不是 Transformer 的并行模式（一次处理所有词）。</li>
+</ul>
+</li>
+<li>
+<p><strong>核心逻辑：</strong></p>
+<ul>
+<li>想象你在读一本书。你每读一个字（输入），脑子里的理解（状态 $h$）就会更新一下，然后你会预测下一个字（输出）。</li>
+<li>这个文件就是写给 GPU 的指令：<strong>“如何快速地读完一段话，并不断更新脑子里的状态。”</strong></li>
+</ul>
+</li>
+<li>
+<p><strong>关键词：</strong></p>
+<ul>
+<li><strong>Fused (融合)</strong>：把很多数学运算打包成一个 GPU 核心任务，避免数据搬来搬去，速度极快。</li>
+<li><strong>Recurrent (循环)</strong>：$t$ 时刻的状态依赖于 $t-1$ 时刻。</li>
+<li><strong>DPLR Delta Rule</strong>：这是这个模型具体的数学更新公式（后面会细讲）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🔵 任务 2：理解数学公式 (核心算法)</h3>
+<p><strong>目标</strong>：把代码里的变量对应到数学公式上。</p>
+<p>代码的文档字符串里写了这个公式：
+$$S_t = S_{t-1} @ (I + a_t b_t^T) + v_t k_t^T$$</p>
+<p><strong>让我们拆解代码中的变量映射：</strong></p>
+<ul>
+<li><strong><code>h</code> 或 <code>S</code> (State)</strong>: 记忆状态。代码里叫 <code>b_h</code> (block of h) 或 <code>h0</code> (初始状态)。这是一个矩阵。</li>
+<li><strong><code>q, k, v</code></strong>: 传统的 Attention 三剑客。<ul>
+<li>$k, v$: 用来写入新记忆。</li>
+<li>$q$: 用来从当前记忆里读取信息生成输出。</li>
+</ul>
+</li>
+<li><strong><code>gk</code> (Gate K)</strong>: 遗忘门/衰减系数。决定了我们保留多少旧记忆。代码里用了 <code>exp(b_gk)</code>。</li>
+<li><strong><code>a, b</code></strong>: 这是这个特定算法（Delta Rule）独有的。它们用来“旋转”或“调整”旧记忆，而不仅仅是衰减它。</li>
+</ul>
+<p><strong>代码里的核心更新逻辑 (在 <code>for</code> 循环里)：</strong></p>
+<ol>
+<li><strong>衰减旧记忆</strong>：<code>exp(b_gk) * b_h</code> （旧事忘掉一点）</li>
+<li><strong>调整旧记忆</strong>：<code>b_h @ a * b</code> （对旧记忆做个变形，即 DPLR 中的 Low Rank 部分）</li>
+<li><strong>写入新记忆</strong>：<code>+ k * v</code> （把当前时刻的新信息写进去）</li>
+<li><strong>读取输出</strong>：<code>o = h * q</code> （根据当前记忆回答问题）</li>
+</ol>
+<hr />
+<h3>🟡 任务 3：解读 Triton Kernel (代码细节)</h3>
+<p><strong>目标</strong>：看懂 <code>fused_recurrent_dplr_delta_rule_fwd_kernel</code> 这个函数在干嘛。</p>
+<p>这个函数是用 <strong>Triton</strong> 写的，它是一种专门写 GPU 程序的 Python 语言。</p>
+<p><strong>步骤分解：</strong></p>
+<ol>
+<li>
+<p><strong>定位坐标 (Setup)</strong>：</p>
+<ul>
+<li><code>i_v, i_nh = ...</code>: 确定当前 GPU 线程负责处理哪一部分数据（哪个 Batch，哪个 Head）。</li>
+<li><code>offsets</code>: 处理变长序列用的（比如第一句话 5 个字，第二句话 10 个字）。</li>
+</ul>
+</li>
+<li>
+<p><strong>加载指针 (Pointers)</strong>：</p>
+<ul>
+<li><code>p_q, p_k, p_v...</code>: 算出数据在显存里的内存地址。</li>
+</ul>
+</li>
+<li>
+<p><strong>加载初始状态 (Load Initial State)</strong>：</p>
+<ul>
+<li><code>if USE_INITIAL_STATE:</code>: 如果是接着上一段话读，就把之前的记忆 <code>h0</code> 读进来。</li>
+</ul>
+</li>
+<li>
+<p><strong>时间循环 (The Loop - 最重要的地方)</strong>：</p>
+<ul>
+<li><code>for _ in range(0, T):</code>: 从第 1 个字读到第 T 个字。</li>
+<li><strong>Load</strong>: <code>tl.load(...)</code> 把当前时刻 $t$ 的 $q, k, v, a, b, gk$ 数据从显存加载到寄存器。</li>
+<li><strong>Compute (核心公式)</strong>:
+    <code>python
+    # 1. 计算记忆的“调整项” (h * a)
+    tmp = tl.sum(b_h * b_a[None, :], axis=1)
+    # 2. 更新记忆 h = 衰减*h + 调整项*b + 新信息(k*v)
+    b_h = exp(b_gk)[None, :] * b_h + (tmp[:, None] * b_b[None, :] + b_k[None, :] * b_v[:, None])
+    # 3. 计算输出 o = h * q
+    b_o = tl.sum(b_h * b_q[None, :], axis=1)</code></li>
+<li><strong>Store</strong>: <code>tl.store(p_o, ...)</code> 把算好的输出 $o$ 写回显存。</li>
+<li><strong>Advance</strong>: <code>p_q += ...</code> 指针移动到下一个时间步（下一个字）。</li>
+</ul>
+</li>
+<li>
+<p><strong>保存最终状态 (Save Final State)</strong>：</p>
+<ul>
+<li><code>if STORE_FINAL_STATE:</code>: 读完了，把现在的脑子里的记忆 <code>ht</code> 存下来，供下一次推理使用（KV Cache 的变体）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🟠 任务 4：理解 Python 包装层</h3>
+<p><strong>目标</strong>：理解 <code>fused_recurrent_dplr_delta_rule</code> 函数。</p>
+<p>这是给 PyTorch 用户调用的接口。</p>
+<ol>
+<li><strong>检查输入</strong>：确保 <code>q, k, v</code> 形状对得上。</li>
+<li><strong>准备 Grid</strong>：<code>grid</code> 决定了启动多少个 GPU 线程块。</li>
+<li><strong>启动 Kernel</strong>：调用刚才那个 Triton 函数。</li>
+<li><strong>重要限制</strong>：<ul>
+<li>看 <code>backward</code> 函数：<code>raise NotImplementedError</code>。</li>
+<li><strong>意思就是</strong>：这个文件里的代码<strong>只能用来做前向传播（推理/预测）</strong>，不能用来训练（反向传播）。训练通常需要并行计算（Chunkwise），而这个是串行循环（Recurrent），训练起来太慢，所以作者直接禁用了它的反向传播。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🔴 任务 5：总结与复述 (Checklist)</h3>
+<p>现在，你可以尝试回答以下问题来检查自己是否理解：</p>
+<ul>
+<li><strong>[ ] 为什么要有这个文件？</strong><ul>
+<li>答：为了在生成文本时（Inference），极快地计算 DPLR 这种线性 Attention 模型，通过把循环写在 GPU 核心里（Kernel Fusion）来加速。</li>
+</ul>
+</li>
+<li><strong>[ ] 它的核心计算模式是什么？</strong><ul>
+<li>答：RNN 模式。维护一个状态矩阵 $h$，每来一个 token 更新一次 $h$，并输出一个结果。</li>
+</ul>
+</li>
+<li><strong>[ ] 这里的 $a$ 和 $b$ 是干嘛的？</strong><ul>
+<li>答：它们构成了 Update Rule 中的“低秩 (Low Rank)”部分，用来让状态矩阵不仅仅是衰减，还能发生方向上的变化。</li>
+</ul>
+</li>
+<li><strong>[ ] 能用这个代码训练模型吗？</strong><ul>
+<li>答：不能。<code>backward</code> 没实现。训练要用另一个叫 <code>chunk_dplr_delta_rule</code> 的文件。</li>
+</ul>
+</li>
+</ul>
+<h3>一句话总结</h3>
+<p>这个文件是一个<strong>高度优化的、仅用于推理的、基于 Triton 编写的 GPU 核函数</strong>，它实现了一个带有<strong>衰减和旋转机制</strong>的<strong>线性 RNN</strong> 模型的逐帧计算过程。</p>

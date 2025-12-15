@@ -1,0 +1,123 @@
+<h1>docs/workers/megatron_workers.rst</h1>
+<p>这份文档确实比较硬核，因为它涉及到<strong>超大模型分布式训练（Megatron-LM）</strong>和<strong>高性能推理（vLLM）</strong>的结合，以及<strong>强化学习（RLHF）</strong>的流程。</p>
+<p>简单来说，这份文档是给开发者看的说明书，告诉他们：<strong>“如果你想用 Megatron-LM 这个框架来训练巨大的模型（比如千亿参数），我们的系统是怎么设计‘工人（Workers）’来干活的。”</strong></p>
+<p>为了让你读懂，我把这个过程拆解成一个 <strong>“理解任务清单 (Todo List)”</strong>，我们一步一步来攻克：</p>
+<hr />
+<h3>Task 1：搞清楚背景 (Context)</h3>
+<p><strong>目标：</strong> 理解为什么会有这份文档。</p>
+<ul>
+<li><strong>现状：</strong> 在 RLHF（基于人类反馈的强化学习）中，我们需要四个模型在 GPU 上跑：<ol>
+<li><strong>Actor（演员）：</strong> 生成回答，需要训练。</li>
+<li><strong>Rollout（推理）：</strong> 负责让演员生成一批数据，需要极快的推理速度。</li>
+<li><strong>Reference（参考）：</strong> 旧版本的演员，用来防止新演员跑偏。</li>
+<li><strong>Critic/Reward（评论家/奖励模型）：</strong> 给回答打分。</li>
+</ol>
+</li>
+<li><strong>痛点：</strong> 模型太大了，单卡放不下，必须用 <strong>Megatron-LM</strong> 做切分（3D 并行）。同时，为了生成速度快，推理阶段想用 <strong>vLLM</strong>。</li>
+<li><strong>文档核心：</strong> 讲如何把 Megatron（训练强）和 vLLM（推理强）结合在一起，并分配给不同的 Worker 去执行。</li>
+</ul>
+<hr />
+<h3>Task 2：分析优缺点 (Pros &amp; Cons)</h3>
+<p><strong>目标：</strong> 知道这套方案的代价和收益。</p>
+<ul>
+<li><strong>收益 (Pros)：</strong><ul>
+<li><strong>能扛大模型：</strong> 支持 3D 并行（数据并行+模型并行+流水线并行），能训练极大模型。</li>
+<li><strong>省显存 (HybridEngine)：</strong> 这是重点。它让 Actor（训练）和 Rollout（推理）<strong>共享权重</strong>。不用存两份模型，而且在训练和推理之间切换时，传输开销很小。</li>
+</ul>
+</li>
+<li><strong>代价 (Cons)：</strong><ul>
+<li><strong>麻烦：</strong> 用户得自己写代码适配 Megatron 模型。</li>
+<li><strong>手动挡：</strong> 用户得自己写 <code>weight_loader</code>，负责把权重从 Megatron 格式倒腾给 vLLM 用。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 3：认识“工头” (MegatronWorker)</h3>
+<p><strong>目标：</strong> 理解基础类 <code>MegatronWorker</code> 是干嘛的。</p>
+<ul>
+<li><strong>解释：</strong> 在分布式训练里，几十张显卡一起工作，每张卡都需要知道自己在哪里（Rank）以及一共有多少兄弟（World Size）。</li>
+<li><strong>功能：</strong> 这个类就是负责获取这些“工牌信息”的，它是所有其他工人的“爸爸”（基类）。</li>
+</ul>
+<hr />
+<h3>Task 4：理解核心工人 (ActorRolloutRefWorker)</h3>
+<p><strong>目标：</strong> 這是文档最长、最难的部分。理解<strong>“混合引擎 (HybridEngine)”</strong>是如何工作的。</p>
+<p>这个 Worker 身兼多职：它既是演员（Actor），又是负责生成的（Rollout），还是参考模型（Ref）。</p>
+<p><strong>分步理解：</strong></p>
+<ol>
+<li>
+<p><strong>初始化 (Init Model)：</strong></p>
+<ul>
+<li><strong>动作：</strong> <code>ONE_TO_ALL</code> 模式。主控节点一声令下，所有显卡开始初始化。</li>
+<li><strong>关键点：</strong> 这里提到了 <strong>HybridEngine（混合引擎）</strong>。</li>
+<li><strong>流程：</strong><ul>
+<li>建立 <code>MegatronPPOActor</code>：这是用来<strong>训练</strong>的，用 Megatron 框架。</li>
+<li>建立 <code>vLLMRollout</code>：这是用来<strong>推理生成</strong>的，用 vLLM 框架。</li>
+<li>建立 <code>MegatronVLLMShardingManager</code>：这是一个<strong>搬运工</strong>，负责在训练和推理之间，把切碎的权重重新拼装、分发。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>生成数据 (Generate)：</strong></p>
+<ul>
+<li><strong>动作：</strong> <code>MEGATRON_PP_AS_DP_PROTO</code> 模式。</li>
+<li><strong>白话翻译：</strong> 这是一个特殊的数据分发模式。因为 Megatron 训练时把模型切得很碎（流水线并行 PP），但在 vLLM 推理时，我们希望并行度不一样（为了快）。所以这里需要把数据重新组织，让 vLLM 能顺利吃进去，进行“自回归生成”。</li>
+<li><strong>结果：</strong> 产出对话文本。</li>
+</ul>
+</li>
+<li>
+<p><strong>更新模型 (Update Actor)：</strong></p>
+<ul>
+<li><strong>动作：</strong> <code>MEGATRON_COMPUTE_PROTO</code> 模式。</li>
+<li><strong>白话翻译：</strong> 这是标准的训练模式。数据按“数据并行(DP)”切分，大家算完梯度，同步一下，更新权重。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>Task 5：认识其他工人 (Critic &amp; Reward)</h3>
+<p><strong>目标：</strong> 理解辅助角色的工作。</p>
+<ul>
+<li><strong>ReferenceModel（参考模型）：</strong><ul>
+<li>它只负责算概率，不训练。所以它初始化很简单，不需要优化器。</li>
+</ul>
+</li>
+<li><strong>CriticWorker &amp; RewardWorker：</strong><ul>
+<li><strong>初始化：</strong> 和参考模型类似，但 Critic 需要优化器（因为它也要被训练）。</li>
+<li><strong>干活：</strong> 也是用标准模式 (<code>MEGATRON_COMPUTE_PROTO</code>) 接收数据，计算分数（Values 或 Rewards），然后传回去。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 6：总结流程 (The Workflow)</h3>
+<p><strong>目标：</strong> 把上面的碎片拼成一个完整的故事。</p>
+<p>如果把这个系统看作一个工厂，流程是这样的：</p>
+<ol>
+<li><strong>开工 (Init)：</strong> 大家把模型加载进显存。Actor 和 Rollout 共享一套内存（HybridEngine）。</li>
+<li><strong>生成 (Generate)：</strong><ul>
+<li>搬运工把 Actor 的权重整理好给 Rollout (vLLM)。</li>
+<li>Rollout 快速生成一堆问答数据。</li>
+</ul>
+</li>
+<li><strong>打分 (Compute Rewards/Values)：</strong><ul>
+<li>Reward 模型给生成的数据打分。</li>
+<li>Critic 模型预估价值。</li>
+<li>Reference 模型计算一下旧概率。</li>
+</ul>
+</li>
+<li><strong>训练 (Update)：</strong><ul>
+<li>搬运工把权重切回 Megatron 格式。</li>
+<li>Actor 根据分数和概率进行学习（PPO 更新）。</li>
+<li>Critic 也进行学习。</li>
+</ul>
+</li>
+<li><strong>循环：</strong> 回到第2步。</li>
+</ol>
+<hr />
+<h3>你的“待办事项” (User Action Items)</h3>
+<p>根据文档最后的 <strong>Context Parallel</strong> 和 <strong>Cons</strong> 部分，如果你是开发者，你需要做：</p>
+<ol>
+<li><strong>写模型代码：</strong> 必须自己实现适配 Megatron 的模型结构。</li>
+<li><strong>写加载器：</strong> 实现 <code>weight_loader</code>，确保权重能在 Actor（训练态）和 vLLM（推理态）之间无缝转换。</li>
+<li><strong>处理上下文并行：</strong> 如果需要处理超长文本（Context Parallel），得自己在模型里实现。</li>
+</ol>
+<p>希望这个 List 能帮你把这篇晦涩的技术文档看懂！</p>

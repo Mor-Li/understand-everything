@@ -1,0 +1,77 @@
+<h1>docs/single_controller.rst</h1>
+<p>这份文档是一篇<strong>面向开发者</strong>的设计文档，主要解释了 <code>verl</code> 框架中 <code>single_controller</code> 这个模块是如何工作的。</p>
+<p><strong>简单总结：</strong>
+它的核心目的是<strong>“让写分布式（多显卡）代码像写单机代码一样简单”</strong>。通常在多显卡训练时，你需要处理复杂的数据同步和进程管理，而这个模块把这些脏活累活都藏起来了，让你感觉好像只在控制一个进程，但实际上后台有一群工人在帮你干活。</p>
+<p>下面我按照你的要求，列一个 <strong>Task List</strong>，并一步步拆解文中的观点。</p>
+<hr />
+<h3>核心任务清单 (Task List)</h3>
+<p>如果你要在这个框架下开发一个分布式功能（比如让多个 GPU 一起生成文本），你需要经历以下 4 个步骤：</p>
+<ol>
+<li><strong>[贴标签]：</strong> 在你的函数上加一个装饰器 <code>@register</code>，告诉系统这个函数需要分布式运行。</li>
+<li><strong>[组建团队]：</strong> 创建一个 <code>WorkerGroup</code>（工人组），把你的类放进去。</li>
+<li><strong>[自动绑定]：</strong> 系统会自动扫描你的类，把贴了标签的函数“改装”成分布式版本。</li>
+<li><strong>[一键调用]：</strong> 像调用普通函数一样调用它，系统自动完成数据的拆分、分发和结果回收。</li>
+</ol>
+<hr />
+<h3>逐步讲解 (Step-by-Step Guide)</h3>
+<h4>0. 背景：为什么要搞这个？(Origin)</h4>
+<ul>
+<li><strong>痛点：</strong> 传统的 PyTorch DDP（分布式数据并行）虽然好用，但在做 RLHF（强化学习）时很麻烦，因为流程复杂（不仅仅是简单的训练），且很难调试中间过程。</li>
+<li><strong>方案：</strong> 作者想用 Ray（一个分布式框架）来管理，但 Ray 默认是一对一调用的。</li>
+<li><strong>目标：</strong> 作者想做一个“中间层”，把复杂的分布式调用封装起来，让用户无感。</li>
+</ul>
+<h4>1. 第一步：[贴标签] 使用装饰器注册 (Register)</h4>
+<p>你在写代码定义一个“工人类”（Worker）时，需要告诉系统哪个方法是核心任务。</p>
+<ul>
+<li><strong>操作：</strong> 在函数 <code>generate_sequences</code> 上面写 <code>@register(dispatch_mode=...)</code>。</li>
+<li><strong>原理：</strong> 这个装饰器通过 <code>MAGIC_ATTR</code> 给函数贴了个“便利贴”。<ul>
+<li>便利贴上写着：这个任务的数据需要切分（Dispatch）、执行模式是全体执行（Execute）、是否阻塞等。</li>
+<li><strong>关键点：</strong> 此时代码还没跑起来，只是打了个标记。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 第二步：[组建团队] 初始化 WorkerGroup (Binding)</h4>
+<p>这是最神奇的一步。当你创建 <code>RayWorkerGroup</code> 时，它不仅是启动了几个进程，还做了一次“魔改”。</p>
+<ul>
+<li><strong>操作：</strong>
+    <code>python
+    wg = RayWorkerGroup(resource_pool=..., ray_cls_with_init=...)</code></li>
+<li><strong>原理：</strong><ol>
+<li><code>WorkerGroup</code> 启动后，会检查你传入的类。</li>
+<li>它会遍历类里所有的方法，找谁身上贴了 <code>MAGIC_ATTR</code>（刚才那个便利贴）。</li>
+<li><strong>动态生成新方法：</strong> 一旦找到，它会根据便利贴的内容，现场写一个新的函数来替换掉原来的逻辑。</li>
+</ol>
+</li>
+</ul>
+<h4>3. 第三步：[自动绑定] 数据如何分发与回收 (Dispatch &amp; Collect)</h4>
+<p>在“动态生成新方法”的过程中，系统配置了三个关键动作，这是分布式运行的核心逻辑：</p>
+<ul>
+<li><strong>Dispatch (分发)：</strong> 比如你有一大块数据（Batch Size = 100），你有 4 个 GPU。<ul>
+<li>如果是 <code>ONE_TO_ALL</code> 模式：系统把这份数据复制 4 份，每人一份。</li>
+<li>如果是 <code>DP_COMPUTE_PROTO</code> 模式：系统把数据切成 4 份（每份 25），每人领一份。</li>
+</ul>
+</li>
+<li><strong>Execute (执行)：</strong> 命令这 4 个 GPU 同时开始干活。</li>
+<li><strong>Collect (回收)：</strong> 4 个 GPU 干完活了，系统把它们的结果收集起来，拼回成一个完整的结果返给你。</li>
+</ul>
+<h4>4. 第四步：[一键调用] 实际运行 (Call Chain)</h4>
+<p>对于使用这个框架的人来说，这一步非常简单。</p>
+<ul>
+<li><strong>单机代码写法（旧）：</strong>
+    <code>python
+    rollout.generate_sequences(batch) # 只有一个进程在跑</code></li>
+<li><strong>Verl 分布式写法（新）：</strong>
+    <code>python
+    rollout_group.generate_sequences(batch) # 这是一个 WorkerGroup</code></li>
+<li><strong>发生了什么：</strong>
+    当你调用这行代码时，后台默默完成了：<ol>
+<li><strong>切肉：</strong> 把 <code>batch</code> 切分成小块。</li>
+<li><strong>派活：</strong> 通过网络（RPC）发给远程的 GPU。</li>
+<li><strong>干活：</strong> 远程 GPU 运行原始的逻辑。</li>
+<li><strong>装盘：</strong> 把结果拼好给你。</li>
+</ol>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这篇文章讲的就是 <strong><code>verl</code> 如何通过装饰器和动态绑定的黑魔法，把复杂的“数据切分-远程执行-结果合并”这套流程自动化了</strong>。</p>
+<p>你只需要记住：<strong>你写的是单机逻辑，Verl 帮你把它变成了分布式执行。</strong></p>

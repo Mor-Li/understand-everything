@@ -1,0 +1,139 @@
+<h1>fla/ops/gsa/naive.py</h1>
+<p>这份代码实现的是 <strong>Gated Slot Attention (GSA)</strong> 的一种“朴素循环（Naive Recurrent）”版本。</p>
+<p>简单来说，这是一种<strong>线性注意力机制（Linear Attention）</strong>的变体。主要目的是为了让模型在处理长序列时，不像标准 Transformer 那样消耗巨大的显存，而是像 RNN 一样，一步一步地更新记忆。</p>
+<p>为了让你听懂，我把这个复杂的数学过程拆解成一个<strong>“任务清单 (Task List)”</strong>，我们把这段代码看作是一个<strong>“档案管理员整理资料”</strong>的过程。</p>
+<hr />
+<h3>📋 任务清单 (Task List)</h3>
+<ol>
+<li><strong>准备工作 (Setup)</strong>：对齐数据的维度，准备好“记忆容器”（Hidden States）。</li>
+<li><strong>计算遗忘率 (Gate Calculation)</strong>：如果没给遗忘门 $g$，就根据输入 $s$ 自动计算一个，决定每一步要记住多少旧信息。</li>
+<li><strong>第一轮循环：寻址 (Loop 1: Routing)</strong>：<ul>
+<li>把“钥匙 ($k$)”存进“槽位 ($s$)”里。</li>
+<li>用“查询 ($q$)”去问：“我该关注哪个槽位？”</li>
+</ul>
+</li>
+<li><strong>生成权重 (Softmax)</strong>：把第一轮的结果归一化，变成概率（即：对每个槽位的关注度）。</li>
+<li><strong>第二轮循环：取值 (Loop 2: Aggregation)</strong>：<ul>
+<li>把“内容 ($v$)”存进“槽位 ($s$)”里。</li>
+<li>根据刚才算出来的关注度，从槽位里把内容取出来。</li>
+</ul>
+</li>
+<li><strong>打包输出 (Output)</strong>：返回结果和最终的记忆状态。</li>
+</ol>
+<hr />
+<h3>🧐 逐步详细讲解</h3>
+<p>下面我们对照代码，一步步执行这个清单。</p>
+<h4>1. 准备工作 (Setup)</h4>
+<p>代码开头的一大段 <code>if</code> 和 <code>map</code> 主要是为了处理数据形状。</p>
+<ul>
+<li><strong>代码片段</strong>：
+    <code>python
+    NG = q.shape[1]//k.shape[1]  # 处理多头注意力分组 (MQA/GQA)
+    # ... map(lambda x: repeat(...)) ...
+    hk = torch.zeros(...) # 初始化第一块记忆
+    ok = torch.zeros_like(s) # 准备第一轮输出容器</code></li>
+<li><strong>解释</strong>：<ul>
+<li>这里主要是为了兼容 Grouped Query Attention (GQA)。如果 $k, v$ 的头数少于 $q$，就复制几份让它们对齐。</li>
+<li><strong>关键点</strong>：初始化了 <code>hk</code>。你可以把它想象成<strong>第一块黑板</strong>，用来记录 $k$ (Key) 和 $s$ (Slot) 的关系。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 计算遗忘率 (Gate Calculation)</h4>
+<ul>
+<li><strong>代码片段</strong>：
+    <code>python
+    if g is None:
+        z = s.float().logcumsumexp(2)
+        g = torch.cat(...) - z
+        s = torch.exp(s - z)</code></li>
+<li><strong>解释</strong>：<ul>
+<li>GSA 是一种门控机制（Gated）。这就好比人脑，不能记住所有东西，必须边记边忘。</li>
+<li>$g$ (Gate) 就是<strong>遗忘门</strong>。如果函数输入没给 $g$，代码会利用 $s$ (Slot scores) 计算出一个归一化的衰减系数。</li>
+<li>这意味着：<strong>旧的信息会随着时间推移，按照 $g$ 的比例逐渐变淡。</strong></li>
+</ul>
+</li>
+</ul>
+<h4>3. 第一轮循环：寻址 (Loop 1: Routing)</h4>
+<p>这是代码中最核心的两个循环之一。它的目的是算出 <strong>Query (查询) 到底想看哪一个 Slot (槽位)</strong>。</p>
+<ul>
+<li><strong>代码片段</strong>：
+    ```python
+    for i in range(T): # 遍历时间步 (就像 RNN 一样一步步走)
+        # ... 取出当前时刻的 q, k, s, g ...<div class="codehilite"><pre><span></span><code><span class="gh">#</span> 1. 更新记忆 (Write)
+<span class="gh">#</span> 记忆 = 旧记忆 * 遗忘门 + 新信息(Key * Slot)
+hk = hk <span class="gs">* g_i[..., None, :] + k_i[..., None] *</span> v_i[..., None, :]
+
+<span class="gh">#</span> 2. 读取记忆 (Read)
+<span class="gh">#</span> 输出 = Query * 当前记忆
+ok[:, :, i] = (q_i[..., None] * hk).sum(-2)
+</code></pre></div>
+
+<p><code>``
+*   **通俗理解**：
+*   这里的</code>v_i<code>其实是代码里的变量名，但它的值来自输入的</code>s<code>(Slot)。
+*   **存**：我们在建立 Key 和 Slot 的联系。比如，“这种 Key 的特征通常属于第 3 号 Slot”。
+*   **取**：Query 进来问</code>hk<code>记忆库：“嘿，我和这个 Key 很像，我应该去哪个 Slot 找东西？”
+*   **结果</code>ok`**：代表了 Query 对每个 Slot 的原始打分。</p>
+</li>
+</ul>
+<h4>4. 生成权重 (Softmax)</h4>
+<ul>
+<li><strong>代码片段</strong>：
+    <code>python
+    qv = ok.softmax(-1)</code></li>
+<li><strong>解释</strong>：<ul>
+<li>刚才算出的 <code>ok</code> 是个数值，可能很大也可能很小。</li>
+<li><code>softmax</code> 把它变成了<strong>概率</strong>（加起来等于 1）。</li>
+<li>现在的 <code>qv</code> 变成了：<strong>“我在当前时刻，有 80% 的概率要看 Slot A，20% 的概率看 Slot B”。</strong></li>
+</ul>
+</li>
+</ul>
+<h4>5. 第二轮循环：取值 (Loop 2: Aggregation)</h4>
+<p>现在我们要根据刚才算出的概率，去真正的 Slot 里拿信息（Value）了。</p>
+<ul>
+<li><strong>代码片段</strong>：
+    ```python
+    hv = torch.zeros(...) # 初始化第二块黑板
+    # ...
+    for i in range(T):
+        # ... 取出 qv(刚才算的权重), s(作为Key), v(真正的Value) ...<div class="codehilite"><pre><span></span><code><span class="gh">#</span> 1. 更新记忆 (Write)
+<span class="gh">#</span> 记忆 = 旧记忆 * 遗忘门 + 新信息(Slot * Value)
+hv = hv <span class="gs">* g_i[..., :, None] + k_i[..., None] *</span> v_i[..., None, :]
+
+<span class="gh">#</span> 2. 读取记忆 (Read)
+<span class="gh">#</span> 输出 = 权重(qv) * 当前记忆
+ov[:, :, i] = (q_i[..., None] * hv).sum(-2)
+</code></pre></div>
+
+<p><code>``
+*   **通俗理解**：
+*   这里的</code>k_i<code>实际上是</code>s<code>，</code>v_i<code>是真正的</code>v<code>。
+*   **存**：我们在建立 Slot 和 Value 的联系。比如，“第 3 号 Slot 现在存放了刚才那句话的动词信息”。
+*   **取**：根据第 4 步算出的概率</code>qv<code>（比如 80% 看 Slot A），去</code>hv<code>记忆库里把对应的信息加权取出来。
+*   **结果</code>ov`**：这就是最终的注意力输出结果。</p>
+</li>
+</ul>
+<h4>6. 打包输出 (Output)</h4>
+<ul>
+<li><strong>代码片段</strong>：
+    <code>python
+    if output_final_state:
+        final_state = ...
+    return ov.to(dtype), final_state</code></li>
+<li><strong>解释</strong>：<ul>
+<li>把计算好的结果返回。</li>
+<li>如果有需要，把最后时刻的记忆（黑板上的内容 <code>hk</code> 和 <code>hv</code>）也返回，方便处理下一段文本（类似 RNN 的 state passing）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结：这段代码到底在干啥？</h3>
+<p>标准的 Transformer 是让 $Q$ 直接去和所有的历史 $K$ 算相似度，然后找 $V$。这需要保留所有历史，内存消耗大。</p>
+<p><strong>GSA (这段代码) 的做法是：</strong></p>
+<ol>
+<li>设立了 $M$ 个中间<strong>槽位 (Slots)</strong>（比如 64 个桶）。</li>
+<li><strong>循环 1</strong>：把输入的 $K$ 扔进这些桶里，训练一个“分类器”告诉 $Q$：“你应该去翻哪个桶”。</li>
+<li><strong>循环 2</strong>：把输入的 $V$ 也扔进这些桶里。</li>
+<li><strong>最后</strong>：$Q$ 根据循环 1 的指引，去循环 2 的桶里把数据拿出来。</li>
+</ol>
+<p>因为是循环写进去的（Recurrent），所以不需要存下所有的历史，只需要存下那几个桶（State <code>hk</code> 和 <code>hv</code>），这就大大节省了显存。</p>

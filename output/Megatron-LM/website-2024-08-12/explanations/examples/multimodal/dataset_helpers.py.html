@@ -1,0 +1,101 @@
+<h1>examples/multimodal/dataset_helpers.py</h1>
+<p>这份代码确实看起来很复杂，因为它涉及到了<strong>多模态大模型（Multimodal LLM）</strong>训练中最繁琐的部分——<strong>数据预处理和加载</strong>。</p>
+<p>简单来说，这个文件的作用是：<strong>把原始的“图片+文字”数据，加工成模型（GPU）能看懂的“数字矩阵”。</strong></p>
+<p>为了让你听懂，我把这个过程拆解成一个 <strong>“流水线工厂的Todo List”</strong>，我们一步步来看每个车间都在干什么。</p>
+<hr />
+<h3>📋 任务清单 (Todo List)</h3>
+<ol>
+<li><strong>准备工具箱 (Setup)</strong>：准备好处理文字的字典（Tokenizer）和处理图片的标准参数。</li>
+<li><strong>图片加工车间 (Image Transforms)</strong>：把各种尺寸的图片裁剪、缩放、变色，变成统一规格。</li>
+<li><strong>文字加工车间 (Text Tokenization)</strong>：把人类语言变成数字ID，并补齐长度。</li>
+<li><strong>核心调度中心 (Task Encoder)</strong>：根据数据类型（是看图说话？还是问答？还是认字？），分配不同的加工流程。</li>
+<li><strong>打包发货 (Batching)</strong>：把处理好的单个数据，堆叠成一批（Batch），喂给显卡。</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Step 1: 准备工具箱 (Setup)</h4>
+<p><strong>代码位置</strong>：开头的一堆 import，<code>pixel_mean</code>, <code>pixel_std</code>，以及 <code>Tokenizer</code> 类。</p>
+<ul>
+<li><strong>观点</strong>：模型不能直接吃 JPG 图片或 string 字符串。</li>
+<li><strong>做什么</strong>：<ul>
+<li><strong>图片标准</strong>：定义了 <code>pixel_mean</code> (均值) 和 <code>pixel_std</code> (方差)。这是为了让所有输入的图片在颜色数值上分布均匀，防止模型因为某张图太亮或太暗而跑偏。</li>
+<li><strong>Tokenizer (分词器)</strong>：这是一个翻译官。比如把 "Cat" 翻译成数字 <code>5023</code>。代码里的 <code>Tokenizer</code> 类还负责处理特殊符号（比如 <code>&lt;image&gt;</code> 占位符）和填充（Pad，把短句子填长）。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 2: 图片加工车间 (Image Transforms)</h4>
+<p><strong>代码位置</strong>：<code>_transform_train</code>, <code>RandomResize</code>, <code>RandomPad</code>, <code>_get_ocr_...</code> 等函数和类。</p>
+<ul>
+<li><strong>观点</strong>：原始图片大小不一，而且为了防止模型“死记硬背”，我们需要对图片进行<strong>数据增强 (Augmentation)</strong>。</li>
+<li><strong>做什么</strong>：<ul>
+<li><strong>统一尺寸</strong>：不管原图多大，都要通过 <code>Resize</code> 或 <code>RandomResizedCrop</code> 变成模型设定的大小（比如 1024x1024）。</li>
+<li><strong>捣乱（增强）</strong>：代码里有很多 <code>RandAugment</code>、<code>ColorJitter</code>（颜色抖动）、<code>RandomRotation</code>（旋转）。这是故意把图片弄歪、变色、模糊一点，逼迫模型学会“透过现象看本质”。</li>
+<li><strong>OCR 特供</strong>：专门为 OCR（文字识别）任务写的变换（<code>_get_ocr_document_visual_transform</code>），模拟扫描件的扭曲和透视变形。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 3: 核心调度中心 (TaskEncoder) - 最关键的部分</h4>
+<p><strong>代码位置</strong>：<code>class TaskEncoder</code> 及其下的 <code>encode_sample</code> 方法。</p>
+<ul>
+<li><strong>观点</strong>：多模态模型通常要学好几种本事，比如：<strong>Captioning</strong>（看图说话）、<strong>VQA</strong>（视觉问答）、<strong>OCR</strong>（文字识别）。每种本事的输入格式不一样，需要分流。</li>
+<li><strong>做什么</strong>：
+    <code>TaskEncoder</code> 类是总指挥。它通过 <code>encode_sample</code> 函数看数据类型：<ul>
+<li>如果是 <code>OCRSample</code> -&gt; 去找 <code>encode_ocr</code></li>
+<li>如果是 <code>CaptioningSample</code> -&gt; 去找 <code>encode_captioning</code></li>
+<li>如果是 <code>VQASample</code> -&gt; 去找 <code>encode_vqa</code></li>
+</ul>
+</li>
+</ul>
+<p>让我们看看这三个分会场在干啥：</p>
+<ol>
+<li>
+<p><strong>Captioning (看图说话)</strong>:</p>
+<ul>
+<li><strong>图</strong>：把图拿去 Step 2 处理好。</li>
+<li><strong>文</strong>：随机选一个提示词（Prompt），比如“请描述这张图”。</li>
+<li><strong>拼</strong>：把 <code>[图片占位符]</code> + <code>[提示词]</code> + <code>[图片的真实描述]</code> 拼在一起，转成数字 ID。</li>
+</ul>
+</li>
+<li>
+<p><strong>VQA (视觉问答)</strong>:</p>
+<ul>
+<li><strong>图</strong>：处理图（如果标记了 <code>-noimage</code> 就不放图）。</li>
+<li><strong>文</strong>：把 <code>Question</code>（问题）和 <code>Answer</code>（答案）拿出来。</li>
+<li><strong>拼</strong>：<code>[图片占位符]</code> + <code>[问题]</code> + <code>[答案]</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>OCR (文字识别)</strong>:</p>
+<ul>
+<li><strong>清洗</strong>：代码里有一段逻辑 <code>filter_words_mask = sample.words_boxes[:, 4] &lt; 0.9</code>。意思是：如果原始数据里某些字的置信度太低（识别得不准），就把图上那个位置涂黑（Mask掉），免得教坏模型。</li>
+<li><strong>拼</strong>：<code>[提示词]</code> + <code>[图里的文字内容]</code>。</li>
+</ul>
+</li>
+</ol>
+<h4>Step 4: 打包发货 (Batching)</h4>
+<p><strong>代码位置</strong>：<code>batch</code> 方法和 <code>ImageTaskBatch</code> 类。</p>
+<ul>
+<li><strong>观点</strong>：显卡（GPU）不喜欢一次处理一条数据，它喜欢一次处理一大块（比如一次 32 条）。</li>
+<li><strong>做什么</strong>：<ul>
+<li><code>encode_sample</code> 产生的是<strong>一条</strong>数据。</li>
+<li><code>batch</code> 函数把<strong>一堆</strong>（List）数据接收进来。</li>
+<li>使用 <code>torch.stack</code> 把图片叠在一起（变成 <code>[N, C, H, W]</code> 的形状）。</li>
+<li>使用 <code>np.stack</code> 把文字 ID 叠在一起。</li>
+<li>最终输出一个 <code>ImageTaskBatch</code> 对象，这就是喂给神经网络的最终“饲料”。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底在讲啥？</h3>
+<p>这段代码是一个<strong>数据厨师</strong>。</p>
+<ol>
+<li><strong>原材料</strong>：原始的图片文件、文本描述、问答对、OCR数据。</li>
+<li><strong>预处理</strong>：切菜（图片裁剪）、调味（图片变色增强）、切肉（文本分词）。</li>
+<li><strong>烹饪逻辑</strong>：<ul>
+<li>如果是“看图说话”菜系，就按 A 菜谱做。</li>
+<li>如果是“问答”菜系，就按 B 菜谱做。</li>
+</ul>
+</li>
+<li><strong>装盘</strong>：把做好的菜整齐地码放在盘子（Batch）里，端给客人（模型）吃。</li>
+</ol>
+<p>你看不懂是因为它把这所有的步骤都写在了一起，而且用了大量的 PyTorch 和 Megatron（NVIDIA 的训练框架）的专业术语。你只需要关注 <code>TaskEncoder</code> 里的 <code>encode_...</code> 那几个函数，就能明白它是如何组装数据的了。</p>

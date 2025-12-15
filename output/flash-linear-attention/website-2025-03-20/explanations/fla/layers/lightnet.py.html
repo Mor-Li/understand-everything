@@ -1,0 +1,111 @@
+<h1>fla/layers/lightnet.py</h1>
+<p>这份代码确实比较硬核，因为它涉及到最新的<strong>线性注意力机制（Linear Attention）</strong>和<strong>状态空间模型（SSM）</strong>的混合变体。看不懂是很正常的，因为它不再是标准的 Transformer Attention（那个 $QK^T$ 的矩阵乘法）。</p>
+<p>为了让你读懂，我们把它想象成你在<strong>组装一台特殊的“信息处理机器”</strong>。这台机器的目标是：<strong>读文章速度极快，而且记忆力很好</strong>。</p>
+<p>我为你列了一个 <strong>"理解 LightNet 的 5 个 Task"</strong>，我们一步步来通关。</p>
+<hr />
+<h3>📝 任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1: 搞清定位</strong> —— 它是谁？它是干嘛的？</li>
+<li><strong>Task 2: 准备零件 (<code>__init__</code>)</strong> —— 看看它肚子里都有什么组件。</li>
+<li><strong>Task 3: 局部感知 (Short Conv)</strong> —— 理解它如何处理“身边”的信息。</li>
+<li><strong>Task 4: 核心魔法 (Decay &amp; GLA)</strong> —— 理解它如何处理“长距离”记忆（最难的一步）。</li>
+<li><strong>Task 5: 把关输出 (Output Gate)</strong> —— 理解最后的整理工作。</li>
+</ol>
+<hr />
+<h3>🚀 逐步通关讲解</h3>
+<h4>✅ Task 1: 搞清定位</h4>
+<p>首先，你要知道 <code>LightNetAttention</code> 是用来替换 Transformer 里的 <code>SelfAttention</code> 的。
+*   <strong>传统 Attention</strong>：看一遍文章，每个字都要和所有字打招呼，字数多了计算量爆炸（$O(N^2)$）。
+*   <strong>LightNet (本代码)</strong>：看文章像扫描仪一样，扫过去就记住了，不用反复回头看（$O(N)$，线性复杂度）。</p>
+<p><strong>一句话总结</strong>：这是一个<strong>带卷积预处理</strong>的、<strong>基于门控机制</strong>的<strong>线性注意力层</strong>。</p>
+<hr />
+<h4>✅ Task 2: 准备零件 (<code>__init__</code> 函数)</h4>
+<p>看 <code>__init__</code> 方法，这台机器装了三个主要部件：</p>
+<ol>
+<li><strong>Q, K, V 投影层</strong>：<ul>
+<li><code>self.q_proj</code>, <code>self.k_proj</code>, <code>self.v_proj</code>。</li>
+<li>这和标准 Transformer 一样，把输入变成 Query（查询）、Key（索引）、Value（内容）。</li>
+</ul>
+</li>
+<li><strong>短卷积 (Short Convolution)</strong>：<ul>
+<li><code>if use_short_conv: ... self.q_conv1d ...</code></li>
+<li>这是一个“小窗口”。在做复杂的长记忆之前，先看看每个词“左邻右舍”的关系。</li>
+</ul>
+</li>
+<li><strong>门控与输出 (Gate &amp; Output)</strong>：<ul>
+<li><code>self.g_proj</code>：一个额外的“门”网络，用来决定输出多少信息。</li>
+<li><code>self.o_proj</code>：最后的输出层。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 3: 局部感知 (Forward 中的 Conv 部分)</h4>
+<p>进入 <code>forward</code> 函数。数据进来后，第一件事是处理局部信息。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_short_conv</span><span class="p">:</span>
+    <span class="c1"># ... 省略部分代码</span>
+    <span class="n">q</span><span class="p">,</span> <span class="n">conv_state_q</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">q_conv1d</span><span class="p">(</span><span class="n">x</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">q_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">),</span> <span class="o">...</span><span class="p">)</span>
+    <span class="n">k</span><span class="p">,</span> <span class="n">conv_state_k</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">k_conv1d</span><span class="p">(</span><span class="n">x</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">k_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">),</span> <span class="o">...</span><span class="p">)</span>
+    <span class="n">v</span><span class="p">,</span> <span class="n">conv_state_v</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">v_conv1d</span><span class="p">(</span><span class="n">x</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">v_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">),</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>直觉</strong>：标准的线性 Attention 有个弱点，对“此时此刻”和“紧挨着的词”不够敏感。</li>
+<li><strong>操作</strong>：这里用了一个 <code>Conv1d</code>（一维卷积）。</li>
+<li><strong>比喻</strong>：在背诵全文（长记忆）之前，先快速把每个词和它前后的词连起来读顺口（局部平滑）。</li>
+</ul>
+<hr />
+<h4>✅ Task 4: 核心魔法 (Decay &amp; GLA) —— <strong>最难点</strong></h4>
+<p>这是代码中最晦涩的部分，也是 LightNet 的核心。</p>
+<p><strong>第一步：计算衰减 (Decay/Gate)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这里的数学操作非常 tricky</span>
+<span class="n">z</span> <span class="o">=</span> <span class="n">k</span><span class="o">.</span><span class="n">float</span><span class="p">()</span><span class="o">.</span><span class="n">logcumsumexp</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+<span class="n">k</span><span class="p">,</span> <span class="n">g</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="n">k</span> <span class="o">-</span> <span class="n">z</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">k</span><span class="o">.</span><span class="n">dtype</span><span class="p">),</span> <span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">((</span><span class="n">z</span><span class="p">[:,</span> <span class="p">:</span><span class="mi">1</span><span class="p">],</span> <span class="n">z</span><span class="p">[:,</span> <span class="p">:</span><span class="o">-</span><span class="mi">1</span><span class="p">]),</span> <span class="mi">1</span><span class="p">)</span> <span class="o">-</span> <span class="n">z</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">k</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>你在看什么</strong>：这段代码在把原始的 <code>k</code> 变成一种“遗忘率”或“衰减率”。</li>
+<li><code>logcumsumexp</code>：这是一个累积操作。它在计算一种归一化因子。</li>
+<li><strong>目的</strong>：LightNet 不需要显式的位置编码（Positional Encoding），它通过这种数学变换，让模型自动学会<strong>随着距离增加，旧的信息该保留多少，该忘掉多少</strong>。生成的 <code>g</code> (gate) 就是那个控制遗忘的开关。</li>
+</ul>
+<p><strong>第二步：放入 GLA 引擎</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">mode</span> <span class="o">==</span> <span class="s1">&#39;chunk&#39;</span><span class="p">:</span>
+    <span class="n">o</span><span class="p">,</span> <span class="n">recurrent_state</span> <span class="o">=</span> <span class="n">chunk_gla</span><span class="p">(</span><span class="n">q</span><span class="o">=</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="o">=</span><span class="n">v</span><span class="p">,</span> <span class="n">g</span><span class="o">=</span><span class="n">g</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>GLA (Gated Linear Attention)</strong>：这是 <code>fla</code> 库的核心算子。</li>
+<li><strong>原理</strong>：它不像 Transformer 那样生成一个巨大的 Attention Matrix。它是<strong>递归 (Recurrent)</strong> 的。<ul>
+<li>读入一个词，更新一下脑子里的“记忆状态” (State)。</li>
+<li>根据 <code>q</code> (当前查询) 和 <code>State</code> (历史记忆) 算出输出。</li>
+<li>根据 <code>g</code> (刚才算的衰减) 忘掉一点旧记忆。</li>
+</ul>
+</li>
+<li><strong>Chunk</strong>：为了加速，它不是一个字一个字读，而是一块一块（Chunk）读。</li>
+</ul>
+<hr />
+<h4>✅ Task 5: 把关输出 (Output Gate)</h4>
+<p>机器处理完记忆后，最后一步是整理输出。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">o</span> <span class="o">=</span> <span class="n">rms_norm_swish_gate_linear_fn</span><span class="p">(</span>
+    <span class="n">rearrange</span><span class="p">(</span><span class="n">o</span><span class="p">,</span> <span class="s1">&#39;b t h d -&gt; b t (h d)&#39;</span><span class="p">),</span> <span class="c1"># 把多头拼接回去</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">g_proj</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">),</span>           <span class="c1"># 原始输入算出的一个“门”</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">g_norm</span><span class="o">.</span><span class="n">weight</span><span class="p">,</span>                   <span class="c1"># 归一化参数</span>
+    <span class="o">...</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>直觉</strong>：刚才算出来的 <code>o</code> 是基于历史记忆的。现在，我们再看一眼原始输入 <code>hidden_states</code>，算一个 <code>gate</code>。</li>
+<li><strong>操作</strong>：<code>o * sigmoid(gate)</code> (Swish 类似操作)。</li>
+<li><strong>目的</strong>：这是为了进一步增强模型的非线性能力和稳定性。类似于：“虽然我回忆起了很多东西，但我还要根据当前的上下文，决定这一句话到底要说多少出来。”</li>
+</ul>
+<hr />
+<h3>总结：这段代码在讲什么故事？</h3>
+<p>这段代码实现了一个 <strong>LightNetAttention 层</strong>。它的工作流程是：</p>
+<ol>
+<li><strong>输入</strong>：拿到句子的向量。</li>
+<li><strong>局部混合</strong>：用小卷积核先处理一下邻居关系（Short Conv）。</li>
+<li><strong>计算遗忘率</strong>：用一种特殊的数学技巧（<code>logcumsumexp</code>）处理 Key，决定记忆的衰减。</li>
+<li><strong>全局扫描</strong>：调用 <code>chunk_gla</code> 算子，像 RNN 一样扫描全句，更新记忆并提取信息（这是替代传统 Attention 的步骤）。</li>
+<li><strong>门控输出</strong>：把提取的信息和原始输入结合，经过归一化和门控，输出最终结果。</li>
+</ol>
+<p><strong>它的核心价值</strong>：让你能用处理短文章的速度和显存消耗，去处理超长的文章（Long Context），同时效果还很棒。</p>

@@ -1,0 +1,160 @@
+<h1>fla/ops/triton/gla/block_parallel/inter_chunk_contribution/chunk_scan_triton_only_gk.py</h1>
+<p>这份代码确实比较硬核，因为它是用 <strong>Triton</strong> 写的底层算子，用于加速 <strong>Gated Linear Attention (GLA)</strong> 模型中“块（Chunk）与块之间”的状态传递。</p>
+<p>简单来说，它的核心任务是：<strong>计算一个随时间衰减的累加和（Recurrence / Scan）</strong>。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>任务清单 (Todo List)</strong>，我们一步步来完成这个思维任务。</p>
+<hr />
+<h3>任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1: 理解背景场景 (这是在干什么？)</strong></li>
+<li><strong>Task 2: 搞懂输入和输出 (数据长什么样？)</strong></li>
+<li><strong>Task 3: 拆解并行策略 (怎么切分大任务？)</strong></li>
+<li><strong>Task 4: 核心逻辑 - 前向传播 (Forward)</strong></li>
+<li><strong>Task 5: 核心逻辑 - 反向传播 (Backward)</strong></li>
+</ol>
+<hr />
+<h3>Task 1: 理解背景场景</h3>
+<p>想象你在处理长文本。为了加速，我们把长文本切成了很多个 <strong>Chunk (块)</strong>。
+每个块内部计算完后，会产生一个 <strong>KV State (记忆状态)</strong>。
+这个状态需要传给下一个块，作为下一个块的“初始记忆”。但是，记忆传递过程中会遗忘（Decay）。</p>
+<ul>
+<li><strong>核心公式</strong>：
+    $$ \text{State}<em>{i} = \text{State}</em>{i-1} \times \text{Decay}<em>{i-1} + \text{NewInfo}</em>{i} $$<ul>
+<li><code>State</code>: 当前块的记忆。</li>
+<li><code>Decay</code>: 遗忘门控（保留多少之前的记忆）。</li>
+<li><code>NewInfo</code>: 当前块新产生的记忆。</li>
+</ul>
+</li>
+</ul>
+<p>这个文件的代码就是在算这个公式，只不过是用 GPU 极速并行算的。</p>
+<hr />
+<h3>Task 2: 搞懂输入和输出</h3>
+<p>看 <code>Chunk_memory_update_only_gk</code> 这个 Python 类：</p>
+<ul>
+<li><strong>输入 <code>to_add</code></strong>: 形状 <code>[B, H, N, D_k, D_v]</code>。<ul>
+<li>这就是上面公式里的 <code>NewInfo</code>。</li>
+<li>$B$: Batch size, $H$: Head, $N$: Number of blocks (块的数量), $D_k, D_v$: 特征维度。</li>
+</ul>
+</li>
+<li><strong>输入 <code>decay_key_last</code></strong>: 形状 <code>[B, H, N, D_k]</code>。<ul>
+<li>这就是公式里的 <code>Decay</code>。注意它只跟 Key 的维度 ($D_k$) 有关，所以叫 <code>only_gk</code> (Only Gating on Key)。</li>
+</ul>
+</li>
+<li><strong>输出 <code>output</code></strong>: 形状和 <code>to_add</code> 一样。<ul>
+<li>这就是计算完递归后的 <code>State</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 3: 拆解并行策略 (Triton 的精髓)</h3>
+<p>矩阵 <code>[D_k, D_v]</code> 可能很大，比如 128x128 或更大。Triton 擅长把大矩阵切成小块并行算。</p>
+<p>看代码中的 <code>grid</code> 和 <code>BLOCK_MODEL</code>：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">BLOCK_MODEL</span> <span class="o">=</span> <span class="mi">32</span>
+<span class="n">grid</span> <span class="o">=</span> <span class="p">(</span><span class="n">B</span><span class="o">*</span><span class="n">H</span><span class="p">,</span> <span class="n">D_k</span><span class="o">//</span><span class="n">BLOCK_MODEL</span><span class="p">,</span> <span class="n">D_v</span><span class="o">//</span><span class="n">BLOCK_MODEL</span><span class="p">)</span>
+</code></pre></div>
+
+<p>这意味着：
+1.  <strong>Batch 和 Head 维度</strong>：完全并行（互不干扰）。
+2.  <strong>特征维度 ($D_k, D_v$)</strong>：被切成了 $32 \times 32$ 的小方块。</p>
+<p><strong>每个 Triton 程序 (Program) 只负责计算这一个小方块在时间轴上的递归。</strong>
+比如，某个线程只负责计算矩阵左上角那 $32 \times 32$ 区域随时间 $N$ 的变化。</p>
+<hr />
+<h3>Task 4: 核心逻辑 - 前向传播 (<code>_fwd_recurrence</code>)</h3>
+<p>这是最关键的部分。请跟着我的注释看代码逻辑：</p>
+<p><strong>步骤 4.1: 定位内存</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这里的 offset 算术是在找当前线程负责的那个 32x32 小方块在显存里的起始位置</span>
+<span class="n">offset_bh</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span> <span class="c1"># 哪个 Batch, 哪个 Head</span>
+<span class="n">offset_d</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>  <span class="c1"># D_k 维度的切片索引</span>
+<span class="n">offset_s</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span>  <span class="c1"># D_v 维度的切片索引</span>
+
+<span class="c1"># 指针 S 指向 to_add (NewInfo)</span>
+<span class="c1"># 指针 O 指向 output (State)</span>
+<span class="c1"># 指针 p1 指向 decay</span>
+</code></pre></div>
+
+<p><strong>步骤 4.2: 初始化</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># acc 是累加器，也就是当前的 &quot;State&quot;</span>
+<span class="n">acc</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">zeros</span><span class="p">([</span><span class="n">BLOCK_MODEL</span><span class="p">,</span> <span class="n">BLOCK_MODEL</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+
+<span class="c1"># 加载第 0 个块的数据作为初始状态</span>
+<span class="n">acc</span> <span class="o">+=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">S</span><span class="p">)</span> 
+
+<span class="c1"># 指针移动到下一个块</span>
+<span class="n">S</span> <span class="o">+=</span> <span class="n">D_MODEL_K</span> <span class="o">*</span> <span class="n">D_MODEL_V</span> 
+<span class="c1"># 存下第 0 个块的结果</span>
+<span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">O</span><span class="p">,</span> <span class="n">acc</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">O</span><span class="o">.</span><span class="n">dtype</span><span class="o">.</span><span class="n">element_ty</span><span class="p">))</span>
+<span class="n">O</span> <span class="o">+=</span> <span class="n">D_MODEL_K</span> <span class="o">*</span> <span class="n">D_MODEL_V</span> 
+</code></pre></div>
+
+<p><strong>步骤 4.3: 时间循环 (递归核心)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 遍历剩下的所有块</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">NUM_BLOCK</span><span class="o">-</span><span class="mi">2</span><span class="p">):</span>
+    <span class="n">p_k</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p1</span><span class="p">)</span>  <span class="c1"># 加载 decay (衰减系数)</span>
+    <span class="n">S_i</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">S</span><span class="p">)</span>   <span class="c1"># 加载当前块的 NewInfo</span>
+
+    <span class="c1"># === 核心公式 ===</span>
+    <span class="c1"># State = State_old * Decay + NewInfo</span>
+    <span class="c1"># p_k[:, None] 是因为 decay 只有 D_k 维度，需要广播到 D_v 维度</span>
+    <span class="n">acc</span> <span class="o">=</span> <span class="n">acc</span> <span class="o">*</span> <span class="n">p_k</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">+</span> <span class="n">S_i</span> 
+
+    <span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">O</span><span class="p">,</span> <span class="n">acc</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">O</span><span class="o">.</span><span class="n">dtype</span><span class="o">.</span><span class="n">element_ty</span><span class="p">))</span> <span class="c1"># 写入结果</span>
+
+    <span class="c1"># 指针全部移动到下一个块</span>
+    <span class="n">p1</span> <span class="o">+=</span> <span class="n">D_MODEL_K</span>
+    <span class="n">S</span> <span class="o">+=</span> <span class="n">D_MODEL_K</span> <span class="o">*</span> <span class="n">D_MODEL_V</span>
+    <span class="n">O</span> <span class="o">+=</span> <span class="n">D_MODEL_K</span> <span class="o">*</span> <span class="n">D_MODEL_V</span>
+</code></pre></div>
+
+<p><strong>总结 Task 4</strong>：这就是一个简单的 <code>for</code> 循环，不停地执行 $h_t = h_{t-1} \cdot p + x_t$，把结果存下来。</p>
+<hr />
+<h3>Task 5: 核心逻辑 - 反向传播 (<code>_bwd_recurrence</code>)</h3>
+<p>反向传播是用来算梯度的。如果我们前向是“累加”，反向通常就是“逆序累加”或者“分配误差”。</p>
+<ul>
+<li><strong>目标</strong>：算出 <code>DS</code> (输入的梯度) 和 <code>Dp1</code> (Decay 的梯度)。</li>
+<li><strong>逻辑</strong>：
+    在前向中，前面的块影响后面的块。
+    在反向中，<strong>后面的误差 (Gradient) 会流回前面的块</strong>。</li>
+</ul>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Dacc 是梯度的累加器</span>
+<span class="n">Dacc</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">zeros</span><span class="p">([</span><span class="n">BLOCK_MODEL</span><span class="p">,</span> <span class="n">BLOCK_MODEL</span><span class="p">],</span> <span class="n">dtype</span><span class="o">=</span><span class="n">tl</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+
+<span class="c1"># 从最后一个块往前遍历 (Reverse Loop)</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">NUM_BLOCK</span> <span class="o">-</span> <span class="mi">1</span><span class="p">):</span>
+    <span class="c1"># 加载数据</span>
+    <span class="n">p_key</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p1</span><span class="p">)</span> <span class="c1"># Decay</span>
+    <span class="n">S_i</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">S</span><span class="p">)</span>    <span class="c1"># 原图的 State</span>
+    <span class="n">DS_i</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">DS</span><span class="p">)</span>  <span class="c1"># 当前块收到的输出梯度 (Gradient of Output)</span>
+
+    <span class="c1"># 1. 计算 State 的梯度</span>
+    <span class="c1"># 当前梯度 = 传回来的梯度 + 当前位置的直接梯度</span>
+    <span class="n">Dacc</span> <span class="o">+=</span> <span class="n">DS_i</span> 
+
+    <span class="c1"># 2. 计算 Decay 的梯度 (链式法则)</span>
+    <span class="c1"># d(Loss)/d(p) = d(Loss)/d(State) * d(State)/d(p)</span>
+    <span class="c1"># 因为 State = Old_State * p + ...</span>
+    <span class="c1"># 所以 d(State)/d(p) = Old_State (代码里的 S_i 其实存的是上一时刻积累的 State)</span>
+    <span class="n">dp_i</span> <span class="o">=</span> <span class="n">Dacc</span> <span class="o">*</span> <span class="n">S_i</span>
+    <span class="n">dp_key</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">dp_i</span><span class="p">,</span> <span class="n">axis</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span> <span class="c1"># 在 D_v 维度求和，因为 p 只跟 D_k 有关</span>
+    <span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">Dp1</span><span class="p">,</span> <span class="n">dp_key</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">Dp1</span><span class="o">.</span><span class="n">dtype</span><span class="o">.</span><span class="n">element_ty</span><span class="p">))</span>
+
+    <span class="c1"># 3. 算出输入的梯度 (DS)</span>
+    <span class="c1"># d(Loss)/d(Input) = Dacc (直接透传，因为 Input 是加法进来的)</span>
+    <span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">S</span><span class="p">,</span> <span class="n">Dacc</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">S</span><span class="o">.</span><span class="n">dtype</span><span class="o">.</span><span class="n">element_ty</span><span class="p">))</span> <span class="c1"># 这里复用了 S 的内存存梯度</span>
+
+    <span class="c1"># 4. 准备传给上一个块的梯度</span>
+    <span class="c1"># 下一个时刻的梯度传给上一个时刻时，要乘上 Decay</span>
+    <span class="n">Dacc</span> <span class="o">*=</span> <span class="n">p_key</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">]</span>
+
+    <span class="c1"># 指针回退 (因为是反向遍历)</span>
+    <span class="n">S</span> <span class="o">-=</span> <span class="n">D_MODEL_K</span> <span class="o">*</span> <span class="n">D_MODEL_V</span>
+    <span class="c1"># ... 其他指针回退</span>
+</code></pre></div>
+
+<hr />
+<h3>总结 (The Big Picture)</h3>
+<ol>
+<li><strong>文件目的</strong>：在 GPU 上高效计算 GLA 模型中块与块之间的记忆状态更新。</li>
+<li><strong>前向 (Forward)</strong>：像滚雪球一样，把之前的记忆乘以衰减系数，加上当前的新信息，传给下一块。</li>
+<li><strong>反向 (Backward)</strong>：从未来往回看，把误差传回过去。如果当前的 Decay 很大，未来的误差对过去的影响就很大。</li>
+<li><strong>Triton 技巧</strong>：把大矩阵切成 32x32 的小片，每个 CUDA 核心只算这一小片的“滚雪球”过程，极大提高了并行度。</li>
+</ol>
+<p><strong>一句话概括</strong>：这就是一个<strong>并行的、切块的、带遗忘机制的累加器 (Parallel Chunked Decaying Accumulator)</strong>。</p>

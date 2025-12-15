@@ -1,0 +1,70 @@
+<h1>fla/ops/simple_gla/fused_recurrent.py</h1>
+<p>这段代码确实涉及比较前沿的大模型架构（Linear Attention / RNN 变体），如果不是专门做这个方向的，看起来确实像天书。</p>
+<p>别担心，我们把它拆解成一个 <strong>“学习任务清单 (Todo List)”</strong>，就像玩游戏做任务一样，一步步解锁它的含义。</p>
+<p>这个文件的核心功能是：<strong>实现了一个“简化版”的门控线性注意力（Simple GLA）的“循环（Recurrent）”计算模式。</strong></p>
+<hr />
+<h3>📋 任务清单：一步步读懂 <code>fused_recurrent.py</code></h3>
+<h4>✅ Task 1：搞懂背景 —— 这到底是个啥？</h4>
+<ul>
+<li><strong>概念：</strong> 你可能熟悉 Transformer 里的 Attention（注意力机制）。标准的 Attention 需要看以前所有的词，计算量很大。</li>
+<li><strong>痛点：</strong> 随着句子变长，标准 Attention 越来越慢。</li>
+<li><strong>解决：</strong> 这一类代码（FLA库）试图用 <strong>RNN（循环神经网络）</strong> 的方式来算 Attention。<ul>
+<li><em>RNN 的特点：</em> 读一个词，更新一下脑子里的“记忆（State）”，然后读下一个词。这样不管句子多长，内存占用都差不多。</li>
+</ul>
+</li>
+<li><strong>结论：</strong> 这个函数就是用来执行这种 <strong>“读一个词 -&gt; 更新记忆 -&gt; 输出”</strong> 的过程的。</li>
+</ul>
+<h4>✅ Task 2：认识主角 —— 输入参数 (Args)</h4>
+<p>我们要关注这几个核心参数，它们是计算的原材料：
+1.  <strong>Q, K, V</strong>: 老朋友了。Query（查询）, Key（键）, Value（值）。
+2.  <strong>g (Gate/Decay)</strong>: <strong>这是最重要的参数</strong>。
+    *   在 RNN 里，这叫“遗忘门”。
+    *   它的作用是决定：<strong>上一时刻的记忆，我要保留多少？</strong>
+    *   如果不保留，就是 0；如果全保留，就是 1（代码里通常用 log space，所以是负数到0）。
+3.  <strong>initial_state</strong>: 初始记忆。比如你读文章读了一半，想接着读，就需要把之前的记忆传进来。</p>
+<h4>✅ Task 3：理解 "Simple" —— 为什么叫 Simple GLA？</h4>
+<p>这是理解这个文件最关键的“观点”。请看代码注释中关于 <code>g</code> 的描述：</p>
+<blockquote>
+<p><code>g (torch.Tensor): Forget gates ... Compared to GLA, the gating is head-wise instead of elementwise.</code></p>
+</blockquote>
+<ul>
+<li><strong>普通 GLA (Gated Linear Attention):</strong> 每一个特征维度（Element）都有自己独立的遗忘速度。就像你背单词，有的词忘得快，有的忘得慢。</li>
+<li><strong>Simple GLA (本文件):</strong> 做了简化。<strong>整个注意力头（Head）共享同一个遗忘速度</strong>。<ul>
+<li><em>形状区别：</em> 普通 GLA 的 <code>g</code> 是 <code>[Batch, Time, Head, K]</code>，而这里的 <code>g</code> 是 <code>[Batch, Time, Head]</code>（少了一个 K 维度）。</li>
+<li><em>目的：</em> 这种“标量门控”计算起来更快，显存占用更小。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4：理解 "Fused Recurrent" —— 它是怎么算的？</h4>
+<p>函数名里有 <code>fused</code>（融合）和 <code>recurrent</code>（循环）。
+*   <strong>Recurrent (循环模式):</strong> 代码不是一次性算完矩阵乘法，而是像下面这样一步步算（伪代码）：
+    <code>python
+    当前记忆 = 上一刻记忆 * 遗忘门(g) + 新知识(K * V)
+    当前输出 = Query(q) * 当前记忆</code>
+*   <strong>Fused (算子融合):</strong> 如果用 Python 写上面的循环，在 GPU 上会非常慢。这个函数实际上是一个 <strong>Wrapper（包装器）</strong>，它最终调用了一个写好的 C++/CUDA 底层核心（<code>fla.ops.common.fused_recurrent</code>）。这个核心把所有步骤“融合”在一起，在 GPU 上飞快地跑完。</p>
+<h4>✅ Task 5：处理特殊情况 —— 变长序列 (Variable Lengths)</h4>
+<p>代码里有一大段关于 <code>cu_seqlens</code> 的逻辑：
+*   <strong>场景：</strong> 训练时，有的句子长 10 个词，有的长 100 个词。
+*   <strong>FlashAttention 风格：</strong> 为了不浪费显存存一堆 0（padding），这种高级算子通常把所有句子拼成一条长龙（Batch Size = 1），然后用 <code>cu_seqlens</code>（Cumulative Sequence Lengths，累积序列长度）来标记每个句子从哪开始、到哪结束。
+*   <strong>代码逻辑：</strong>
+    <code>python
+    if cu_seqlens is not None:
+        # 检查 batch size 是否为 1（因为拼成了一条龙）
+        # 检查是否支持 head_first 等格式</code>
+    这部分代码纯粹是在做格式检查，防止你传错参数。</p>
+<h4>✅ Task 6：总结 —— 这个函数的实际工作</h4>
+<p>看完上面几步，你会发现这个 Python 函数本身其实没干什么“重活”。它的工作流是：</p>
+<ol>
+<li><strong>安检员：</strong> 检查你输入的 <code>q, k, v, g</code> 形状对不对，特别是如果你用了变长序列 (<code>cu_seqlens</code>)，格式是否合规。</li>
+<li><strong>默认值填充员：</strong> 如果你没给 <code>scale</code>，它帮你算一个默认值 (<code>1 / sqrt(K)</code>)。</li>
+<li><strong>传话筒：</strong> 把整理好的数据扔给底层的通用算子 <code>fused_recurrent</code>。
+    <code>python
+    # 核心就是这一句调用
+    o, final_state = fused_recurrent(...)</code></li>
+</ol>
+<hr />
+<h3>🧠 核心观点提炼 (Takeaway)</h3>
+<p>如果你要给别人讲这个文件，抓住这三点就够了：
+1.  <strong>定位：</strong> 这是一个线性注意力（Linear Attention）算子，用来替代标准 Transformer Attention 以降低推理成本。
+2.  <strong>特点：</strong> 它是 <strong>Simple</strong> 版本，意味着同一个 Head 内的所有特征共享同一个遗忘门（Decay），牺牲了一点点灵活性换取更快的速度。
+3.  <strong>实现：</strong> 它是 <strong>Recurrent</strong> 模式的接口，主要用于推理（生成文本）或者显存受限的训练场景，底层调用了 CUDA 加速。</p>

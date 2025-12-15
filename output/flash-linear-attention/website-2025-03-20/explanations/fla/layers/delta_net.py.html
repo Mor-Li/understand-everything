@@ -1,0 +1,109 @@
+<h1>fla/layers/delta_net.py</h1>
+<p>这份代码实现了一个名为 <strong>DeltaNet</strong> 的神经网络层。</p>
+<p>简单来说，它是 Transformer 中“自注意力机制（Self-Attention）”的一个<strong>替代品</strong>。它的目标是：<strong>拥有 Transformer 的性能，但计算速度像 RNN 一样快（特别是推理时），并且更省显存。</strong></p>
+<p>为了让你读懂它，我把这份代码的执行流程拆解成了一个 <strong>“任务清单 (Todo List)”</strong>。我们可以把这个层看作是一个“信息加工厂”，数据进来后，需要经过以下 7 个步骤的处理。</p>
+<hr />
+<h3>📋 DeltaNet 任务清单 (Todo List)</h3>
+<ol>
+<li><strong>【准备原材料】特征投影 (Projections)</strong>：把输入变成 Q, K, V。</li>
+<li><strong>【局部打磨】短卷积 (Short Convolution)</strong>：先看看邻居，提取局部特征。</li>
+<li><strong>【预处理】激活与归一化 (Activation &amp; Norm)</strong>：把数据调整到合适的分布。</li>
+<li><strong>【控制阀门】计算 Beta ($\beta$)</strong>：决定要往记忆里写入多少新信息。</li>
+<li><strong>【核心工艺】Delta Rule 计算 (The Delta Rule)</strong>：更新记忆状态，计算输出。</li>
+<li><strong>【质量控制】门控与归一化 (Gating &amp; Norm)</strong>：过滤杂质，稳定输出。</li>
+<li><strong>【打包出厂】输出投影 (Output Projection)</strong>：变回原来的形状。</li>
+</ol>
+<hr />
+<h3>逐步讲解 (Step-by-Step)</h3>
+<h4>1. 【准备原材料】特征投影 (Projections)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>__init__</code> 中的 <code>self.q_proj</code>, <code>self.k_proj</code>, <code>self.v_proj</code>。</li>
+<li><strong>在做什么</strong>：
+    就像标准的 Transformer 一样，我们把输入的向量 <code>hidden_states</code> 分别通过三个全连接层，变成了三个新的向量：<ul>
+<li><strong>Q (Query)</strong>：查询向量。</li>
+<li><strong>K (Key)</strong>：键向量。</li>
+<li><strong>V (Value)</strong>：值向量（包含实际内容）。</li>
+<li><em>注：这里还支持 <code>expand_k/v</code>，意味着 K 和 V 的维度可以比输入更大或更小。</em></li>
+</ul>
+</li>
+</ul>
+<h4>2. 【局部打磨】短卷积 (Short Convolution)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>forward</code> 函数中的 <code>if self.use_short_conv:</code> 代码块。</li>
+<li><strong>在做什么</strong>：
+    这是线性 Attention 模型的一个关键技巧。<ul>
+<li><strong>问题</strong>：普通的线性 Attention 往往忽略了词与词之间紧挨着的“局部关系”（比如“好”后面大概率接“的”）。</li>
+<li><strong>解决</strong>：在进行复杂的计算前，先用一个很小的卷积核（<code>kernel_size=4</code>）在 Q, K, V 上滑一遍。这相当于让每个词先和它左右的邻居“交流”一下。</li>
+<li><strong>代码体现</strong>：<code>self.q_conv1d</code>, <code>self.k_conv1d</code>, <code>self.v_conv1d</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 【预处理】激活与归一化 (Activation &amp; Norm)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>forward</code> 函数中 <code>if self.qk_activation ...</code> 和 <code>if self.qk_norm ...</code>。</li>
+<li><strong>在做什么</strong>：
+    为了让数学公式稳定运行，需要对 Q 和 K 做非线性变换。<ul>
+<li>通常使用 <code>SiLU</code> 或 <code>ReLU</code> 激活函数。</li>
+<li>代码中还涉及了 <code>rearrange</code>，把数据形状调整为适合多头计算的格式 <code>(batch, seq_len, num_heads, head_dim)</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 【控制阀门】计算 Beta ($\beta$)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>forward</code> 函数中 <code>if self.use_beta:</code>。</li>
+<li><strong>在做什么</strong>：
+    这是 DeltaNet 的核心特色之一。<ul>
+<li><strong>概念</strong>：你可以把 $\beta$ 想象成一个<strong>“学习率”</strong>或者<strong>“更新强度”</strong>。</li>
+<li>它是由输入数据通过 <code>self.b_proj</code> 计算出来的。</li>
+<li>如果 $\beta$ 很大，说明当前的输入很重要，我们要大幅更新记忆；如果 $\beta$ 很小，说明当前输入是噪音，忽略它，保持原有的记忆。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 【核心工艺】Delta Rule 计算 (The Delta Rule)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>forward</code> 函数中调用 <code>chunk_delta_rule</code> 或 <code>fused_recurrent_delta_rule</code> 的地方。</li>
+<li><strong>在做什么</strong>：
+    这是整个文件最难懂、也是最重要的地方。它不再使用 Transformer 的 $QK^T$ 矩阵乘法（那是 $O(N^2)$ 的复杂度），而是用一种<strong>递归（Recurrent）</strong>的方式。<ul>
+<li><strong>原理</strong>：它维护一个记忆状态矩阵 $S$。<ul>
+<li>传统 RNN：$S_t = S_{t-1} + K^T V$ （简单的累加）。</li>
+<li><strong>Delta Rule</strong>：$S_t = S_{t-1} + \beta (V - K S_{t-1})$。</li>
+</ul>
+</li>
+<li><strong>通俗解释</strong>：<ol>
+<li>先用当前的 Key ($K$) 去查询旧的记忆 ($S_{t-1}$)，看看我们预测出的 Value 是什么。</li>
+<li>计算<strong>误差 (Delta)</strong>：实际的 $V$ 减去 预测的 $V$。</li>
+<li>根据 $\beta$ 的大小，把这个误差更新回记忆 $S$ 中。</li>
+</ol>
+</li>
+<li><strong>两种模式</strong>：<ul>
+<li><code>chunk</code>：训练时用。把序列切成小块并行计算，速度快。</li>
+<li><code>fused_recurrent</code>：推理（生成文本）时用。像 RNN 一样一个词一个词处理，显存占用极低。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>6. 【质量控制】门控与归一化 (Gating &amp; Norm)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>forward</code> 最后的 <code>if self.use_gate:</code> 和 <code>self.o_norm</code>。</li>
+<li><strong>在做什么</strong>：<ul>
+<li><strong>Gating (门控)</strong>：计算出一个 Gate 向量 <code>g</code>，通过 <code>o * g</code> 来过滤输出。这能让模型训练更稳定。</li>
+<li><strong>Norm</strong>：通常使用 RMSNorm，确保输出数值的尺度是正常的，防止梯度爆炸。</li>
+</ul>
+</li>
+</ul>
+<h4>7. 【打包出厂】输出投影 (Output Projection)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>forward</code> 最后一行 <code>return self.o_proj(o), ...</code>。</li>
+<li><strong>在做什么</strong>：
+    把经过各种复杂计算的输出向量，通过一个全连接层 <code>o_proj</code>，映射回模型原本的 <code>hidden_size</code>。这样这个层就可以无缝衔接到下一个层去。</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底牛在哪里？</h3>
+<p>如果你看懂了上面的流程，就会发现 DeltaNet 的本质是：</p>
+<ol>
+<li>它是一个 <strong>RNN</strong>（因为它有状态 $S$，且是随时间更新的）。</li>
+<li>它引入了 <strong>Delta 规则</strong>（利用“预测误差”来更新记忆，比简单的累加更聪明）。</li>
+<li>它引入了 <strong>Short Conv</strong>（不仅看历史，也看局部邻居）。</li>
+<li>它在代码实现上做了<strong>高度优化</strong>（<code>chunk_delta_rule</code>），使得它训练时能像 Transformer 一样并行，推理时能像 RNN 一样快。</li>
+</ol>

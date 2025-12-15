@@ -1,0 +1,55 @@
+<h1>megatron/legacy/model/transformer.py</h1>
+<p>这份代码确实非常硬核，它是 <strong>NVIDIA Megatron-LM</strong> 项目的核心文件之一。Megatron-LM 是目前世界上训练超大语言模型（如 GPT-3, Llama 等）最主流的基础库。</p>
+<p>这份代码解决的核心问题只有一个：<strong>当模型大到单张显卡装不下时，如何把 Transformer 拆解开，放在成百上千张显卡上并行训练。</strong></p>
+<p>为了让你听懂，我把阅读这份代码想象成<strong>“建造一座摩天大楼（大模型）”</strong>的工程任务清单（To-Do List）。我们按照从局部组件到整体大楼的顺序一步步来看。</p>
+<hr />
+<h3>📋 任务清单：构建一个分布式的 Transformer</h3>
+<h4>✅ Task 1: 造砖头——定义基础计算单元 (MLP)</h4>
+<p>大楼的每一层都需要“砖头”来处理信息。在 Transformer 中，这叫前馈神经网络（MLP）。
+*   <strong>代码对应类：</strong> <code>ParallelMLP</code>
+*   <strong>核心观点：</strong> 普通的 MLP 就是两个矩阵乘法。但在 Megatron 里，矩阵太大了，一张卡算不过来。
+*   <strong>怎么做：</strong>
+    *   它使用了 <code>ColumnParallelLinear</code> 和 <code>RowParallelLinear</code>。意思是把一个巨大的矩阵切成竖条或横条，分给不同的显卡去算，最后再把结果拼起来。
+    *   <strong>特殊变体 (<code>SwitchMLP</code>)：</strong> 这是“混合专家模型”（MoE）。如果任务太难，它会用 <code>router</code>（路由器）决定把数据交给哪几个“专家”（Experts，即多个小的 MLP）去处理，而不是让所有人一起上。</p>
+<h4>✅ Task 2: 装雷达——定义注意力机制 (Attention)</h4>
+<p>模型需要“看”上下文的关系，这需要注意力机制。
+*   <strong>代码对应类：</strong> <code>ParallelAttention</code>, <code>CoreAttention</code>, <code>FlashSelfAttention</code>
+*   <strong>核心观点：</strong> 注意力机制计算量巨大（$O(N^2)$），且参数很多。
+*   <strong>怎么做：</strong>
+    *   <strong>切分多头 (Tensor Parallelism)：</strong> 比如有 32 个注意力头，我有 4 张显卡，那么代码会自动分配每张卡算 8 个头。
+    *   <strong>加速计算 (<code>FlashSelfAttention</code>)：</strong> 代码里判断了 <code>use_flash_attn</code>。如果开启，它会调用底层的 FlashAttention 库（一种极致优化的算法），不再生成巨大的中间矩阵，极大地节省显存并加速。
+    *   <strong>位置编码 (Rotary Embedding)：</strong> 代码里多次出现 <code>rotary_pos_emb</code>，这是目前最流行的相对位置编码（RoPE），让模型知道词语的先后顺序。</p>
+<h4>✅ Task 3: 盖楼层——组装单个 Transformer 层 (Layer)</h4>
+<p>有了“砖头”（MLP）和“雷达”（Attention），现在要把它们组装成标准的一层。
+*   <strong>代码对应类：</strong> <code>ParallelTransformerLayer</code>
+*   <strong>核心观点：</strong> 标准的 Transformer 结构是三明治形状。
+*   <strong>怎么做：</strong>
+    *   <strong>流程：</strong> 输入 -&gt; LayerNorm -&gt; Attention -&gt; 残差连接(Add) -&gt; LayerNorm -&gt; MLP -&gt; 残差连接(Add) -&gt; 输出。
+    *   <strong>特殊处理：</strong> 代码里有一个 <code>bias_dropout_add</code> 函数。这是为了性能优化，把 偏置加法、Dropout、残差相加 这三步合并成一个 GPU 内核操作（Kernel Fusion），减少数据搬运。</p>
+<h4>✅ Task 4: 叠大楼——堆叠多层并管理显存 (The Model)</h4>
+<p>现在要把上面的“层”重复堆叠几十次甚至上百次（比如 GPT-3 有 96 层）。
+*   <strong>代码对应类：</strong> <code>ParallelTransformer</code>
+*   <strong>核心观点：</strong> 层数太多，单卡显存不仅存不下参数，更存不下中间的激活值（Activation）。
+*   <strong>怎么做：</strong>
+    *   <strong>流水线并行 (Pipeline Parallelism)：</strong> 代码里的 <code>_get_num_layers</code> 函数很有意思。它会计算当前这张显卡应该负责哪几层。比如一共 100 层，4 张卡，卡 0 负责 1-25 层，卡 1 负责 26-50 层... 数据像流水线一样流过显卡。
+    *   <strong>激活重算 (Activation Checkpointing/Recompute)：</strong> 这是一个极其重要的省显存技巧（代码里的 <code>_checkpointed_forward</code>）。
+        *   <em>原理：</em> 为了省显存，前向传播时我不存中间结果，等反向传播需要用到时，我再重新算一遍。虽然多花了计算时间，但显存占用能降到原来的几分之一。
+    *   <strong>FP8 支持：</strong> 代码里提到了 <code>transformer_engine</code> 和 <code>fp8</code>。这是利用最新的 H100/H800 显卡特性，用 8 位浮点数进行计算，速度翻倍。</p>
+<h4>✅ Task 5: 检索增强 (Retro) —— 选修任务</h4>
+<p>代码里夹杂了很多 <code>retro</code> 字眼。
+*   <strong>核心观点：</strong> 这是 DeepMind 提出的一种架构，让模型不仅靠脑子记（参数），还能去查书（检索外部数据库）。
+*   <strong>怎么做：</strong> 代码里的 <code>retro_decoder_cross_attention</code> 就是让模型在生成文本时，去关注（Cross Attention）检索回来的外部文档块。</p>
+<hr />
+<h3>总结：这段代码在讲什么？</h3>
+<p>如果用一句话总结：
+<strong>这是一个工业级的、为了在几千张显卡上把 Transformer 跑起来并尽可能榨干硬件性能的“施工图纸”。</strong></p>
+<p>它不像教科书里的 Transformer 那么干净，因为它塞满了：
+1.  <strong>切分逻辑</strong>（怎么把矩阵切碎分给不同 GPU）。
+2.  <strong>通信逻辑</strong>（切碎后怎么把结果拼回来）。
+3.  <strong>显存优化</strong>（Checkpointing，丢弃中间结果重算）。
+4.  <strong>计算加速</strong>（Fused Kernels，把多个加减乘除合并成一步）。</p>
+<p><strong>建议阅读顺序：</strong>
+如果你想学习，不要从头读到尾。
+1.  先看 <code>ParallelTransformerLayer</code> 的 <code>forward</code> 函数，看懂数据流向（Norm -&gt; Attn -&gt; MLP）。
+2.  再看 <code>ParallelAttention</code> 怎么调用 <code>CoreAttention</code>。
+3.  最后再看最外层的 <code>ParallelTransformer</code> 怎么循环调用 layer。</p>

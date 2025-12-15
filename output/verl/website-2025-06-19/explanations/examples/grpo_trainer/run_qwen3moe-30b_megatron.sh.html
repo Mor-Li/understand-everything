@@ -1,0 +1,61 @@
+<h1>examples/grpo_trainer/run_qwen3moe-30b_megatron.sh</h1>
+<p>这份脚本确实看起来很复杂，因为它涉及到了<strong>大模型训练中最硬核的部分</strong>：多机多卡分布式训练、MoE（混合专家）架构、以及强化学习（RLHF/PPO）。</p>
+<p>简单来说，这个脚本的目的是：<strong>动用32张显卡（4台机器 x 8卡），使用 GRPO 算法（DeepSeek-R1 同款思路），去训练一个 Qwen3-30B 的 MoE 大模型，让它通过做数学题（GSM8K）变得更聪明。</strong></p>
+<p>为了让你听懂，我把这个脚本拆解成一个<strong>“项目经理的 To-Do List”</strong>，我们一步步来看它到底在干啥。</p>
+<hr />
+<h3>📋 任务清单：训练 Qwen3-30B MoE 模型的步骤</h3>
+<h4>✅ 第一步：准备模型格式（格式转换）</h4>
+<ul>
+<li><strong>代码对应：</strong> <code>python scripts/converter_hf_to_mcore.py ...</code></li>
+<li><strong>在干什么：</strong><ul>
+<li>你手里拿到的模型是 Hugging Face 的通用格式（<code>HF_MODEL_PATH</code>）。</li>
+<li>但是，我们要用 <strong>Megatron</strong>（英伟达开发的一个超强分布式训练框架）来跑训练。Megatron 脾气很怪，它不吃通用格式，只吃它自己的切片格式。</li>
+<li><strong>观点：</strong> 想在大规模集群上高效训练，必须先把“普通模型”转换成“分布式专用模型”（即 <code>DIST_CKPT_PATH</code>）。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ 第二步：设置环境加速（玄学调优）</h4>
+<ul>
+<li><strong>代码对应：</strong> <code>export CUDA_DEVICE_MAX_CONNECTIONS=1</code></li>
+<li><strong>在干什么：</strong><ul>
+<li>这是给显卡设的一个环境变量。</li>
+<li><strong>观点：</strong> 在使用 Megatron 进行模型并行计算时，设置这个参数可以开启“通信与计算重叠”，简单说就是让显卡一边传数据一边算数，别闲着，提升效率。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ 第三步：启动主训练程序（核心配置）</h4>
+<ul>
+<li><strong>代码对应：</strong> <code>python3 -m verl.trainer.main_ppo ...</code></li>
+<li><strong>在干什么：</strong> 启动 <code>verl</code> 框架的 PPO 训练器。</li>
+<li>
+<p><strong>关键点拆解：</strong></p>
+<p><strong>3.1 确定教学大纲（算法与数据）</strong>
+*   <code>algorithm.adv_estimator=grpo</code>: <strong>重点！</strong> 这里没用传统的 PPO，而是用了 <strong>GRPO</strong> (Group Relative Policy Optimization)。这是一种更省显存、效果很好的强化学习算法（DeepSeek-R1 论文里重点提到的）。
+*   <code>data.train_files=...gsm8k...</code>: 使用 GSM8K 数据集（小学数学题）来训练。</p>
+<p><strong>3.2 怎么切分这个巨大的模型？（切蛋糕策略）</strong>
+*   这个模型有 300亿参数 (30B)，单张卡绝对放不下，必须切碎了放在不同显卡里。脚本里定义了切法：
+*   <code>pipeline_model_parallel_size=2</code> (PP): <strong>流水线并行</strong>。把模型像切香肠一样切成2段，前几层放在一组卡，后几层放在另一组卡。
+*   <code>tensor_model_parallel_size=4</code> (TP): <strong>张量并行</strong>。把每一层的矩阵运算拆给4张卡同时算。
+*   <code>expert_model_parallel_size=4</code> (EP): <strong>专家并行</strong>。<strong>这是 MoE 模型特有的</strong>。MoE 模型里有很多“专家”（Expert），这个参数把不同的专家分配到不同的卡上（4路并行）。
+*   <strong>观点：</strong> 大模型训练不是简单的“多卡多力气”，而是需要极度复杂的“切分策略”来平衡显存和计算速度。</p>
+<p><strong>3.3 怎么让模型“做题”？（Rollout/生成）</strong>
+*   <code>actor_rollout_ref.rollout.name=vllm</code>: 使用 <strong>vLLM</strong> 引擎来做推理生成。vLLM 速度极快。
+*   <code>actor_rollout_ref.rollout.n=5</code>: 每一道数学题，让模型生成 <strong>5个</strong> 不同的解法/答案。GRPO 算法会对比这5个答案的好坏来更新模型。</p>
+<p><strong>3.4 硬件资源分配</strong>
+*   <code>trainer.nnodes=4</code>: 用 4 台服务器（节点）。
+*   <code>trainer.n_gpus_per_node=8</code>: 每台服务器有 8 张显卡。
+*   <strong>算一下：</strong> 4 * 8 = <strong>32 张显卡</strong> 一起跑这个任务。</p>
+<p><strong>3.5 训练目标</strong>
+*   <code>trainer.total_epochs=15</code>: 把所有题目反复训练 15 轮。</p>
+</li>
+</ul>
+<hr />
+<h3>💡 总结：这个脚本背后的核心观点</h3>
+<p>如果你看不懂代码，只需要记住这几个核心逻辑：</p>
+<ol>
+<li><strong>工具要专业：</strong> 训练 30B 这种级别的模型，不能用普通的 PyTorch 代码，必须上 <strong>Megatron</strong>（搞分布式并行的）和 <strong>vLLM</strong>（搞快速生成的）。</li>
+<li><strong>MoE 需要特殊照顾：</strong> 因为是 MoE（混合专家模型），所以除了常规的切分，还专门设置了 EP（专家并行），这是为了解决 MoE 模型参数量巨大的问题。</li>
+<li><strong>算法在进化：</strong> 脚本特意强调了 <strong>GRPO</strong>。这是目前大模型强化学习（RLHF）最火的方向，它通过让模型自己生成多个答案并进行组内对比（Group Relative），来省去训练一个巨大的 Critic 模型（省了一半显存）。</li>
+</ol>
+<p><strong>一句话人话版：</strong>
+这是一个<strong>土豪级</strong>的脚本，指挥 <strong>32张显卡</strong>，先把模型<strong>格式转好</strong>，然后把模型<strong>大卸八块</strong>（PP/TP/EP并行）塞进显卡里，用 <strong>vLLM</strong> 飞快地做数学题，最后用 <strong>GRPO</strong> 算法让它通过对比自己的答案来变聪明。</p>

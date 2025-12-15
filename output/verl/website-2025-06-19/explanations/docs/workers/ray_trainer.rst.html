@@ -1,0 +1,108 @@
+<h1>docs/workers/ray_trainer.rst</h1>
+<p>这份文档实际上是在描述一个 <strong>PPO 强化学习训练的大管家（Trainer）</strong> 是如何工作的。</p>
+<p>你可以把 <code>RayPPOTrainer</code> 想象成一个<strong>指挥官</strong>（运行在 CPU 上），他手里没有枪（不直接算梯度），但他指挥着一群<strong>士兵</strong>（WorkerGroup，运行在 GPU 上）去完成训练任务。</p>
+<p>为了让你更容易理解，我把文档内容拆解成一个 <strong>“训练任务清单 (To-Do List)”</strong>。这个 Trainer 的工作就是按顺序执行下面这些步骤：</p>
+<hr />
+<h3>📋 PPO 训练任务清单</h3>
+<h4>第一阶段：准备工作 (初始化)</h4>
+<ol>
+<li>
+<p><strong>[ ] 准备教材 (Data Preparation)</strong></p>
+<ul>
+<li><strong>目标</strong>：把原始数据变成模型能读懂的格式。</li>
+<li><strong>动作</strong>：使用 <code>RLHFDataset</code> 类。它负责读取文件（parquet格式），把人类的对话加上模板（Chat Template），把太长的截断，太短的补齐，最后转换成数字（Tokenize）。</li>
+<li><strong>结果</strong>：一个随时可以取用的数据加载器（Dataloader）。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 组建团队 &amp; 分配工位 (WorkerGroup Initialization)</strong></p>
+<ul>
+<li><strong>目标</strong>：在 GPU 上启动各种模型（Actor, Critic, Reference, Reward Model）。</li>
+<li><strong>动作</strong>：<ul>
+<li>使用 <code>RayResourcePool</code> 圈定我们要用多少 GPU。</li>
+<li><strong>优化技巧 (Colocation)</strong>：文档特别提到，为了省显存，可以把不同的模型（比如 Actor 和 Critic）合并在同一个进程里。</li>
+<li><strong>启动顺序</strong>：先启动 Critic、Reference 和 Reward Model，<strong>最后</strong>启动 Actor (Rollout)。</li>
+<li><em>为什么最后启动 Actor？</em> 文档注释里说了，为了让 vLLM（推理引擎）能更准确地预估显存，最好把它放在最后初始化。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>第二阶段：训练循环 (PPO Loop - 核心部分)</h4>
+<p>一旦准备工作完成，指挥官就开始在大循环里（Epochs）不停地重复以下步骤，每一步都是指挥 GPU 士兵干活：</p>
+<ol>
+<li>
+<p><strong>[ ] 学生做题 (Generate / Rollout)</strong></p>
+<ul>
+<li><strong>动作</strong>：指挥官把题目（Prompts）发给 <code>Actor</code> 模型。</li>
+<li><strong>代码对应</strong>：<code>self.actor_rollout_wg.generate_sequences(gen_batch)</code></li>
+<li><strong>解释</strong>：让模型根据提示生成回复。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 对照参考答案 (Reference Log Prob)</strong></p>
+<ul>
+<li><strong>动作</strong>：把刚才生成的回复，发给 <code>Reference</code> 模型（原始模型）算一遍概率。</li>
+<li><strong>代码对应</strong>：<code>self.ref_policy_wg.compute_ref_log_prob(batch)</code></li>
+<li><strong>解释</strong>：这是为了防止模型训练过头，我们要计算 KL 散度（即现在的回答和原始模型的回答差别有多大），差别太大要惩罚。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 老师估分 (Critic Values)</strong></p>
+<ul>
+<li><strong>动作</strong>：让 <code>Critic</code> 模型预估一下当前的回答大概能得多少分。</li>
+<li><strong>代码对应</strong>：<code>self.critic_wg.compute_values(batch)</code></li>
+<li><strong>解释</strong>：Critic 是用来辅助训练的，它负责判断当前状态“好不好”。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 真正打分 &amp; 计算优势 (Advantage Computation)</strong></p>
+<ul>
+<li><strong>动作</strong>：<ul>
+<li>让 <code>Reward Model</code> (RM) 给生成的回答打分。</li>
+<li>结合规则打分（比如格式是否正确）。</li>
+<li>扣除 KL 惩罚（如果偏离参考模型太远，扣分）。</li>
+<li><strong>计算优势 (Advantage)</strong>：算出“这一步走得比预期好多少”。</li>
+</ul>
+</li>
+<li><strong>代码对应</strong>：<code>compute_advantage(...)</code></li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 更新老师模型 (Update Critic)</strong></p>
+<ul>
+<li><strong>动作</strong>：根据刚才的打分误差，反向传播更新 <code>Critic</code> 模型。</li>
+<li><strong>代码对应</strong>：<code>self.critic_wg.update_critic(batch)</code></li>
+<li><strong>解释</strong>：让 Critic 下次估分更准。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 更新学生模型 (Update Actor)</strong></p>
+<ul>
+<li><strong>动作</strong>：这是最关键的一步。根据算出来的“优势”，更新 <code>Actor</code> 模型的参数。</li>
+<li><strong>代码对应</strong>：<code>self.actor_rollout_wg.update_actor(batch)</code></li>
+<li><strong>注意</strong>：文档里写了 <code>critic_warmup</code>，意思是可能前几步只更新 Critic，等 Critic 准了再更新 Actor。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 考试与存档 (Validation &amp; Checkpoint)</strong></p>
+<ul>
+<li><strong>动作</strong>：<ul>
+<li>每隔一段时间，用验证集跑一遍，看看效果（Validate）。</li>
+<li>记录各种指标到日志（Logging）。</li>
+<li>把训练好的模型保存到硬盘（Save Checkpoint）。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结</h3>
+<p>这篇文档其实就是在讲<strong>如何用代码实现上述流程</strong>。</p>
+<ul>
+<li><strong>Data Preparation</strong> 讲的是清单第 1 步。</li>
+<li><strong>WorkerGroup Initialization</strong> 讲的是清单第 2 步（重点在于如何利用 Ray 分配 GPU 资源）。</li>
+<li><strong>PPO Training Loop</strong> 讲的是清单第 3 到 9 步（也就是 <code>fit</code> 函数里的逻辑）。</li>
+</ul>
+<p>你看不懂可能是因为被里面的类名（如 <code>RayClassWithInitArgs</code>）或分布式术语（如 <code>driver process</code>, <code>colocate</code>）绕晕了。其实核心逻辑就是标准的强化学习流程：<strong>生成数据 -&gt; 算分 -&gt; 算差距 -&gt; 更新模型</strong>。</p>

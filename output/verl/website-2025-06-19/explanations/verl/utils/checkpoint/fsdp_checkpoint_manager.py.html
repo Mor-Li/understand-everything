@@ -1,0 +1,86 @@
+<h1>verl/utils/checkpoint/fsdp_checkpoint_manager.py</h1>
+<p>这份代码 <code>fsdp_checkpoint_manager.py</code> 的核心作用是<strong>管理大规模分布式训练（FSDP）中的“存档”和“读档”</strong>。</p>
+<p>简单来说，当模型太大（比如大语言模型），一张显卡装不下时，我们用 FSDP 技术把模型切碎（Shard）放在不同显卡上。这个文件就是负责指挥每张显卡怎么把属于自己的那一小块碎片存下来，或者读回去。</p>
+<p>为了让你更容易理解，我把它拆解成三个部分：<strong>核心任务清单</strong>、<strong>读档流程（TODO）</strong>、<strong>存档流程（TODO）</strong>。</p>
+<hr />
+<h3>1. 核心任务清单 (Task List)</h3>
+<p>这个类的主要职责只有三件事：</p>
+<ol>
+<li><strong>初始化 (Setup)</strong>： 认领要管理的对象（模型、优化器、分词器）。</li>
+<li><strong>读档 (Load Checkpoint)</strong>： 训练中断了，从硬盘把之前的进度读回来，继续训练。<ul>
+<li><em>特点</em>：每张显卡只读自己的那一份（碎片化读取），速度快。</li>
+</ul>
+</li>
+<li><strong>存档 (Save Checkpoint)</strong>： 训练了一段时间，把当前进度保存到硬盘。<ul>
+<li><em>特点</em>：每张显卡只存自己的那一份（碎片化保存）。</li>
+<li><em>附加</em>：如果需要，也可以让 0 号显卡把碎片拼起来，存成一个完整的 HuggingFace 格式模型（方便以后推理用）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>2. 读档流程 TODO (Load Checkpoint)</h3>
+<p>假设你现在的任务是<strong>“恢复训练”</strong>，代码会按照这个 TODO List 一步步执行 <code>load_checkpoint</code> 函数：</p>
+<ul>
+<li><strong>[检查]</strong> 确认一下要读哪些东西？（是不是既要读模型参数，又要读优化器状态？）</li>
+<li><strong>[准备环境]</strong> 告诉 PyTorch：“我们要开始处理碎片（Sharded）数据了，请准备好 FSDP 的上下文环境。”</li>
+<li><strong>[模型读档]</strong><ul>
+<li>我是第 N 号显卡。</li>
+<li>去硬盘找 <code>model_..._rank_N.pt</code> 这个文件。</li>
+<li>把文件加载到内存，填入我的模型碎片里。</li>
+</ul>
+</li>
+<li><strong>[优化器读档]</strong><ul>
+<li>我是第 N 号显卡。</li>
+<li>去硬盘找 <code>optim_..._rank_N.pt</code> 这个文件。</li>
+<li>恢复优化器的状态（比如动量、学习率历史）。</li>
+</ul>
+</li>
+<li><strong>[杂项读档]</strong><ul>
+<li>读取 <code>extra_state_..._rank_N.pt</code>。</li>
+<li>恢复 <strong>学习率调度器 (LR Scheduler)</strong> 的进度。</li>
+<li>恢复 <strong>随机数生成器 (RNG)</strong> 的状态（确保随机性是可以复现的）。</li>
+</ul>
+</li>
+<li><strong>[清理]</strong> 如果设置了 <code>del_local_after_load</code>，就把刚才下载到本地的临时文件删掉。</li>
+<li><strong>[集合]</strong> <code>torch.distributed.barrier()</code> -&gt; 等所有显卡都做完上面的步骤，再一起进行下一步。</li>
+</ul>
+<hr />
+<h3>3. 存档流程 TODO (Save Checkpoint)</h3>
+<p>假设你现在的任务是<strong>“保存进度”</strong>，代码会按照这个 TODO List 一步步执行 <code>save_checkpoint</code> 函数：</p>
+<ul>
+<li><strong>[清理旧档]</strong><ul>
+<li>我是 0 号显卡吗？如果是，检查一下硬盘上的存档是不是超过了 <code>max_ckpt_to_keep</code>（比如只保留最近3个）。</li>
+<li>如果超了，把最旧的那个删掉。</li>
+</ul>
+</li>
+<li><strong>[创建目录]</strong> 确保保存路径的文件夹是存在的。</li>
+<li><strong>[准备环境]</strong> 告诉 PyTorch：“我们要开始存碎片数据了。”</li>
+<li><strong>[碎片化存档 - 核心]</strong> (所有显卡同时做)<ul>
+<li><strong>存模型</strong>：把属于我管理的模型参数碎片，保存为 <code>model_..._rank_N.pt</code>。</li>
+<li><strong>存优化器</strong>：把属于我管理的优化器状态，保存为 <code>optim_..._rank_N.pt</code>。</li>
+<li><strong>存杂项</strong>：把当前的学习率和随机数种子，保存为 <code>extra_state_..._rank_N.pt</code>。</li>
+</ul>
+</li>
+<li><strong>[存配置文件 - 仅 Rank 0]</strong> (只有 0 号显卡做)<ul>
+<li>保存 HuggingFace 的 <code>config.json</code>（模型配置）。</li>
+<li>保存 <code>tokenizer</code>（分词器）相关文件。</li>
+<li>保存 <code>generation_config</code>（生成配置）。</li>
+</ul>
+</li>
+<li><strong>[集合]</strong> <code>barrier()</code> -&gt; 等大家都存完了。</li>
+<li><strong>[可选任务：存完整模型]</strong> (如果 <code>should_save_hf_model</code> 为真)<ul>
+<li>这是一个特殊的步骤。为了得到一个能直接用 <code>transformers.from_pretrained</code> 加载的完整模型。</li>
+<li><strong>收集</strong>：0 号显卡命令所有显卡：“把你们的碎片都发给我！”</li>
+<li><strong>拼图</strong>：0 号显卡把碎片拼成一个完整的 State Dict。</li>
+<li><strong>转换</strong>：创建一个空的 HuggingFace 模型结构，把拼好的参数填进去。</li>
+<li><strong>保存</strong>：把这个完整模型保存到 <code>huggingface/</code> 子文件夹下。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结文中的核心观点</h3>
+<ol>
+<li><strong>FSDP 必须分片存取</strong>：因为模型太大，不能像以前单卡训练那样存一个大文件，必须利用 FSDP 的特性，每个 Rank (显卡) 存取自己的部分 (<code>ShardedStateDictConfig</code>)。</li>
+<li><strong>不仅存模型，还要存状态</strong>：为了完美恢复训练，必须保存优化器状态、学习率调度器 (Scheduler) 和 随机数种子 (RNG)。</li>
+<li><strong>兼容性</strong>：虽然训练时用碎片化存储，但为了方便以后使用，代码提供了一个选项，在保存时顺便转换出一份标准的 HuggingFace 格式模型。</li>
+</ol>

@@ -1,0 +1,101 @@
+<h1>verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py</h1>
+<p>这份代码 <code>vllm_rollout_spmd.py</code> 是 <strong>Verl</strong>（一个强化学习训练框架）中的一个核心组件。</p>
+<p>简单来说，它的角色是 <strong>“打手”</strong> 或者 <strong>“写手”</strong>。在 RLHF（基于人类反馈的强化学习）训练循环中，它的任务是利用 <strong>vLLM</strong> 这个推理引擎，根据给定的提示（Prompts）快速生成回复（Responses）。</p>
+<p>为了让你看懂，我把它想象成一个 <strong>“文章生成任务”</strong>，并列了一个 Todo List。代码的运行流程就是按顺序执行这个 List。</p>
+<hr />
+<h3>核心任务：利用 vLLM 批量生成文本 (Rollout)</h3>
+<p>这个文件的核心类是 <code>vLLMRollout</code>。你可以把它看作是一个 <strong>“生成工头”</strong>。</p>
+<h4>阶段一：准备工作 (对应 <code>__init__</code> 方法)</h4>
+<p><strong>场景</strong>：工厂开工前，工头需要配置机器。</p>
+<ul>
+<li><strong>[TODO 1] 读取配置单</strong><ul>
+<li>读取 <code>config</code>：决定是用几张显卡（Tensor Parallel Size）、显存占用多少、最大序列长度是多少。</li>
+<li>读取 <code>model_hf_config</code>：了解模型的基础架构（比如 Rope Scaling，上下文长度限制）。</li>
+</ul>
+</li>
+<li><strong>[TODO 2] 初始化 vLLM 引擎</strong><ul>
+<li>代码行：<code>self.inference_engine = LLM(...)</code></li>
+<li><strong>关键点</strong>：这里启动了一个 vLLM 实例。因为这是在训练过程中做推理，它还需要处理和训练框架（如 Megatron 或 FSDP）的并行兼容问题。</li>
+</ul>
+</li>
+<li><strong>[TODO 3] 设置采样参数</strong><ul>
+<li>代码行：<code>self.sampling_params = SamplingParams(...)</code></li>
+<li>设定默认的“写作风格”：是随机一点（Temperature高），还是保守一点（Greedy Search）。</li>
+</ul>
+</li>
+<li><strong>[TODO 4] 待机 (Sleep)</strong><ul>
+<li>代码行：<code>self.inference_engine.sleep(level=1)</code></li>
+<li><strong>为什么要睡？</strong> 因为显存是有限的。生成完数据后，显卡要用来做“训练”（更新参数）。所以 vLLM 需要把模型权重卸载或暂停，给训练腾出显存。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>阶段二：执行生成任务 (对应 <code>generate_sequences</code> 方法)</h4>
+<p><strong>场景</strong>：训练开始，Actor 模型需要根据 Prompts 试错，生成一批回答。</p>
+<ul>
+<li><strong>[TODO 1] 唤醒与缓存清理</strong><ul>
+<li>如果之前为了省显存把 KV Cache 清空了，现在要重新初始化缓存引擎 (<code>init_cache_engine</code>)。</li>
+</ul>
+</li>
+<li><strong>[TODO 2] 数据预处理 (洗菜)</strong><ul>
+<li><strong>去填充 (Unpadding)</strong>：输入的 Prompt 是一批 Tensor，为了对齐长度通常左边有很多 <code>pad_token</code>。vLLM 不喜欢 Padding，所以 <code>_pre_process_inputs</code> 函数负责把左边的 Pad 去掉，变成纯净的 Token List。</li>
+<li><strong>多模态处理</strong>：如果是图文模型，把图片数据也整理好。</li>
+</ul>
+</li>
+<li><strong>[TODO 3] 确定本次生成的参数</strong><ul>
+<li>判断是“验证模式”还是“采样模式”。</li>
+<li>如果是验证（Validate），通常只生成 1 个结果，不做随机采样。</li>
+<li>如果是训练采样（Do Sample），可能会一次生成多个结果（<code>n&gt;1</code>）。</li>
+</ul>
+</li>
+<li><strong>[TODO 4] 调用 vLLM 生成 (开火)</strong><ul>
+<li>代码行：<code>outputs = self.inference_engine.generate(...)</code></li>
+<li>这是最重的一步。vLLM 接收 Token ID，吐出生成的文本 Token ID。</li>
+</ul>
+</li>
+<li><strong>[TODO 5] 整理生成结果 (装盘)</strong><ul>
+<li><strong>提取结果</strong>：从 vLLM 的复杂输出对象中，把生成的 <code>token_ids</code> 拿出来。</li>
+<li><strong>计算 LogProbs</strong>：如果配置要求（<code>calculate_log_probs</code>），还需要把每个 Token 的对数概率拿出来（用于后续强化学习计算优势函数）。</li>
+<li><strong>补齐 (Padding)</strong>：因为生成的回复长度不一，需要用 Pad Token 把它们补齐成一样长的 Tensor，方便后续计算。</li>
+</ul>
+</li>
+<li><strong>[TODO 6] 拼接完整序列</strong><ul>
+<li>代码行：<code>seq = torch.cat([idx, response], dim=-1)</code></li>
+<li>把 <strong>Prompt</strong> 和 <strong>Response</strong> 拼起来，形成一条完整的“对话历史”。</li>
+<li>同时更新 <code>attention_mask</code> 和 <code>position_ids</code>，确保后续训练时模型能看懂这段话的位置关系。</li>
+</ul>
+</li>
+<li><strong>[TODO 7] 打包返回</strong><ul>
+<li>把所有处理好的 Tensor（输入、输出、掩码、位置编码）打包成一个 <code>DataProto</code> 对象返回给训练器。</li>
+</ul>
+</li>
+<li><strong>[TODO 8] 再次待机</strong><ul>
+<li>如果是特定的 vLLM 版本，生成完后手动释放 KV Cache (<code>free_cache_engine</code>)，把显存还给训练进程。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>阶段三：异步管理 (对应 <code>vLLMAsyncRollout</code> 类)</h4>
+<p><strong>场景</strong>：这是一个“遥控器”，用于在多进程环境下控制上面的工头。</p>
+<ul>
+<li><strong>[TODO 1] 初始化 Worker</strong><ul>
+<li>设置 Rank（显卡编号），启动真正的推理引擎。</li>
+</ul>
+</li>
+<li><strong>[TODO 2] 睡眠与唤醒 (Sleep / Wake Up)</strong><ul>
+<li><strong>Sleep</strong>: 告诉 vLLM，“我要去训练了，你把显存腾出来，权重卸载掉”。</li>
+<li><strong>Wake Up</strong>: 告诉 vLLM，“训练完了，我要做生成了，你把权重加载回来，准备推理”。</li>
+<li>这是为了在单张卡上实现 <strong>“训练”</strong> 和 <strong>“推理”</strong> 的显存复用（Time-sharing）。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这段代码主要解决了一个矛盾：
+<strong>强化学习需要频繁生成数据，但显存有限。</strong></p>
+<p>所以它列了一个清单：
+1.  把数据整理成 vLLM 喜欢的格式。
+2.  <strong>唤醒</strong> vLLM 引擎。
+3.  极速生成回复。
+4.  把数据整理回 PyTorch 训练喜欢的格式。
+5.  <strong>休眠</strong> vLLM 引擎（释放显存）。
+6.  把数据交出去。</p>

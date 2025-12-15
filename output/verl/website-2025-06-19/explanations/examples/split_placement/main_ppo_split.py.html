@@ -1,0 +1,95 @@
+<h1>examples/split_placement/main_ppo_split.py</h1>
+<p>这份代码确实涉及了很多分布式训练和强化学习（RLHF）的底层概念。为了让你容易理解，我把这份代码的逻辑拆解成一个<strong>“项目经理的任务清单” (Task Todo List)</strong>。</p>
+<p>想象你是一个大模型训练的项目经理，你的目标是<strong>用 PPO 算法训练一个数学解题模型</strong>。但是你的显卡显存有限，不能在一张卡上塞下所有模型，所以你需要精打细算地分配资源。</p>
+<p>以下是你的执行步骤：</p>
+<hr />
+<h3>✅ Task 1: 确定考核标准（编写奖励函数）</h3>
+<p><strong>目标</strong>：模型写出答案后，我得知道它写得对不对，给它打分。
+<strong>代码对应部分</strong>：<code>RewardManager</code> 类和 <code>_select_rm_score_fn</code> 函数。</p>
+<ul>
+<li><strong>逻辑解读</strong>：<ol>
+<li>我们主要训练数学能力（支持 <code>gsm8k</code> 和 <code>math</code> 数据集）。</li>
+<li>当模型生成一个回答（Response）后，<code>RewardManager</code> 会把生成的文本提取出来。</li>
+<li>它会调用 <code>compute_score</code> 函数，拿生成的答案和标准答案（Ground Truth）比对。</li>
+<li>如果对不上，给低分；对上了，给高分。</li>
+<li><strong>Todo</strong>: 这是一个“规则派”的老师，不靠模型打分，而是靠硬性的答案匹配来打分。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 2: 准备基础设施（初始化 Ray 集群）</h3>
+<p><strong>目标</strong>：我要指挥很多张显卡一起工作，需要一个调度中心。
+<strong>代码对应部分</strong>：<code>main</code> 函数中的 <code>ray.init</code> 和 <code>@hydra.main</code>。</p>
+<ul>
+<li><strong>逻辑解读</strong>：<ol>
+<li>使用 <code>Hydra</code> 读取配置文件（比如学习率、GPU数量等）。</li>
+<li>启动 <code>Ray</code>。Ray 是一个分布式计算框架，你可以把它理解为这个项目的“包工头”，负责把任务分发给不同的显卡。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 3: 解决显存不足难题（核心：资源切分 Split Placement）</h3>
+<p><strong>目标</strong>：PPO 训练非常吃显存，因为同时要有四个模型在跑（Actor, Critic, Reference, Reward Model）。一张卡塞不下怎么办？
+<strong>代码对应部分</strong>：<code>main_task</code> 函数中关于 <code>resource_pool_spec</code> 的部分。</p>
+<ul>
+<li><strong>逻辑解读（重点）</strong>：<ul>
+<li><strong>常规做法</strong>：每张卡上都加载全套模型，容易爆显存（OOM）。</li>
+<li><strong>本文做法（Split）</strong>：把显卡分成两拨队伍（Pool）。<ul>
+<li><strong>队伍 A (<code>actor_rollout_ref_pool</code>)</strong>：负责“生成文本”和“参考对比”。这里放 Actor 模型（负责写作业）和 Ref 模型（负责保持初心）。</li>
+<li><strong>队伍 B (<code>critic_pool</code>)</strong>：负责“打分评价”。这里放 Critic 模型（预估价值）和 Reward Model（真正打分的）。</li>
+</ul>
+</li>
+<li><strong>代码逻辑</strong>：
+    <code>python
+    # 如果节点够多，就把节点对半劈开
+    if config.trainer.nnodes // 2 == 0 ...:
+         # 一半节点给队伍A，一半节点给队伍B
+    # 如果节点少，就在节点内部把显卡对半劈开
+    else:
+         # 一半显卡给队伍A，一半显卡给队伍B</code></li>
+<li><strong>Todo</strong>: 这样做的目的是<strong>物理隔离</strong>，让生成模型和评价模型互不抢占显存。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 4: 给两拨队伍分配具体角色</h3>
+<p><strong>目标</strong>：有了两拨显卡（Pool A 和 Pool B），现在要指派具体谁去哪个池子上班。
+<strong>代码对应部分</strong>：<code>role_worker_mapping</code> 和 <code>mapping</code> 字典。</p>
+<ul>
+<li><strong>逻辑解读</strong>：<ol>
+<li><strong>Actor (演员)</strong> 去 Pool A。</li>
+<li><strong>Ref Policy (参考策略)</strong> 也去 Pool A（因为它们结构类似，通常共享权重或显存）。</li>
+<li><strong>Critic (评论家)</strong> 去 Pool B。</li>
+<li><strong>Reward Model (奖励模型)</strong> 去 Pool B。</li>
+<li><strong>Todo</strong>: 确保每个角色都知道自己该去哪堆显卡上运行，避免走错片场。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 5: 组装训练器并开始魔改（Monkey Patch）</h3>
+<p><strong>目标</strong>：把所有组件装进 PPO 训练器，并且替换掉默认的训练逻辑。
+<strong>代码对应部分</strong>：<code>from split_monkey_patch import fit</code> 和 <code>RayPPOTrainer.fit = fit</code>。</p>
+<ul>
+<li><strong>逻辑解读</strong>：<ol>
+<li><code>verl</code> 这个库原本有一个标准的训练流程。</li>
+<li>但是，因为我们搞了“资源切分（Split Placement）”，原本的数据流转逻辑（数据怎么从 Actor 传给 Critic）可能需要调整。</li>
+<li>所以代码里做了一个<strong>Monkey Patch（猴子补丁）</strong>：<code>RayPPOTrainer.fit = fit</code>。意思是：“嘿，RayPPOTrainer，把你原本的 <code>fit</code>（训练）函数扔掉，用我在这个文件里导入的这个定制版 <code>fit</code> 函数”。</li>
+<li><strong>Todo</strong>: 这是为了适配上面提到的“显卡分家”策略而做的特殊修改。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 6: 启动引擎（Start Training）</h3>
+<p><strong>目标</strong>：一切就绪，点火发射。
+<strong>代码对应部分</strong>：<code>trainer.init_workers()</code> 和 <code>trainer.fit()</code>。</p>
+<ul>
+<li><strong>逻辑解读</strong>：<ol>
+<li><code>init_workers()</code>: 让所有显卡加载好各自的模型权重（Actor加载Actor的，Critic加载Critic的）。</li>
+<li><code>fit()</code>: 开始死循环——生成数据 -&gt; 打分 -&gt; 计算优势 -&gt; 更新模型参数。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结：这篇文章的核心观点是什么？</h3>
+<p>这个脚本不仅仅是一个普通的训练入口，它的核心观点在于<strong>“解耦部署（Split Placement）”</strong>：</p>
+<ol>
+<li><strong>痛点</strong>：在大模型 RLHF 阶段，4个模型挤在一起太挤了。</li>
+<li><strong>方案</strong>：<strong>Actor/Ref 放在一组 GPU 上，Critic/RM 放在另一组 GPU 上</strong>。</li>
+<li><strong>实现</strong>：通过 Ray 的资源池（Resource Pool）机制，强制指定模型跑在特定的硬件上，并通过修改 <code>fit</code> 函数来适配这种跨显卡的数据传输。</li>
+</ol>
+<p><strong>简单一句话</strong>：这是一个为了在大模型训练时<strong>省显存、提效率</strong>，把不同的神经网络模型强行拆开放在不同显卡上运行的 PPO 训练脚本。</p>

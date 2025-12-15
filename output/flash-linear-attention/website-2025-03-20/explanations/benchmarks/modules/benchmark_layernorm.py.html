@@ -1,0 +1,88 @@
+<h1>benchmarks/modules/benchmark_layernorm.py</h1>
+<p>这份代码其实就是一个<strong>“速度比武大赛”</strong>的脚本。</p>
+<p>简单来说，它的目的是：<strong>对比标准的 PyTorch 归一化层（LayerNorm/GroupNorm）和该项目自己写的优化版本（Fused LayerNorm/GroupNorm）谁跑得更快。</strong></p>
+<p>为了让你彻底看懂，我把阅读这份代码拆解成了一个 <strong>6步走的 To-Do List</strong>，我们一步步来完成：</p>
+<hr />
+<h3>✅ Task 1: 搞清楚比赛的“选手”是谁 (Imports)</h3>
+<p>首先看代码开头的导入部分，这里定义了谁要上场比赛。</p>
+<ul>
+<li><strong>选手 A (Naive/原生派):</strong> <code>torch.nn</code>。这是 PyTorch 自带的标准工具箱。</li>
+<li><strong>选手 B (Fused/融合派):</strong> <code>fla.modules</code> 中的 <code>GroupNorm</code> 和 <code>LayerNorm</code>。这是这个项目（FLA）自己写的、经过 Triton 深度优化的版本。</li>
+<li><strong>裁判:</strong> <code>triton</code>。这里用来做性能测试报告。</li>
+</ul>
+<p><strong>观点：</strong> 作者写这个脚本就是为了证明“我自己写的 Fused 版本比 PyTorch 自带的 Naive 版本要快”。</p>
+<hr />
+<h3>✅ Task 2: 设定比赛规则 (Benchmark Configuration)</h3>
+<p>看 <code>@triton.testing.perf_report</code> 这一大段装饰器配置。这是在画图表和定义测试范围。</p>
+<ul>
+<li><strong>X 轴 (变量):</strong> <code>T</code>。你可以理解为序列长度（数据量的大小）。代码里 <code>x_vals</code> 从 $128 \times 2^0$ 一直测到 $128 \times 2^7$。意思是：数据量从小到大，看看谁撑得住。</li>
+<li><strong>线条 (对比项):</strong> <code>provider</code>。图表上会有 8 条线，代表 8 种情况：<ol>
+<li><code>naive_ln</code>: PyTorch 原生 LayerNorm</li>
+<li><code>fused_ln</code>: FLA 优化版 LayerNorm</li>
+<li><code>naive_gn</code>: PyTorch 原生 GroupNorm</li>
+<li><code>fused_gn</code>: FLA 优化版 GroupNorm</li>
+<li>以及上面这 4 个对应的 <code>_bwd</code> (Backward，反向传播) 版本。</li>
+</ol>
+</li>
+<li><strong>Y 轴 (指标):</strong> <code>Execution Time (ms)</code>。执行时间，越低越好。</li>
+</ul>
+<p><strong>观点：</strong> 这是一个全方位的测试，既测 LayerNorm 也测 GroupNorm，既测数据量小也测数据量大。</p>
+<hr />
+<h3>✅ Task 3: 准备测试用的“假人” (Data Setup)</h3>
+<p>进入 <code>def benchmark(T, provider):</code> 函数内部。</p>
+<ul>
+<li><strong>代码:</strong> <code>x = torch.randn(B * T, D, ...)</code></li>
+<li><strong>解读:</strong><ul>
+<li><code>B</code> (Batch size) = 16</li>
+<li><code>D</code> (Dimension) = 1024</li>
+<li><code>T</code>: 也就是 Task 2 里定义的变量。</li>
+<li><code>dtype=torch.bfloat16</code>: 使用半精度浮点数（现在的显卡通常在这个精度下跑得快）。</li>
+<li><code>requires_grad=True</code>: 这一点很重要，说明要记录梯度，为稍后的“反向传播”测试做准备。</li>
+</ul>
+</li>
+</ul>
+<p><strong>观点：</strong> 制造一个形状为 <code>(B*T, 1024)</code> 的随机输入张量，模拟真实的神经网络输入。</p>
+<hr />
+<h3>✅ Task 4: 第一轮比武 —— 正向传播 (Forward Pass)</h3>
+<p>代码中的 <code>if provider.startswith(...)</code> 前四个判断：</p>
+<ul>
+<li><strong>Naive 组:</strong><ul>
+<li><code>norm = nn.LayerNorm(...)</code> (PyTorch 自带)</li>
+<li>测试动作: <code>norm(x)</code></li>
+</ul>
+</li>
+<li><strong>Fused 组:</strong><ul>
+<li><code>norm = LayerNorm(...)</code> (FLA 自定义)</li>
+<li>测试动作: <code>norm(x)</code></li>
+</ul>
+</li>
+</ul>
+<p><strong>观点：</strong> 这里测的是<strong>推理速度</strong>。也就是模型计算一次结果需要多久。作者预期 <code>fused_ln</code> 应该比 <code>naive_ln</code> 用时更短。</p>
+<hr />
+<h3>✅ Task 5: 第二轮比武 —— 反向传播 (Backward Pass)</h3>
+<p>代码中带有 <code>_bwd</code> 后缀的后四个判断：</p>
+<ul>
+<li><strong>核心动作:</strong> <code>lambda: norm(x).backward(x)</code></li>
+<li><strong>解读:</strong> 这不仅仅是算结果，还要算梯度（Gradient）。这是<strong>模型训练</strong>时的核心步骤。</li>
+<li>通常 PyTorch 原生的 LayerNorm 在反向传播时会读写多次内存，而 Triton 优化的“Fused（融合）”版本试图把多个操作合并成一个，减少内存读写。</li>
+</ul>
+<p><strong>观点：</strong> 这里测的是<strong>训练速度</strong>。作者预期 Fused 版本在反向传播时的优势会比正向传播更明显。</p>
+<hr />
+<h3>✅ Task 6: 裁判宣布结果 (Run)</h3>
+<p>最后两行：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
+    <span class="n">benchmark</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">print_data</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读:</strong> 启动测试，并在终端打印出具体的数据表格，同时（根据配置）生成一张性能对比图。</li>
+</ul>
+<hr />
+<h3>总结 (Executive Summary)</h3>
+<p>如果你是老板，让你看这个文件，你应该得到以下结论：</p>
+<ol>
+<li><strong>这是什么？</strong> 这是一个性能基准测试脚本。</li>
+<li><strong>测什么？</strong> 测 LayerNorm（层归一化）和 GroupNorm（组归一化）的计算速度。</li>
+<li><strong>怎么测？</strong> 随着序列长度 <code>T</code> 的增加，对比 PyTorch 官方实现（Naive）和该项目自定义实现（Fused）的耗时。</li>
+<li><strong>预期结果？</strong> 作者希望通过这个脚本展示：<strong>在各种长度下，我们的 Fused 实现都比 PyTorch 官方的更快，无论是前向推理还是反向训练。</strong></li>
+</ol>

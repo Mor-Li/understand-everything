@@ -1,0 +1,107 @@
+<h1>docs/workers/ray_trainer.rst</h1>
+<p>这份文档主要介绍了一个叫 <strong><code>RayPPOTrainer</code></strong> 的核心组件。你可以把它想象成整个强化学习（RLHF）训练任务的 <strong>“总指挥”</strong> 或 <strong>“项目经理”</strong>。</p>
+<p>它不直接干重活（重活由底下的 GPU Workers 干），它的作用是协调数据、分配资源，并指挥整个训练流程。</p>
+<p>为了让你听懂，我把文档内容拆解成一个 <strong>“任务清单 (To-Do List)”</strong>，分为 <strong>准备阶段</strong> 和 <strong>正式工作阶段</strong>。</p>
+<hr />
+<h3>第一部分：核心任务清单 (Task To-Do List)</h3>
+<p>想象你（作为 Trainer）要开始一天的训练工作，你的待办事项如下：</p>
+<h4>📋 阶段一：准备工作 (Setup)</h4>
+<ol>
+<li><strong>[数据准备] 备好原材料</strong>：<ul>
+<li>读取训练数据（Parquet文件）。</li>
+<li>把文本整理好（加Prompt模版、截断过长的句子、转成数字Token）。</li>
+<li>打包成一个个小批次（Batch），准备发给工人们。</li>
+</ul>
+</li>
+<li><strong>[招聘工人] 分配 GPU 资源 (WorkerGroup Init)</strong>：<ul>
+<li>你需要组建四个团队（角色）：<ul>
+<li><strong>Actor (演员)</strong>：负责生成回答（这是我们要训练的主模型）。</li>
+<li><strong>Critic (评论家)</strong>：负责预估当前状态好不好。</li>
+<li><strong>Ref (参考者)</strong>：旧版本的模型，用来防止新模型跑偏。</li>
+<li><strong>RM (打分员)</strong>：给生成的回答打分。</li>
+</ul>
+</li>
+<li><strong>关键决策</strong>：你是让每个角色独占显卡（土豪做法），还是把几个角色塞到同一张显卡上（省钱省显存的做法，文档里叫 <code>Colocated</code>）？</li>
+</ul>
+</li>
+</ol>
+<h4>🔄 阶段二：训练循环 (The Loop)</h4>
+<p>一旦准备好，你就进入死循环（Epochs），每一轮都要做以下步骤：</p>
+<ol>
+<li><strong>[生成]</strong>：把题目发给 <strong>Actor</strong>，让它写出答案。</li>
+<li><strong>[对比]</strong>：把答案发给 <strong>Ref</strong>，算一下新答案和旧习惯差多少（防止步子迈太大）。</li>
+<li><strong>[预估]</strong>：把答案发给 <strong>Critic</strong>，让它估算一下这波能得多少分。</li>
+<li><strong>[打分]</strong>：把答案发给 <strong>RM (Reward Model)</strong>，给出真实的奖励分数。</li>
+<li><strong>[算账]</strong>：在你的电脑上（Driver端）计算“优势函数 (Advantage)” —— 意思是“这波操作比预期的好了多少？”</li>
+<li><strong>[更新 Critic]</strong>：根据算账结果，让 <strong>Critic</strong> 学习，以后估分更准点。</li>
+<li><strong>[更新 Actor]</strong>：根据算账结果，让 <strong>Actor</strong> 学习，以后多写高分答案。</li>
+<li><strong>[体检与存档]</strong>：偶尔跑一下验证集（Validation），并把模型保存下来（Checkpoint）。</li>
+</ol>
+<hr />
+<h3>第二部分：逐步详解 (Step-by-Step Explanation)</h3>
+<p>下面我结合文档里的代码片段，给你详细讲讲这三个核心观点。</p>
+<h4>1. 数据准备 (Data Preparation)</h4>
+<ul>
+<li><strong>观点</strong>：Trainer 是个单进程（在大脑 CPU 上运行），它负责把这一轮要用的所有“考题”（Prompts）加载进来。</li>
+<li><strong>操作</strong>：它用了一个叫 <code>RLHFDataset</code> 的类。<ul>
+<li>这个类不仅是读文件，还负责把聊天记录格式化（比如加上 <code>&lt;user&gt;...&lt;assistant&gt;</code> 标签），并且处理长度（太长的截断，不够的补零）。</li>
+<li><strong>目的</strong>：保证发给 GPU 的数据是整齐划一的。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 工人组初始化 (WorkerGroup Initialization)</h4>
+<ul>
+<li><strong>观点</strong>：这是文档里比较技术的部分。因为大模型很大，需要多张 GPU。Trainer 通过 Ray（一个分布式计算框架）来管理这些 GPU。</li>
+<li><strong>操作 A（普通模式）</strong>：<ul>
+<li>给 Actor 开一个组，给 Critic 开一个组……大家各占各的坑。</li>
+</ul>
+</li>
+<li><strong>操作 B（省钱优化模式 - Colocated）</strong>：<ul>
+<li>文档特别提到了 <code>create_colocated_worker_cls</code>。</li>
+<li><strong>为什么？</strong> 如果你只有 8 张卡，Actor 要用 8 张，Critic 也要用 8 张。分开弄你就需要 16 张卡，或者来回切换加载模型（很慢）。</li>
+<li><strong>优化</strong>：把 Actor 和 Critic 等模型加载在<strong>同一组进程/显卡</strong>里。这样虽然显存占用高，但不用跨机器传输数据，也不用反复加载模型，效率极高。</li>
+</ul>
+</li>
+</ul>
+<h4>3. PPO 训练循环 (PPO Training Loop)</h4>
+<ul>
+<li><strong>观点</strong>：这是整个代码的灵魂 <code>fit()</code> 函数。它展示了数据如何在不同的模型之间流转。</li>
+<li>
+<p><strong>流程解析</strong>：</p>
+<ul>
+<li>
+<p><strong>生成 (Generation)</strong>：
+    <code>python
+    # 这里的 gen_batch 是题目
+    self.actor_rollout_wg.generate_sequences(gen_batch)</code>
+    Trainer 喊话 Actor 组：“快，根据这些题目写作文！”</p>
+</li>
+<li>
+<p><strong>计算奖励与优势 (Compute Rewards &amp; Advantage)</strong>：
+    <code>python
+    # 这一步结合了 RM 模型打分 和 规则打分
+    reward_tensor = self.rm_wg.compute_rm_score(batch)
+    reward_tensor = self.reward_fn(batch)
+    # 这一步计算 PPO 里的核心数学指标：优势
+    batch = compute_advantage(...)</code>
+    Trainer 喊话 RM 组：“给这些作文打分！” 然后自己拿出计算器算一下这波操作值不值。</p>
+</li>
+<li>
+<p><strong>模型更新 (Update)</strong>：
+    <code>python
+    self.critic_wg.update_critic(batch) # 批评家先学
+    self.actor_rollout_wg.update_actor(batch) # 演员后学</code>
+    Trainer 喊话：“Critic，你刚才估分不准，调整参数！Actor，刚才那种高分写法记住了，调整参数！”</p>
+</li>
+<li>
+<p><strong>顺序很重要</strong>：代码里特意提到，如果设置了 <code>critic_warmup</code>，会先让 Critic 练几轮，Actor 先别动。这就像先训练好教练的眼光，再让教练去教运动员。</p>
+</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这篇文档其实就是说明书，告诉开发者：
+1.  <strong>怎么喂数据</strong>（用 RLHFDataset）。
+2.  <strong>怎么分配显卡</strong>（用 WorkerGroup，推荐合并部署以节省资源）。
+3.  <strong>怎么跑流程</strong>（fit 函数里写好了标准的 PPO 三步走：生成 -&gt; 评价 -&gt; 更新）。</p>
+<p>你看懂这个逻辑后，再回看代码里的 <code>self.actor_rollout_wg.xxx</code> 就知道它只是在给远端的显卡发号施令而已。</p>

@@ -1,0 +1,81 @@
+<h1>tests/ops/test_iplr_delta.py</h1>
+<p>这份代码确实涉及到了深度学习中比较前沿且底层的概念，特别是关于<strong>线性注意力机制（Linear Attention）</strong>和<strong>RNN（循环神经网络）</strong>的高效实现。</p>
+<p>简单来说，这个文件的作用是：<strong>“对账”</strong>。</p>
+<p>它写了两套逻辑：一套是用简单的 Python 代码写的（慢，但逻辑清晰，作为标准答案）；另一套是库里封装好的高性能算子（快，但代码复杂，容易写错）。测试的目的就是确保这两套算出的结果是一模一样的。</p>
+<p>为了让你读懂，我制定了一个<strong>5步学习清单（To-Do List）</strong>，我们一步步拆解：</p>
+<hr />
+<h3>📋 学习清单 Task List</h3>
+<h4>✅ Task 1: 搞清楚这是在干什么 (Context)</h4>
+<ul>
+<li><strong>背景</strong>：这是一个名为 <code>fla</code> (Fast Linear Attention) 的库的测试文件。</li>
+<li><strong>核心对象</strong>：<strong>IPLR Delta Rule</strong>。<ul>
+<li><strong>IPLR</strong>：一种特定的模型结构（类似于 Mamba 或 RWKV 这种现代 RNN）。</li>
+<li><strong>Delta Rule</strong>：一种更新记忆（State）的数学规则。</li>
+</ul>
+</li>
+<li><strong>目的</strong>：测试该算法的两种实现方式（<strong>Chunk 分块模式</strong> 和 <strong>Recurrent 循环模式</strong>）计算结果是否正确，梯度反向传播是否正确。</li>
+</ul>
+<h4>✅ Task 2: 认识输入数据 (Inputs)</h4>
+<p>在看逻辑之前，先看输入是什么。代码里的 $Q, K, V$ 和 Transformer 里的一样，但多了 $A, B$。
+*   <strong>Q (Query), K (Key), V (Value)</strong>：标准注意力机制的三剑客。
+*   <strong>A, B</strong>：这是 Delta Rule 特有的参数，用于控制记忆状态 $S$ 的衰减和更新（你可以理解为一种“遗忘门”或“更新权重”）。
+*   <strong>S (State)</strong>：模型的“记忆”。在 RNN 中，上一步算出的 $S$ 会传给下一步。</p>
+<h4>✅ Task 3: 理解“标准答案” —— 循环模式 (The Recurrent Reference)</h4>
+<p>请看函数 <code>recurrence_iplr_delta_rule_ref</code>。这是最符合直觉的逻辑，模拟了 RNN 一步一步处理数据的过程。</p>
+<ul>
+<li><strong>逻辑拆解</strong>：<ol>
+<li>初始化一个记忆 $S$（全0或给定初值）。</li>
+<li><strong>For 循环</strong> 遍历序列的每一步 $i$（从第1个词到最后1个词）：<ul>
+<li>拿出当前的 $q_i, k_i, v_i, a_i, b_i$。</li>
+<li><strong>核心公式</strong>：计算新的记忆增量。
+    <code>_kv = ...</code> 这一行是在算 $\Delta S$。
+    公式逻辑大致是：$S_{new} = S_{old} + (k \cdot v^T + \text{基于 } a, b \text{ 的修正项})$。</li>
+<li><strong>更新记忆</strong>：$S = S + _kv$。</li>
+<li><strong>计算输出</strong>：$o_i = q_i \cdot S$（用当前的 Query 去查询当前的记忆 State）。</li>
+</ul>
+</li>
+<li>返回所有步的输出 $o$ 和最后的记忆 $S$。</li>
+</ol>
+</li>
+</ul>
+<blockquote>
+<p><strong>结论</strong>：这个函数是<strong>真理</strong>，但跑得慢（因为有 Python 的 <code>for</code> 循环）。</p>
+</blockquote>
+<h4>✅ Task 4: 理解“并行加速” —— 分块模式 (The Chunk Reference)</h4>
+<p>请看函数 <code>chunk_iplr_delta_rule_ref</code>。这是为了加速而设计的逻辑。</p>
+<ul>
+<li><strong>痛点</strong>：RNN 一步步算太慢了，GPU 喜欢并行计算。</li>
+<li><strong>解决方案</strong>：把长序列切成很多小块（Chunk，比如每块64个词）。</li>
+<li><strong>逻辑拆解</strong>：<ol>
+<li><strong>块内并行</strong>：在每一个 64 长度的小块内部，使用矩阵乘法一次性算出块内的注意力结果（代码里涉及 <code>mask</code> 和 <code>attn</code> 的部分）。</li>
+<li><strong>块间循环</strong>：块与块之间依然需要传递记忆 $S$。<ul>
+<li>算出当前块的输出 $o$。</li>
+<li>算出当前块过完后，记忆 $S$ 变成了什么样，传给下一个块。</li>
+</ul>
+</li>
+</ol>
+</li>
+<li><strong>难点</strong>：代码里有很多 <code>pad</code>（填充）、<code>rearrange</code>（重排维度）、<code>masked_fill</code>（掩码）。这些都是为了让矩阵运算能并行跑起来。</li>
+</ul>
+<blockquote>
+<p><strong>结论</strong>：这个函数是<strong>半并行半循环</strong>的逻辑，用来验证分块算法的数学推导是否正确。</p>
+</blockquote>
+<h4>✅ Task 5: 看懂测试用例 (The Tests)</h4>
+<p>最后看底部的两个测试函数：<code>test_chunk</code> 和 <code>test_recurrent</code>。</p>
+<p><strong>1. <code>test_chunk</code> (测试分块算法)</strong>
+*   <strong>准备数据</strong>：随机生成 $q, k, v, a, b$。
+*   <strong>跑标准答案</strong>：调用 <code>recurrence_iplr_delta_rule_ref</code> 得到 <code>ref</code> (Reference)。
+*   <strong>跑待测函数</strong>：调用 <code>chunk_iplr_delta_rule</code>（这是库里真正要用的高性能算子）。
+*   <strong>对比</strong>：<code>assert_close(ref, tri)</code>。如果两者误差极小（比如小于 0.007），测试通过。</p>
+<p><strong>2. <code>test_recurrent</code> (测试循环算子及反向传播)</strong>
+*   <strong>前向传播</strong>：和上面一样，对比 <code>ref</code> 和 <code>fused_recurrent_iplr_delta_rule</code> 的输出。
+*   <strong>反向传播 (Backward)</strong>：
+    *   这是深度学习训练的关键。代码里构造了 <code>loss</code>，并调用了 <code>.backward()</code>。
+    *   它对比了 Python 自动求导算出的梯度（<code>q.grad</code> 等）和 CUDA 算子算出的梯度 (<code>dq</code> 等) 是否一致。
+    *   如果梯度也一致，说明这个算子可以放心地用来训练模型。</p>
+<hr />
+<h3>💡 总结 (Summary)</h3>
+<p><strong>这个文件在讲什么？</strong>
+它在说：“嘿，我写了一个超快的 CUDA 算子（<code>chunk_iplr_delta_rule</code> 和 <code>fused_recurrent_...</code>），为了证明我没写错，我用 Python 写了一个最笨但最正确的版本（<code>_ref</code> 函数），然后用随机数据跑了一遍，发现两者的结果是一样的！甚至连梯度（用于训练的导数）也是一样的！”</p>
+<p><strong>你需要关注什么？</strong>
+如果你不是在开发这个库，你只需要知道：<strong>这是一种带有衰减机制的线性注意力（Linear Attention）或 RNN 更新规则，这个文件保证了它的数学实现是正确的。</strong></p>

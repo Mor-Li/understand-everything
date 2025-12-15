@@ -1,0 +1,60 @@
+<h1>examples/grpo_trainer/run_qwen2_5_vl_7b_npu.sh</h1>
+<p>这份脚本确实看起来很“硬核”，因为它是一个<strong>深度强化学习（RLHF/RL）</strong>的训练启动脚本，而且是针对特定硬件（华为昇腾 NPU）和特定模型（Qwen2.5-VL）的。</p>
+<p>简单来说，这个脚本在指挥机器：<strong>“用 GRPO 算法，在华为 NPU 芯片上，训练 Qwen2.5 视觉-语言模型做几何题。”</strong></p>
+<p>为了让你读懂，我把它拆解成一个<strong>“项目经理的任务清单 (Task List)”</strong>。我们可以把这个脚本看作是在给训练程序下达的一系列指令。</p>
+<hr />
+<h3>📋 任务清单：训练 Qwen2.5-VL 模型</h3>
+<h4>Task 1: 确认硬件与环境 (基础设施)</h4>
+<p><strong>目标</strong>：告诉程序我们在什么机器上跑，用什么加速引擎。
+*   <strong>代码对应</strong>：
+    *   <code>trainer.device=npu</code>: <strong>关键点</strong>。这说明不是在跑 NVIDIA 的 GPU，而是在跑华为的 <strong>NPU (Ascend 昇腾芯片)</strong>。
+    *   <code>trainer.n_gpus_per_node=16</code>: 这台机器有 16 张 NPU 卡（通常是两台服务器互联或者超大服务器）。
+    *   <code>ENGINE=${1:-vllm}</code>: 使用 <code>vllm</code> 作为推理加速引擎（让模型生成答案更快）。
+    *   <code>export USE_OPTIMIZED_MODEL=0</code>: 关闭某些针对 NPU 的特定优化，因为在训练模式下可能会出问题。</p>
+<h4>Task 2: 选定“选手”与“赛制” (模型与算法)</h4>
+<p><strong>目标</strong>：我们要训练谁？用什么方法训练？
+*   <strong>代码对应</strong>：
+    *   <code>python3 -m verl.trainer.main_ppo</code>: 启动主程序，使用 PPO（近端策略优化）框架。
+    *   <code>algorithm.adv_estimator=grpo</code>: <strong>核心算法</strong>。这里用的不是传统的 PPO，而是 <strong>GRPO</strong> (Group Relative Policy Optimization)。这是最近 DeepSeek-R1 背后的核心训练算法，省显存且效果好。
+    *   <code>actor_rollout_ref.model.path=Qwen/Qwen2.5-VL-7B-Instruct</code>: <strong>主角</strong>。我们要训练的是 Qwen2.5 的 7B 版本，而且是 VL (Vision-Language)，能看图的模型。</p>
+<h4>Task 3: 准备教材 (数据配置)</h4>
+<p><strong>目标</strong>：给模型喂什么数据来学习？
+*   <strong>代码对应</strong>：
+    *   <code>data.train_files=$HOME/data/geo3k/...</code>: 训练数据是 <code>geo3k</code>（一个几何题数据集）。
+    *   <code>data.image_key=images</code>: 告诉程序数据里包含图片，字段名叫 <code>images</code>。
+    *   <code>data.max_prompt_length=1024</code> &amp; <code>data.max_response_length=2048</code>: 题目最长 1024 token，答案最长 2048 token。</p>
+<h4>Task 4: 规定“考试”方式 (Rollout/推理配置)</h4>
+<p><strong>目标</strong>：强化学习需要模型先自己做题（生成答案），这部分叫 Rollout。
+*   <strong>代码对应</strong>：
+    *   <code>actor_rollout_ref.rollout.tensor_model_parallel_size=4</code>: <strong>模型切分</strong>。因为 7B 模型加上图片处理很占显存，这里把 1 个模型切开放在 <strong>4 张卡</strong> 上一起运行。
+    *   <code>actor_rollout_ref.rollout.n=5</code>: <strong>一题多解</strong>。对于每一道题，让模型生成 5 个不同的答案，然后去评分，看哪个好。
+    *   <code>actor_rollout_ref.rollout.gpu_memory_utilization=0.5</code>: 限制推理时只用 50% 的显存，剩下的要留给训练（反向传播）。</p>
+<h4>Task 5: 规定“学习”方式 (Actor/训练配置)</h4>
+<p><strong>目标</strong>：模型做完题被评分后，如何根据分数修改自己的参数？
+*   <strong>代码对应</strong>：
+    *   <code>actor_rollout_ref.actor.optim.lr=1e-6</code>: <strong>学习率</strong>。非常小，说明是微调，不想让模型学“飞”了。
+    *   <code>actor_rollout_ref.actor.use_kl_loss=True</code>: <strong>防止跑偏</strong>。KL 散度惩罚，意思是“你学新东西可以，但不要和原来的自己（Reference Model）差别太大，别变成胡言乱语”。
+    *   <code>actor_rollout_ref.model.enable_gradient_checkpointing=True</code>: <strong>省显存技巧</strong>。用时间换空间，防止显存爆炸。</p>
+<h4>Task 6: 项目管理 (日志与进度)</h4>
+<p><strong>目标</strong>：训练多久？记录记在哪？
+*   <strong>代码对应</strong>：
+    *   <code>trainer.project_name='verl_grpo_example_geo3k'</code>: 项目名叫这个，方便在 WandB 等面板上找。
+    *   <code>trainer.total_epochs=15</code>: 整个数据集要反复训练 15 轮。
+    *   <code>trainer.save_freq=-1</code>: 设置为 -1 通常意味着不按步数自动保存，或者只在最后保存（具体看代码逻辑，这里可能是为了省硬盘空间）。</p>
+<hr />
+<h3>💡 总结：这脚本在干嘛？</h3>
+<p>想象你在教一个学生（Qwen2.5-VL）做几何题（Geo3k）：</p>
+<ol>
+<li><strong>环境</strong>：你在一个华为提供的特制教室里（NPU），这里有 16 个助教。</li>
+<li><strong>流程</strong>：<ul>
+<li>老师发卷子（Prompt）。</li>
+<li>学生利用 <code>vllm</code> 快速思考，每道题写 5 个不同的解法（Rollout n=5）。</li>
+<li>判卷系统（Reward Model，虽然脚本里没细写，但 GRPO 必须有奖励机制）给这 5 个解法打分。</li>
+<li><strong>GRPO 算法</strong>介入：分析这 5 个解法，告诉学生“那个得高分的解法好在哪里，得低分的差在哪里”。</li>
+<li>学生根据反馈微调自己的脑子（Update Policy），但被警告不能完全变态（KL Loss）。</li>
+</ul>
+</li>
+<li><strong>循环</strong>：这个过程反复进行 15 轮（Epochs）。</li>
+</ol>
+<p><strong>一句话人话版：</strong>
+这是一个在 <strong>16 张华为 NPU 卡</strong>上，使用 <strong>GRPO 算法</strong>，对 <strong>Qwen2.5 视觉模型</strong>进行<strong>几何题解题能力</strong>强化训练的脚本。</p>

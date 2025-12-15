@@ -1,0 +1,113 @@
+<h1>.gitlab-ci.yml</h1>
+<p>这份文件是一个 <strong>GitLab CI/CD 配置文件</strong>。你可以把它想象成一个<strong>自动化流水线的说明书</strong>。每当你提交代码（或者有人合并代码、定时任务触发）时，GitLab 就会照着这份说明书，指挥服务器去干活。</p>
+<p>这份流水线主要属于 <strong>NVIDIA Megatron-LM</strong> 相关的项目（深度学习模型训练框架），因为它涉及大量的 GPU 环境配置、Docker 镜像构建和 PyTorch 测试。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>6步走的 Task List（任务清单）</strong>，不仅告诉你它在干嘛，还告诉你为什么要这么干。</p>
+<hr />
+<h3>📝 Task 1: 搞清楚“什么时候干活” (Workflow &amp; Rules)</h3>
+<p><strong>目标</strong>：阅读文件开头的 <code>workflow</code> 部分，理解流水线在什么情况下会被触发。</p>
+<ul>
+<li><strong>逻辑解读</strong>：<ul>
+<li><strong>合并请求 (Merge Request) + 标签</strong>：如果你提交了合并请求，并且打上了 <code>Run tests</code> 或 <code>Run tests and nightly</code> 的标签，流水线就会运行，并且会设置一个叫 <code>JET_CUSTOM_FILTER</code> 的变量（用来决定具体跑哪些测试）。</li>
+<li><strong>定时任务 (Schedule)</strong>：如果是定时的（比如每晚），也会跑。</li>
+<li><strong>Web 触发</strong>：如果在网页上点“运行”，也会跑。</li>
+<li><strong>主分支 (Main/Default Branch)</strong>：代码合入主分支时，也会跑。</li>
+<li><strong>特殊规则</strong>：如果已经有一个合并请求（MR）开着，那么普通的“分支提交”就不会触发流水线（避免重复浪费资源）。</li>
+</ul>
+</li>
+</ul>
+<h3>📝 Task 2: 准备“全局配置” (Variables &amp; Stages)</h3>
+<p><strong>目标</strong>：阅读 <code>stages</code> 和 <code>variables</code>，了解整个工程的步骤和环境。</p>
+<ul>
+<li><strong>步骤 (Stages)</strong>：流水线分四步走：<ol>
+<li><code>build</code> (构建环境/镜像)</li>
+<li><code>unit_tests</code> (单元测试)</li>
+<li><code>functional_tests</code> (功能测试 - 虽然这里没直接写 job，但后面引用的文件里有)</li>
+<li><code>publish</code> (发布包)</li>
+</ol>
+</li>
+<li><strong>变量 (Variables)</strong>：<ul>
+<li>定义了 Docker 镜像的地址（<code>CI_MCORE_IMAGE</code> 等）。</li>
+<li>定义了默认超时时间（10小时）。</li>
+<li>定义了集群名称（<code>SLURM_CLUSTER</code>），这是 NVIDIA 内部的高性能计算集群（dgxa100 或 dgxh100）。</li>
+</ul>
+</li>
+</ul>
+<h3>📝 Task 3: 预检与资源盘点 (Pre-check)</h3>
+<p><strong>目标</strong>：看懂 <code>metadata</code> 和 <code>ppp_capacity_statistics</code> 这两个任务。它们在正式干活前运行（<code>.pre</code> 阶段）。</p>
+<ol>
+<li><strong><code>metadata</code> 任务</strong>：<ul>
+<li>它根据你选择的集群（EOS 还是 Draco），自动决定一个环境变量 <code>JET_CI_BRANCH</code>。</li>
+<li>把这个变量保存到 <code>build.env</code> 文件里，供后面的任务使用。</li>
+</ul>
+</li>
+<li><strong><code>ppp_capacity_statistics</code> 任务</strong>：<ul>
+<li>这是一段比较复杂的脚本。它的作用是<strong>查水表</strong>。</li>
+<li>它调用 API 去检查计算集群（Slurm）的资源配额（Quota）和当前使用量。</li>
+<li><strong>目的</strong>：看看剩下的计算资源还够不够。它只打印信息（echo），告诉你“预算/资源还剩多少”，主要用于监控，防止资源耗尽导致任务卡死。</li>
+</ul>
+</li>
+</ol>
+<h3>📝 Task 4: 造轮子——构建镜像 (Build)</h3>
+<p><strong>目标</strong>：看懂 <code>build_image</code> 任务。这是 <code>build</code> 阶段的核心。</p>
+<ul>
+<li><strong>并行构建 (Matrix)</strong>：它同时构建三个不同的 Docker 镜像：<ul>
+<li><code>CI_MCORE_IMAGE</code>: 核心运行环境。</li>
+<li><code>CI_NEMO_IMAGE</code>: 配合 NeMo 框架的环境。</li>
+<li><code>LINTING_IMAGE</code>: 用来检查代码格式的环境。</li>
+</ul>
+</li>
+<li><strong>缓存机制</strong>：<ul>
+<li>它会先检查有没有旧镜像（Cache），如果有就利用起来，加快构建速度。</li>
+<li>构建完后，它会把镜像推送到仓库（<code>docker push</code>）。</li>
+</ul>
+</li>
+<li><strong>打标签</strong>：如果是主分支或特定版本分支，它会给镜像打上特殊的标签（Tag），方便后续引用。</li>
+</ul>
+<h3>📝 Task 5: 质检——运行测试 (Unit Tests)</h3>
+<p><strong>目标</strong>：这是最长的一块，包含 <code>unit_tests</code> 开头的各种任务。</p>
+<ol>
+<li><strong>通用配置 (<code>.unit_test_common</code>)</strong>：<ul>
+<li>所有测试任务都继承这个配置。</li>
+<li><strong>硬件</strong>：必须在 <code>8xL40S</code> 这种高端 GPU 节点上运行。</li>
+<li><strong>环境</strong>：使用刚才构建好的 Docker 镜像。</li>
+</ul>
+</li>
+<li>
+<p><strong>具体测试任务</strong>：</p>
+<ul>
+<li><code>unit_tests</code> (主任务)：跑核心单元测试，并生成代码覆盖率报告（Coverage）。</li>
+<li><code>unit_tests-data</code>, <code>unit_tests-fusions</code>, <code>unit_tests-models</code> 等：<ul>
+<li>这些是将测试<strong>拆分</strong>运行。</li>
+<li><strong>注意规则 (Rules)</strong>：如果是在合并请求（MR）里且打了 <code>Run tests</code> 标签，这些拆分的任务<strong>不跑</strong>（<code>when: never</code>），可能只跑主任务。反之，在某些情况下它们会默认运行。</li>
+</ul>
+</li>
+<li><code>formatting</code>: 检查代码风格是否符合规范（Linting）。</li>
+<li><code>docs_build_test</code>: 尝试构建文档，确保文档没写坏。</li>
+</ul>
+</li>
+<li>
+<p><strong>补充</strong>：文件末尾有一句 <code>include: - jet-tests.yml</code>。这意味着还有一部分测试逻辑（可能是更复杂的集成测试）写在 <code>jet-tests.yml</code> 这个外部文件里，被引入进来了。</p>
+</li>
+</ol>
+<h3>📝 Task 6: 发货——打包发布 (Publish)</h3>
+<p><strong>目标</strong>：看懂最后的 <code>publish-wheel</code> 任务。</p>
+<ul>
+<li><strong>触发条件</strong>：只有在分支名以 <code>core_r</code> 开头（发布分支），并且手动设置变量 <code>PUBLISH</code> 为 "yes" 时，才会出现“手动点击”按钮（<code>when: manual</code>）。平时是不会跑的。</li>
+<li><strong>做什么</strong>：<ul>
+<li>安装打包工具 (<code>twine</code>, <code>build</code>)。</li>
+<li>构建 Python 的 <code>.whl</code> 安装包（兼容 Python 3.10 和 3.11）。</li>
+<li>修复包的依赖 (<code>auditwheel repair</code>)。</li>
+<li>最后上传到 PyPI 仓库（让别人能 <code>pip install</code>）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>如果把这个流程比作<strong>做菜</strong>：</p>
+<ol>
+<li><strong>Workflow</strong>: 老板下单（提交代码），看单子上有没有备注（Label），决定接不接单。</li>
+<li><strong>Pre-check</strong>: 看看厨房煤气够不够（资源配额），确定是用哪个灶台（集群环境）。</li>
+<li><strong>Build</strong>: 备菜。切菜、洗菜，准备好半成品（构建 Docker 镜像）。</li>
+<li><strong>Unit Tests</strong>: 试吃。分好几个试吃员，有的尝咸淡（Linting），有的尝核心味道（Unit Test），用的都是高级餐具（8xL40S GPU）。</li>
+<li><strong>Publish</strong>: 装盘上桌。只有在确定是正式宴席（Release分支）且老板确认（Manual）时，才打包送给客人（PyPI）。</li>
+</ol>

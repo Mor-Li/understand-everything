@@ -1,0 +1,74 @@
+<h1>fla/modules/convolution.py</h1>
+<p>这份代码确实比较硬核，因为它涉及到大语言模型（LLM）中<strong>序列建模</strong>的底层优化，特别是<strong>状态空间模型（SSM）</strong>或<strong>线性Attention</strong>架构中常用的技术。它不是处理图像的卷积（2D），而是处理文本/序列的卷积（1D）。</p>
+<p>别担心，我们把它拆解成一个学习任务清单（To-Do List），一步一步来攻克它。</p>
+<hr />
+<h3>📋 学习任务清单：从入门到精通</h3>
+<h4>✅ Task 1: 搞懂背景——我们在做什么？</h4>
+<p><strong>目标</strong>：理解为什么要在处理文本时用卷积。
+*   <strong>核心观点</strong>：在现代架构（如 Mamba, RWKV, Hyena）中，卷积被用来做“<strong>混合（Mixing）</strong>”。
+*   <strong>类比</strong>：
+    *   <strong>Attention</strong> 是“我看整本书，想看哪页看哪页”（全局，但慢）。
+    *   <strong>Convolution (这里讲的)</strong> 是“我只看当前字和它前面几个字”（局部，极快）。
+    *   这个文件定义了两种看书方式：<strong>Short（只看附近）</strong> 和 <strong>Long（用特殊数学技巧看全书）</strong>。</p>
+<hr />
+<h4>✅ Task 2: 掌握核心数学工具——<code>fft_conv</code></h4>
+<p><strong>目标</strong>：看懂文件开头的 <code>fft_conv</code> 函数。
+*   <strong>代码位置</strong>：<code>def fft_conv(...)</code>
+*   <strong>为什么需要它</strong>：如果你的序列很长（比如 100k tokens），普通的卷积操作会慢死。
+*   <strong>解决办法</strong>：利用 <strong>快速傅里叶变换（FFT）</strong>。
+    *   <strong>原理</strong>：时域上的卷积 = 频域上的乘法。
+*   <strong>步骤解析</strong>：
+    1.  <code>torch.fft.rfft</code>: 把输入 <code>u</code> 和卷积核 <code>k</code> 变到频域。
+    2.  <code>u_f * k_f</code>: 在频域直接相乘（比卷积快得多）。
+    3.  <code>torch.fft.irfft</code>: 变回时域，得到结果。
+*   <strong>结论</strong>：这是一个加速器，专门给后面的 <code>LongConvolution</code> 用的。</p>
+<hr />
+<h4>✅ Task 3: 理解“短视”的卷积——<code>ShortConvolution</code></h4>
+<p><strong>目标</strong>：理解 <code>ShortConvolution</code> 类。这是很多现代模型（如 Mamba）用来处理局部信息的模块。
+*   <strong>特点</strong>：
+    *   <strong>因果性 (Causal)</strong>：只能看过去，不能看未来（因为是生成式模型）。
+    *   <strong>短核 (Short Kernel)</strong>：通常只看过去 3 或 4 个 token。
+*   <strong>关键代码解析</strong>：
+    *   <strong><code>use_fast_conv1d</code></strong>: 作者非常在意速度。如果安装了 <code>causal_conv1d</code> 这个CUDA加速包，就用它；否则用 PyTorch 原生的（慢）。
+    *   <strong><code>step</code> 函数</strong>: 这是为了<strong>推理（Inference/Generation）</strong>用的。
+        *   当你在生成文本时，是一个字一个字生成的。
+        *   不需要每次都重新算整个卷积，只需要把新的字塞进 <code>cache</code>（缓存），把最旧的字挤出去，然后算一下点积。这叫 <strong>KV Cache</strong> 的卷积版。
+    *   <strong><code>forward</code> 函数</strong>: 训练时用。一次性把整个句子的卷积算完。</p>
+<hr />
+<h4>✅ Task 4: 理解“长视”的卷积——<code>LongConvolution</code></h4>
+<p><strong>目标</strong>：理解 <code>LongConvolution</code> 类。
+*   <strong>场景</strong>：如果你想用卷积来模拟类似 Attention 的长距离依赖（比如文章开头的名字在结尾被提到了）。
+*   <strong>实现</strong>：
+    *   定义了一个巨大的 <code>self.filter</code>（参数），长度等于最大序列长度 <code>max_len</code>。
+    *   直接调用 Task 2 学到的 <code>fft_conv</code> 进行计算。
+*   <strong>缺点</strong>：如果序列超级长，这个 <code>filter</code> 参数量会很大。</p>
+<hr />
+<h4>✅ Task 5: 进阶——隐式生成卷积核 <code>ImplicitLongConvolution</code></h4>
+<p><strong>目标</strong>：解决 <code>LongConvolution</code> 参数太多的问题。
+*   <strong>核心思想</strong>：我们不直接存那个巨大的卷积核，而是<strong>用一个神经网络（MLP）把卷积核“画”出来</strong>。
+*   <strong>步骤解析</strong>：
+    1.  <strong><code>PositionalEmbedding</code></strong>: 创建位置编码（告诉网络现在是第几个字）。
+    2.  <strong><code>self.mlp</code></strong>: 一个小型的神经网络。
+        *   输入：位置编码。
+        *   输出：该位置对应的卷积核数值。
+    3.  <strong>流程</strong>：
+        *   先生成位置编码 $\rightarrow$ 扔进 MLP $\rightarrow$ 得到卷积核 $k$。
+        *   用生成的 $k$ 和输入 $x$ 做 <code>fft_conv</code>。
+*   <strong>好处</strong>：无论序列多长，参数量只取决于 MLP 的大小，非常节省参数，而且能学到平滑的规律。</p>
+<hr />
+<h3>🚀 总结：这个文件到底讲了啥？</h3>
+<p>如果把这个文件看作一个工具箱，它提供了三种工具：</p>
+<ol>
+<li><strong>⚡️ 魔法加速器 (<code>fft_conv</code>)</strong>：用数学魔法加速长序列计算。</li>
+<li><strong>🔍 显微镜 (<code>ShortConvolution</code>)</strong>：<ul>
+<li><strong>用途</strong>：看细节，看局部上下文。</li>
+<li><strong>亮点</strong>：支持极速推理（Caching）和 CUDA 加速。</li>
+</ul>
+</li>
+<li><strong>🔭 望远镜 (<code>LongConvolution</code> / <code>Implicit</code>)</strong>：<ul>
+<li><strong>用途</strong>：看全局，捕捉长距离关系。</li>
+<li><strong>亮点</strong>：利用 MLP 动态生成镜片（Implicit），省参数且灵活。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话概括</strong>：这是一个为<strong>长序列大模型</strong>设计的高性能卷积模块库，既包含了处理局部信息的快速短卷积，也包含了处理全局信息的FFT长卷积。</p>

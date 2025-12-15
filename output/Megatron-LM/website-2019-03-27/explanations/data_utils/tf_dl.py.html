@@ -1,0 +1,75 @@
+<h1>data_utils/tf_dl.py</h1>
+<p>这份代码确实看起来有点“拧巴”，因为它在做一件跨界的事情：<strong>用 TensorFlow 的工具读取数据，然后喂给 PyTorch 的模型去训练</strong>。</p>
+<p>这通常发生在以下场景：你有很多现成的、处理好的 TFRecord 格式的数据（通常用于 BERT 预训练），但你想用 PyTorch 来写模型。</p>
+<p>为了让你听懂，我把这份代码的逻辑拆解成一个 <strong>“项目经理的 Task Todo List”</strong>。想象你接到了一个任务：<strong>“把仓库里堆积如山的 TensorFlow 格式包裹，拆开并重新打包成 PyTorch 格式发货”</strong>。</p>
+<p>下面是完成这个任务的 5 个步骤（Task）：</p>
+<hr />
+<h3>Task 1: 开启“即时操作”模式 (Setup)</h3>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">tensorflow</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">tf</span>
+<span class="n">tf</span><span class="o">.</span><span class="n">enable_eager_execution</span><span class="p">()</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+*   <strong>背景：</strong> 老版本的 TensorFlow (1.x) 是“懒加载”的，像写好了一张图纸但不动工，直到你喊 <code>run</code> 才会执行。而 PyTorch 是“即时执行”的。
+*   <strong>动作：</strong> <code>tf.enable_eager_execution()</code> 就像是告诉 TensorFlow：“别画图纸了，我让你干嘛你就立刻干嘛，就像 PyTorch 一样。”
+*   <strong>目的：</strong> 这样我们才能在 Python 循环里直接把 TF 的数据拿出来，转成 Numpy，再转成 PyTorch Tensor。</p>
+<hr />
+<h3>Task 2: 定义“包裹清单” (Define Schema)</h3>
+<p><strong>代码位置：</strong> <code>class Record2Example</code> 和 <code>self.record_converter = ...</code></p>
+<p><strong>解读：</strong>
+*   <strong>背景：</strong> TFRecord 文件里存的是一堆二进制乱码，计算机不知道哪一段是“单词”，哪一段是“标签”。
+*   <strong>动作：</strong> 我们需要定义一个“解码字典”（Feature Map）。
+*   <strong>清单内容：</strong>
+    *   <code>input_ids</code>: 句子的单词编码（长度 <code>max_seq_len</code>）。
+    *   <code>input_mask</code>: 掩码（区分哪些是真实单词，哪些是补齐的0）。
+    *   <code>segment_ids</code>: 区分第一句还是第二句。
+    *   <code>masked_lm_ids</code>: 被挖掉的词原本是什么（用于 BERT 的完形填空任务）。
+*   <strong>目的：</strong> 告诉程序如何把二进制数据解析成具体的数字矩阵。</p>
+<hr />
+<h3>Task 3: 搭建流水线 (Build Pipeline)</h3>
+<p><strong>代码位置：</strong> <code>TFRecordDataLoader</code> 的 <code>__init__</code> 部分</p>
+<p><strong>解读：</strong>
+这是最核心的“物流系统”搭建。
+*   <strong>如果是训练模式 (<code>if train</code>)：</strong>
+    1.  <strong>Repeat:</strong> 数据读完了别停，从头再读（无限循环）。
+    2.  <strong>Shuffle:</strong> 把数据打乱，防止模型死记硬背。
+    3.  <strong>Parallel Interleave:</strong> 这一步很关键。假设你有 100 个文件，不要读完文件1再读文件2。而是同时打开几个文件（<code>num_workers</code>），交替着读。这能极大提高读取速度。
+*   <strong>如果是测试模式 (<code>else</code>)：</strong>
+    1.  老老实实按顺序读，不需要打乱。
+*   <strong>Batching:</strong> 最后用 <code>map_and_batch</code> 把单条数据打包成一捆一捆的（Batch Size），方便显卡批量处理。</p>
+<hr />
+<h3>Task 4: 启动发货 (Iterator)</h3>
+<p><strong>代码位置：</strong> <code>def __iter__(self):</code></p>
+<p><strong>解读：</strong>
+*   <strong>动作：</strong> PyTorch 的 DataLoader 需要一个迭代器。这里定义了当训练循环喊 <code>next(data)</code> 时发生什么。
+*   <strong>流程：</strong>
+    1.  从 TF 的流水线里拿出一捆数据（此时还是 TF 的 Tensor）。
+    2.  调用 <code>convert_tf_example_to_torch_tensors</code> 进行“重新包装”。
+    3.  把重新包装好的 PyTorch 数据交出去 (<code>yield</code>)。</p>
+<hr />
+<h3>Task 5: 重新包装与格式转换 (Translation)</h3>
+<p><strong>代码位置：</strong> <code>def convert_tf_example_to_torch_tensors(example):</code></p>
+<p><strong>解读：</strong>
+这是最繁琐的一步，相当于把“美式插头”改成“国标插头”。</p>
+<ol>
+<li><strong>格式转换：</strong> <code>torch.from_numpy(v.numpy())</code>。把 TensorFlow 的数据变成 Numpy，再变成 PyTorch Tensor。</li>
+<li><strong>BERT 特殊处理（最难懂的部分）：</strong><ul>
+<li>TFRecord 里存的 BERT 掩码数据通常是“稀疏”的。比如一句话 128 个词，只挖掉了 3 个词，它只存这 3 个词的位置和答案。</li>
+<li>但 PyTorch 模型计算 Loss 时，通常需要一个跟句子一样长（128长）的向量。</li>
+<li><strong>代码逻辑：</strong><ul>
+<li>创建一个全为 0 的 <code>mask</code>。</li>
+<li>创建一个全为 -1 的 <code>mask_labels</code> (PyTorch 里 -1 通常代表忽略不算 Loss)。</li>
+<li><strong>For 循环：</strong> 遍历那些被挖掉的词的位置，把 <code>mask_labels</code> 里对应的位置填上真正的单词 ID。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>最终输出：</strong> 返回一个字典，包含 <code>text</code> (输入), <code>types</code> (句子分段), <code>mask_labels</code> (完形填空答案) 等，完全符合 PyTorch BERT 模型的输入要求。</li>
+</ol>
+<hr />
+<h3>总结</h3>
+<p>这个文件的作用就是：
+<strong>“利用 TensorFlow 强大的数据读取流水线（并发读取、解压 TFRecord），在最后一刻把数据‘偷梁换柱’成 PyTorch 格式，喂给 PyTorch 模型。”</strong></p>
+<p>这样做的好处是你不需要把巨大的 TFRecord 数据集转换成 PyTorch 格式（这可能需要几天时间），直接拿来就能用。</p>

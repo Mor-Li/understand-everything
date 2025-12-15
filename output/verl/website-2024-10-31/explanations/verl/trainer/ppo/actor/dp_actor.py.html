@@ -1,0 +1,87 @@
+<h1>verl/trainer/ppo/actor/dp_actor.py</h1>
+<p>这个文件 <code>dp_actor.py</code> 是 <strong>PPO（强化学习）训练中的核心组件——“演员”（Actor）</strong>。</p>
+<p>在强化学习里，“演员”就是那个<strong>负责生成文本的大模型</strong>（LLM）。这个文件的作用就是定义这个模型如何<strong>计算概率</strong>、如何<strong>计算损失（Loss）</strong>，以及如何<strong>更新自己的参数</strong>。</p>
+<p>为了让你看懂，我们把它想象成一个<strong>“特训班”</strong>。我们要训练一个学生（模型）写出更好的回答。</p>
+<p>下面是一个 <strong>To-Do List</strong>，我们将按照这个清单，一步步拆解代码在做什么：</p>
+<hr />
+<h3>✅ Task 1: 招聘与入职 (初始化)</h3>
+<p><strong>代码对应：</strong> <code>__init__</code></p>
+<ul>
+<li><strong>目标</strong>：把模型（大脑）和优化器（学习方法）领进门。</li>
+<li><strong>解释</strong>：<ul>
+<li><code>actor_module</code>：这就是你的 LLM（比如 Llama, Qwen 等）。</li>
+<li><code>actor_optimizer</code>：这是用来更新模型参数的工具（比如 AdamW）。</li>
+<li>如果 <code>optimizer</code> 是空的，说明这个模型只是用来做“参考”的（Reference Model），不需要学习。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 2: 基础能力测验 (前向传播)</h3>
+<p><strong>代码对应：</strong> <code>_forward_micro_batch</code></p>
+<ul>
+<li><strong>目标</strong>：给模型一段输入，算出它生成每个字的概率。</li>
+<li><strong>解释</strong>：这是最底层的计算函数。<ol>
+<li><strong>输入</strong>：<code>input_ids</code>（问题+回答）。</li>
+<li><strong>处理</strong>：扔给 <code>actor_module</code> 跑一遍。</li>
+<li><strong>输出</strong>：拿到 <code>logits</code>（原始打分）。</li>
+<li><strong>调整</strong>：除以 <code>temperature</code>（温度），温度越高输出越随机。</li>
+<li><strong>转化</strong>：把打分变成 <code>log_probs</code>（对数概率），这是 PPO 算法计算 Loss 必须要用的数学格式。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 3: 摸底考试 (只算不算)</h3>
+<p><strong>代码对应：</strong> <code>compute_log_prob</code></p>
+<ul>
+<li><strong>目标</strong>：在不更新参数的情况下，计算当前模型对某些数据的生成概率。</li>
+<li><strong>场景</strong>：通常用于采集数据阶段，或者对比“新旧模型”差异时。</li>
+<li><strong>解释</strong>：<ul>
+<li><code>self.actor_module.eval()</code>：<strong>重点</strong>，开启“评估模式”，告诉模型现在别改参数，只管做题。</li>
+<li><code>torch.no_grad()</code>：<strong>重点</strong>，不计算梯度（省显存，因为不需要反向传播）。</li>
+<li>它把数据切成小块（micro_batch），一块块算完概率，最后拼起来返回。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 4: 正式特训 (核心训练循环) 🌟🌟🌟</h3>
+<p><strong>代码对应：</strong> <code>update_policy</code></p>
+<p>这是整个文件最重要的地方。它执行了 PPO 算法的核心步骤。</p>
+<ul>
+<li><strong>目标</strong>：拿着采集好的数据（经验），根据反馈（奖励/Advantage），更新模型的大脑。</li>
+<li><strong>步骤拆解</strong>：<ol>
+<li><strong>开启训练模式</strong>：<code>self.actor_module.train()</code>。</li>
+<li><strong>准备教材</strong>：<code>_make_minibatch_iterator</code> 把数据打乱（Shuffle），分成一个个小批次（Mini-batch）。</li>
+<li><strong>循环学习</strong>：遍历每一批数据。</li>
+<li><strong>梯度累积 (Gradient Accumulation)</strong>：<ul>
+<li>因为显存有限，不能一次性把所有数据塞进 GPU。</li>
+<li>所以把 Mini-batch 再切分成更小的 <code>micro_batches</code>。</li>
+<li><strong>计算 Loss</strong>：<ul>
+<li><code>logits, log_prob = self._forward_micro_batch(...)</code>：算现在的概率。</li>
+<li><code>core_algos.compute_policy_loss(...)</code>：<strong>PPO 核心公式</strong>。对比“旧概率”和“新概率”，结合“优势值（Advantages）”，计算我们要怎么改。如果这个回答分高，就提高生成它的概率；分低就降低。</li>
+<li><code>entropy_loss</code>：<strong>熵损失</strong>。为了防止模型“死记硬背”变得单一，我们要鼓励它保持一定的随机性（探索性）。</li>
+<li><code>loss.backward()</code>：<strong>反向传播</strong>。告诉模型每一层参数该往哪个方向调。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>记录指标</strong>：把 <code>pg_loss</code>（策略损失）、<code>ppo_kl</code>（模型改变量）等记下来，方便画图看 TensorBoard。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 5: 消化吸收 (参数更新)</h3>
+<p><strong>代码对应：</strong> <code>_optimizer_step</code></p>
+<ul>
+<li><strong>目标</strong>：根据刚才计算出的“修改方向”（梯度），真正地修改模型参数。</li>
+<li><strong>解释</strong>：<ol>
+<li><strong>梯度裁剪 (Clip Grad)</strong>：<code>clip_grad_norm_</code>。这是为了防止“步子迈太大扯着蛋”。如果计算出的修改幅度太夸张，把它强行按住，避免模型训练崩溃。</li>
+<li><strong>执行更新</strong>：<code>self.actor_optimizer.step()</code>。这一步走完，模型就变了，变得更倾向于生成高分回答了。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结一下</h3>
+<p>这个文件其实就干了一件事：<strong>实现 PPO 算法中的 Actor 更新逻辑。</strong></p>
+<ol>
+<li><strong>收数据</strong>：接收包含 Prompt、Response 和 Reward（Advantage）的数据。</li>
+<li><strong>算差距</strong>：算出当前模型和旧模型对这些数据的概率差。</li>
+<li><strong>算 Loss</strong>：利用 PPO 公式，算出为了提高 Reward 应该怎么改。</li>
+<li><strong>改参数</strong>：用优化器修改模型权重。</li>
+</ol>
+<p>你看懂这个流程，就看懂了这个文件 90% 的内容。</p>

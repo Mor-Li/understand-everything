@@ -1,0 +1,118 @@
+<h1>fla/ops/triton/gla/block_parallel/inter_chunk_contribution/chunk_scan_triton_full.py</h1>
+<p>完全理解你的感受。Triton 代码因为涉及到 GPU 的底层线程管理和内存指针操作，乍一看确实像天书。</p>
+<p>这段代码的核心功能是实现 <strong>Gated Linear Attention (GLA)</strong> 模型中，<strong>Chunk（块）与 Chunk 之间</strong>的状态传递（Recurrence）。</p>
+<p>简单来说，它在做一件事：<strong>把上一个时间块（Chunk）的记忆（State），经过衰减（Decay）后，传递给下一个时间块。</strong></p>
+<p>我们可以把理解这个代码的过程拆解成一个 <strong>Todo List</strong>，一共 5 步，我们一步步来勾选。</p>
+<hr />
+<h3>✅ Task 1: 搞懂数学原理 (它在算什么？)</h3>
+<p>不要看代码，先看公式。这是一个典型的“<strong>带有衰减的累加</strong>”过程（Recurrence）。</p>
+<p>假设我们把长序列切成了很多小块（Chunk）。
+- $S_{t}$：第 $t$ 个块结束时的记忆状态（State）。
+- $S_{add}$：第 $t$ 个块内部新产生的记忆。
+- $g$：衰减系数（Gate/Decay），决定了遗忘多少旧记忆。</p>
+<p>公式大概长这样：
+$$ S_{t} = S_{t-1} \times \text{decay} + S_{add} $$</p>
+<p>在代码中，这个 $\text{decay}$ 被拆成了两个向量 $p1$ (key方向的衰减) 和 $p2$ (value方向的衰减)。
+所以核心逻辑是：
+<strong>当前总记忆 = 上一刻记忆 $\times$ ($p1 \times p2$) + 当前块的新增记忆</strong></p>
+<hr />
+<h3>✅ Task 2: 搞懂并行策略 (Triton 怎么切分任务？)</h3>
+<p>GPU 不喜欢处理巨大的矩阵，它喜欢处理小方块。
+记忆矩阵 $S$ 的形状通常是 <code>[Batch, Head, D_key, D_value]</code>。</p>
+<p>Triton 的策略是把 <code>D_key</code> 和 <code>D_value</code> 这两个维度切碎。
+- 代码中 <code>BLOCK_MODEL = 32</code>。
+- 它把巨大的记忆矩阵切成了很多 $32 \times 32$ 的小方块。
+- <strong>并行逻辑</strong>：每一个 Triton 程序（Program/Kernel）只负责维护和更新这一个 $32 \times 32$ 的小方块在时间轴上的演变。</p>
+<p><strong>对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">grid</span> <span class="o">=</span> <span class="p">(</span><span class="n">B</span><span class="o">*</span><span class="n">H</span><span class="p">,</span> <span class="n">D_k</span><span class="o">//</span><span class="n">BLOCK_MODEL</span><span class="p">,</span> <span class="n">D_v</span><span class="o">//</span><span class="n">BLOCK_MODEL</span><span class="p">)</span>
+</code></pre></div>
+
+<p>这行代码决定了启动多少个并行任务。</p>
+<hr />
+<h3>✅ Task 3: 解析 Forward (前向传播)</h3>
+<p>让我们看 <code>_fwd_recurrence</code> 函数。这是核心计算逻辑。</p>
+<p><strong>步骤拆解：</strong></p>
+<ol>
+<li>
+<p><strong>定位坐标 (<code>offset_...</code>)</strong>：</p>
+<ul>
+<li>我是哪个 Batch？哪个 Head？</li>
+<li>我负责矩阵里哪一行（<code>offset_d</code> -&gt; Key维度）？</li>
+<li>我负责矩阵里哪一列（<code>offset_s</code> -&gt; Value维度）？</li>
+<li><em>目的：计算出我这个线程块应该去显存的什么位置读数据。</em></li>
+</ul>
+</li>
+<li>
+<p><strong>初始化循环</strong>：</p>
+<ul>
+<li><code>acc</code>：这是累加器（Accumulator），也就是当前的记忆状态 $S$。</li>
+<li>一开始，<code>acc</code> 读取的是第一个块的数据 (<code>tl.load(S)</code>)。</li>
+</ul>
+</li>
+<li>
+<p><strong>时间循环 (<code>for i in range(NUM_BLOCK-2)</code>)</strong>：</p>
+<ul>
+<li>这是最关键的一步。它沿着时间轴（Chunk 数量）往下走。</li>
+<li><strong>加载衰减率</strong>：<code>p_k = tl.load(p1)</code>, <code>p_v = tl.load(p2)</code>。</li>
+<li><strong>加载新输入</strong>：<code>S_i = tl.load(S)</code> (这是当前块新产生的信息)。</li>
+<li><strong>核心计算</strong>：
+    <code>python
+    acc = acc * p_k[:, None] * p_v[None, :] + S_i</code>
+    翻译：<code>旧记忆 * (Key衰减 x Value衰减) + 新记忆</code>。</li>
+<li><strong>保存结果</strong>：<code>tl.store(O, acc...)</code> 把更新后的记忆写回显存。</li>
+<li><strong>指针移动</strong>：<code>S</code>, <code>O</code>, <code>p1</code>, <code>p2</code> 全部加上偏移量，指向下一个时间块。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 4: 解析 Backward (反向传播)</h3>
+<p><code>_bwd_recurrence</code> 是用来训练神经网络的，计算梯度。这部分通常比前向传播难懂，因为它是<strong>时间倒流</strong>。</p>
+<p><strong>步骤拆解：</strong></p>
+<ol>
+<li>
+<p><strong>倒着走</strong>：</p>
+<ul>
+<li>循环是从后往前的。</li>
+<li>我们需要计算：输出的梯度 <code>DO</code> 对 输入 <code>S</code>, <code>p1</code>, <code>p2</code> 的导数。</li>
+</ul>
+</li>
+<li>
+<p><strong>核心逻辑 (链式法则)</strong>：</p>
+<ul>
+<li>如果 $S_{t} = S_{t-1} \times p + S_{add}$</li>
+<li>那么 $S_{t-1}$ 的梯度不仅来自当前时刻的损失，还来自 $S_{t}$ 传回来的梯度乘以衰减 $p$。</li>
+<li>代码里的 <code>Dacc</code> 就是在这个过程中累积的梯度。</li>
+</ul>
+</li>
+<li>
+<p><strong>原子加法 (Atomic Add) 的替代方案</strong>：</p>
+<ul>
+<li>注意 <code>Chunk_memory_update_full.backward</code> 里的注释：
+    &gt; "I don't want atomic_add to be used... so I add another dimension"</li>
+<li>因为 <code>p1</code> 和 <code>p2</code> 是向量，而 $S$ 是矩阵。多个 $32 \times 32$ 的块会同时用到同一个 $p1$ 或 $p2$。</li>
+<li>为了避免多个线程同时写同一个地址（Data Race），作者让每个块把算出来的 <code>p1/p2</code> 梯度先写到不同的地方 (<code>D_p1</code>, <code>D_p2</code> 增加了一个维度)。</li>
+<li>最后在 Python 层做一次 <code>.sum(-2)</code> 把它们加起来。这是一种用<strong>显存空间换取计算速度和数值稳定性</strong>的技巧。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 5: 总结与串联</h3>
+<p><strong>Python Wrapper (<code>Chunk_memory_update_full</code>) 的作用：</strong></p>
+<ol>
+<li><strong>整理数据</strong>：确保输入张量是连续的 (<code>contiguous</code>)。</li>
+<li><strong>设置网格</strong>：计算好要启动多少个 Triton block。</li>
+<li><strong>调用内核</strong>：启动 <code>_fwd_recurrence</code>。</li>
+<li><strong>处理边界</strong>：<ul>
+<li><code>output[:, :, 0] = 0</code>：通常第一个块没有“前一个块”，所以初始记忆设为 0 或者忽略。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话总结全文：</strong>
+这个文件用 Triton 写了一个高性能的算子，用于在 GLA 模型中，把各个时间块（Chunk）独立计算出的 KV 状态，通过带有衰减因子的方式串联起来，形成全局的上下文记忆。</p>
+<p><strong>现在的 List 状态：</strong>
+- [x] 理解是做状态传递 (Recurrence)。
+- [x] 理解是 $32 \times 32$ 分块并行。
+- [x] 理解前向是 <code>旧 * 衰减 + 新</code>。
+- [x] 理解反向是时间倒流算梯度。
+- [x] 理解为了避免冲突，梯度先分散存，最后再求和。</p>
+<p>希望这个 List 能帮你建立起对这份代码的直观认识！</p>

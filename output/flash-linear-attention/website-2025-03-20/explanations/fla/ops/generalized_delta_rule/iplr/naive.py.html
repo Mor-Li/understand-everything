@@ -1,0 +1,67 @@
+<h1>fla/ops/generalized_delta_rule/iplr/naive.py</h1>
+<p>这份代码实现的是一种<strong>线性注意力机制（Linear Attention）</strong>或者说是<strong>状态空间模型（SSM）</strong>的变体。具体来说，它属于 <strong>IPLR</strong> (In-Context Pretraining with Linear Recurrence) 这一类算法。</p>
+<p>简单来说，它的核心思想是：<strong>不再像传统 Transformer 那样保留所有历史 Token（算 $N^2$ 的矩阵），而是维护一个核心的“记忆状态矩阵” $S$。每读入一个新词，就更新一下这个 $S$，然后用 $S$ 去预测输出。</strong></p>
+<p>为了让你看懂，我把这个过程拆解成一个 <strong>Task List（任务清单）</strong>，分三个阶段带你一步步过一遍。</p>
+<hr />
+<h3>阶段一：搞懂核心概念（背景任务）</h3>
+<p>在看代码前，先建立这个心理模型：
+*   <strong>$Q, K, V$</strong>: 和 Transformer 一样，是查询、键、值。
+*   <strong>$S$ (State)</strong>: 这是一个“记忆矩阵”，形状通常是 $[D_k, D_v]$。它压缩了之前看过的内容。
+*   <strong>$\alpha, \beta$</strong>: 这是这个算法特有的。你可以把它们理解为<strong>“控制门”</strong>或<strong>“遗忘/更新系数”</strong>，用来决定怎么修改记忆矩阵 $S$。</p>
+<p>文件里的公式注释写着：
+<code>S_t = S_t @ (I + alpha_t beta_t^T) + v_t k_t^T</code>
+翻译成人话就是：<strong>新的记忆 = (旧记忆经过某种变形/衰减) + (当前时刻的新信息 $v \cdot k$)</strong>。</p>
+<hr />
+<h3>阶段二：Task List - 逐字逐句模式 (<code>iplr_recurrence</code>)</h3>
+<p>这个函数是<strong>最朴素、最慢</strong>的实现方式，用 Python 的 <code>for</code> 循环一步步算，最容易看懂逻辑。</p>
+<p><strong>Task 1: 准备工作</strong>
+*   把输入数据 $Q, K, V, \beta$ 转成 <code>float</code> 类型（为了精度）。
+*   初始化一个全零的记忆矩阵 <code>S</code>（形状是 <code>[Batch, Head, D_k, D_v]</code>）。
+*   如果有 <code>initial_state</code>（以前剩下的记忆），就加进去。</p>
+<p><strong>Task 2: 开启时间循环 (Loop <code>for i in range(l)</code>)</strong>
+*   这是一个“一步一步读文章”的过程。<code>i</code> 代表当前读到的第几个词。
+*   取出当前的 $q_i, k_i, v_i, \alpha_i, \beta_i$。</p>
+<p><strong>Task 3: 计算记忆更新量 (最核心的代码)</strong>
+*   代码：<code>_kv = ...</code>
+*   这一行极其复杂，其实它在算两部分：
+    1.  <code>_k * _v</code>: 当前时刻的新知识（写入 $S$）。
+    2.  <code>(S * _alpha)... * _beta</code>: 旧记忆 $S$ 根据 $\alpha$ 和 $\beta$ 进行的调整（比如遗忘或旋转）。
+*   <strong>动作</strong>：<code>S = S + _kv</code>。把计算出的变化量加到记忆矩阵里。</p>
+<p><strong>Task 4: 产出结果</strong>
+*   代码：<code>o[:, :, i] = torch.einsum(..., _q, S)</code>
+*   <strong>动作</strong>：用当前的查询 $q_i$ 去“读”记忆矩阵 $S$，得到当前的输出 $o_i$。</p>
+<p><strong>总结</strong>：这就是一个标准的 RNN 模式：<strong>读入 -&gt; 更新记忆 -&gt; 输出 -&gt; 下一步</strong>。</p>
+<hr />
+<h3>阶段三：Task List - 分块加速模式 (<code>iplr_chunkwise</code>)</h3>
+<p><code>recurrence</code> 函数虽然逻辑简单，但在 GPU 上跑 <code>for</code> 循环极慢。
+这个 <code>chunkwise</code> 函数是为了<strong>加速</strong>。它的策略是：<strong>先把数据切成小块（Chunk），块内部并行算，块之间再串行传导。</strong></p>
+<p><strong>Task 1: 切蛋糕 (Chunking)</strong>
+*   代码：<code>rearrange(x, '... (n c) d -&gt; ... n c d')</code>
+*   <strong>动作</strong>：把长长的时间序列切成一段一段的。比如长度 1024，切成 32 个块，每块 32 长。</p>
+<p><strong>Task 2: 块内预计算 (Intra-chunk Computation)</strong>
+*   <strong>难点</strong>：这一段代码很长，有很多 <code>masked_fill</code> 和 <code>@</code>。
+*   <strong>目的</strong>：在一个小块（比如 32 个词）内部，词和词之间的关系是可以并行算出来的，不需要等 $S$。
+*   <strong>动作</strong>：
+    *   <code>v2</code>, <code>attn</code>: 计算块内的局部注意力衰减。
+    *   <code>mask</code>: 保证因果性（只能看前面的词，不能看后面的）。
+    *   这里用了一个小循环 <code>for i in range(1, chunk_size)</code> 来累积块内的衰减效果（累积 $\alpha, \beta$ 的影响）。
+    *   算出 <code>u</code> 和 <code>w</code>：这些是“块内总结好的信息”，准备喂给全局状态 $S$。</p>
+<p><strong>Task 3: 块间循环 (Inter-chunk Recurrence)</strong>
+*   代码：<code>for i in range(0, l // chunk_size)</code>
+*   <strong>动作</strong>：现在我们不再是一个词一个词跳了，而是一个块一个块跳。
+*   <strong>步骤</strong>：
+    1.  <code>o_1</code>: 块内部的 Attention（这一块自己内部解决的部分）。
+    2.  <code>o_2</code>, <code>o_3</code>: 利用之前的全局记忆 $S$ 对当前块的影响。
+    3.  <code>o = o_1 + o_2 + o_3</code>: 合并结果。
+    4.  <strong>更新 S</strong>：<code>S = S + ...</code>。当前块处理完后，把这一整块的信息压缩进 $S$，传给下一个块。</p>
+<p><strong>Task 4: 还原形状</strong>
+*   代码：<code>rearrange(o, ...)</code>
+*   <strong>动作</strong>：把切开的块重新拼回成一条长序列。</p>
+<hr />
+<h3>总结 Checklist (一句话看懂)</h3>
+<ol>
+<li><strong><code>iplr_recurrence</code></strong>: 是<strong>教学版</strong>。像小学生做算术，一步一步算，用来验证数学公式对不对，但跑得慢。</li>
+<li><strong><code>iplr_chunkwise</code></strong>: 是<strong>工业版</strong>。像流水线工人，先把任务分批（Chunk），批次内部大家一起干（并行），批次之间再交接（Recurrence），为了在显卡上跑得快。</li>
+</ol>
+<p><strong>你的阅读建议：</strong>
+如果你不是为了优化速度，而只是为了理解算法原理，<strong>只需要死磕 <code>iplr_recurrence</code> 那个函数</strong>即可，尤其是 <code>S = S + _kv</code> 那一行。<code>chunkwise</code> 是纯粹的工程优化，逻辑非常绕，初学可以直接跳过。</p>

@@ -1,0 +1,92 @@
+<h1>tests/unit_tests/dist_checkpointing/test_optimizer.py</h1>
+<p>这份代码确实比较硬核，它属于 <strong>Megatron-LM</strong>（一个用于训练超大模型的框架）的核心组件测试代码。</p>
+<p>简单来说，这个文件的核心目的是：<strong>测试“分布式优化器”（Distributed Optimizer）在不同并行配置下，能否正确地保存（Save）和加载（Load）检查点（Checkpoint）。</strong></p>
+<p>举个例子：你在 8 张显卡上训练模型，保存了一个 Checkpoint。然后你想在 16 张显卡上继续训练（或者改变了模型切分方式），这个代码就是测试这种“搬家”操作后，优化器的状态（比如动量 Momentum、方差等）能不能完美恢复，不出错。</p>
+<p>为了让你读懂，我制定了一个 <strong>学习任务清单 (To-Do List)</strong>，然后按照这个清单一步步给你拆解。</p>
+<hr />
+<h3>📝 阅读任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>基础准备 (Setup)</strong>: 理解测试用的“假模型”和“假参数”是用来干嘛的。</li>
+<li><strong>核心映射 (Mapping)</strong>: 理解代码是如何把“模型参数”和“优化器状态”对应起来的。</li>
+<li><strong>场景一：数据并行 (DP) 重切分</strong>: 测试当数据并行度改变时（例如从 2路 DP 变成 4路 DP），优化器状态能否正确合并或拆分。</li>
+<li><strong>场景二：微调 (Finetune) 与 结构变更</strong>: 测试当你改变模型并行度（TP/PP）或者开启微调模式时，系统是否会明智地丢弃旧的优化器状态（只加载权重）。</li>
+<li><strong>场景三：全能重切分 (Resharding)</strong>: 测试最复杂的场景——同时改变张量并行 (TP) 和流水线并行 (PP)，优化器状态能否通过数学计算被重新分配到正确的位置。</li>
+</ol>
+<hr />
+<h3>🔍 逐步讲解 (Step-by-Step)</h3>
+<h4>第一步：基础准备 (Setup)</h4>
+<p><strong>代码对应部分</strong>: <code>class Model</code>, <code>class SwigluFactoryModel</code>, <code>initialize_gpt_model</code>, <code>setup_model_and_optimizer</code></p>
+<ul>
+<li><strong>观点</strong>: 这里的 <code>Model</code> 不是真实的 GPT-3，而是为了测试写的“玩具模型”。</li>
+<li><strong>解读</strong>:<ul>
+<li>它定义了简单的卷积层 (<code>conv</code>) 和全连接层 (<code>proj</code> / <code>linear</code>)。</li>
+<li><strong>关键点</strong>是 <code>sharded_state_dict</code> 方法。这个方法告诉系统：“我的这个权重矩阵，是按照什么规则被切分到不同显卡上的”。</li>
+<li><code>setup_model_and_optimizer</code> 函数模拟了一个训练环境：它初始化模型，创建优化器（Adam），并给参数随机填充一些梯度和状态值，假装已经训练了一段时间。</li>
+</ul>
+</li>
+</ul>
+<h4>第二步：核心映射 (Mapping)</h4>
+<p><strong>代码对应部分</strong>: <code>class TestOptimizer</code> -&gt; <code>test_optimizer_params</code></p>
+<ul>
+<li><strong>观点</strong>: 优化器里存的不是参数本身，而是参数的“影子”（比如动量）。我们需要确保系统能找到这些影子。</li>
+<li><strong>解读</strong>:<ul>
+<li>这个测试创建了一个模型和一个 Adam 优化器。</li>
+<li>它验证 <code>optim_state_to_sharding_state</code> 这个函数。</li>
+<li><strong>目标</strong>: 确保优化器里的 <code>exp_avg</code> (一阶动量) 和 <code>exp_avg_sq</code> (二阶动量) 能被正确地打上标签（ShardedTensor），并且和模型里的层（如 <code>conv.weight</code>）一一对应。如果对应不上，加载时就会乱套。</li>
+</ul>
+</li>
+</ul>
+<h4>第三步：数据并行 (DP) 重切分</h4>
+<p><strong>代码对应部分</strong>: <code>class TestDistributedOptimizer</code> -&gt; <code>test_dp_sharding</code></p>
+<ul>
+<li><strong>观点</strong>: 分布式优化器为了省显存，会把参数状态切分存放在不同 DP 组的显卡上。如果 DP 大小变了，必须重新汇聚再切分。</li>
+<li><strong>解读</strong>:<ul>
+<li><strong>测试逻辑</strong>:<ol>
+<li>先用一种配置（<code>src_dp</code>，比如 2卡）跑模型，保存 Checkpoint A。</li>
+<li>销毁环境，模拟重启。</li>
+<li>用另一种配置（<code>dest_dp</code>，比如 4卡）初始化环境。</li>
+<li>加载 Checkpoint A，保存为 Checkpoint B。</li>
+<li><strong>核心验证</strong>: 对比 A 和 B 解包后的数值（<code>diff</code> 函数）。</li>
+</ol>
+</li>
+<li><strong>结论</strong>: 无论你是用 2 张卡存，还是 8 张卡存，恢复出来的数学数值必须完全一致（Bit-wise exactness）。</li>
+</ul>
+</li>
+</ul>
+<h4>第四步：微调 (Finetune) 与 结构变更</h4>
+<p><strong>代码对应部分</strong>: <code>test_finetune_doesnt_load_optimizer</code></p>
+<ul>
+<li><strong>观点</strong>: 如果我改变了模型切分方式（TP/PP 改变），通常意味着网络拓扑变了，旧的优化器状态（它是跟具体的参数形状绑定的）可能就失效了，或者我们需要显式地丢弃它。</li>
+<li><strong>解读</strong>:<ul>
+<li><strong>测试逻辑</strong>:<ol>
+<li>在 TP=2, PP=2 的配置下保存模型。</li>
+<li>尝试在 TP=2, PP=4 的配置下加载。</li>
+<li><strong>预期报错</strong>: 代码里用 <code>pytest.raises(RuntimeError)</code> 期待一个报错。因为直接加载会导致形状不匹配。</li>
+<li><strong>微调模式 (<code>args.finetune = True</code>)</strong>: 当开启这个开关，测试验证系统应该<strong>成功加载模型权重</strong>，但是<strong>完全忽略优化器状态</strong>（优化器状态应该是空的或者初始值）。</li>
+<li>这模拟了我们在拿到别人的预训练模型进行微调时的场景：我们要权重，但不需要别人的动量历史。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<h4>第五步：全能重切分 (Resharding)</h4>
+<p><strong>代码对应部分</strong>: <code>class TestFP32Optimizer</code> 和 <code>class TestOptimizerResharding</code></p>
+<ul>
+<li><strong>观点</strong>: 这是最难的部分。如果我要把模型从“横着切”（TP）变成“竖着切”（PP），或者切得更细，优化器状态也得跟着变。</li>
+<li><strong>解读</strong>:<ul>
+<li><code>src_tp_pp</code> (源配置) vs <code>dest_tp_pp</code> (目标配置)。</li>
+<li>例如：从 <code>(2, 4)</code> (2路张量并行，4路流水线并行) 变成 <code>(4, 2)</code>。</li>
+<li><strong>流程</strong>:<ol>
+<li><strong>Save</strong>: 在源配置下，调用 <code>sharded_state_dict</code> 保存。这时保存的是“逻辑上”完整的张量切片信息。</li>
+<li><strong>Load</strong>: 在目标配置下，系统根据新的切分逻辑，去读取 Checkpoint。</li>
+<li><strong>验证</strong>: 为了证明没读错，它把存之前的状态（A）和读之后再存的状态（B）都转换成普通的 PyTorch Tensor（<code>load_plain_tensors</code>），然后做减法。如果结果全是 0，说明重切分成功。</li>
+</ol>
+</li>
+<li>这里分别测试了 FP32 优化器和 BF16 分布式优化器，确保不同精度下都没问题。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件其实就在回答一个问题：
+<strong>“无论我怎么改变显卡的数量（World Size）或者模型的切分方式（TP/PP/DP），Megatron 的 Checkpoint 系统能不能保证我的优化器状态（Training State）不丢失、不错乱？”</strong></p>
+<p>它通过不断地 <strong>[建立环境 -&gt; 保存 -&gt; 销毁 -&gt; 重建不同环境 -&gt; 加载 -&gt; 对比数值]</strong> 的循环来严防死守这个功能的正确性。</p>

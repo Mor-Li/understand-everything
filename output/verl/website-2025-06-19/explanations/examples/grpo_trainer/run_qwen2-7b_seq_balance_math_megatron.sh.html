@@ -1,0 +1,100 @@
+<h1>examples/grpo_trainer/run_qwen2-7b_seq_balance_math_megatron.sh</h1>
+<p>这份脚本确实看起来很“硬核”，因为它涉及到了<strong>大模型训练（LLM Training）</strong>中最复杂的一些概念：<strong>强化学习（RL）、分布式训练（Megatron）和混合精度推理（vLLM）</strong>。</p>
+<p>别担心，我们可以把它想象成<strong>“训练一个学生（AI）参加奥数比赛”</strong>的过程。</p>
+<p>为了让你读懂，我制定了一个<strong>5步走的 Task List（任务清单）</strong>。我们按照这个清单，一步步拆解这个脚本在干什么。</p>
+<hr />
+<h3>📋 任务清单：从小白到看懂脚本</h3>
+<ol>
+<li><strong>Task 01: 确立目标（我们要干啥？）</strong> —— 理解脚本的核心目的。</li>
+<li><strong>Task 02: 准备教材（数据在哪？）</strong> —— 也就是脚本里的 Data 部分。</li>
+<li><strong>Task 03: 组建硬件团队（怎么分工？）</strong> —— 理解 Megatron 和并行策略。</li>
+<li><strong>Task 04: 制定学习计划（怎么学？）</strong> —— 理解 GRPO 算法和 Actor/Rollout/Ref 的关系。</li>
+<li><strong>Task 05: 设定考核标准（参数设置）</strong> —— 也就是 epoch, batch size 等细节。</li>
+</ol>
+<hr />
+<h3>🚀 详细拆解</h3>
+<h4>✅ Task 01: 确立目标（我们要干啥？）</h4>
+<p><strong>一句话总结：</strong> 这个脚本是用来<strong>训练</strong>一个叫 <strong>Qwen2-7B</strong> 的模型，让它通过做题（GSM8K 和 Math 数据集）来提升数学能力。</p>
+<ul>
+<li><strong>脚本里的证据：</strong><ul>
+<li><code>run_qwen2-7b...</code>: 名字告诉我们要跑 Qwen2-7B 模型。</li>
+<li><code>algorithm.adv_estimator=grpo</code>: 使用了一种叫 <strong>GRPO</strong> 的强化学习算法（这是一种比传统 PPO 更省显存的算法）。</li>
+<li><code>project_name='verl_grpo_example_gsm8k_math'</code>: 项目名也写了，是针对数学题的。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 02: 准备教材（数据在哪？）</h4>
+<p><strong>通俗解释：</strong> 就像给学生发课本和练习册。</p>
+<ul>
+<li><strong>脚本里的代码：</strong>
+    <code>bash
+    gsm8k_train_path=$HOME/data/gsm8k/train.parquet
+    math_train_path=$HOME/data/math/train.parquet
+    # ... (省略测试集路径)
+    train_files="['$gsm8k_train_path', '$math_train_path']"</code></li>
+<li><strong>解读：</strong><ul>
+<li>这里指定了两个著名的数学数据集：<strong>GSM8K</strong>（小学数学）和 <strong>Math</strong>（更难的竞赛数学）。</li>
+<li>脚本把这两个数据混合在一起（<code>train_files</code>），作为训练材料。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 03: 组建硬件团队（怎么分工？）</h4>
+<p><strong>通俗解释：</strong> 模型很大，一张显卡装不下或者算得慢。我们需要把模型“切开”，分给不同的显卡一起算。这叫<strong>分布式训练</strong>。</p>
+<ul>
+<li><strong>脚本里的关键点：</strong> <code>Megatron</code> 和 <code>Parallel_size</code>。
+    <code>bash
+    # 把模型切成几份？
+    actor_rollout_ref.actor.megatron.tensor_model_parallel_size=2
+    actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=2
+    trainer.n_gpus_per_node=8  # 一台机器上有8张卡</code></li>
+<li><strong>解读：</strong><ul>
+<li><strong>Tensor Parallel (TP)=2</strong>: 把模型的每一层横向切开，2张卡合起来算一层。</li>
+<li><strong>Pipeline Parallel (PP)=2</strong>: 把模型的层数竖向切开，比如前16层给这组卡，后16层给那组卡。</li>
+<li><strong>Megatron</strong>: 这是一个专门用来做这种复杂切割（分布式训练）的框架。</li>
+<li><strong>结论：</strong> 这个任务需要很多显卡配合，不是单卡能跑的。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 04: 制定学习计划（怎么学？）</h4>
+<p><strong>通俗解释：</strong> 这是强化学习（RL）的核心循环。想象一个学生做题的过程：
+1.  <strong>做题 (Rollout):</strong> 学生先自己做几道题。（由 <code>vllm</code> 引擎负责，因为它推理速度快）。
+2.  <strong>打分 (Reward):</strong> 老师批改，做对了给糖吃，做错了没糖。
+3.  <strong>更新 (Actor):</strong> 学生根据有没有糖吃，调整自己的脑子（更新参数）。
+4.  <strong>参照 (Ref):</strong> 旁边坐着一个“原来的我”，防止现在的我因为乱试错而走火入魔（KL 散度约束）。</p>
+<ul>
+<li>
+<p><strong>脚本里的代码：</strong>
+    ```bash
+    # 谁来做题？(Rollout)
+    actor_rollout_ref.rollout.name=vllm 
+    actor_rollout_ref.rollout.n=5  # 每道题生成5个不同的解法试试</p>
+<h1>谁来学习？(Actor)</h1>
+<p>actor_rollout_ref.model.path=Qwen/Qwen2-7B-Instruct # 基础模型
+actor_rollout_ref.actor.optim.lr=1e-6 # 学习率，学得慢一点，细致一点</p>
+<h1>谁来做参照？(Ref)</h1>
+<h1>脚本里有很多 actor_rollout_ref.ref... 的配置</h1>
+<p><code>``
+*   **GRPO 的特点：** 这里的</code>algorithm.adv_estimator=grpo<code>是关键。传统的 PPO 需要一个额外的“打分模型”（Critic），这很占显存。GRPO 不需要这个 Critic 模型，而是通过这 5 个解法（</code>rollout.n=5`）之间的对比来计算分数，非常节省资源。</p>
+</li>
+</ul>
+<h4>✅ Task 05: 设定考核标准（参数设置）</h4>
+<p><strong>通俗解释：</strong> 控制训练的节奏和时长。</p>
+<ul>
+<li><strong>脚本里的代码：</strong>
+    <code>bash
+    data.train_batch_size=1024       # 一次打包学1024道题
+    trainer.total_epochs=15          # 这本习题册从头到尾刷15遍
+    trainer.save_freq=20             # 每20步存个档，防止停电白干
+    trainer.test_freq=5              # 每5步考试一次，看看水平咋样</code></li>
+</ul>
+<hr />
+<h3>💡 总结：这个脚本在讲什么故事？</h3>
+<p>想象你是一个班主任（User），你正在指挥一个叫 <code>verl</code> 的教学系统：</p>
+<ol>
+<li><strong>命令：</strong> “嘿，系统，我要特训 <strong>Qwen2-7B</strong> 这个学生。”</li>
+<li><strong>教材：</strong> “用 <strong>GSM8K</strong> 和 <strong>Math</strong> 这两本奥数书。”</li>
+<li><strong>资源：</strong> “我有 <strong>8张显卡</strong>，你们用 <strong>Megatron</strong> 框架把模型切开，2张卡算一部分，协作运行。”</li>
+<li><strong>方法：</strong> “用 <strong>GRPO</strong> 学习法。让学生每道题试着写 <strong>5个</strong> 答案，做对了就奖励。用 <strong>vLLM</strong> 让他写快点。”</li>
+<li><strong>目标：</strong> “这套书刷 <strong>15遍</strong>，每隔一会向我汇报一下成绩（Wandb）。”</li>
+</ol>
+<p>现在，你再回头看那堆代码，是不是能对应上这个故事了？</p>

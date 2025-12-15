@@ -1,0 +1,99 @@
+<h1>verl/utils/debug/trajectory_tracker.py</h1>
+<p>这份代码确实涉及到了<strong>分布式计算（Ray）</strong>、<strong>文件存储（HDFS）</strong>和<strong>多线程/异步操作</strong>，如果不熟悉这些概念，读起来会非常吃力。</p>
+<p>简单来说，这个文件的作用是：<strong>在程序运行过程中，把中间产生的变量（比如 Tensor 数据）偷偷地、不卡顿地保存到远程硬盘上，方便以后拿出来检查 bug。</strong></p>
+<p>为了让你看懂，我把你想象成一个<strong>“总指挥”</strong>（正在运行的主程序），你需要列一个 <strong>Task Todo List</strong> 来实现“一边干活一边记笔记”的功能。</p>
+<p>我们把代码拆解成下面这 5 个任务步骤：</p>
+<hr />
+<h3>Task 1: 准备工作（配置与开关）</h3>
+<p><strong>目标</strong>：确定我们要不要记笔记，以及笔记存哪里。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>dump_data</code> 函数开头 和 <code>get_trajectory_tracker</code> 函数。</li>
+<li><strong>解读</strong>：<ul>
+<li>你肯定不希望每次运行都存一大堆垃圾文件，所以需要一个开关。代码里用环境变量 <code>VERL_ENABLE_TRACKER</code> 来控制。如果是 "0" 就不存，直接跳过。</li>
+<li>如果决定要存，得知道存哪儿。代码用 <code>VERL_TRACKER_HDFS_DIR</code> 指定了远程存储（HDFS）的路径。</li>
+<li><strong>逻辑</strong>：<ol>
+<li>检查开关开了没？</li>
+<li>没开 -&gt; 啥也不干。</li>
+<li>开了 -&gt; 准备好存储路径。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<h3>Task 2: 雇佣一个“专职秘书”（创建 Tracker Actor）</h3>
+<p><strong>目标</strong>：你（主程序）很忙，不能亲自去写硬盘（太慢了）。你需要雇一个“秘书”专门负责这件事，而且这个秘书必须是全局唯一的，大家都能找到它。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>class TrajectoryTracker</code> 和 <code>get_trajectory_tracker</code>。</li>
+<li><strong>解读</strong>：<ul>
+<li><code>@ray.remote</code>：这表示这个类是一个独立运行的进程（在 Ray 里叫 Actor）。</li>
+<li><code>TrajectoryTracker</code> 就是这个“秘书”。</li>
+<li><code>get_trajectory_tracker</code> 里有一句 <code>TrajectoryTracker.options(name="global_tracker", ...)</code>。意思就是：给我找那个叫 "global_tracker" 的秘书，如果没有就雇一个。</li>
+<li><strong>逻辑</strong>：<ol>
+<li>创建一个独立的后台进程。</li>
+<li>给它起个名字叫“全局追踪器”。</li>
+<li>所有想存数据的人都把数据交给它。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<h3>Task 3: 打包数据（序列化）</h3>
+<p><strong>目标</strong>：数据（比如 PyTorch 的 Tensor）是内存里的对象，不能直接发快递。需要先把它打包成二进制包裹。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>dump_data</code> 函数中间部分。</li>
+<li><strong>解读</strong>：<ul>
+<li><code>buffer = io.BytesIO()</code>：拿一个空的内存箱子。</li>
+<li><code>torch.save(data, buffer)</code>：把数据（data）压缩打包放进箱子（buffer）里。</li>
+<li><strong>逻辑</strong>：<ol>
+<li>拿到要保存的数据 <code>data</code>。</li>
+<li>把它转换成字节流（bytes），方便传输。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<h3>Task 4: 甩手掌柜（异步上传）</h3>
+<p><strong>目标</strong>：把包裹扔给秘书，你就继续干你的活，不要在原地等秘书写完。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>tracker.dump.remote(buffer, name)</code> 和 <code>class TrajectoryTracker</code> 里的 <code>dump</code> 方法。</li>
+<li><strong>解读</strong>：<ul>
+<li><strong>关键点</strong>：<code>.remote(...)</code>。在 Ray 里，这意味着“<strong>异步调用</strong>”。你只需要把包裹扔过去，立马就可以执行下一行代码，不会卡住。</li>
+<li>秘书（Tracker）收到包裹后，会调用 <code>save_to_hdfs</code>。</li>
+<li><code>save_to_hdfs</code> 是真正的苦力：它把内存里的数据写入临时文件，然后上传到 HDFS（分布式文件系统）。</li>
+<li><strong>逻辑</strong>：<ol>
+<li>主程序调用 <code>dump</code>，把数据扔给秘书。</li>
+<li>秘书把这个任务记在一个小本本上（<code>self.handle.append(...)</code>）。</li>
+<li>秘书安排后台线程去写文件。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<h3>Task 5: 下班前的确认（同步等待）</h3>
+<p><strong>目标</strong>：程序运行结束前，要确保秘书把手里的活都干完了，不能这边程序退出了，那边数据还没写完。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>wait_for_hdfs</code> 方法。</li>
+<li><strong>解读</strong>：<ul>
+<li><code>while len(self.handle) != 0:</code>：只要手里还有没干完的活。</li>
+<li><code>ray.get(future)</code>：这就变成了<strong>同步等待</strong>。强制等待这个任务完成。</li>
+<li><strong>逻辑</strong>：<ol>
+<li>检查任务列表。</li>
+<li>如果有没完成的上传任务，就死等，直到全部上传成功。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：整个流程是这样的</h3>
+<ol>
+<li><strong>设置环境</strong>：你在命令行输入 <code>export VERL_ENABLE_TRACKER=1</code>，开启功能。</li>
+<li><strong>代码运行</strong>：你的训练代码跑到了 <code>dump_data(my_tensor, "step_1")</code> 这一行。</li>
+<li><strong>打包</strong>：<code>my_tensor</code> 瞬间被打包成二进制包。</li>
+<li><strong>派单</strong>：主程序大喊一声：“秘书（Tracker），把这个包存一下！”然后主程序立刻跑去算下一步了（毫秒级耗时）。</li>
+<li><strong>后台处理</strong>：秘书在后台慢慢地把数据写成文件，上传到服务器（可能耗时几秒）。</li>
+<li><strong>收尾</strong>：整个程序跑完时，主程序问秘书：“都存好了吗？”秘书说：“好了。”程序退出。</li>
+</ol>
+<h3>这个脚本存在的意义</h3>
+<p>在做大规模 AI 训练时，如果你直接在训练循环里写 <code>torch.save</code> 保存文件，硬盘读写速度慢，会把显卡（GPU）急死（因为 GPU 算得快，IO 存得慢）。
+这个脚本利用 <strong>Ray</strong> 实现了 <strong>IO 和 计算 的解耦</strong>，让保存数据不影响训练速度。</p>

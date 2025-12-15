@@ -1,0 +1,136 @@
+<h1>tools/checkpoint/saver_megatron.py</h1>
+<p>这份代码确实比较晦涩，因为它涉及到了 <strong>Megatron-LM</strong>（一个用于训练超大模型的框架）的底层机制。</p>
+<p>简单来说，这个脚本是一个 <strong>“存档员”（Saver）</strong>。它的工作是从另一个程序（Loader，加载器）那里接收模型的数据（权重），然后把这些数据整理、切割，最后保存成 Megatron-LM 能够识别和加载的检查点（Checkpoint）文件格式。</p>
+<p>你可以把它想象成一个 <strong>“打包搬家”</strong> 的过程：Loader 负责把家具（模型权重）搬过来，这个 Saver 负责把家具拆解（并行切分）并装进特定的箱子（保存文件）里。</p>
+<p>为了让你看懂，我列了一个 <strong>Task List (任务清单)</strong>，然后我们一步步对照代码来讲。</p>
+<hr />
+<h3>📋 Task List (代码执行流程清单)</h3>
+<ol>
+<li><strong>环境准备</strong>：加载 Megatron 库，确保能调用它的功能。</li>
+<li><strong>伪造配置</strong>：根据传入的模型元数据（Metadata），伪造命令行参数，初始化 Megatron 的全局配置。</li>
+<li><strong>搭建骨架</strong>：根据配置，初始化一个“空”的 Megatron 模型结构（还没有填入权重）。</li>
+<li><strong>处理词表（Embeddings）</strong>：接收词向量，根据并行度（TP）切分词向量，填入模型。</li>
+<li><strong>处理中间层（Transformer Layers）</strong>：<ul>
+<li>循环接收每一层的权重。</li>
+<li>按需切分权重（为了适应多卡并行）。</li>
+<li>将切分后的权重填入模型的对应层。</li>
+</ul>
+</li>
+<li><strong>处理收尾层（Output/Head）</strong>：接收并填入最后的归一化层（LayerNorm）和输出层权重。</li>
+<li><strong>保存文件</strong>：调用 Megatron 的接口，将填好权重的模型写入硬盘。</li>
+</ol>
+<hr />
+<h3>💡 逐步详细解读</h3>
+<h4>1. 环境准备 (Imports &amp; Megatron Path)</h4>
+<p>代码一开始尝试导入 <code>megatron</code> 库。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">try</span><span class="p">:</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">megatron.training.arguments</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">parse_args</span><span class="p">,</span> <span class="n">validate_args</span><span class="p">)</span>
+        <span class="c1"># ... 导入其他模块</span>
+    <span class="k">except</span> <span class="ne">ModuleNotFoundError</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;Unable to import Megatron...&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：因为我们要保存成 Megatron 的格式，必须依赖它的原生代码。如果找不到库，脚本就报错退出。</li>
+</ul>
+<h4>2. 伪造配置 (Fake Arguments &amp; Initialization)</h4>
+<p>这是代码中最“黑客”也是最难懂的部分。
+Megatron 是一个通过命令行参数（如 <code>--num-layers 12</code>）来初始化的框架。但是这里我们是脚本调用，不是命令行启动。
+*   <strong>代码逻辑</strong>：
+    *   <code>md = queue_get()</code>: 从队列里拿到模型的元数据（比如层数、隐藏层大小）。
+    *   <code>sys.argv = ['script.py', ...]</code>：<strong>这里是关键！</strong> 代码手动修改了 <code>sys.argv</code>，假装用户是在命令行里输入了这些参数。
+    *   <code>margs = parse_args()</code>: 让 Megatron 解析这些伪造的参数。
+    *   <code>set_global_variables(margs, ...)</code>: 初始化 Megatron 的全局变量。</p>
+<ul>
+<li><strong>为什么要这样做？</strong>：为了骗过 Megatron 的初始化流程，让它以为自己是在正常启动训练，从而建立起正确的配置环境。</li>
+</ul>
+<h4>3. 搭建骨架 (Get Models &amp; Fake Distributed)</h4>
+<p>配置好后，需要创建一个空的模型对象，用来存放即将到来的权重。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># 伪造分布式环境，假装我们现在处于第0号显卡</span>
+    <span class="n">mpu</span><span class="o">.</span><span class="n">set_tensor_model_parallel_rank</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+
+    <span class="c1"># 创建模型实例</span>
+    <span class="n">models</span> <span class="o">=</span> <span class="n">get_models</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">target_tensor_parallel_size</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：<ul>
+<li><strong>TP (Tensor Parallel)</strong>：张量并行。大模型通常把一个大矩阵切开放在不同显卡上。</li>
+<li><strong>PP (Pipeline Parallel)</strong>：流水线并行。把模型的不同层放在不同显卡上。</li>
+<li>这段代码会根据你设定的目标并行度（<code>target_tensor_parallel_size</code>），创建出对应数量的空模型对象。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 处理词表 (Embeddings)</h4>
+<p>模型的第一部分是 Embedding 层。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="n">embeddings_msg</span> <span class="o">=</span> <span class="n">queue_get</span><span class="p">(</span><span class="s2">&quot;embeddings&quot;</span><span class="p">)</span> <span class="c1"># 从队列接收数据</span>
+    <span class="c1"># ... 处理 padding (词表对齐) ...</span>
+
+    <span class="c1"># 核心操作：切分</span>
+    <span class="n">out_word_embed</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">chunk</span><span class="p">(</span><span class="n">full_word_embed</span><span class="p">,</span> <span class="n">args</span><span class="o">.</span><span class="n">target_tensor_parallel_size</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：<ul>
+<li><strong><code>torch.chunk</code></strong>：这是核心。如果我要把模型分成 2 份（TP=2），我就要把词向量矩阵切成 2 半。</li>
+<li>代码随后把切好的一块块权重，塞进 <code>models</code> 里的对应位置。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 处理中间层 (Transformer Layers Loop)</h4>
+<p>这是代码最长的一段循环，处理 Transformer 的核心层（Attention 和 MLP）。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">for</span> <span class="n">layer</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">models</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">language_model</span><span class="o">.</span><span class="n">encoder</span><span class="o">.</span><span class="n">layers</span><span class="p">)):</span>
+        <span class="n">msg</span> <span class="o">=</span> <span class="n">queue_get</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;transformer layer </span><span class="si">{</span><span class="n">total_layer_num</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="c1"># 接收 QKV 权重，并切分</span>
+        <span class="n">qkv_weight</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">chunk</span><span class="p">(</span><span class="n">msg</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">&quot;qkv weight&quot;</span><span class="p">),</span> <span class="n">args</span><span class="o">.</span><span class="n">target_tensor_parallel_size</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+        <span class="c1"># 接收 Dense 权重，并切分 (注意 dim=1，因为矩阵乘法维度不同)</span>
+        <span class="n">dense_weight</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">chunk</span><span class="p">(</span><span class="n">msg</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">&quot;dense weight&quot;</span><span class="p">),</span> <span class="n">args</span><span class="o">.</span><span class="n">target_tensor_parallel_size</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+
+        <span class="c1"># ... 将切分后的权重 copy_ 到模型里 ...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：<ul>
+<li><strong>权重切分规则</strong>：<ul>
+<li><code>QKV</code> (Query, Key, Value) 矩阵通常按行切 (<code>dim=0</code>)。</li>
+<li><code>Dense</code> (输出投影) 矩阵通常按列切 (<code>dim=1</code>)。</li>
+</ul>
+</li>
+<li><strong>SwiGLU</strong>：代码里有专门处理 <code>md.swiglu</code> 的逻辑，因为 SwiGLU 结构的权重组合方式和普通 MLP 不一样。</li>
+<li>这一步就是把通用的权重，按照 Megatron 的并行规则，“分发”到各个分片的模型中。</li>
+</ul>
+</li>
+</ul>
+<h4>6. 处理收尾层 (Post Process)</h4>
+<p>Transformer 层结束后，还有最后的 LayerNorm 和输出层。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">if</span> <span class="n">post_process</span><span class="p">:</span>
+        <span class="n">msg</span> <span class="o">=</span> <span class="n">queue_get</span><span class="p">(</span><span class="s2">&quot;final norm&quot;</span><span class="p">)</span>
+        <span class="c1"># ... 复制 final norm 权重 ...</span>
+
+        <span class="k">if</span> <span class="n">md</span><span class="o">.</span><span class="n">output_layer</span><span class="p">:</span>
+            <span class="c1"># 如果有独立的输出层，也要切分</span>
+            <span class="n">output_layer_weight</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">chunk</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：如果是 BERT 或 GPT，最后还有 Pooler 或 LM Head，逻辑是一样的：接收 -&gt; 切分 -&gt; 填入。</li>
+</ul>
+<h4>7. 保存文件 (Save Checkpoint)</h4>
+<p>最后，所有权重都填好了，调用 Megatron 的保存函数。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">for</span> <span class="n">tp_rank</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">target_tensor_parallel_size</span><span class="p">):</span>
+        <span class="n">mpu</span><span class="o">.</span><span class="n">set_tensor_model_parallel_rank</span><span class="p">(</span><span class="n">tp_rank</span><span class="p">)</span> <span class="c1"># 假装自己是当前这个 rank</span>
+        <span class="n">save_checkpoint</span><span class="p">(</span><span class="n">md</span><span class="o">.</span><span class="n">iteration</span><span class="p">,</span> <span class="p">[</span><span class="n">models</span><span class="p">[</span><span class="n">tp_rank</span><span class="p">]],</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：<ul>
+<li>代码模拟了每一张显卡（Rank）。</li>
+<li>例如 TP=2，它先假装自己是 Rank 0，保存前半部分模型；然后假装自己是 Rank 1，保存后半部分模型。</li>
+<li>最终在磁盘上生成 <code>mp_rank_00/model_optim_rng.pt</code> 等文件。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个脚本的核心逻辑就是：
+<strong>接收完整参数 -&gt; 按照 Megatron 的并行规则（TP/PP）进行切分（Chunk） -&gt; 塞入 Megatron 模型结构 -&gt; 落盘保存。</strong></p>

@@ -1,0 +1,125 @@
+<h1>megatron/core/transformer/mlp.py</h1>
+<p>这份代码确实比较硬核，因为它不仅仅是一个普通的神经网络层，而是 <strong>Megatron-Core</strong> 里的代码。这意味着它是为了<strong>在成百上千张显卡上并行训练超大模型</strong>（比如 GPT-3, Llama）而设计的。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“学习 To-Do List”</strong>。我们不一行行死磕，而是按功能模块一步步攻破。</p>
+<hr />
+<h3>📝 任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1: 理解 MLP 的基本“三明治”结构</strong> (最基础的数学逻辑)</li>
+<li><strong>Task 2: 看懂初始化 (<code>__init__</code>) 里的维度变化</strong> (数据形状是怎么变的)</li>
+<li><strong>Task 3: 拆解前向传播 (<code>forward</code>) 的三个步骤</strong> (数据是怎么流动的)</li>
+<li><strong>Task 4: 理解“融合算子” (Fusion) 优化的逻辑</strong> (为什么要写得这么复杂)</li>
+<li><strong>Task 5: 搞懂 GLU/SwiGLU 是什么鬼</strong> (为什么中间要切分数据)</li>
+<li><strong>Task 6: (选修) 分布式存储的噩梦</strong> (代码下半部分的 <code>ShardedTensor</code> 是干嘛的)</li>
+</ol>
+<hr />
+<h3>✅ Task 1: 理解 MLP 的基本“三明治”结构</h3>
+<p>在 Transformer 模型中，MLP（多层感知机）的作用很简单：把输入的特征“揉碎了再重组”，增加模型的非线性能力。</p>
+<p>它通常由两层全连接层（Linear Layer）组成，中间夹一个激活函数。
+*   <strong>输入</strong> -&gt; [放大维度] -&gt; <strong>激活函数</strong> -&gt; [缩小回原维度] -&gt; <strong>输出</strong></p>
+<p><strong>对应代码逻辑：</strong>
+这个类 <code>MLP</code> 就是干这个的。它包含两个主要的层：
+1.  <code>linear_fc1</code>: 第一层，把维度从 $h$ 变大到 $4h$。
+2.  <code>linear_fc2</code>: 第二层，把维度从 $4h$ 变小回 $h$。</p>
+<hr />
+<h3>✅ Task 2: 看懂初始化 (<code>__init__</code>) 里的维度变化</h3>
+<p>看 <code>__init__</code> 函数，核心在定义这两个层。</p>
+<ul>
+<li><strong><code>self.input_size</code></strong>: 输入维度，通常记为 $h$ (Hidden Size)。</li>
+<li><strong><code>ffn_hidden_size</code></strong>: 中间层的维度。通常是 $4 \times h$。<ul>
+<li><em>注意点</em>：代码里有个 <code>if self.config.gated_linear_unit: ffn_hidden_size *= 2</code>。如果是用 SwiGLU 这种高级结构，中间层得加倍（后面 Task 5 会讲）。</li>
+</ul>
+</li>
+</ul>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 第一层：从 input_size (h) -&gt; ffn_hidden_size (4h)</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">linear_fc1</span> <span class="o">=</span> <span class="n">build_module</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_size</span><span class="p">,</span> <span class="n">ffn_hidden_size</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+<span class="c1"># 第二层：从 ffn_hidden_size (4h) -&gt; hidden_size (h)</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">linear_fc2</span> <span class="o">=</span> <span class="n">build_module</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">ffn_hidden_size</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><em>注：这里用了 <code>build_module</code> 而不是 <code>torch.nn.Linear</code>，是因为 Megatron 需要处理多卡并行（把一个大矩阵切开放在不同显卡上），这个函数封装了那些复杂的并行逻辑。</em></p>
+<hr />
+<h3>✅ Task 3: 拆解前向传播 (<code>forward</code>) 的三个步骤</h3>
+<p>这是最核心的部分，数据 <code>hidden_states</code> 进来后经历了什么？</p>
+<p><strong>Step 1: 第一层投影</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># [s, b, h] -&gt; [s, b, 4h]</span>
+<span class="c1"># s=序列长度, b=batch大小</span>
+<span class="n">intermediate_parallel</span><span class="p">,</span> <span class="n">bias_parallel</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">linear_fc1</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+</code></pre></div>
+
+<p>数据通过 FC1，维度变大。注意它返回了结果和偏置(bias)。</p>
+<p><strong>Step 2: 激活函数 (核心逻辑)</strong>
+代码里有一大堆 <code>if/else</code>，其实就是在做：<code>y = Activation(x + bias)</code>。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">bias_activation_fusion</span><span class="p">:</span>
+    <span class="c1"># ... 各种加速优化 ...</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="c1"># 朴素写法：</span>
+    <span class="k">if</span> <span class="n">bias_parallel</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">intermediate_parallel</span> <span class="o">=</span> <span class="n">intermediate_parallel</span> <span class="o">+</span> <span class="n">bias_parallel</span> <span class="c1"># 加偏置</span>
+    <span class="n">intermediate_parallel</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">activation_func</span><span class="p">(</span><span class="n">intermediate_parallel</span><span class="p">)</span> <span class="c1"># 激活 (比如 ReLU, GELU)</span>
+</code></pre></div>
+
+<p><strong>Step 3: 第二层投影</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># [s, b, 4h] -&gt; [s, b, h]</span>
+<span class="n">output</span><span class="p">,</span> <span class="n">output_bias</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">linear_fc2</span><span class="p">(</span><span class="n">intermediate_parallel</span><span class="p">)</span>
+</code></pre></div>
+
+<p>数据通过 FC2，维度变回原样，准备输出。</p>
+<hr />
+<h3>✅ Task 4: 理解“融合算子” (Fusion) 优化的逻辑</h3>
+<p>你会在 <code>forward</code> 里看到很多 <code>bias_gelu_impl</code> 或 <code>bias_swiglu_impl</code>。</p>
+<p><strong>为什么不直接写 <code>GELU(x + bias)</code>？</strong>
+在 GPU 上，<code>x + bias</code> 需要读写一次显存，<code>GELU(...)</code> 又要读写一次显存。显存带宽是瓶颈。
+<strong>Fusion (融合)</strong> 技术就是写一个专门的 C++/CUDA 内核，把“加偏置”和“激活”这两个动作合并成一步完成。只读一次，算完写回。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">bias_activation_fusion</span><span class="p">:</span>
+    <span class="c1"># 如果开启了融合优化，直接调用特制的函数</span>
+    <span class="n">intermediate_parallel</span> <span class="o">=</span> <span class="n">bias_gelu_impl</span><span class="p">(</span><span class="n">intermediate_parallel</span><span class="p">,</span> <span class="n">bias_parallel</span><span class="p">)</span>
+</code></pre></div>
+
+<hr />
+<h3>✅ Task 5: 搞懂 GLU/SwiGLU 是什么鬼</h3>
+<p>这是现代大模型（如 Llama 2/3, Mistral）都在用的技术，比传统的 GELU 效果好。</p>
+<p><strong>原理：</strong>
+传统的激活：$y = Activation(x \cdot W)$
+GLU (门控) 激活：它会有两条路。
+1. 一部分做激活。
+2. 一部分不做激活。
+3. 两个乘起来。
+公式类似：$y = (x \cdot W) \times Activation(x \cdot V)$</p>
+<p>因为需要 $W$ 和 $V$ 两个矩阵，所以中间层的输出维度需要 <strong>x2</strong>（在 Task 2 里提到的 <code>ffn_hidden_size *= 2</code>）。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">gated_linear_unit</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">glu</span><span class="p">(</span><span class="n">x</span><span class="p">):</span>
+        <span class="c1"># 把长长的向量从中间切成两半</span>
+        <span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">chunk</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span> 
+        <span class="c1"># 一半过激活函数，另一半直接乘上去</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">activation_func</span><span class="p">(</span><span class="n">x</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span> <span class="o">*</span> <span class="n">x</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+
+    <span class="n">intermediate_parallel</span> <span class="o">=</span> <span class="n">glu</span><span class="p">(</span><span class="n">intermediate_parallel</span><span class="p">)</span>
+</code></pre></div>
+
+<p>如果是 Fusion 模式，就叫 <code>bias_swiglu_impl</code>，原理一样，速度更快。</p>
+<hr />
+<h3>✅ Task 6: (选修) 分布式存储的噩梦</h3>
+<p>代码下半部分的 <code>sharded_state_dict</code> 和 <code>apply_swiglu_sharded_factory</code> 是最难懂的。</p>
+<p><strong>场景：</strong>
+假设你有 8 张显卡。模型的一个大矩阵被切成了 8 份（Sharded），每张卡存一份。
+当你保存模型（Checkpoint）时，你希望存下来的文件是完整的，或者是按另一种方式切分的。</p>
+<p><strong>SwiGLU 的特殊麻烦：</strong>
+SwiGLU 把两个逻辑矩阵 ($W$ 和 $V$) 拼在一起存在显存里。
+*   显存里是：<code>[W 的一部分 | V 的一部分]</code>
+*   如果你直接存，以后加载时可能会乱。</p>
+<p><strong>代码解释：</strong>
+<code>apply_swiglu_sharded_factory</code> 这个函数就是个<strong>翻译官</strong>。
+它告诉保存程序：“嘿，这个张量虽然看起来是一个整体，但它其实是左右两半拼起来的。你在保存的时候，请把它们拆开，或者按照特定的逻辑记录偏移量 (offsets)，这样下次加载或者改变并行度时，数据才不会错位。”</p>
+<hr />
+<h3>总结</h3>
+<p>这文件讲的是一个 <strong>工业级的、支持超大规模并行训练的 Transformer MLP 层</strong>。</p>
+<ol>
+<li><strong>构造</strong>：两层线性层，中间夹心。</li>
+<li><strong>特色</strong>：支持 SwiGLU（Llama 同款结构，维度翻倍再切分）。</li>
+<li><strong>优化</strong>：支持 Fusion Kernel（把加法和激活合并加速）。</li>
+<li><strong>工程</strong>：包含复杂的分布式 Checkpoint 逻辑，确保几百张卡训练的模型能被正确保存和加载。</li>
+</ol>

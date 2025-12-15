@@ -1,0 +1,113 @@
+<h1>recipe/dapo/test_dapo_dspk_671b_megatron.sh</h1>
+<p>这份脚本确实看起来很复杂，因为它涉及到<strong>DeepSeek-V3 (671B参数)</strong> 这样一个巨型模型的训练，而且是用 <strong>Megatron</strong> 框架在 <strong>多节点（64台机器）</strong> 上进行 <strong>强化学习（PPO/GRPO）</strong> 训练。</p>
+<p>简单来说，这个脚本就是一份<strong>“训练启动说明书”</strong>。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>Task Todo List（行动清单）</strong>，然后分块给你解释每一步在干什么。</p>
+<hr />
+<h3>核心任务清单 (Task Todo List)</h3>
+<p>如果你要运行这个脚本，你需要按顺序完成以下任务：</p>
+<ol>
+<li><strong>[硬件准备]</strong> 确认你有极大规模的计算资源（脚本里默认是 <code>NNODES=64</code>，即64台服务器，每台8张卡，共512张显卡）。</li>
+<li><strong>[环境配置]</strong> 安装好 <code>verl</code> 训练框架和 <code>Megatron-LM</code> 相关的依赖。</li>
+<li><strong>[下载配置]</strong> (对应脚本 Step 0) 从 HuggingFace 下载 DeepSeek 的配置文件。</li>
+<li><strong>[修改配置]</strong> (对应脚本注释) 手动修改下载下来的 <code>config.json</code>，删除量化配置，禁用 MTP 功能。</li>
+<li><strong>[下载权重]</strong> (对应脚本 Step 1) 下载经过转换的 DeepSeek-V3 分布式权重（Megatron格式）。</li>
+<li><strong>[准备数据]</strong> 准备好训练数据（<code>dapo-math-17k</code>）和测试数据（<code>aime-2024</code>）。</li>
+<li><strong>[修改路径]</strong> 将脚本中的 <code>&lt;path_to_...&gt;</code> 替换为你本地的真实路径。</li>
+<li><strong>[启动训练]</strong> 运行脚本。</li>
+</ol>
+<hr />
+<h3>逐步解读 (Step-by-Step Explanation)</h3>
+<p>下面我把脚本切分成几个逻辑块，用大白话给你讲讲每一块在配置什么。</p>
+<h4>第一步：下载与魔改配置文件</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 0. download the config</span>
+<span class="c1"># ...</span>
+huggingface-cli<span class="w"> </span>download<span class="w"> </span>deepseek-ai/DeepSeek-V3-0324<span class="w"> </span>configuration_deepseek.py<span class="w"> </span>config.json
+</code></pre></div>
+
+<ul>
+<li><strong>在干啥</strong>：去 HuggingFace 下载 DeepSeek-V3 的“说明书”（config文件），而不是下载几百GB的模型权重。</li>
+<li><strong>重点</strong>：注释里提醒你，下载完后要<strong>手动修改</strong> <code>config.json</code>：<ul>
+<li>删掉 <code>quantization_config</code>：因为我们要训练，通常不用量化版，要用全精度或BF16。</li>
+<li>设置 <code>num_nextn_predict_layers=0</code>：DeepSeek 有个“多Token预测”功能（MTP），目前的训练框架还不支持，所以要关掉。</li>
+</ul>
+</li>
+</ul>
+<h4>第二步：定义训练算法与超参数</h4>
+<div class="codehilite"><pre><span></span><code><span class="nv">project_name</span><span class="o">=</span><span class="s1">&#39;DAPO&#39;</span>
+<span class="nv">adv_estimator</span><span class="o">=</span>grpo<span class="w">  </span><span class="c1"># 使用 GRPO 算法（DeepSeek-R1 同款思路）</span>
+
+<span class="nv">use_kl_in_reward</span><span class="o">=</span>False<span class="w"> </span><span class="c1"># 不把 KL 散度加到奖励里</span>
+<span class="nv">clip_ratio_low</span><span class="o">=</span><span class="m">0</span>.2<span class="w">     </span><span class="c1"># PPO 算法的截断参数，防止模型更新步子迈太大</span>
+</code></pre></div>
+
+<ul>
+<li><strong>在干啥</strong>：设置强化学习的规则。</li>
+<li><strong>重点</strong>：这里用的是 <strong>GRPO</strong> (Group Relative Policy Optimization)。这是一种不需要额外的“Critic模型”的算法，能节省大量显存，非常适合超大模型训练。</li>
+</ul>
+<h4>第三步：设置数据长度与Batch Size</h4>
+<div class="codehilite"><pre><span></span><code><span class="nv">max_prompt_length</span><span class="o">=</span><span class="k">$((</span><span class="m">1024</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="m">2</span><span class="k">))</span><span class="w">   </span><span class="c1"># 提问最长 2048 token</span>
+<span class="nv">max_response_length</span><span class="o">=</span><span class="k">$((</span><span class="m">1024</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="m">4</span><span class="k">))</span><span class="w"> </span><span class="c1"># 回答最长 4096 token</span>
+
+<span class="nv">train_prompt_bsz</span><span class="o">=</span><span class="m">512</span><span class="w"> </span><span class="c1"># 全局 Batch Size</span>
+<span class="nv">NNODES</span><span class="o">=</span><span class="si">${</span><span class="nv">NNODES</span><span class="k">:-</span><span class="nv">64</span><span class="si">}</span><span class="w"> </span><span class="c1"># 节点数，默认64台机器！</span>
+</code></pre></div>
+
+<ul>
+<li><strong>在干啥</strong>：规定模型能读多长、写多长，以及一次训练吃多少数据。</li>
+<li><strong>重点</strong>：<code>NNODES=64</code> 暴露了这是土豪级训练。如果你只有一台机器，这个脚本跑不起来。</li>
+</ul>
+<h4>第四步：定义模型和数据路径 (最关键的一步)</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. download the dist_ckpt format model ...</span>
+<span class="nv">MODEL_PATH</span><span class="o">=</span><span class="s2">&quot;&lt;path_to_dsv3_config&gt;&quot;</span><span class="w">         </span><span class="c1"># 刚才下载的配置文件路径</span>
+<span class="nv">MCORE_MODEL_PATH</span><span class="o">=</span><span class="s2">&quot;&lt;path_to_..._dist_ckpt&gt;&quot;</span><span class="w"> </span><span class="c1"># 真正的模型权重路径（Megatron格式）</span>
+<span class="nv">TRAIN_FILE</span><span class="o">=</span>...<span class="w">                             </span><span class="c1"># 训练数据 parquet 文件</span>
+</code></pre></div>
+
+<ul>
+<li><strong>在干啥</strong>：告诉程序东西都在哪。</li>
+<li><strong>重点</strong>：DeepSeek-V3 太大了，普通的 HuggingFace 权重加载太慢且显存扛不住。这里用的是 <strong>Dist-Ckpt (分布式权重)</strong>，也就是把大模型切碎了存的，方便多卡并行加载。</li>
+</ul>
+<h4>第五步：设置并行策略 (Parallelism) - 这里的数字最吓人</h4>
+<div class="codehilite"><pre><span></span><code><span class="nv">gen_tp</span><span class="o">=</span><span class="m">32</span><span class="w">    </span><span class="c1"># 生成时的张量并行</span>
+<span class="nv">train_tp</span><span class="o">=</span><span class="m">1</span><span class="w">   </span><span class="c1"># 训练时的张量并行</span>
+<span class="nv">train_ep</span><span class="o">=</span><span class="m">32</span><span class="w">  </span><span class="c1"># 专家并行 (MoE 特有)</span>
+<span class="nv">train_pp</span><span class="o">=</span><span class="m">16</span><span class="w">  </span><span class="c1"># 流水线并行</span>
+</code></pre></div>
+
+<ul>
+<li><strong>在干啥</strong>：把一个巨大的 671B 模型拆解塞进几百张显卡里。<ul>
+<li><strong>TP (Tensor Parallel)</strong>: 把一层的矩阵切开，多张卡一起算。</li>
+<li><strong>EP (Expert Parallel)</strong>: DeepSeek 是 MoE 模型，有几百个专家。EP=32 意味着把专家分发到32组卡上。</li>
+<li><strong>PP (Pipeline Parallel)</strong>: 把模型的层（比如60层）切成16段，像流水线工厂一样，显卡1算完传给显卡2。</li>
+</ul>
+</li>
+<li><strong>为什么这么设</strong>：如果不切分，单张显卡甚至单台服务器（8卡）都放不下模型。</li>
+</ul>
+<h4>第六步：启动命令 (The Grand Finale)</h4>
+<div class="codehilite"><pre><span></span><code>python3<span class="w"> </span>-m<span class="w"> </span>verl.trainer.main_ppo<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--config-path<span class="o">=</span>config<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>...
+<span class="w">    </span>actor_rollout_ref.actor.megatron.param_offload<span class="o">=</span><span class="si">${</span><span class="nv">offload</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>...
+</code></pre></div>
+
+<ul>
+<li><strong>在干啥</strong>：调用 <code>verl</code> 库（一个大模型强化学习库）开始跑 PPO。</li>
+<li><strong>参数解读</strong>：<ul>
+<li><code>actor_rollout_ref</code>: 这是一个混合引擎架构。<ul>
+<li><strong>Actor</strong>: 负责学习（正在训练的模型）。</li>
+<li><strong>Rollout</strong>: 负责做题（生成答案）。</li>
+<li><strong>Ref</strong>: 参考模型（防止训练跑偏）。</li>
+</ul>
+</li>
+<li><code>reward_model.reward_manager=dapo</code>: 使用名为 "dapo" 的自定义奖励计算逻辑（可能包含数学题答案正确性的校验）。</li>
+</ul>
+</li>
+</ul>
+<h3>总结：这个脚本主要讲了啥观点？</h3>
+<p>这不算是“观点”，而是一个<strong>工程实践方案</strong>。它传达了以下信息：</p>
+<ol>
+<li><strong>大模型训练门槛极高</strong>：训练 DeepSeek-V3 这种级别的模型，需要复杂的并行策略（TP+EP+PP）和海量的硬件资源（64节点）。</li>
+<li><strong>GRPO 是趋势</strong>：对于数学/推理任务（脚本里的数据是 math），使用 GRPO 且不强制加 KL 惩罚（<code>use_kl_loss=False</code>），是目前让模型“顿悟”出强推理能力的主流方法。</li>
+<li><strong>显存优化是核心</strong>：脚本里大量的配置（offload=True, 各种并行切分）都是为了解决“模型太大塞不进显存”的问题。</li>
+</ol>

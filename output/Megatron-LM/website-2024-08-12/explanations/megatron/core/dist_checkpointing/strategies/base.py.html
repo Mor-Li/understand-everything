@@ -1,0 +1,139 @@
+<h1>megatron/core/dist_checkpointing/strategies/base.py</h1>
+<p>这份代码确实比较抽象，因为它使用了<strong>面向对象编程（OOP）</strong>中的“抽象基类”和“策略模式”。简单来说，这个文件<strong>不是干活的人，而是给干活的人定的规矩（接口）</strong>。</p>
+<p>为了让你看懂，我为你制定了一个 <strong>Task Todo List</strong>，我们将分 5 个阶段，像剥洋葱一样，一步步揭开它的面纱。</p>
+<hr />
+<h3>Task 1: 理解背景 —— 为什么要搞这么复杂？</h3>
+<p><strong>目标</strong>：明白“分布式检查点（Distributed Checkpointing）”是在解决什么问题。</p>
+<ul>
+<li><strong>背景</strong>：Megatron 是用来训练超大模型的（比如 GPT-3）。模型太大，一张显卡装不下，所以参数被切分（Sharded）到了几百张显卡上。</li>
+<li><strong>痛点</strong>：保存模型时，如果几百张卡同时往一个文件写，或者把所有参数汇聚到一张卡再写，内存会爆，速度会慢死。</li>
+<li><strong>解决</strong>：我们需要不同的“策略”来保存和加载。<ul>
+<li>有的策略是大家存成 PyTorch 原生格式。</li>
+<li>有的策略是存成 Zarr 格式（一种高效数组存储格式）。</li>
+</ul>
+</li>
+<li><strong>结论</strong>：这个文件就是为了<strong>定义所有这些策略必须遵守的共同标准</strong>。</li>
+</ul>
+<hr />
+<h3>Task 2: 区分两种核心数据 —— Common vs. Sharded</h3>
+<p><strong>目标</strong>：理解代码中反复出现的 <code>Common</code> 和 <code>Sharded</code> 是什么意思。</p>
+<p>请看代码中的 <code>StrategyAction</code> 枚举类：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">StrategyAction</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
+    <span class="n">LOAD_COMMON</span> <span class="o">=</span> <span class="s1">&#39;load_common&#39;</span>    <span class="c1"># 加载通用数据</span>
+    <span class="n">LOAD_SHARDED</span> <span class="o">=</span> <span class="s1">&#39;load_sharded&#39;</span>  <span class="c1"># 加载切片数据</span>
+    <span class="n">SAVE_COMMON</span> <span class="o">=</span> <span class="s1">&#39;save_common&#39;</span>    <span class="c1"># 保存通用数据</span>
+    <span class="n">SAVE_SHARDED</span> <span class="o">=</span> <span class="s1">&#39;save_sharded&#39;</span>  <span class="c1"># 保存切片数据</span>
+</code></pre></div>
+
+<ul>
+<li><strong>Common（通用数据）</strong>：<ul>
+<li><strong>是什么</strong>：不需要被切分的小数据。比如：当前的训练步数（iteration）、学习率（learning rate）、简单的配置参数。</li>
+<li><strong>特点</strong>：很小，所有显卡上存的都一样，或者只有主进程需要处理。</li>
+</ul>
+</li>
+<li><strong>Sharded（切片数据/分片数据）</strong>：<ul>
+<li><strong>是什么</strong>：模型的权重（Weights）、优化器的状态（Optimizer States）。</li>
+<li><strong>特点</strong>：巨大无比，被切碎了散落在各个显卡上。这是保存/加载的难点。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 3: 看懂“包工头” —— 抽象基类 (Base Classes)</h3>
+<p><strong>目标</strong>：理解 <code>LoadStrategyBase</code> 和 <code>SaveStrategyBase</code>。</p>
+<p>这部分代码使用了 <code>ABC</code> (Abstract Base Class)。这相当于<strong>制定合同</strong>：如果你想写一个新的保存方法（比如保存到阿里云 OSS），你必须遵守这些规定。</p>
+<ol>
+<li>
+<p><strong>加载策略基类 (<code>LoadStrategyBase</code>)</strong>：</p>
+<ul>
+<li>规定了必须实现 <code>check_version_compatibility</code>（检查版本兼不兼容）。</li>
+<li>规定了必须告诉大家 <code>can_handle_sharded_objects</code>（你能处理被切分的对象吗？）。</li>
+</ul>
+</li>
+<li>
+<p><strong>保存策略基类 (<code>SaveStrategyBase</code>)</strong>：</p>
+<ul>
+<li>初始化时需要 <code>backend</code>（后端，比如 'zarr' 或 'torch_dist'）和 <code>version</code>（版本号）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>Task 4: 细分工种 —— 四个具体的蓝图</h3>
+<p><strong>目标</strong>：对应 Task 2 中的分类，看懂代码中定义的四个具体操作类。</p>
+<p>代码把工作拆得很细，防止一个类太大。</p>
+<ol>
+<li>
+<p><strong><code>LoadCommonStrategy</code> (加载通用数据)</strong></p>
+<ul>
+<li><strong>任务</strong>：只负责加载那些不切分的小数据。</li>
+<li><strong>代码点</strong>：定义了 <code>load_common</code> 方法。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>LoadShardedStrategy</code> (加载切片数据)</strong></p>
+<ul>
+<li><strong>任务</strong>：负责加载那些巨大的、切碎的张量。</li>
+<li><strong>代码点</strong>：<ul>
+<li><code>load(...)</code>: 真正加载数据。</li>
+<li><code>load_tensors_metadata(...)</code>: <strong>这很重要</strong>。在加载几百 GB 的数据前，先只加载“元数据”（比如形状 Shape、数据类型 Dtype），看看内存够不够，或者规划一下怎么读，而不真正把数据读进内存。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong><code>SaveCommonStrategy</code> (保存通用数据)</strong></p>
+<ul>
+<li><strong>任务</strong>：保存小数据。</li>
+<li><strong>代码点</strong>：定义了 <code>save_common</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>SaveShardedStrategy</code> (保存切片数据)</strong></p>
+<ul>
+<li><strong>任务</strong>：保存大切片数据。</li>
+<li><strong>代码点</strong>：定义了 <code>save</code>。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>Task 5: 进阶功能 —— 异步保存与工厂模式</h3>
+<p><strong>目标</strong>：理解代码中剩下的两个高级概念：<code>Async</code> 和 <code>get_default_strategy</code>。</p>
+<ol>
+<li>
+<p><strong>异步保存 (<code>AsyncSaveShardedStrategy</code>)</strong></p>
+<ul>
+<li><strong>场景</strong>：训练大模型很贵，如果保存一次模型要卡住 10 分钟，那太浪费钱了。</li>
+<li><strong>逻辑</strong>：<ul>
+<li><code>async_save</code>: 准备好数据，把写硬盘的操作扔到后台（或者另一个进程）去跑。</li>
+<li>代码最后几行展示了如何调度这个异步请求 (<code>async_calls.schedule_async_request</code>)。</li>
+</ul>
+</li>
+<li><strong>大白话</strong>：你去饭店点菜（Save），服务员记下菜单（AsyncRequest）就走了，厨师在后台做，你可以继续聊天（继续训练），不用干等着菜端上来。</li>
+</ul>
+</li>
+<li>
+<p><strong>工厂函数 (<code>get_default_strategy</code>)</strong></p>
+<ul>
+<li><strong>代码</strong>：
+    <code>python
+    def get_default_strategy(action: StrategyAction, backend: str, version: int):
+        ...</code></li>
+<li><strong>作用</strong>：这是一个“分发器”。</li>
+<li><strong>逻辑</strong>：<ul>
+<li>你告诉它：我要“保存切片数据”(<code>action</code>)，我要用“Zarr格式”(<code>backend</code>)。</li>
+<li>它会检查你有没有装 <code>zarr</code> 的包。</li>
+<li>如果有，它就给你返回对应的策略类。</li>
+</ul>
+</li>
+<li><strong>目的</strong>：让用户不需要知道具体的类名，只需要给配置字符串就行。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>现在回头看这个文件，它其实就讲了三件事：</p>
+<ol>
+<li><strong>分类</strong>：把存取操作分为“小文件（Common）”和“大分片（Sharded）”。</li>
+<li><strong>定规矩</strong>：定义了所有存取操作必须遵守的函数名（<code>load</code>, <code>save</code>, <code>check_compatibility</code>）。</li>
+<li><strong>做管理</strong>：提供了一个函数（<code>get_default_strategy</code>）来根据配置自动分发对应的存取工具。</li>
+</ol>
+<p>它没有任何真正的“读写硬盘”的代码，它只是<strong>所有读写硬盘代码的父类</strong>。</p>

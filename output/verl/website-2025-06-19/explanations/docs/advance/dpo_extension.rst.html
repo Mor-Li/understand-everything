@@ -1,0 +1,82 @@
+<h1>docs/advance/dpo_extension.rst</h1>
+<p>这篇文章确实涉及了很多分布式训练和系统架构的术语，如果对 <code>Ray</code> 或者分布式编程不熟悉，读起来会非常晦涩。</p>
+<p>简单来说，这篇文章在教你：<strong>如何利用 <code>verl</code> 这个框架，把一个新的强化学习算法（以 Online DPO 为例）实现出来。</strong></p>
+<p>它的核心逻辑是：<strong>“一个大脑（主进程）指挥多双手（多GPU进程）”</strong>。</p>
+<p>为了让你更容易理解，我把文中提到的步骤拆解成了一个 <strong>“开发新算法的 Todo List”</strong>。你把它想象成你在组织一个工厂的生产线。</p>
+<hr />
+<h3>🛠️ 任务清单：开发 Online DPO 算法</h3>
+<h4>✅ Task 0: 理解核心设计模式 (Mental Model)</h4>
+<ul>
+<li><strong>目标</strong>：明白谁是指挥，谁是干活的。</li>
+<li><strong>文中的观点</strong>：<ul>
+<li><strong>控制进程 (Controller)</strong>：就像工厂的“厂长”。它运行在 CPU 上，只负责发号施令，不干重活。它手里拿着数据，负责把数据分发下去，再把结果收上来。</li>
+<li><strong>计算进程 (Workers)</strong>：就像流水线上的“工人”。它们运行在 GPU 上，负责繁重的计算（比如模型推理、梯度更新）。</li>
+<li><strong>关键点</strong>：你写的代码主要是在“厂长”这边，通过 API 远程操控“工人”。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 1: 定义“工人”的职责 (Step 1)</h4>
+<ul>
+<li><strong>目标</strong>：确定我们需要哪几种类型的 GPU 任务。</li>
+<li><strong>文中的观点</strong>：在 Online DPO 算法中，我们需要三种工人（对应文中的三个类）：<ol>
+<li><strong>生成工 (SampleGenerator)</strong>：负责拿提示词（Prompt）去生成回复。<ul>
+<li><em>怎么做</em>：写一个类，调用 vLLM 或 HuggingFace 去生成文本。</li>
+</ul>
+</li>
+<li><strong>裁判工 (ReferencePolicy)</strong>：负责给数据算一个“参考概率”（这是 DPO 算法需要的）。<ul>
+<li><em>怎么做</em>：写一个类，加载参考模型，计算 log_prob。</li>
+</ul>
+</li>
+<li><strong>训练工 (DPOActor)</strong>：负责算 Loss 并更新模型参数。<ul>
+<li><em>怎么做</em>：写一个类，加载主模型，用 FSDP 或 Megatron 并行策略，执行 <code>loss.backward()</code> 和 <code>optimizer.step()</code>。</li>
+</ul>
+</li>
+</ol>
+</li>
+<li><strong>总结</strong>：把这些涉及 GPU 的重活封装成 <code>Worker</code> 类，并在上面加上 <code>@ray.remote</code> 标签，让它们能被远程调用。</li>
+</ul>
+<hr />
+<h4>✅ Task 2: 建立“高效通讯机制” (Step 2)</h4>
+<ul>
+<li><strong>目标</strong>：解决“厂长”如何把一大块任务分给多个“工人”，再把结果收回来的问题。</li>
+<li><strong>文中的观点</strong>：<ul>
+<li><strong>痛点</strong>：如果厂长手里有 100 条数据，有 10 个工人。手动写代码把数据切成 10 份，分别发给 10 个工人，再等待 10 个结果拼起来，代码会很难看且难维护。</li>
+<li><strong>解决方案</strong>：使用 <code>verl</code> 提供的 <strong>装饰器 (Decorator)</strong>。</li>
+<li><strong>怎么做</strong>：<ul>
+<li>在工人的方法上加一个 <code>@register</code>。</li>
+<li>告诉系统：数据怎么切（dispatch_fn，比如切成 N 份）？结果怎么拼（collect_fn，比如 <code>torch.cat</code>）？</li>
+<li><strong>效果</strong>：在主程序里，你只需要写一行代码 <code>output = worker_group.func(data)</code>，系统自动帮你完成“切分-分发-计算-收集-拼接”的全过程。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 3: 编写“生产剧本” (Step 3: Main Training Loop)</h4>
+<ul>
+<li><strong>目标</strong>：把上面的东西串起来，写出真正的训练循环。</li>
+<li><strong>文中的观点</strong>：这是算法的主逻辑，写在 <code>main_task</code> 里。</li>
+<li><strong>流程 Todo</strong>：<ol>
+<li><strong>招募工人</strong>：初始化资源池（ResourcePool），把 Task 1 定义的三种工人（生成、裁判、训练）实例化成 <code>WorkerGroup</code>。</li>
+<li><strong>准备数据</strong>：加载 DataLoader。</li>
+<li><strong>开始循环 (For Loop)</strong>：<ul>
+<li><code>sample_gen.generate()</code>: 让生成工造数据。</li>
+<li><code>generate_scores()</code>: (这一步通常比较快，可能不需要 GPU) 给数据打分。</li>
+<li><code>ref_policy.infer()</code>: 让裁判工算参考概率。</li>
+<li><code>dpo_policy.update()</code>: 让训练工拿着上面所有的数据去更新模型。</li>
+</ul>
+</li>
+<li><strong>记录日志</strong>：打印 Loss 等信息。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结文中的核心观点</h3>
+<p>这篇文档其实不是在讲 DPO 算法本身的数学原理，而是在讲 <strong>工程实现模式</strong>：</p>
+<ol>
+<li><strong>不要</strong>在主循环里写底层的分布式通信代码（send/recv）。</li>
+<li><strong>要</strong>把重计算封装成独立的 Worker 类。</li>
+<li><strong>要</strong>利用 <code>verl</code> 的封装（WorkerGroup 和 Decorator），让主循环的代码看起来像是在写单机程序一样简单清晰，但实际上它是在驱动成百上千个 GPU 在工作。</li>
+</ol>
+<p>希望这个 List 能帮你理清思路！</p>

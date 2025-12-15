@@ -1,0 +1,116 @@
+<h1>megatron/inference/text_generation/tokenization.py</h1>
+<p>这份代码确实初看会觉得很乱，因为它混合了两个层面的逻辑：
+1.  <strong>NLP 基础逻辑</strong>：把文字变成数字（Tokenization），把数字变回文字（Detokenization）。
+2.  <strong>分布式系统逻辑</strong>：因为 Megatron 是在大规模集群（很多张显卡）上跑的，所以它需要处理“主显卡（Rank 0）”和“其他显卡”之间的数据同步。</p>
+<p>为了让你看懂，我们把这个文件的功能想象成一个<strong>“翻译官 + 广播员”</strong>的角色。</p>
+<p>假设我们的任务是：<strong>我们要问大模型几个问题，模型生成答案，最后我们把答案打印出来。</strong></p>
+<p>下面是按照这个任务流程列出的 <strong>Todo List</strong>，我们一步步对照代码来讲：</p>
+<hr />
+<h3>第一阶段：准备输入 (Human -&gt; Machine)</h3>
+<p><strong>目标</strong>：把人类的文字问题，转换成所有显卡都能看懂的数字矩阵。</p>
+<h4>Todo 1: 把文字翻译成数字 (Tokenize)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>_tokenize_prompts_and_batch</code> 函数的前半部分。</li>
+<li><strong>解释</strong>：<ul>
+<li>机器不认识 "Hello"，它只认识数字 ID。</li>
+<li>代码会根据你用的模型（GPT, Llama 等），查找对应的字典。</li>
+<li><code>add_BOS</code>：有些模型需要在开头加一个“开始符号”（Start of Sentence），告诉模型“我要开始说话了”。</li>
+</ul>
+</li>
+</ul>
+<h4>Todo 2: 把长短不一的句子“对齐” (Padding)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>_tokenize_prompts_and_batch</code> 函数的后半部分。</li>
+<li><strong>解释</strong>：<ul>
+<li>假设你一次问了两个问题：<ol>
+<li>"你好" (2个token)</li>
+<li>"请解释一下量子力学" (8个token)</li>
+</ol>
+</li>
+<li>为了能把它们放进同一个矩阵（Batch）里并行计算，必须把短的那个补齐，让它们一样长。</li>
+<li>代码逻辑：计算最长的句子长度，然后算出还需要生成多少字 (<code>tokens_to_generate</code>)，最后给短句子后面填满 <code>eod_token</code> (结束符/空白符)，直到大家长度一致。</li>
+</ul>
+</li>
+</ul>
+<h4>Todo 3: 把数据从“主显卡”广播给“所有显卡” (Broadcast)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>tokenize_prompts</code> 函数。</li>
+<li><strong>解释</strong>：<ul>
+<li>在分布式训练中，通常只有“主进程”（Rank 0）负责读取数据和预处理。</li>
+<li>但是，计算是大家一起干的。所以 Rank 0 处理好数据后，必须“广播”给 Rank 1, Rank 2...</li>
+<li><strong>Step 3.1</strong>：先告诉大家矩阵有多大 (<code>broadcast_int_list</code>)。大家收到尺寸后，分配好内存。</li>
+<li><strong>Step 3.2</strong>：把真正的 Token 数据发给大家 (<code>broadcast_tensor</code>)。</li>
+<li><strong>结果</strong>：现在，集群里几百张显卡手里都有了完全一样的输入数据，准备开始计算了。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>第二阶段：处理输出 (Machine -&gt; Human)</h3>
+<p><strong>目标</strong>：显卡计算完了一堆数字，现在要把这些数字变成人能看懂的文字。</p>
+<h4>Todo 4: 把数据从显卡搬回内存 (GPU -&gt; CPU)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>detokenize_generations</code> 函数开头。</li>
+<li><strong>解释</strong>：<ul>
+<li><code>tokens_gpu_tensor.cpu().numpy().tolist()</code>：模型生成的结果是在 GPU 显存里的，Python 处理字符串通常要在 CPU 内存里做。所以第一步是把数据搬运回来，转成普通的 Python 列表。</li>
+</ul>
+</li>
+</ul>
+<h4>Todo 5: 掐头去尾 (Truncate)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>sequence_tokens = sequence_tokens[:length]</code></li>
+<li><strong>解释</strong>：<ul>
+<li>模型生成时可能会生成很多填充用的废话（padding），或者我们只关心有效长度内的内容。这里根据 <code>lengths</code> 截取有效的数字序列。</li>
+</ul>
+</li>
+</ul>
+<h4>Todo 6: 把数字翻译回文字 (Detokenize)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>tokenizer.detokenize(sequence_tokens)</code></li>
+<li><strong>解释</strong>：<ul>
+<li>这是最核心的一步。查字典，把 <code>[101, 7592]</code> 变回 "Hello World"。</li>
+<li>结果存入 <code>prompts_plus_generations</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>Todo 7: (可选) 逐词拆解分析 (Segments)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>if return_segments:</code> 下面的那个大 <code>for</code> 循环。</li>
+<li><strong>解释</strong>：<ul>
+<li>有时候我们需要调试，想知道模型具体是一个词一个词怎么崩出来的（比如 "apple" 是作为一个整体，还是 "ap" + "ple"）。</li>
+<li>这段看起来很乱的 <code>if args.tokenizer_type in ...</code> 代码，其实就是<strong>“方言处理”</strong>。</li>
+<li>不同的模型（Llama2, Llama3, GPT, HuggingFace）用的分词器库不一样，查字典的方法（API）也不一样。<ul>
+<li>有的直接用 <code>decoder[token]</code>。</li>
+<li>有的要用 <code>decode([token])</code>。</li>
+<li>有的要处理字节编码 <code>bytearray(...).decode('utf-8')</code>（处理中文乱码常见）。</li>
+</ul>
+</li>
+<li>这一步把每个 token 单独还原成字符，存入 <code>prompts_plus_generations_segments</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结一下代码结构</h3>
+<ol>
+<li>
+<p><strong><code>tokenize_prompts</code></strong>:</p>
+<ul>
+<li><strong>我是谁</strong>：我是总调度。</li>
+<li><strong>我干啥</strong>：我让 Rank 0 先把数据打包好（调用下面的函数），然后负责把包分发给所有显卡。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>_tokenize_prompts_and_batch</code></strong>:</p>
+<ul>
+<li><strong>我是谁</strong>：我是打包工。</li>
+<li><strong>我干啥</strong>：我把文字变成数字，还要负责把短句子填长（Padding），做成整齐的矩阵。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>detokenize_generations</code></strong>:</p>
+<ul>
+<li><strong>我是谁</strong>：我是翻译官。</li>
+<li><strong>我干啥</strong>：我把显卡算出来的数字拿出来，翻译成人类语言。如果需要，我还负责处理不同模型（Llama/GPT）之间的“方言”差异。</li>
+</ul>
+</li>
+</ol>
+<p>这样看，是不是清晰了一些？它其实就是<strong>输入处理（打包+分发）</strong>和<strong>输出处理（解包+翻译）</strong>的过程。</p>

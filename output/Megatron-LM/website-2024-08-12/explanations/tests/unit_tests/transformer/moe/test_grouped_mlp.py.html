@@ -1,0 +1,98 @@
+<h1>tests/unit_tests/transformer/moe/test_grouped_mlp.py</h1>
+<p>这份代码是一个 <strong>单元测试（Unit Test）</strong> 文件。</p>
+<p>简单来说，它的核心目的是：<strong>验证一种名为“Grouped GEMM”的加速技术在 MoE（混合专家模型）中是否工作正常。</strong></p>
+<p>为了让你听懂，我们可以把这个测试任务想象成你在做一个 <strong>“新旧机器对比实验”</strong>。
+*   <strong>旧机器（Sequential MLP）</strong>：传统的、慢的、但大家都知道它是对的（基准）。
+*   <strong>新机器（Grouped MLP）</strong>：用了新加速技术的、快的、但我们需要证明它没有算错。</p>
+<p>下面我为你列一个 <strong>Task Todo List</strong>，模拟编写在这个测试文件时开发者的思路，一步步带你读懂它。</p>
+<hr />
+<h3>📋 任务清单 (Task Todo List)</h3>
+<ol>
+<li><strong>准备阶段 (Setup)</strong>：同时搭建“旧机器”和“新机器”，确保它们配置一模一样。</li>
+<li><strong>外观检查 (Constructor Test)</strong>：检查两台机器的零件数量（参数量）和形状是否一致。</li>
+<li><strong>初始状态检查 (Init Test)</strong>：确保两台机器启动时的初始设置（权重数值）是一样的。</li>
+<li><strong>运行测试 (Forward Test)</strong>：喂给它们同样的数据，看它们能不能跑通，结果是否一致。</li>
+<li><strong>极端情况测试 (Edge Case)</strong>：如果没有数据喂给某个专家（Expert），机器会不会死机？</li>
+<li><strong>高级测试 (TE Grouped MLP)</strong>：针对特定版本（Transformer Engine），不仅测结果，还要测“反向传播”（梯度）是否一致。</li>
+</ol>
+<hr />
+<h3>🧐 详细步骤讲解</h3>
+<h4>1. 准备阶段 (Setup)</h4>
+<p><strong>代码对应位置：</strong> <code>setup_method</code> 函数</p>
+<ul>
+<li><strong>观点</strong>：要做对比实验，必须控制变量。</li>
+<li><strong>做了什么</strong>：<ul>
+<li>设置了一些基本参数：比如 <code>hidden_size=16</code>（为了测试跑得快，设得很小），<code>num_experts=2</code>（2个专家）。</li>
+<li><strong>搭建旧机器 (<code>self.sequential_mlp</code>)</strong>：设置 <code>moe_grouped_gemm=False</code>。这是传统的做法，它会写一个 <code>for</code> 循环，一个一个地计算专家模型，速度慢但逻辑简单。</li>
+<li><strong>搭建新机器 (<code>self.grouped_mlp</code>)</strong>：设置 <code>moe_grouped_gemm=True</code>。这是要测试的主角，它利用特殊的 CUDA 算子把所有专家的计算合并在一起算，速度快。</li>
+<li><strong>关键点</strong>：使用了 <code>_set_random_seed(123)</code>，保证两次搭建模型时，随机生成的权重是一样的，否则没法比。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 外观检查 (Constructor Test)</h4>
+<p><strong>代码对应位置：</strong> <code>test_constructor</code> 函数</p>
+<ul>
+<li><strong>观点</strong>：新技术的内部结构虽然变了，但总的“零件”数量不能变。</li>
+<li><strong>做了什么</strong>：<ul>
+<li>计算旧机器的总参数量 (<code>num_weights_smm</code>)。</li>
+<li>计算新机器的总参数量 (<code>num_weights_gmm</code>)。</li>
+<li><strong>断言 (Assert)</strong>：两者必须相等。</li>
+<li><strong>检查形状</strong>：新机器使用了 <code>GroupedGEMM</code>，它的权重矩阵通常是把所有专家的权重拼在一起的大矩阵。代码检查了这个大矩阵的 <code>shape</code> 是否符合预期（例如：<code>num_experts * hidden_size</code>）。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 初始状态检查 (Init Test)</h4>
+<p><strong>代码对应位置：</strong> <code>test_weight_init_value_the_same</code> 函数</p>
+<ul>
+<li><strong>观点</strong>：光是参数数量一样不行，里面的数值（权重）也得一模一样，我们才能对比输出结果。</li>
+<li><strong>做了什么</strong>：<ul>
+<li>把新机器的大权重矩阵切片，切成一个个小专家的权重。</li>
+<li>把旧机器里对应专家的权重拿出来。</li>
+<li><strong>断言</strong>：<code>torch.equal(...)</code>，检查每一个数字是否完全相同。</li>
+<li><em>注：代码里提到如果不用 CPU 初始化，有些权重可能微小差异，这是浮点数精度问题。</em></li>
+</ul>
+</li>
+</ul>
+<h4>4. 运行测试 (Forward Test)</h4>
+<p><strong>代码对应位置：</strong> <code>test_gpu_forward</code> 函数</p>
+<ul>
+<li><strong>观点</strong>：是骡子是马，拉出来溜溜。喂数据进去，看能不能跑通。</li>
+<li><strong>做了什么</strong>：<ul>
+<li>造一些假数据 (<code>hidden_states</code>)，比如形状是 <code>[3, 2, 16]</code> 的张量。</li>
+<li>让旧机器跑一遍：<code>output_smm = self.sequential_mlp(hidden_states)</code>。</li>
+<li>让新机器跑一遍：<code>output_gmm = self.grouped_mlp(hidden_states)</code>。</li>
+<li><strong>原本的意图</strong>：应该检查 <code>output_smm</code> 和 <code>output_gmm</code> 是否相等。但代码里注释掉了 <code>assert torch.equal</code>，因为在 GPU 上并行计算和串行计算可能会有极微小的精度误差，或者初始化时有一点点不同，导致严格相等失败。只要能跑通不报错，通常就说明算子没崩。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 极端情况测试 (Edge Case)</h4>
+<p><strong>代码对应位置：</strong> <code>test_gpu_forward_with_no_tokens_allocated</code> 等</p>
+<ul>
+<li><strong>观点</strong>：MoE 模型有个特点，可能某个时刻所有数据都去了“专家A”，而“专家B”没分到任何数据。这时候加速算法不能报错。</li>
+<li><strong>做了什么</strong>：<ul>
+<li>故意构造一个场景，分配给专家的 token 数量是 0 (<code>num_allocated_tokens = 0</code>)。</li>
+<li>尝试运行新机器的计算核心 (<code>gg.ops.gmm</code>)。</li>
+<li><strong>预期</strong>：代码里写了一个 <code>try...except</code>，如果不给 Token 且 batch_size 全为 0，它应该抛出特定的错误提示，或者在某些封装下正常返回空结果（见 <code>test_gradient_with_no_tokens_allocated</code>）。</li>
+<li>这测试了系统的<strong>鲁棒性</strong>。</li>
+</ul>
+</li>
+</ul>
+<h4>6. 高级测试 (TE Grouped MLP)</h4>
+<p><strong>代码对应位置：</strong> <code>class TestTEGroupedMLP</code> (文件的下半部分)</p>
+<ul>
+<li><strong>观点</strong>：这是针对 <strong>Transformer Engine (TE)</strong> 这个库的特定实现进行的更严格测试。TE 是 NVIDIA 推出的一个加速库。</li>
+<li><strong>做了什么</strong>：<ul>
+<li>这个类里的测试逻辑和上面类似，但更严谨。</li>
+<li><strong>特别之处 (<code>test_gpu_forward_backward</code>)</strong>：<ul>
+<li>不仅比较输出结果（Forward）。</li>
+<li>还执行了 <code>.backward()</code>（反向传播）。</li>
+<li><strong>断言</strong>：检查新旧两种方法的<strong>梯度 (Gradient)</strong> 是否也非常接近 (<code>torch.testing.assert_close</code>)。这对于训练模型至关重要，如果梯度不对，模型就训练不收敛。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件的逻辑就是：
+<strong>“我写了一个很炫酷的并行加速算法（Grouped MLP），为了证明它没写由于 Bug 导致算错，我把它和一个最笨但最稳的串行算法放在一起跑，对比它们的参数、权重、前向输出和反向梯度。如果都对上了，说明这个加速算法是可靠的。”</strong></p>

@@ -1,0 +1,123 @@
+<h1>megatron/core/dist_checkpointing/strategies/torch.py</h1>
+<p>这份代码确实比较晦涩，因为它处于两个复杂系统的交界处：<strong>Megatron-Core (MCore)</strong> 的分布式张量管理系统和 <strong>PyTorch 原生</strong> 的分布式检查点系统 (<code>torch.distributed.checkpoint</code>，简称 DCP)。</p>
+<p>简单来说，<strong>这个文件的作用是一个“翻译官”或者“适配器”</strong>。它负责把 MCore 内部定义的切分张量（ShardedTensor），转换成 PyTorch 能听懂的格式，以便利用 PyTorch 的底层功能进行存取。</p>
+<p>为了让你看懂，我把这个文件要做的事情拆解成一个 <strong>Project To-Do List</strong>（任务清单），模拟程序执行的逻辑流程。</p>
+<hr />
+<h3>核心任务清单：如何实现“翻译”与存取</h3>
+<p>这个文件主要定义了两个核心策略类：<code>TorchDistSaveShardedStrategy</code> (负责存) 和 <code>TorchDistLoadShardedStrategy</code> (负责取)。</p>
+<h4>Task 1: 存盘流程 (Saving Workflow)</h4>
+<p><strong>目标</strong>：把显存里切碎的 MCore 张量，存成 PyTorch 格式的文件。</p>
+<ol>
+<li>
+<p><strong>[准备] 整理字典键值 (Flatten Keys)</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>_replace_state_dict_keys_with_sharded_keys</code></li>
+<li><strong>动作</strong>: MCore 的状态字典可能是嵌套的（字典套字典）。第一步要把它们“拍平”成一层，并处理好键名（Key），方便后续索引。</li>
+</ul>
+</li>
+<li>
+<p><strong>[转换] 核心翻译：MCore -&gt; PyTorch (The Translation)</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>mcore_to_pyt_state_dict</code> -&gt; <code>sharded_tensor_to_torch_sharded_tensor</code></li>
+<li><strong>动作</strong>: 这是最难的一步。<ul>
+<li>MCore 说：“我有一个大张量，被切成了很多块，我现在手里拿着第 [x, y] 块。”</li>
+<li>这个函数要把它转换成 PyTorch 的 <code>ShardedTensor</code> 对象。它需要计算：全局形状是多少？我这一块在全局的哪个偏移量（Offset）？</li>
+<li><strong>难点</strong>: 代码中处理了三种情况：普通切分、1D 扁平化切分、N-D 扁平化切分（这是 MCore 特有的优化，需要复杂的数学计算来重组形状）。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>[规划] 制定保存计划 (Planning)</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>MCoreSavePlanner</code></li>
+<li><strong>动作</strong>: 并不是所有 GPU 都把所有数据写到磁盘。这个 Planner 决定谁负责写什么。</li>
+<li><strong>特例</strong>: 它还专门处理了 <code>io.BytesIO</code> 对象（非张量数据），确保这些元数据也能被正确保存。</li>
+</ul>
+</li>
+<li>
+<p><strong>[执行] 异步写入 (Async Write)</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>TorchDistSaveShardedStrategy.async_save</code></li>
+<li><strong>动作</strong>: 调用 PyTorch 的 <code>FileSystemWriterAsync</code>。因为保存很慢，所以是“异步”的，程序可以继续跑，后台慢慢写磁盘。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>Task 2: 读盘流程 (Loading Workflow)</h4>
+<p><strong>目标</strong>：从磁盘读取文件，还原成 MCore 需要的切分张量格式。</p>
+<ol>
+<li>
+<p><strong>[准备] 读取元数据 (Read Metadata)</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>get_reformulation_metadata</code></li>
+<li><strong>动作</strong>: 先读一下文件头，看看存了哪些张量，它们的原始形状是什么。特别是对于那些“N-D 扁平化”的特殊张量，需要获取它们变形前的形状。</li>
+</ul>
+</li>
+<li>
+<p><strong>[重组] 计算切分逻辑 (Resharding Logic)</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>apply_nd_flattened_tensors_reformulation</code></li>
+<li><strong>动作</strong>: 因为读取时的 GPU 数量可能和保存时不一样（比如 8卡存，4卡读）。这里需要根据元数据，重新计算当前每个 GPU 应该加载哪一部分数据。</li>
+</ul>
+</li>
+<li>
+<p><strong>[转换] 建立空壳 (Setup Empty Shells)</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>mcore_to_pyt_state_dict</code> (带 <code>is_loading=True</code> 参数)</li>
+<li><strong>动作</strong>: 在显存里先创建好一堆“空的”PyTorch ShardedTensor，告诉 PyTorch：“一会儿请把数据填到这里面”。</li>
+</ul>
+</li>
+<li>
+<p><strong>[执行] 加载数据 (Load)</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>checkpoint.load_state_dict</code></li>
+<li><strong>动作</strong>: 调用 PyTorch 原生接口，从磁盘读取数据并填充到刚才建立的空壳里。</li>
+<li><strong>细节</strong>: <code>MCoreLoadPlanner</code> 会在这里发挥作用，它会校验加载进来的形状是否匹配，并处理 FP8（8位浮点数）张量的特殊内存连续性问题。</li>
+</ul>
+</li>
+<li>
+<p><strong>[还原] 逆向翻译：PyTorch -&gt; MCore (Unwrap)</strong></p>
+<ul>
+<li><strong>代码位置</strong>: <code>_unwrap_pyt_sharded_tensor</code></li>
+<li><strong>动作</strong>: 数据加载完了，现在手里是 PyTorch 的对象。需要把里面的 Tensor 数据取出来，塞回 MCore 的对象里，并恢复之前“拍平”的字典结构。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>关键类与函数速查表</h3>
+<p>如果你要读代码，重点关注这几个部分：</p>
+<ul>
+<li>
+<p><strong><code>sharded_tensor_to_torch_sharded_tensor</code></strong>:</p>
+<ul>
+<li><strong>作用</strong>: <strong>核心转换器</strong>。</li>
+<li><strong>看点</strong>: 里面有很多 <code>if/else</code> 判断 <code>has_flattened_range</code>，这是在处理 MCore 为了性能把多维张量拉直（Flatten）后的特殊情况。它要把这些拉直的张量在逻辑上映射回全局的多维视角，以便 PyTorch 理解。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>MCoreSavePlanner</code> / <code>MCoreLoadPlanner</code></strong>:</p>
+<ul>
+<li><strong>作用</strong>: <strong>指挥官</strong>。</li>
+<li><strong>看点</strong>: 继承自 PyTorch 的 <code>DefaultPlanner</code>。主要修改了如何处理非 Tensor 数据（BytesIO）以及在加载时对 FP8 数据做内存连续化处理（<code>resolve_tensor</code> 方法）。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>TorchDistSaveShardedStrategy</code></strong>:</p>
+<ul>
+<li><strong>作用</strong>: <strong>保存策略入口</strong>。</li>
+<li><strong>看点</strong>: <code>async_save</code> 方法。它整合了上述所有步骤：转换字典 -&gt; 生成计划 -&gt; 异步写入。它还支持缓存元数据（<code>cached_metadata</code>），这样在训练中频繁保存 checkpoint 时不用每次都重新计算结构，提升速度。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>TorchDistLoadShardedStrategy</code></strong>:</p>
+<ul>
+<li><strong>作用</strong>: <strong>加载策略入口</strong>。</li>
+<li><strong>看点</strong>: <code>load</code> 方法。它不仅要加载，还要处理“Resharding”（重切分）。比如你用 TP=4 (张量并行) 训练存的模型，想在 TP=2 的环境下加载，这个类里的逻辑就要负责处理这种形状变化。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这篇代码其实就是在回答一个问题：
+<strong>“PyTorch 标准库不懂 Megatron 是怎么切分模型的，我该怎么把 Megatron 的切分方式‘骗’过 PyTorch，让它以为这就是它自己标准的切分方式，从而帮我存文件？”</strong></p>
+<p>代码里大量的逻辑（比如处理 <code>flattened_range</code>、<code>prepend_axis_num</code>）都是为了抹平这两个系统之间的数据结构差异。</p>

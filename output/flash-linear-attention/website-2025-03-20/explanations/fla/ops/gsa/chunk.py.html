@@ -1,0 +1,105 @@
+<h1>fla/ops/gsa/chunk.py</h1>
+<p>这份代码确实非常硬核，因为它结合了<strong>线性注意力（Linear Attention）</strong>、<strong>RNN（循环神经网络）</strong>以及<strong>Triton GPU 编程</strong>。看不懂是很正常的。</p>
+<p>为了让你能够消化这份代码，我为你设计了一个由浅入深的 <strong>“学习任务清单 (To-Do List)”</strong>。我们不直接看代码细节，而是先看它想干什么，再看它是怎么实现的。</p>
+<p>以下是你的 5 个阶段任务：</p>
+<hr />
+<h3>✅ Task 1：搞懂核心概念 —— 什么是 GSA？</h3>
+<p><strong>目标</strong>：理解这个算法的数学逻辑，而不是代码逻辑。</p>
+<p>这份代码实现的是 <strong>GSA (Gated Slot Attention)</strong> 的一种变体。
+普通的注意力机制是 $Attention(Q, K, V)$。而 GSA 引入了一个中间变量 <strong>$S$ (Slots, 槽位)</strong>。它的逻辑是“两步走”：</p>
+<ol>
+<li><strong>第一步 (K-Step)</strong>：用 Query ($Q$) 和 Key ($K$) 去筛选 Slot ($S$) 里的信息，计算出一组“注意力分数”或“门控值”。<ul>
+<li>逻辑公式：$O_k = \text{Attention}(Q, K, S)$</li>
+</ul>
+</li>
+<li><strong>第二步 (Softmax)</strong>：对这个分数做归一化，得到概率 $P$。<ul>
+<li>逻辑公式：$P = \text{Softmax}(O_k)$</li>
+</ul>
+</li>
+<li><strong>第三步 (V-Step)</strong>：用这个概率 $P$ 作为新的 Query，去 Slot ($S$) 里提取最终的 Value ($V$)。<ul>
+<li>逻辑公式：$Output = \text{Attention}(P, S, V)$</li>
+</ul>
+</li>
+</ol>
+<p><strong>🔑 关键点</strong>：这就像是一个“双层路由”系统。先通过 Q/K 找到“我们要用哪些 Slot”，然后再从这些 Slot 里把 V 拿出来。</p>
+<hr />
+<h3>✅ Task 2：搞懂架构策略 —— 什么是 "Chunk" (分块)？</h3>
+<p><strong>目标</strong>：理解为什么不直接算，而是要分块。</p>
+<p>如果序列长度 $T$ 很长（比如 100k），直接算 $Q \times K^T$ 显存会爆炸。
+这份代码采用了 <strong>Chunk (分块)</strong> 策略，把长序列切成很多小块（比如每块长度 64）。</p>
+<ul>
+<li><strong>块内 (Intra-chunk)</strong>：在小块内部，把它当成普通的 Attention 算（矩阵乘法）。因为块很小，所以很快。</li>
+<li><strong>块间 (Inter-chunk)</strong>：块与块之间，把它当成 RNN 算。上一个块算完，把一个“记忆状态” ($H$) 传给下一个块。</li>
+</ul>
+<p><strong>🔑 关键点</strong>：既有 Attention 的并行能力（块内），又有 RNN 的线性复杂度（块间）。</p>
+<hr />
+<h3>✅ Task 3：代码映射 —— 追踪数据流向</h3>
+<p><strong>目标</strong>：在 Python 函数层找到 Task 1 中说的“三步走”。</p>
+<p>请打开代码，定位到 <code>chunk_gsa_fwd</code> 函数（大约第 660 行左右），这是前向传播的总入口。</p>
+<ol>
+<li>
+<p><strong>对应 Task 1 的第一步</strong>：
+    <code>python
+    # 调用 chunk_gsa_fwd_k
+    # 注意参数：v=s。这里把 Slot(s) 当作 Value 传进去了
+    Ak, hk, hkt, ok = chunk_gsa_fwd_k(q=q, k=k, v=s, ...)</code>
+    这里计算出了 <code>ok</code> (即 $O_k$)。</p>
+</li>
+<li>
+<p><strong>对应 Task 1 的第二步</strong>：
+    <code>python
+    # 对 ok 做 Softmax，得到概率 p
+    p = softmax_fwd(ok, dtype=torch.float)</code></p>
+</li>
+<li>
+<p><strong>对应 Task 1 的第三步</strong>：
+    <code>python
+    # 调用 chunk_gsa_fwd_v
+    # 注意参数：q=qv (即上面的 p), k=s。
+    # 这次把 概率p 当作 Query，把 Slot(s) 当作 Key，去查 v
+    Av, hv, hvt, ov = chunk_gsa_fwd_v(q=qv, k=s, v=v, ...)</code>
+    这里计算出了最终输出 <code>ov</code>。</p>
+</li>
+</ol>
+<p><strong>🔑 关键点</strong>：代码复用了同一个计算逻辑（<code>chunk_gsa_fwd_k/v</code> 其实底层逻辑类似），只是传入的 Q/K/V 参数不同，实现了两步走的逻辑。</p>
+<hr />
+<h3>✅ Task 4：攻克 Triton 内核 —— 它是怎么加速的？</h3>
+<p><strong>目标</strong>：理解那些以 <code>kernel</code> 结尾的函数在干嘛。</p>
+<p>代码里有一大堆 <code>@triton.jit</code> 的函数，那是 GPU 上的汇编级优化。我们主要看 <code>chunk_gsa_fwd_k</code> 里面调用的两个核：</p>
+<ol>
+<li><strong><code>chunk_gsa_fwd_k_kernel_inter</code> (Inter = 块间)</strong><ul>
+<li><strong>作用</strong>：处理 RNN 部分。</li>
+<li><strong>逻辑</strong>：读取上一个块传过来的“记忆” $h$，计算 $Q \times h$。这部分捕捉了<strong>全局历史信息</strong>。</li>
+</ul>
+</li>
+<li><strong><code>chunk_gsa_fwd_k_kernel_intra</code> (Intra = 块内)</strong><ul>
+<li><strong>作用</strong>：处理 Attention 部分。</li>
+<li><strong>逻辑</strong>：在当前的 64 个 token 内部，计算 $Q \times K^T$，然后乘以 $V$（注意这里的 V 其实是 S）。这部分捕捉了<strong>局部详细信息</strong>。</li>
+</ul>
+</li>
+</ol>
+<p>最后把这两部分的结果加起来，就是最终结果。</p>
+<hr />
+<h3>✅ Task 5：总结输入输出 —— 怎么用这个东西？</h3>
+<p><strong>目标</strong>：看懂最下面的 <code>chunk_gsa</code> 接口函数。</p>
+<p>定位到文件末尾的 <code>chunk_gsa</code> 函数：</p>
+<ul>
+<li><strong>输入</strong>：<ul>
+<li><code>q, k, v</code>: 也就是 Query, Key, Value。</li>
+<li><code>s</code>: <strong>Slot representations</strong>。这是 GSA 特有的输入。</li>
+<li><code>g</code>: <strong>Forget gates</strong> (遗忘门)。用来控制 RNN 记忆衰减的，决定多少历史信息被遗忘。</li>
+</ul>
+</li>
+<li><strong>输出</strong>：<ul>
+<li><code>o</code>: 最终的 Attention 输出。</li>
+<li><code>final_state</code>: 最后的记忆状态（如果你想接着生成下一个 token，就需要这个）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结建议</h3>
+<p>不要试图一行行读 Triton kernel（那些 <code>tl.load</code>, <code>tl.dot</code>），除非你要修改底层算法。</p>
+<p><strong>你应该关注的重点是：</strong>
+1.  <strong><code>chunk_gsa_fwd</code></strong>：看它如何串联 K-step 和 V-step。
+2.  <strong><code>chunk_gsa_fwd_k</code></strong>：看它如何准备数据，然后分别调用 <code>inter</code>（RNN部分）和 <code>intra</code>（Attention部分）的 kernel。</p>
+<p>按照这个逻辑再去读代码，你会发现它清晰很多！</p>

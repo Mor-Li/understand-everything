@@ -1,0 +1,82 @@
+<h1>fla/modules/fused_bitlinear.py</h1>
+<p>这份代码的核心目的是为了实现 <strong>“1-bit LLM”</strong>（1比特大语言模型，参考了 BitNet b1.58 等论文）。</p>
+<p>简单来说，它的目标是：<strong>把神经网络中原本占用显存大、计算慢的浮点数（FP16/BF16），强行压缩成极小的整数（比如 -1, 0, 1 或者 8-bit 整数），并且为了跑得快，把几个步骤“融合（Fuse）”在一起在 GPU 上一次性算完。</strong></p>
+<p>为了让你看懂，我把这份代码拆解成一个 <strong>“开发者的 Todo List”</strong>，按照逻辑顺序一步步带你读。</p>
+<hr />
+<h3>📝 开发任务清单 (Todo List)</h3>
+<h4>✅ Task 1: 定义“压缩”规则 (Quantization Functions)</h4>
+<p><strong>目标</strong>：我们需要两个函数，一个把输入数据（Activations）变小，一个把权重（Weights）变小。</p>
+<ul>
+<li><strong>代码位置</strong>：<code>activation_quant</code> 和 <code>weight_quant</code> 函数。</li>
+<li><strong>原理解析</strong>：<ul>
+<li><strong><code>activation_quant(x)</code></strong>: 把输入数据压缩到 8-bit 整数范围（-128 到 127）。<ul>
+<li><em>怎么做？</em> 找出绝对值最大的数，算一个比例尺（scale），然后除以这个比例尺并四舍五入。</li>
+</ul>
+</li>
+<li><strong><code>weight_quant(w)</code></strong>: 把权重压缩到 <strong>1.58-bit</strong>（即只有 -1, 0, +1 三种状态）。<ul>
+<li><em>怎么做？</em> 算出权重的平均绝对值作为比例尺，然后把权重强行变成 -1, 0 或 1。这是 BitNet b1.58 的核心魔法。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 编写极速“前向传播”内核 (Fused Forward Kernel)</h4>
+<p><strong>目标</strong>：普通的 PyTorch 写法是 <code>LayerNorm -&gt; 读写显存 -&gt; Quantize -&gt; 读写显存 -&gt; Linear</code>。太慢了！我们要用 Triton 写一个 GPU 内核，把 <strong>LayerNorm（归一化）</strong> 和 <strong>Quantization（量化）</strong> 合并成一步。</p>
+<ul>
+<li><strong>代码位置</strong>：<code>layer_norm_fwd_kernel_quant</code> (Triton kernel)。</li>
+<li><strong>步骤拆解</strong>：<ol>
+<li><strong>读取数据</strong>：从显存加载输入 <code>X</code>。</li>
+<li><strong>计算归一化</strong>：计算均值和方差，执行 RMSNorm 或 LayerNorm（把数据拉平，防止过大过小）。</li>
+<li><strong>直接量化 (关键点)</strong>：在数据还在 GPU 寄存器里没写回显存时，直接应用 Task 1 中的压缩逻辑（计算 scale，四舍五入）。</li>
+<li><strong>写回结果</strong>：把处理好且压缩过的数据 <code>Y</code> 写回显存。</li>
+</ol>
+</li>
+<li><strong>为什么这么做？</strong> 省去了中间频繁读写显存的时间，大幅提升速度。</li>
+</ul>
+<h4>✅ Task 3: 编写省显存的“反向传播”内核 (Fused Backward Kernel)</h4>
+<p><strong>目标</strong>：训练模型需要算梯度。通常为了算梯度，我们需要保存前向传播时的中间结果，但这很占显存。我们要实现“重计算（Recomputation）”。</p>
+<ul>
+<li><strong>代码位置</strong>：<code>layer_norm_bwd_kernel</code> (Triton kernel)。</li>
+<li><strong>核心逻辑</strong>：<ul>
+<li>注意参数 <code>RECOMPUTE_OUTPUT</code>。</li>
+<li>在算梯度时，我们<strong>不依赖</strong>前向传播保存的巨大输出张量。相反，我们在反向传播时，利用输入 <code>X</code> 和权重 <code>W</code> <strong>现场重新算一遍</strong>输出 <code>Y</code>。</li>
+<li>虽然多算了一次，但因为显存读写减少了（不用存那个巨大的 <code>Y</code>），整体反而可能更快，且极大地节省了显存。</li>
+<li>同时计算 <code>DX</code> (输入的梯度), <code>DW</code> (权重的梯度), <code>DB</code> (偏置的梯度)。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 包装成 PyTorch 能用的“胶水层” (Autograd Function)</h4>
+<p><strong>目标</strong>：上面写的 Triton 内核是底层的，PyTorch 的 <code>backward()</code> 不知道怎么调用它。我们需要写一个 <code>torch.autograd.Function</code> 来连接它们。</p>
+<ul>
+<li><strong>代码位置</strong>：<code>LayerNormLinearQuantFn</code> 类。</li>
+<li><strong>功能</strong>：<ul>
+<li><strong><code>forward</code></strong>: 调用 Task 2 写的 <code>layer_norm_fwd_quant</code>。如果是训练模式，它会保存必要的参数（如 <code>mean</code>, <code>rstd</code>），但为了省显存，它<strong>不保存</strong>量化后的输出 <code>y</code>（除非是为了调试）。</li>
+<li><strong><code>backward</code></strong>: 当 PyTorch 需要反向传播时，它调用 Task 3 写的 <code>layer_norm_bwd</code>。这里会利用 <code>dout</code>（输出的梯度）算出所有参数的梯度。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 提供给用户的最终接口 (The Modules)</h4>
+<p><strong>目标</strong>：用户不想看内核代码，他们只想要一个像 <code>nn.Linear</code> 一样好用的层。</p>
+<ul>
+<li><strong>代码位置</strong>：<ol>
+<li><strong><code>BitLinear</code> 类</strong>：这是一个<strong>参考实现</strong>（慢速版）。它直接用 PyTorch 原生算子拼凑出逻辑。<ul>
+<li>流程：<code>RMSNorm</code> -&gt; <code>activation_quant</code> -&gt; <code>weight_quant</code> -&gt; <code>F.linear</code>。</li>
+<li><em>用途</em>：用于验证逻辑正确性，或者在不支持 Triton 的机器上跑。</li>
+</ul>
+</li>
+<li><strong><code>FusedBitLinear</code> 类</strong>：这是<strong>高性能版</strong>。<ul>
+<li>它继承自 <code>BitLinear</code>，但在 <code>forward</code> 里直接调用了 Task 4 写的 <code>layer_norm_linear_quant_fn</code>。</li>
+<li><em>用途</em>：实际训练和推理使用，速度快，显存占用低。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结：这代码到底讲了啥？</h3>
+<p><strong>一句话总结</strong>：
+这是一个<strong>高性能的、融合了归一化（LayerNorm）和量化（Quantization）的线性层实现</strong>，专门用于训练 1.58-bit 的超低精度大模型。</p>
+<p><strong>它的核心价值</strong>：
+1.  <strong>省显存</strong>：通过 Triton 内核在前向和后向传播中融合算子，并使用“重计算”技术，避免存储巨大的中间激活值。
+2.  <strong>低精度</strong>：实现了 BitNet 的核心思想，权重只有 -1, 0, 1，输入只有 8-bit，理论上比传统 FP16 运算快得多且模型更小。</p>
+<p>你现在再看代码，关注 <code>FusedBitLinear</code> -&gt; <code>layer_norm_linear_quant_fn</code> -&gt; <code>layer_norm_fwd_kernel_quant</code> 这条线，就能看懂数据是怎么流动的了。</p>

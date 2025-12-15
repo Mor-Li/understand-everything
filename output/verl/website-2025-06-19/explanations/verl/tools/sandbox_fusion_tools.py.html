@@ -1,0 +1,94 @@
+<h1>verl/tools/sandbox_fusion_tools.py</h1>
+<p>这份代码其实是一个<strong>“中间人”或者“代理管家”</strong>。它的核心作用是让大模型（LLM）能够安全地执行代码。</p>
+<p>因为直接让大模型在本地服务器跑代码太危险（可能会把服务器搞挂），所以这个脚本负责把代码发给一个专门的<strong>“沙盒环境”（Sandbox Fusion）</strong>去跑，并管理并发量（别发太快把沙盒挤爆了）。</p>
+<p>为了让你看懂，我把这个文件的运行逻辑拆解成一个 <strong>Task Todo List（任务清单）</strong>。想象你就是这个程序，你需要按顺序完成以下任务：</p>
+<hr />
+<h3>📋 任务清单：代码执行管家的工作流程</h3>
+<h4>✅ Task 1: 开张准备（初始化阶段）</h4>
+<p><strong>对应代码：</strong> <code>SandboxFusionTool.__init__</code> 和 <code>init_execution_pool</code></p>
+<p>在你（程序）刚启动的时候，你需要组建好团队。
+1.  <strong>读取配置</strong>：看看老板（Config）给了多少预算。比如 <code>num_workers</code>（雇几个工人）、<code>rate_limit</code>（每秒允许处理多少单）、<code>sandbox_fusion_url</code>（那个负责真正跑代码的沙盒地址在哪里）。
+2.  <strong>雇佣安保（限流器）</strong>：
+    *   代码里叫 <code>TokenBucketWorker</code>。
+    *   <strong>职责</strong>：它手里拿着令牌（Token）。如果有人要执行代码，必须先找它拿令牌。如果令牌发完了，后面的人就得排队。这是为了防止瞬间请求太多把系统打崩。
+3.  <strong>雇佣工人（执行池）</strong>：
+    *   代码里叫 <code>ExecutionWorker</code> 和 <code>init_execution_pool</code>。
+    *   <strong>职责</strong>：这群工人利用 <code>Ray</code>（一个分布式计算框架）在后台待命，准备随时处理代码执行请求。</p>
+<h4>✅ Task 2: 接待客户（创建会话）</h4>
+<p><strong>对应代码：</strong> <code>SandboxFusionTool.create</code></p>
+<p>当大模型想要开始做一道题或者执行一次任务时：
+1.  <strong>生成身份证</strong>：给这次任务发一个唯一的 ID (<code>uuid4</code>)。
+2.  <strong>建档</strong>：在内存字典 <code>_instance_dict</code> 里开辟一块空间，准备记录这次任务的输入、输出和奖励。</p>
+<h4>✅ Task 3: 处理订单（核心：执行代码）</h4>
+<p><strong>对应代码：</strong> <code>SandboxFusionTool.execute</code> -&gt; <code>ExecutionWorker.execute</code> -&gt; <code>SandboxFusionTool.execute_code</code></p>
+<p>这是最复杂的一步，大模型把写好的 Python 代码传过来了，你需要按步骤处理：</p>
+<ul>
+<li>
+<p><strong>Step 3.1: 检查排队 (Rate Limit)</strong></p>
+<ul>
+<li>工人接到代码后，先问安保 (<code>TokenBucketWorker</code>)：“我现在能去跑代码吗？”</li>
+<li>代码逻辑：<code>rate_limit_worker.acquire.remote()</code>。如果人太多，就在这等着，直到拿到令牌。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.2: 外包执行 (Send to Sandbox)</strong></p>
+<ul>
+<li>拿到令牌后，工人调用 <code>execute_code</code> 函数。</li>
+<li>这个函数并没有在本地跑代码，而是把代码打包，通过网络发送给 <code>sandbox_fusion_url</code>（那个远程的沙盒环境）。</li>
+<li>代码逻辑：调用 <code>_process_single_case</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.3: 拿回结果 (Get Result)</strong></p>
+<ul>
+<li>远程沙盒跑完代码，会返回结果（比如打印了 "Hello World" 或者报错信息）。</li>
+<li>你需要把这个结果（<code>stdout</code>）提取出来。</li>
+<li>如果沙盒没跑通，就返回 "no stdout here"。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.4: 归还令牌 (Release Token)</strong></p>
+<ul>
+<li>不管执行成功还是失败，都要告诉安保：“我完事了，把令牌还给你，让下一个人进来吧。”</li>
+<li>代码逻辑：<code>rate_limit_worker.release.remote</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 结算与清理（收尾）</h4>
+<p><strong>对应代码：</strong> <code>SandboxFusionTool.calc_reward</code> 和 <code>SandboxFusionTool.release</code></p>
+<ol>
+<li><strong>计算奖励</strong>：如果需要训练模型，这里会返回任务的得分（代码里目前只是简单返回记录的 reward）。</li>
+<li><strong>销毁档案</strong>：任务结束，把 <code>_instance_dict</code> 里对应的那个 ID 的数据删掉，释放内存。</li>
+</ol>
+<hr />
+<h3>总结一下代码里的几个关键角色：</h3>
+<ol>
+<li>
+<p><strong><code>SandboxFusionTool</code> (大管家)</strong>:</p>
+<ul>
+<li>面向用户（LLM）的接口。用户只管调它的 <code>execute</code>，不用管后面怎么排队、怎么发请求。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>TokenBucketWorker</code> (门口保安)</strong>:</p>
+<ul>
+<li>基于 <code>Ray</code> 的 Actor。</li>
+<li><strong>作用</strong>：限流。它用信号量 (<code>Semaphore</code>) 控制并发，保证同时跑代码的任务不会超过设定的 <code>rate_limit</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>ExecutionWorker</code> (打工仔)</strong>:</p>
+<ul>
+<li>基于 <code>Ray</code> 的 Actor。</li>
+<li><strong>作用</strong>：干苦力。它负责去拿令牌，然后去调函数。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>_process_single_case</code> (外包公司)</strong>:</p>
+<ul>
+<li>这是一个从外部导入的工具函数。它负责真正的“脏活累活”——把代码发给远程服务器运行并拿回结果。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话概括：</strong>
+这个文件定义了一个工具，利用 Ray 框架实现了<strong>带限流功能</strong>的<strong>远程代码执行</strong>客户端。</p>

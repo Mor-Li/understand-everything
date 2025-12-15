@@ -1,0 +1,92 @@
+<h1>recipe/dapo/dapo_ray_trainer.py</h1>
+<p>这份代码是一个基于 <strong>Ray</strong> 分布式框架的 <strong>PPO (Proximal Policy Optimization)</strong> 训练脚本，专门用于大模型（LLM）的强化学习训练。</p>
+<p>它继承自 <code>RayPPOTrainer</code>，核心逻辑在 <code>fit()</code> 函数中。简单来说，它的工作就是：<strong>指挥</strong>一群工人（GPU Workers）去生成数据、打分、计算优势，然后更新模型。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“项目经理的 To-Do List”</strong>。想象你就是这个脚本（Driver 进程），你需要按顺序完成以下任务清单：</p>
+<hr />
+<h3>📋 任务清单：DAPO PPO 训练流程</h3>
+<h4>第一阶段：准备工作 (Setup)</h4>
+<ol>
+<li><strong>[ ] 启动日志记录员</strong> (<code>logger = Tracking(...)</code>)<ul>
+<li>准备好记录训练过程中的各种指标（Loss, Reward 等）。</li>
+</ul>
+</li>
+<li><strong>[ ] 加载存档</strong> (<code>_load_checkpoint()</code>)<ul>
+<li>如果是断点续训，把之前的模型参数读进来。</li>
+</ul>
+</li>
+<li><strong>[ ] 考前摸底 (可选)</strong> (<code>_validate()</code>)<ul>
+<li>在正式训练前，先跑一遍验证集，看看模型现在的水平。</li>
+</ul>
+</li>
+</ol>
+<h4>第二阶段：开始训练循环 (Training Loop)</h4>
+<p><em>这是一个大循环，每一轮（Epoch）都要做，直到训练结束。</em></p>
+<p><strong>Step 1: 获取题目 (Get Prompt)</strong>
+*   <strong>[ ] 从数据加载器拿一批 Prompt</strong> (<code>batch_dict</code>)
+    *   比如：“请写一首关于春天的诗”。
+    *   把这些非 Tensor 数据转成 <code>DataProto</code> 格式。</p>
+<p><strong>Step 2: 让模型做题 (Rollout / Generation)</strong>
+*   <strong>[ ] 指挥 Actor 节点生成回复</strong> (<code>actor_rollout_wg.generate_sequences</code>)
+    *   发指令给 GPU Worker，让它们根据 Prompt 生成答案（Response）。
+    *   <em>（可选分支 REMAX）</em>：如果配置了 REMAX 算法，还需要生成基线数据。
+*   <strong>[ ] 数据复制与对齐</strong>
+    *   为了减少方差，通常一个 Prompt 会生成 <code>n</code> 个不同的回答，这里要把数据复制扩充一下。</p>
+<p><strong>Step 3: 给作业打分 (Reward Computation)</strong>
+*   <strong>[ ] 计算奖励模型分数</strong> (<code>rm_wg.compute_rm_score</code>)
+    *   如果有独立的 Reward Model (RM)，让 RM 给生成的答案打分。
+*   <strong>[ ] 结合规则打分</strong> (<code>reward_fn</code>)
+    *   把 RM 的分数和预设的规则分数（比如格式是否正确）结合起来。
+*   <strong>[ ] 计算 KL 惩罚</strong> (<code>apply_kl_penalty</code>)
+    *   如果生成的答案偏离原始模型太远，扣分！(防止模型为了高分乱说话)。</p>
+<p><strong>Step 4: 筛选数据 (Filtering - DAPO 的核心差异)</strong>
+*   <em>这是这段代码比较特殊的地方：</em>
+*   <strong>[ ] 检查是否开启筛选</strong> (<code>if config.algorithm.filter_groups.enable</code>)
+*   <strong>[ ] 计算分数的标准差 (Std)</strong>
+    *   对于同一个 Prompt 生成的多个回答，计算它们得分的差异。
+*   <strong>[ ] 过滤无用数据</strong>
+    *   如果标准差是 0（说明生成的回答得分全一样，没有对比价值），或者只有一个回答，可能就扔掉。
+    *   只保留那些 <strong>“有优有劣”</strong> 的数据（<code>std &gt; 0</code>），这样模型才能学到什么是好，什么是坏。
+*   <strong>[ ] 凑够一个 Batch</strong>
+    *   如果过滤完剩下的数据不够一个 Batch 大小，<strong>跳回到 Step 1</strong>，继续生成，直到凑够数据为止。</p>
+<p><strong>Step 5: 准备更新所需的数学参数 (Computation)</strong>
+<em>一旦凑够了数据，就开始计算梯度更新所需的各种参数。</em>
+*   <strong>[ ] 平衡数据</strong> (<code>_balance_batch</code>)
+    *   确保每个 GPU 处理的数据量差不多。
+*   <strong>[ ] 计算旧的 Log 概率</strong> (<code>compute_log_prob</code>)
+    *   计算模型生成这些 Token 的原始概率。
+*   <strong>[ ] 计算参考模型概率</strong> (<code>compute_ref_log_prob</code>)
+    *   计算 Reference Model (原始模型) 生成这些 Token 的概率（用于 KL 散度约束）。
+*   <strong>[ ] 计算价值估计 (Value)</strong> (<code>compute_values</code>)
+    *   让 Critic 模型预估当前状态的价值。
+*   <strong>[ ] 计算优势函数 (Advantage)</strong> (<code>compute_advantage</code>)
+    *   这是 PPO 的核心。计算“实际发生的奖励”比“Critic 预测的奖励”好了多少？(GAE 或 GRPO 算法)。</p>
+<p><strong>Step 6: 更新模型 (Update)</strong>
+*   <strong>[ ] 更新 Critic 模型</strong> (<code>critic_wg.update_critic</code>)
+    *   让裁判（Critic）学得更准。
+*   <strong>[ ] 更新 Actor 模型</strong> (<code>actor_rollout_wg.update_actor</code>)
+    *   <strong>这是最终目的</strong>：让演员（Actor）根据优势函数调整参数，以后多生成高分回答，少生成低分回答。
+    *   <em>注意：</em> 这里有个 <code>critic_warmup</code>，可能前几步只更新 Critic，不更新 Actor。</p>
+<h4>第三阶段：收尾与监控 (Maintenance)</h4>
+<ul>
+<li><strong>[ ] 阶段性验证</strong> (<code>_validate</code>)<ul>
+<li>每隔几步，跑一次验证集，看看有没有变强。</li>
+</ul>
+</li>
+<li><strong>[ ] 保存模型</strong> (<code>_save_checkpoint</code>)<ul>
+<li>定期存盘，防止白跑。</li>
+</ul>
+</li>
+<li><strong>[ ] 记录日志</strong> (<code>logger.log</code>)<ul>
+<li>把这一步的 Reward、Loss、吞吐量等画成图表。</li>
+</ul>
+</li>
+<li><strong>[ ] 进度条更新</strong> (<code>progress_bar.update</code>)<ul>
+<li>告诉用户：“这一步跑完了，进入下一步”。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结一下本文观点的核心</h3>
+<p>这段代码其实就是一个标准的 <strong>PPO 训练流水线</strong>，但它增加了一个 <strong>数据筛选 (Filtering)</strong> 的机制（在 Step 4）。</p>
+<p><strong>文中的隐含观点（通过代码逻辑体现）：</strong>
+普通的 PPO 不管生成什么样的数据都拿来训练。但这个 <code>DAPO</code> Trainer 认为：<strong>如果对于同一个问题，模型生成的多个回答得分完全一样（方差为0），那么这组数据对模型改进没有帮助（没有对比就没有伤害，也就没有学习），应该扔掉。</strong> 它只训练那些模型感到“纠结”（输出有差异）的样本。</p>

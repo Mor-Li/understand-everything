@@ -1,0 +1,101 @@
+<h1>fp16/fp16util.py</h1>
+<p>这份代码是早期 PyTorch 进行 <strong>混合精度训练 (Mixed Precision Training / FP16 Training)</strong> 的工具库。</p>
+<p>简单来说，它的核心目的是：<strong>让模型跑得更快（用 FP16 半精度），但这会导致精度不够，所以需要用一套复杂的流程来保证模型能正常收敛。</strong></p>
+<p>为了让你看懂，我把这个文件要做的事情拆解成一个 <strong>Task Todo List</strong>，然后对应代码一步步给你讲。</p>
+<hr />
+<h3>核心任务清单 (Todo List)</h3>
+<p>要实现混合精度训练，我们需要完成以下步骤：</p>
+<ol>
+<li><strong>[模型转换]</strong>：把神经网络的大部分层转成 FP16（半精度），因为这样计算快、省显存。</li>
+<li><strong>[保护特殊层]</strong>：BatchNorm 层必须保持 FP32（单精度），因为在 FP16 下它极不稳定。</li>
+<li><strong>[创建主权重]</strong>：在内存里备份一份 FP32 的“主权重 (Master Weights)”。<ul>
+<li><em>原因：FP16 精度太低，微小的梯度更新会被忽略（下溢出），所以更新权重要在 FP32 上进行。</em></li>
+</ul>
+</li>
+<li><strong>[梯度搬运]</strong>：反向传播算出 FP16 的梯度后，把它拷贝给 FP32 的主权重。</li>
+<li><strong>[权重同步]</strong>：优化器更新完 FP32 的主权重后，把新权重拷贝回 FP16 的模型，供下一轮使用。</li>
+</ol>
+<hr />
+<h3>逐步代码讲解</h3>
+<h4>第一步：模型转换与保护特殊层</h4>
+<p><strong>目标</strong>：把模型转成 FP16，但放过 BatchNorm 层。</p>
+<p>代码对应：
+*   <code>tofp16</code> (类)
+*   <code>BN_convert_float</code> (函数)
+*   <code>network_to_half</code> (函数)
+*   <code>FP16Model</code> (类)</p>
+<p><strong>讲解</strong>：
+*   <strong><code>tofp16</code></strong>: 一个极其简单的层，它的作用就是把流经它的数据变成半精度 (<code>input.half()</code>)。
+*   <strong><code>BN_convert_float</code></strong>: 这是一个递归函数。它会遍历模型的所有层，如果发现是 <code>BatchNorm</code> 层，就强制把它转回 FP32 (<code>module.float()</code>)。这是为了防止训练崩溃。
+*   <strong><code>FP16Model</code></strong>: 这是一个包装器。
+    *   在 <code>__init__</code> 里，它调用 <code>convert_network</code> 把你的模型转成 FP16（同时跳过 BatchNorm）。
+    *   在 <code>forward</code> 里，它会自动把输入数据转成 FP16，然后再喂给网络。</p>
+<blockquote>
+<p><strong>总结</strong>：这部分代码负责把你的模型变成“计算速度快但精度略低”的状态。</p>
+</blockquote>
+<hr />
+<h4>第二步：创建 FP32 主权重 (Master Weights)</h4>
+<p><strong>目标</strong>：为了防止更新时精度丢失，我们需要一份高精度的权重备份。</p>
+<p>代码对应：
+*   <code>prep_param_lists</code> (函数)</p>
+<p><strong>讲解</strong>：
+这个函数是整个流程的核心准备工作。
+1.  它接收你的 FP16 模型 (<code>model</code>)。
+2.  它提取出模型参数，然后 <code>.clone().float().detach()</code>。意思是：复制一份，转成 FP32，并切断与原图的联系。
+3.  这就得到了 <strong>Master Params</strong>（主参数）。
+4.  <strong><code>flat_master=True</code> 是什么？</strong>
+    *   这是一个性能优化技巧。它把几千个小的参数张量（Tensor）压扁（Flatten）成一个巨大的长条张量。显卡处理一大块连续内存比处理无数小碎片要快得多。</p>
+<blockquote>
+<p><strong>总结</strong>：现在我们有两套参数：
+1. <strong>Model Params (FP16)</strong>: 在显卡上跑前向/反向传播，速度快。
+2. <strong>Master Params (FP32)</strong>: 躺在内存里，专门等着被优化器更新，精度高。</p>
+</blockquote>
+<hr />
+<h4>第三步：梯度搬运 (Model Grads -&gt; Master Grads)</h4>
+<p><strong>目标</strong>：模型跑完反向传播后，梯度在 FP16 参数上。我们需要把这些梯度搬运到 FP32 主参数上，这样优化器才能工作。</p>
+<p>代码对应：
+*   <code>model_grads_to_master_grads</code> (函数)</p>
+<p><strong>讲解</strong>：
+*   当你调用 <code>loss.backward()</code> 后，FP16 的模型参数里有了 <code>.grad</code>（梯度）。
+*   这个函数的作用就是把 FP16 的梯度值 <strong>复制 (Copy)</strong> 到 FP32 的主参数的 <code>.grad</code> 属性里。
+*   如果开启了 <code>flat_master</code>，它会先把分散的 FP16 梯度拼成一个大张量，再拷过去。</p>
+<hr />
+<h4>第四步：权重同步 (Master Params -&gt; Model Params)</h4>
+<p><strong>目标</strong>：优化器（Optimizer）更新了 FP32 的主参数后，FP16 模型手里的参数就过时了。需要把更新后的值同步回去。</p>
+<p>代码对应：
+*   <code>master_params_to_model_params</code> (函数)</p>
+<p><strong>讲解</strong>：
+*   这是训练循环的最后一步。
+*   优化器（比如 Adam 或 SGD）操作的是 FP32 的 <code>master_params</code>。
+*   更新完成后，这个函数把 FP32 的新数值 <strong>复制</strong> 回 FP16 的模型参数中。
+*   同样，如果用了 <code>flat_master</code>，它会负责把那个巨大的长条张量“解压”回原本的模型结构中。</p>
+<hr />
+<h3>剩下的辅助代码</h3>
+<ul>
+<li><strong><code>convert_module</code> / <code>convert_network</code></strong>: 辅助函数，用于递归地把模型参数转成指定的数据类型（dtype），通常用于初始化。</li>
+<li><strong><code>backwards_debug_hook</code></strong>: 调试用的。如果有人不小心直接对主参数求导了，这个钩子会报错提醒。</li>
+<li><strong><code>to_python_float</code> / <code>clip_grad_norm</code></strong>: 兼容性补丁，处理不同 PyTorch 版本的差异。</li>
+</ul>
+<hr />
+<h3>整个流程图解 (Mental Model)</h3>
+<p>如果不看代码，这个文件实现的训练流程是这样的：</p>
+<ol>
+<li>
+<p><strong>准备阶段</strong>:</p>
+<ul>
+<li>模型: FP16 (BN层除外)</li>
+<li>备份: FP32 (Master Weights)</li>
+</ul>
+</li>
+<li>
+<p><strong>训练循环 (Loop)</strong>:</p>
+<ul>
+<li><strong>Forward</strong>: 输入 -&gt; FP16模型 -&gt; Loss</li>
+<li><strong>Backward</strong>: Loss -&gt; 算出 FP16 梯度</li>
+<li><strong>Copy Grads</strong>: FP16 梯度 --(复制)--&gt; FP32 梯度 (<code>model_grads_to_master_grads</code>)</li>
+<li><strong>Update</strong>: 优化器利用 FP32 梯度更新 FP32 Master Weights</li>
+<li><strong>Sync Weights</strong>: FP32 Master Weights --(复制)--&gt; FP16 模型参数 (<code>master_params_to_model_params</code>)</li>
+</ul>
+</li>
+</ol>
+<p>这个文件 (<code>fp16util.py</code>) 就是提供了上述流程中<strong>复制、转换、同步</strong>所需的全部工具函数。</p>

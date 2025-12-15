@@ -1,0 +1,64 @@
+<h1>tools/preprocess_mmdata.py</h1>
+<p>这份代码确实乍一看比较复杂，因为它涉及到了<strong>多模态（文本+图片）</strong>、<strong>并行处理</strong>以及<strong>底层二进制存储</strong>。</p>
+<p>简单来说，这个脚本是一个<strong>“食材预处理车间”</strong>。它的任务是把原始的“文本”和“图片”文件，切碎、清洗、打包成模型训练能直接吃进去的“压缩饼干”（二进制格式文件）。</p>
+<p>为了让你看懂，我把这个脚本的工作逻辑拆解成一个 <strong>To-Do List (任务清单)</strong>，一步步带你走一遍：</p>
+<hr />
+<h3>✅ 任务清单：多模态数据预处理</h3>
+<h4>1. 准备阶段：接收指令 (Configuration)</h4>
+<p><strong>代码位置：</strong> <code>get_args()</code> 函数
+*   <strong>任务描述</strong>：脚本启动时，先问清楚用户想要干什么。
+*   <strong>具体动作</strong>：
+    *   输入在哪里？（<code>--input</code> 是文本 JSON，<code>--input-image</code> 是图片文件夹）。
+    *   输出存哪里？（<code>--output-prefix</code>）。
+    *   用什么词表（Tokenizer）？（比如 GPT2 还是 BERT）。
+    *   每一段文本要多长？（<code>--pad-length</code>，不够长要补齐，太长要截断）。</p>
+<h4>2. 准备工具：制造分词器 (Tokenizer)</h4>
+<p><strong>代码位置：</strong> <code>Encoder</code> 类里的 <code>initializer</code> 和 <code>main</code> 函数里的 <code>build_tokenizer</code>
+*   <strong>任务描述</strong>：模型看不懂中文或英文，它只认识数字。我们需要一个工具把字变成数字。
+*   <strong>具体动作</strong>：
+    *   加载词表文件。
+    *   准备好把 "Hello World" 变成 <code>[123, 456]</code> 这种 ID 列表的工具。</p>
+<h4>3. 核心任务 A：处理文本 (Text Processing)</h4>
+<p><strong>代码位置：</strong> <code>Encoder.encode</code> 函数的前半部分
+*   <strong>任务描述</strong>：把读入的一行文字处理成定长的数字列表。
+*   <strong>具体动作</strong>：
+    *   读取一行 JSON 数据，提取 <code>text</code> 字段。
+    *   <strong>分词</strong>：用分词器把文本转成 ID 列表。
+    *   <strong>对齐（Padding）</strong>：因为模型训练需要矩阵整齐，如果句子短于 <code>pad_length</code>，就在后面补特殊的结束符（EOD）；如果太长就切掉。</p>
+<h4>4. 核心任务 B：处理图片 (Image Processing)</h4>
+<p><strong>代码位置：</strong> <code>Encoder.encode</code> 函数的后半部分
+*   <strong>任务描述</strong>：把图片文件读成机器能存的原始二进制数据。
+*   <strong>具体动作</strong>：
+    *   打开图片文件（<code>open(img_path, "rb")</code>）。
+    *   <strong>字节补齐</strong>：代码里有个 <code>(4 - len(xs) % 4) % 4</code> 的逻辑。这是为了让图片数据的字节长度能被 4 整除。为什么要这样？因为后面要把它转换成 <code>int32</code>（32位整数，正好4个字节），如果不补齐，转换会报错。
+    *   <strong>转成数字</strong>：把图片的原始字节流（bytes）强行转换成一串整数（numpy array）。
+    *   <em>注意：这里并没有做缩放或裁剪，只是单纯把图片文件的二进制数据读进来了。</em></p>
+<h4>5. 提速阶段：雇佣多个工人 (Multiprocessing)</h4>
+<p><strong>代码位置：</strong> <code>main</code> 函数里的 <code>multiprocessing.Pool</code>
+*   <strong>任务描述</strong>：如果只有一个人（一个 CPU 核心）干活太慢了，要搞“人海战术”。
+*   <strong>具体动作</strong>：
+    *   启动多个进程（<code>args.workers</code>）。
+    *   把读取到的文本行和图片路径打包，分发给不同的进程去并行执行上面的“任务A”和“任务B”。</p>
+<h4>6. 收尾阶段：打包存储 (Saving Output)</h4>
+<p><strong>代码位置：</strong> <code>IndexedDatasetBuilder</code> 和 <code>builders.add_item</code>
+*   <strong>任务描述</strong>：处理完的数据不能散落在内存里，要存成 Megatron-LM 框架专用的高效格式。
+*   <strong>具体动作</strong>：
+    *   <strong>存数据 (.bin)</strong>：把处理好的文本 ID 和图片整数流，直接写入一个巨大的二进制文件。
+    *   <strong>存索引 (.idx)</strong>：同时记录每一条数据在文件里的起始位置和长度。这样训练时读取速度极快。
+    *   <strong>多模态标记</strong>：<code>builders.add_item(..., 1)</code> 这里的 <code>1</code> 可能是为了区分这是图片数据还是文本数据。</p>
+<hr />
+<h3>总结一下文中的核心观点（逻辑流）</h3>
+<p>如果你把这段代码看作一个<strong>流水线</strong>，它的流程是这样的：</p>
+<ol>
+<li><strong>输入</strong>：左手拿一个文本文件（JSON），右手拿一堆图片文件。</li>
+<li><strong>匹配</strong>：代码逻辑假设文本的行数和图片的数量是一一对应的（<code>zip(fin, img_paths)</code>）。</li>
+<li><strong>加工</strong>：<ul>
+<li>文本 -&gt; 变成 Token ID -&gt; 补齐长度。</li>
+<li>图片 -&gt; 读成二进制 -&gt; 补齐字节 -&gt; 转成整数数组。</li>
+</ul>
+</li>
+<li><strong>输出</strong>：生成 <code>.bin</code> 和 <code>.idx</code> 文件。</li>
+</ol>
+<p><strong>你最可能困惑的地方解释：</strong>
+代码里为什么要处理图片成 <code>int32</code>？
+通常我们做 CV（计算机视觉）是把图片读成 Tensor (C, H, W)。但这里是 <strong>Pretraining（预训练）的数据准备阶段</strong>。它现在的目的可能仅仅是把<strong>原始图片文件</strong>以二进制流的形式塞进数据集里，等真正训练读取数据时，再解码成像素。这样做的好处是生成的数据集包含了完整的原始信息，便于大规模存储和读取。</p>

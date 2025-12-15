@@ -1,0 +1,88 @@
+<h1>docs/advance/fsdp_extension.rst</h1>
+<p>没问题，这篇文档主要是在讲<strong>“如何把一个新的大模型添加到 FSDP 后端，并让它能高效地在训练（Actor）和推理（vLLM）之间同步权重”</strong>。</p>
+<p>简单来说，你在训练大模型时，需要把训练好的参数传给 vLLM 去做推理（生成文本）。如果直接传，内存容易爆（OOM）。这篇文档教你如何用一种“省内存”的方法（DTensor）来实现这个过程。</p>
+<p>为了让你更容易理解，我把它拆解成一个<strong>任务清单 (To-Do List)</strong>，分为<strong>背景理解</strong>、<strong>准备工作</strong>和<strong>代码实施</strong>三个阶段。</p>
+<hr />
+<h3>阶段一：背景理解（为什么要读这篇文档？）</h3>
+<p>在开始写代码前，先理解我们在解决什么问题：</p>
+<ul>
+<li><strong>现状</strong>：系统里有一个默认的权重加载器 <code>hf_weight_loader.py</code>。</li>
+<li><strong>痛点</strong>：这个默认加载器太“贪心”，它会在同步时把整个模型的参数全部加载进内存。模型一大，显存就爆了（OOM）。</li>
+<li><strong>解决方案</strong>：建议使用 <code>dtensor_weight_loader</code>。它像“切蛋糕”一样，一层一层地加载参数，用完一层释放一层，从而降低内存峰值。</li>
+<li><strong>你的任务</strong>：如果你想用的模型（比如你自己魔改的 Llama）不在支持列表里，你需要自己写一个加载函数。</li>
+</ul>
+<hr />
+<h3>阶段二：准备工作（Checklist）</h3>
+<p>在动手改代码之前，先检查一下：</p>
+<ol>
+<li>
+<p><strong>[ ] 检查支持列表</strong>：</p>
+<ul>
+<li>看看你想用的模型是不是已经在文档列出的名单里了（比如 <code>LlamaForCausalLM</code>, <code>Qwen2ForCausalLM</code> 等）。</li>
+<li><strong>如果是</strong>：恭喜你，不用看这篇文档了，直接用就行。</li>
+<li><strong>如果不是</strong>：请继续往下看，你需要手动添加支持。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 找到参考代码</strong>：</p>
+<ul>
+<li>找到 vLLM 库中该模型的源代码（通常在 <code>vllm/model_executor/models/</code> 下）。</li>
+<li>找到目标文件：<code>verl/third_party/vllm/vllm_v_0_5_4/dtensor_weight_loader.py</code>（这是你要修改的文件）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>阶段三：代码实施（核心 Todo List）</h3>
+<p>这是文档中最难懂的部分，我把它拆解为 <strong>5 个具体的编程步骤</strong>。假设你要添加一个新模型（文档以 Gemma 为例）：</p>
+<h4>Task 1: 搬运代码</h4>
+<ul>
+<li><strong>动作</strong>：去 vLLM 的源码里，找到该模型的类，复制它的 <code>load_weights</code> 方法。</li>
+<li><strong>目的地</strong>：粘贴到 <code>dtensor_weight_loader.py</code> 文件中。</li>
+<li><strong>目的</strong>：我们复用 vLLM 现有的逻辑，不需要从头写。</li>
+</ul>
+<h4>Task 2: 修改函数签名 (入参)</h4>
+<ul>
+<li><strong>动作</strong>：修改函数定义的参数。<ul>
+<li><strong>原样</strong>：<code>def load_weights(self, weights: ...)</code></li>
+<li><strong>修改后</strong>：<code>def gemma_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) -&gt; nn.Module:</code></li>
+</ul>
+</li>
+<li><strong>解释</strong>：因为这个函数不再属于模型类的一部分，而是一个独立的工具函数。我们需要传入“训练好的权重字典 (<code>actor_weights</code>)”和“要更新的 vLLM 模型对象 (<code>vllm_model</code>)”。</li>
+</ul>
+<h4>Task 3: 替换 <code>self</code></h4>
+<ul>
+<li><strong>动作</strong>：把函数体内所有的 <code>self</code> 替换为 <code>vllm_model</code>。</li>
+<li><strong>例子</strong>：<ul>
+<li><code>self.named_parameters()</code> -&gt; <code>vllm_model.named_parameters()</code></li>
+</ul>
+</li>
+<li><strong>解释</strong>：同上，因为不再是类的方法，无法使用 <code>self</code>，需要操作传入的 <code>vllm_model</code> 对象。</li>
+</ul>
+<h4>Task 4: 插入“省内存”魔法代码 (关键步骤)</h4>
+<ul>
+<li><strong>动作</strong>：在每一次从字典里取权重 (<code>params_dict[name]</code>) <strong>之前</strong>，插入一行代码：
+    <code>python
+    local_loaded_weight = redistribute_dtensor(param_name=name, loaded_weights=loaded_weight)</code></li>
+<li><strong>动作</strong>：把后面原本使用 <code>loaded_weight</code> 的地方，全部改成用 <code>local_loaded_weight</code>。</li>
+<li><strong>解释</strong>：这是核心！<code>redistribute_dtensor</code> 会负责处理分布式的张量（DTensor），确保只加载当前 GPU 需要的那部分权重，而不是整个大权重。</li>
+</ul>
+<h4>Task 5: 注册新函数</h4>
+<ul>
+<li><strong>动作</strong>：在文件的末尾（或者注册表字典里），把你的新函数注册进去。
+    <code>python
+    __MODEL_DTENSOR_WEIGHT_LOADER_REGISTRY__["YourNewModelName"] = your_new_function</code></li>
+<li><strong>解释</strong>：告诉系统，以后遇到这个名字的模型，就用你写的这个函数来加载权重。</li>
+</ul>
+<hr />
+<h3>总结文中的代码对比 (Diff)</h3>
+<p>文档最后给了一段代码对比（Diff），如果你看懂了上面的 Task 4，这里就很好理解了：</p>
+<ul>
+<li><strong>红色行 (-)</strong>：代表原本 vLLM 里的写法。它直接拿 <code>loaded_weight</code>（完整的权重）去赋值，内存消耗大。</li>
+<li><strong>绿色行 (+)</strong>：代表你需要改成的写法。<ol>
+<li>先调用 <code>redistribute_dtensor</code> 拿到 <strong><code>local_loaded_weight</code></strong>（切分好的、省内存的权重）。</li>
+<li>然后用这个 <code>local_loaded_weight</code> 去赋值。</li>
+</ol>
+</li>
+</ul>
+<p><strong>一句话总结：</strong>
+这篇文档就是一个<strong>开发指南</strong>，教你如何把 vLLM 的原生权重加载函数，“魔改”成一个支持分布式、省内存的版本，以便在训练框架中高效运行。</p>

@@ -1,0 +1,145 @@
+<h1>megatron/core/models/retro/encoder_attention.py</h1>
+<p>这份代码确实比较抽象，因为它涉及到了 <strong>Retro (Retrieval-Enhanced Transformer)</strong> 这个比较复杂的模型架构。</p>
+<p>为了让你听懂，我们先别管代码细节，先建立一个<strong>核心概念</strong>：</p>
+<p><strong>Retro 的核心思想是“作弊”</strong>：在写作文（生成文本）时，它不是光靠脑子想，而是先去图书馆（数据库）里搜几篇相似的文章（<strong>Neighbors/邻居</strong>），把这些文章读一遍（<strong>Encoder</strong>），然后参考着写。</p>
+<p>这份文件 <code>encoder_attention.py</code> 讲的就是 <strong>“怎么读这几篇搜来的参考文章”</strong>。</p>
+<p>为了处理这些参考文章，Retro 把数据切得很细。为了让你看懂，我列了一个 <strong>Task Todo List</strong>，我们一步步来拆解这份代码在干什么。</p>
+<hr />
+<h3>Task Todo List (代码执行流程)</h3>
+<p>想象你手里有 <code>B</code> 个任务（Batch Size），每个任务搜到了 <code>K</code> 篇参考文章（Neighbors）。</p>
+<ol>
+<li><strong>Task 0: 数据整理 (Reshape)</strong><ul>
+<li><strong>现状</strong>：所有参考文章的数据都混在一起，排成了一条长龙。</li>
+<li><strong>目标</strong>：把这条长龙切开，按“第1篇参考文”、“第2篇参考文”... 分类整理好。</li>
+</ul>
+</li>
+<li><strong>Task 1: 轮流阅读 (Loop &amp; Attention)</strong><ul>
+<li><strong>现状</strong>：我们有 <code>K</code> 组参考文章。</li>
+<li><strong>目标</strong>：<strong>不要</strong>把它们混在一起读。我们要用一个 <code>for</code> 循环，先读所有任务的“第1篇”，再读所有任务的“第2篇”...</li>
+<li><strong>动作</strong>：做 Cross Attention（交叉注意力）。</li>
+</ul>
+</li>
+<li><strong>Task 2: 整理阅读笔记 (Bias + Dropout + Residual)</strong><ul>
+<li><strong>现状</strong>：读完了，得到了一堆注意力结果（Attention Output）。</li>
+<li><strong>目标</strong>：给这些结果加上偏置（Bias），做一下随机丢弃（Dropout），再把原始信息加回去（Residual Connection）。</li>
+<li><strong>难点</strong>：必须保持“每篇参考文”是独立的，不能混。</li>
+</ul>
+</li>
+<li><strong>Task 3: 最终润色 (LayerNorm)</strong><ul>
+<li><strong>目标</strong>：对处理好的数据做标准化（Normalization）。</li>
+<li><strong>难点</strong>：同样，要对每一篇参考文单独做标准化，最后再拼回去。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>详细代码拆解</h3>
+<p>现在我们带着上面的 Task List，去看具体的代码片段。</p>
+<h4>1. 类 <code>RetroEncoderCrossAttention</code> (对应 Task 0 和 Task 1)</h4>
+<p>这个类是核心，负责计算注意力。</p>
+<p><strong>Task 0: 数据整理</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Input shape. [ r, bs*l*k, d ]</span>
+<span class="c1"># 这里 hidden_states 是所有搜出来的参考文章的向量，混在了一起 (bs*l*k 都在一个维度)</span>
+<span class="n">ns</span><span class="p">,</span> <span class="n">bs</span><span class="p">,</span> <span class="n">d</span> <span class="o">=</span> <span class="n">hidden_states</span><span class="o">.</span><span class="n">shape</span>
+
+<span class="c1"># Reshape sequence into neighboring chunks.</span>
+<span class="c1"># Task 0 完成：这里把它变形成了 [ ..., k, d ]</span>
+<span class="c1"># k 就是 retro_num_neighbors (比如搜了2篇，k就是2)</span>
+<span class="n">chunked_outputs</span> <span class="o">=</span> <span class="n">hidden_states</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">retro_retrieved_length</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">retro_num_neighbors</span><span class="p">,</span> <span class="n">d</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>白话解释</strong>：本来数据是一锅大乱炖，这里用 <code>reshape</code> 把“第几位邻居”这个维度 <code>k</code> 单独拆出来了。</li>
+</ul>
+<p><strong>Task 1: 轮流阅读 (For Loop)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Per-chunk attention.</span>
+<span class="n">attention_output_tuples</span> <span class="o">=</span> <span class="p">[]</span>
+
+<span class="c1"># 开始循环！k 是邻居的数量 (比如 k=0 是第一篇参考文, k=1 是第二篇)</span>
+<span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">retro_num_neighbors</span><span class="p">):</span>
+
+    <span class="c1"># 取出第 k 个邻居的数据</span>
+    <span class="n">chunked_output</span> <span class="o">=</span> <span class="n">chunked_outputs</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">k</span><span class="p">]</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+
+    <span class="c1"># 做注意力机制 (Attention)</span>
+    <span class="c1"># hidden_states (Q): 当前这篇参考文</span>
+    <span class="c1"># key_value_states (K, V): 用来查询的信息 (通常是上一层的输出)</span>
+    <span class="n">attention_output</span><span class="p">,</span> <span class="n">attention_bias</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attn</span><span class="p">(</span>
+        <span class="n">hidden_states</span><span class="o">=</span><span class="n">chunked_output</span><span class="p">,</span>  
+        <span class="n">attention_mask</span><span class="o">=</span><span class="n">chunked_output_mask</span><span class="p">,</span>
+        <span class="n">key_value_states</span><span class="o">=</span><span class="n">key_value_states</span><span class="p">,</span> 
+    <span class="p">)</span>
+
+    <span class="c1"># 这里的 Residual 就是原始输入，留着后面加回去</span>
+    <span class="n">residual</span> <span class="o">=</span> <span class="n">chunked_output</span>
+
+    <span class="c1"># 把结果存进列表里</span>
+    <span class="n">attention_output_tuples</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">attention_output</span><span class="p">,</span> <span class="n">attention_bias</span><span class="p">,</span> <span class="n">residual</span><span class="p">,))</span>
+
+<span class="c1"># 最后返回一个列表，里面存着每个邻居的处理结果</span>
+<span class="k">return</span> <span class="n">attention_output_tuples</span>
+</code></pre></div>
+
+<ul>
+<li><strong>白话解释</strong>：Retro 的 Encoder 比较特殊，它不是把所有参考文章拼在一起算 Attention，而是<strong>分别</strong>对第一篇、第二篇... 做 Attention。所以你看不到巨大的矩阵乘法，而是看到了一个 <code>for</code> 循环。</li>
+</ul>
+<h4>2. 类 <code>RetroEncoderBiasDropoutAdd</code> (对应 Task 2)</h4>
+<p>这个类处理 Attention 之后的“杂活”：加偏置、Dropout、残差连接。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这里的 x_with_bias 就是上面那个函数返回的列表</span>
+<span class="n">outputs</span> <span class="o">=</span> <span class="p">[</span>
+    <span class="n">bias_dropout_add</span><span class="p">(</span>
+        <span class="p">(</span>
+            <span class="n">attention_output</span><span class="p">,</span>
+            <span class="kc">None</span> <span class="k">if</span> <span class="n">attention_bias</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">attention_bias</span><span class="o">.</span><span class="n">expand_as</span><span class="p">(</span><span class="n">residual</span><span class="p">),</span>
+        <span class="p">),</span>
+        <span class="n">residual</span><span class="p">,</span> <span class="c1"># 把原始数据加回去 (ResNet的核心)</span>
+        <span class="n">prob</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="c1"># 这里用 list comprehension (列表推导式) 遍历每一个邻居的结果</span>
+    <span class="k">for</span> <span class="n">attention_output</span><span class="p">,</span> <span class="n">attention_bias</span><span class="p">,</span> <span class="n">residual</span> <span class="ow">in</span> <span class="n">x_with_bias</span>
+<span class="p">]</span>
+
+<span class="c1"># 最后把分开处理好的结果，再拼回成一条长龙 [ r, k*bs*l, d ]</span>
+<span class="n">output</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">outputs</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">r</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">d</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>白话解释</strong>：因为上面是分开算的，这里也要分开处理。处理完后，用 <code>torch.stack</code> 和 <code>reshape</code> 把它们重新拼合，恢复成最开始那种“大乱炖”的形状，以便传给下一层。</li>
+</ul>
+<h4>3. 类 <code>RetroEncoderLayerNorm</code> (对应 Task 3)</h4>
+<p>这个类做层归一化（Layer Normalization）。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="nb">input</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tensor</span><span class="p">:</span>
+    <span class="c1"># 这里的 input 又是那条长龙 [ r, k*bs*l, d ]</span>
+
+    <span class="c1"># 1. 拆分：按邻居数量 k 切开</span>
+    <span class="n">chunk_size</span> <span class="o">=</span> <span class="nb">input</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">retro_num_neighbors</span>
+    <span class="n">inputs</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">chunk_size</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+
+    <span class="c1"># 2. 分别做 Norm：对每一块单独做 LayerNorm</span>
+    <span class="n">outputs</span> <span class="o">=</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">norm</span><span class="p">(</span><span class="n">inp</span><span class="o">.</span><span class="n">contiguous</span><span class="p">())</span> <span class="k">for</span> <span class="n">inp</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">]</span>
+
+    <span class="c1"># 3. 拼合：再拼回去</span>
+    <span class="n">r</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">d</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">shape</span>
+    <span class="n">output</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">outputs</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">r</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">d</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="n">output</span>
+</code></pre></div>
+
+<ul>
+<li><strong>白话解释</strong>：逻辑和上面一样。为了保证统计特征的准确性，必须把不同的参考文章分开来做标准化，做完再拼回去。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这三个类合起来，其实就干了一件事：</p>
+<p><strong>在一个 Transformer 层里，处理 Retro 模型特有的“多篇参考文章”数据结构。</strong></p>
+<ul>
+<li><strong>难点在于形状（Shape）</strong>：数据是以 <code>[Batch * Neighbors]</code> 的形式混在一起传进来的。</li>
+<li><strong>解决办法</strong>：<ol>
+<li>拆开（Reshape/Split）。</li>
+<li>循环处理每一个 Neighbor（For loop / List Comprehension）。</li>
+<li>拼回去（Stack + Reshape）。</li>
+</ol>
+</li>
+</ul>
+<p>你看不懂是因为它没有用标准的 Transformer 写法（一次性矩阵运算），而是为了处理 Retro 的特殊逻辑，手动写了循环和拆分操作。</p>

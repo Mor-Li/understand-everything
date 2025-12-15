@@ -1,0 +1,95 @@
+<h1>examples/mamba/train.sh</h1>
+<p>这份脚本看起来确实很“硬核”，因为它是一个用于<strong>在大规模GPU集群上训练大模型（特别是Mamba架构）的启动脚本</strong>。</p>
+<p>把它想象成<strong>“发射火箭前的检查清单”</strong>。我们可以把你阅读和理解这份代码的过程，拆解成一个 <strong>Task Todo List</strong>。</p>
+<p>我们一步步来完成这个清单：</p>
+<hr />
+<h3>Task 1: 决定你要造多大的火箭 (选择模型规模)</h3>
+<p><strong>代码位置：</strong> 开头 ~ 第26行 (<code>case "${MODEL_SCALE}" in ...</code>)</p>
+<p><strong>解读：</strong>
+这是第一步。你得告诉程序，你是想训练一个“小”模型（8亿参数，800M）还是一个“大”模型（80亿参数，8B）。</p>
+<ul>
+<li><strong>逻辑：</strong><ul>
+<li>如果是 <strong>800M</strong>：模型比较瘦（<code>HIDDEN_SIZE=1024</code>），层数较少（<code>NUM_LAYERS=48</code>）。因为它小，所以不需要把模型切分到多张卡上（<code>TENSOR_MODEL_PARALLEL_SIZE=1</code>）。</li>
+<li>如果是 <strong>8B</strong>：模型很胖（<code>HIDDEN_SIZE=4096</code>），层数多。单张显卡装不下，所以要把模型切成4份放在不同卡上跑（<code>TENSOR_MODEL_PARALLEL_SIZE=4</code>）。</li>
+</ul>
+</li>
+<li><strong>你的待办：</strong> 确认你想跑哪种配置（脚本默认是 <code>"800M"</code>）。</li>
+</ul>
+<h3>Task 2: 准备基础设施 (设置环境变量与文件夹)</h3>
+<p><strong>代码位置：</strong> 第28行 ~ 第46行</p>
+<p><strong>解读：</strong>
+在训练开始前，需要打扫场地，确保存档路径存在，并优化显卡通信。</p>
+<ul>
+<li><strong>输入参数：</strong> <code>$1</code> 和 <code>$2</code> 是你在命令行运行时传入的数据路径和分词器路径。</li>
+<li><strong>通信优化 (<code>export NCCL...</code>)：</strong> 这些是给英伟达显卡通信库（NCCL）看的，目的是让多张显卡之间传输数据更快、更稳，别超时。</li>
+<li><strong>建文件夹 (<code>mkdir</code>)：</strong><ul>
+<li><code>checkpoints</code>: 存“游戏存档”（模型权重）。</li>
+<li><code>data-cache</code>: 存数据缓存，读起来快。</li>
+<li><code>tensorboard</code>: 存训练日志，画图用的。</li>
+<li><code>triton-cache</code>: Mamba 模型用到了一种叫 Triton 的加速技术，这里是它的缓存。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 3: 制定课程表 (训练时长与数据量)</h3>
+<p><strong>代码位置：</strong> 第48行 ~ 第51行</p>
+<p><strong>解读：</strong>
+这里定义了模型要“上多少节课”。</p>
+<ul>
+<li><code>SEQ_LEN=4096</code>: 每次模型一口气读 4096 个字（token）。</li>
+<li><code>TRAIN_SAMPLES</code>: 总共要看 7300多万个样本。</li>
+<li><code>LR_WARMUP...</code>: “热身”阶段。刚开始学习率（LR）要慢慢升上去，防止模型学傻了，然后再慢慢降下来（Decay）。</li>
+</ul>
+<h3>Task 4: 填写详细配置单 (核心参数 options)</h3>
+<p><strong>代码位置：</strong> 第53行 ~ <code>options="..."</code> 结束</p>
+<p><strong>解读：</strong>
+这是最长最难懂的部分。它把所有参数拼成了一个巨大的字符串 <code>options</code>。我们可以把它拆成几个关键的小任务来看：</p>
+<h4>4.1 设定“大脑”结构 (Mamba 特有配置)</h4>
+<ul>
+<li><strong>核心观点：</strong> 这个脚本训练的不是纯 Transformer，而是 <strong>Mamba (SSM)</strong> 或者是 <strong>混合架构 (Hybrid)</strong>。</li>
+<li><strong>关键参数：</strong><ul>
+<li><code>--spec ...mamba_stack_spec</code>: 指定使用 Mamba 的层结构。</li>
+<li><code>--hybrid-attention-ratio 0.08</code>: <strong>重点！</strong> 这说明模型里混入了 8% 的传统 Attention 层。Mamba 虽然强，但有时候加一点点传统注意力机制效果更好。</li>
+<li><code>--hybrid-mlp-ratio 0.5</code>: 混合 MLP 层的比例。</li>
+</ul>
+</li>
+</ul>
+<h4>4.2 设定并行策略 (怎么分工)</h4>
+<ul>
+<li><code>--tensor-model-parallel-size</code>: 对应 Task 1 里决定的数字（1 或 4）。</li>
+<li><code>--sequence-parallel</code>: 序列并行，把长文本切开处理，省显存。</li>
+</ul>
+<h4>4.3 设定学习方式 (优化器与正则化)</h4>
+<ul>
+<li><code>--lr 2.5e-4</code>: 学习率，步子迈多大。</li>
+<li><code>--bf16</code>: 使用 <code>bfloat16</code> 格式，这是一种半精度浮点数，跑得快还省显存，是现在的标配。</li>
+<li><code>--adam-beta...</code>: 优化器 Adam 的参数，控制更新权重的惯性。</li>
+</ul>
+<h4>4.4 设定数据读取</h4>
+<ul>
+<li><code>--tokenizer-type GPTSentencePieceTokenizer</code>: 告诉程序怎么把文字切成数字。</li>
+<li><code>--split 99,1,0</code>: 数据怎么分？99% 训练，1% 验证，0% 测试。</li>
+</ul>
+<h3>Task 5: 按下点火按钮 (启动命令)</h3>
+<p><strong>代码位置：</strong> 最后一行 <code>torchrun ...</code></p>
+<p><strong>解读：</strong>
+这是最后一步，执行 Python 脚本。</p>
+<ul>
+<li><code>torchrun</code>: PyTorch 的分布式启动工具。</li>
+<li><code>--nproc_per_node 8</code>: 假设你的一台机器上有 8 张显卡（通常是 A100/H100 x 8）。</li>
+<li><code>../../pretrain_mamba.py</code>: 真正干活的 Python 代码文件。</li>
+<li><code>${options}</code>: 把上面 Task 4 里那一长串配置单传进去。</li>
+</ul>
+<hr />
+<h3>总结：这个脚本主要讲了什么观点？</h3>
+<p>如果要把这个脚本看作一篇“文章”，它的核心观点是：</p>
+<ol>
+<li><strong>Mamba 也是可以像 GPT 一样大规模预训练的：</strong> 脚本展示了如何用 Megatron（一种超大规模训练框架）来训练 Mamba。</li>
+<li><strong>混合架构 (Hybrid) 是个趋势：</strong> 脚本里没有用纯 Mamba，而是用了 <code>hybrid-attention-ratio</code>，说明作者认为在 Mamba 里掺杂少量的 Attention 层（注意力机制）可能效果更好或更稳定。</li>
+<li><strong>显存效率至上：</strong> 脚本里大量的 <code>parallel</code>（并行）、<code>cache</code>（缓存）、<code>bf16</code>（半精度）设置，都是为了在有限的显卡资源下，尽可能塞入更大的模型和更长的数据。</li>
+</ol>
+<p><strong>给你的 Todo List (操作建议):</strong></p>
+<ol>
+<li><strong>Check 1:</strong> 你有 8 张显卡的机器吗？如果没有，最后一行 <code>--nproc_per_node 8</code> 需要改成你实际的卡数。</li>
+<li><strong>Check 2:</strong> 你有数据吗？运行脚本时需要传入 <code>&lt;data-path&gt;</code> 和 <code>&lt;tokenizer-path&gt;</code>。</li>
+<li><strong>Check 3:</strong> 显存够吗？如果显存爆了（OOM），尝试把 <code>GLOBAL_BATCH_SIZE</code> 改小，或者把 <code>8B</code> 改回 <code>800M</code> 跑跑看。</li>
+</ol>

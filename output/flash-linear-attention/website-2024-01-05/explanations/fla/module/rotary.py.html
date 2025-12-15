@@ -1,0 +1,110 @@
+<h1>fla/module/rotary.py</h1>
+<p>这份代码实现的是大语言模型（LLM）中非常核心的一个组件：<strong>旋转位置编码（Rotary Positional Embedding，简称 RoPE）</strong>。</p>
+<p>简单来说，它的作用是给模型的 Query（查询）和 Key（键）向量加上“位置信息”，让模型知道每个词在句子里的顺序。</p>
+<p>为了让你更容易理解，我把它拆解成一个 <strong>“学习任务清单 (Todo List)”</strong>，我们一步步来完成这个代码的阅读任务。</p>
+<hr />
+<h3>✅ Task 1: 理解核心数学操作 (最底层的积木)</h3>
+<p>我们先看最上面的两个函数，这是 RoPE 的数学基础。</p>
+<p><strong>目标代码：</strong> <code>rotate_half</code> 和 <code>apply_rotary_emb_torch</code></p>
+<ol>
+<li>
+<p><strong><code>rotate_half(x)</code></strong>:</p>
+<ul>
+<li><strong>原理</strong>：RoPE 的核心动作是旋转。想象一个二维向量 $(x_1, x_2)$，旋转它需要变成 $(-x_2, x_1)$。</li>
+<li><strong>代码逻辑</strong>：它把向量切成两半，把第二半取负号放到前面，第一半放到后面。</li>
+<li><strong>Interleaved 参数</strong>：这是两种不同的旋转风格（GPT-J 风格 vs GPT-NeoX 风格），只是切分维度的方式不同，数学本质一样。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>apply_rotary_emb_torch</code></strong>:</p>
+<ul>
+<li><strong>原理</strong>：这是标准的 RoPE 公式：$f(x) = x \cdot \cos(\theta) + \text{rotate}(x) \cdot \sin(\theta)$。</li>
+<li><strong>代码逻辑</strong>：<ol>
+<li>把输入的向量 <code>x</code> 拿来。</li>
+<li>生成对应维度的 <code>cos</code> 和 <code>sin</code> 值。</li>
+<li>执行公式：一部分乘 cos，加上 旋转后的部分乘 sin。</li>
+</ol>
+</li>
+<li><strong>注意</strong>：这个函数是纯 PyTorch 实现，用来做参考或者在不支持 GPU 加速时兜底使用。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 2: 理解加速黑科技 (Triton 优化)</h3>
+<p>大模型计算量很大，纯 PyTorch 算得慢，所以作者用了 Triton（一种 GPU 编程语言）来加速。</p>
+<p><strong>目标代码：</strong> <code>class ApplyRotaryEmb(torch.autograd.Function)</code></p>
+<ol>
+<li>
+<p><strong>为什么要写这个类？</strong></p>
+<ul>
+<li>这是一个自定义的自动求导函数。它告诉 PyTorch：<ul>
+<li><strong>Forward (前向传播)</strong>：怎么算结果？ -&gt; 调用 <code>apply_rotary</code> (这是从 <code>fla.ops.triton.rotary</code> 导入的底层加速内核)。</li>
+<li><strong>Backward (反向传播)</strong>：怎么算梯度？ -&gt; 自己写了 <code>backward</code> 函数，手动计算梯度的旋转，比 PyTorch 自动推导更快、更省显存。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>关键点</strong>：</p>
+<ul>
+<li><code>ctx.save_for_backward</code>: 保存前向传播时的 <code>cos</code>, <code>sin</code> 等数据，给反向传播用。</li>
+<li>这个类是用来“替换”上面那个慢速的 <code>apply_rotary_emb_torch</code> 的。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 3: 理解大管家 (Module 封装)</h3>
+<p>有了计算函数还不够，我们需要一个类来管理这些状态（比如缓存 cos/sin 表），这就是我们在模型里实际调用的层。</p>
+<p><strong>目标代码：</strong> <code>class RotaryEmbedding(torch.nn.Module)</code></p>
+<ol>
+<li>
+<p><strong><code>__init__</code> (初始化)</strong>：</p>
+<ul>
+<li>设定维度 <code>dim</code>。</li>
+<li><strong><code>inv_freq</code> (逆频率)</strong>：这是 RoPE 的数学基础。它生成一串频率数值（比如 $10000^{-2i/d}$），决定了位置编码的波长。</li>
+<li><strong><code>scale</code> (缩放)</strong>：代码里还兼容了 <strong>XPos</strong>（一种 RoPE 的变体），如果 <code>scale_base</code> 不为空，就会对位置编码进行缩放，但这属于进阶功能，通常是 None。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>_update_cos_sin_cache</code> (缓存管理 - 重点！)</strong>：</p>
+<ul>
+<li><strong>问题</strong>：每次 forward 都重新算一遍 <code>cos</code> 和 <code>sin</code> 太慢了。</li>
+<li><strong>解决</strong>：<ul>
+<li>检查当前的序列长度 <code>seqlen</code> 是否超过了缓存的长度。</li>
+<li>如果超过了，或者设备变了（CPU-&gt;GPU），就<strong>重新计算</strong>一次超长的 <code>cos</code> 和 <code>sin</code> 表。</li>
+<li>把算好的表存到 <code>self._cos_cached</code> 和 <code>self._sin_cached</code> 里。</li>
+</ul>
+</li>
+<li><strong>细节</strong>：这里有很多关于 <code>dtype</code> (数据类型 fp32/bf16) 的判断，是为了保证精度不丢失（位置编码对精度很敏感）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 4: 最终执行 (Forward)</h3>
+<p>最后一步，把所有东西串起来。</p>
+<p><strong>目标代码：</strong> <code>RotaryEmbedding.forward</code></p>
+<ol>
+<li>
+<p><strong>输入</strong>：</p>
+<ul>
+<li><code>q</code> (Query) 和 <code>k</code> (Key)。注意：<strong>RoPE 只作用于 Q 和 K，不作用于 V (Value)</strong>。</li>
+<li><code>seqlen_offset</code>: 在推理（Inference）阶段，因为有 KV Cache，我们不需要从头算，只需要算新生成的 token 的位置，这个 offset 就是告诉模型“现在的绝对位置在哪里”。</li>
+</ul>
+</li>
+<li>
+<p><strong>流程</strong>：</p>
+<ul>
+<li><strong>第一步</strong>：看长度够不够？调用 <code>_update_cos_sin_cache</code> 确保缓存里的 cos/sin 表够长。</li>
+<li><strong>第二步</strong>：调用加速函数 <code>apply_rotary_emb_func</code> (其实就是 Task 2 里的 Triton 加速版)。</li>
+<li><strong>第三步</strong>：把加上了位置信息的 <code>q</code> 和 <code>k</code> 返回回去。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>📝 总结：这个文件在讲什么？</h3>
+<p>如果用一句话总结：
+<strong>这是一个高性能（Triton加速）、支持长序列推理（带缓存管理）、兼容性强（支持 XPos 和不同精度）的旋转位置编码（RoPE）实现。</strong></p>
+<p><strong>你的大脑处理流程应该是：</strong>
+1.  <strong>数学层</strong>：$x$ 怎么转？ -&gt; <code>rotate_half</code>
+2.  <strong>算子层</strong>：怎么算得快？ -&gt; <code>ApplyRotaryEmb</code> (Triton)
+3.  <strong>应用层</strong>：怎么管理缓存和调用？ -&gt; <code>RotaryEmbedding</code> (nn.Module)</p>

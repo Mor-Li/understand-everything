@@ -1,0 +1,127 @@
+<h1>fla/ops/utils/softmax.py</h1>
+<p>这份代码确实涉及到了比较底层的 <strong>GPU 编程</strong>（使用的是 OpenAI 的 <strong>Triton</strong> 语言），如果你只熟悉普通的 PyTorch，看这个会觉得像天书是很正常的。</p>
+<p>简单来说，这个文件<strong>手动实现了一个跑在 GPU 上的 Softmax 函数</strong>，包含“前向传播（Forward）”和“反向传播（Backward）”。</p>
+<p>为了让你能看懂，我为你制定了一个 <strong>6步走的学习任务清单 (Task List)</strong>。我们一步步拆解：</p>
+<hr />
+<h3>📝 学习任务清单 (Task Todo List)</h3>
+<ol>
+<li><strong>Task 0: 搞懂背景</strong> —— 为什么要写这个？</li>
+<li><strong>Task 1: 数据预处理</strong> —— Python 包装函数在做什么？</li>
+<li><strong>Task 2: 理解 GPU 的并行逻辑</strong> —— <code>program_id</code> 是什么？</li>
+<li><strong>Task 3: 核心数学逻辑 (前向)</strong> —— <code>softmax_fwd_kernel</code> 怎么算 Softmax？</li>
+<li><strong>Task 4: 核心数学逻辑 (反向)</strong> —— <code>softmax_bwd_kernel</code> 怎么算梯度？</li>
+<li><strong>Task 5: 性能优化魔法</strong> —— <code>@triton.autotune</code> 是干嘛的？</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 0: 搞懂背景</h4>
+<p><strong>问题</strong>：PyTorch 不是自带 <code>torch.softmax</code> 吗？为什么要重写？
+<strong>回答</strong>：为了<strong>速度</strong>和<strong>显存优化</strong>。Triton 允许开发者用类似 Python 的语法写出媲美 CUDA（C++）性能的 GPU 内核。这个文件是 <code>fla</code> 库的一部分，它可能需要一个定制化的高性能 Softmax，或者为了配合其他算子做融合。</p>
+<hr />
+<h4>Task 1: 数据预处理 (Python 包装函数)</h4>
+<p>我们先不看带 <code>@</code> 装饰器的函数，先看底部的普通 Python 函数 <code>softmax_fwd</code>。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">softmax_fwd</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+    <span class="c1"># 1. 把输入数据 x 拍扁成 2D 形状 (N行, D列)</span>
+    <span class="c1"># 比如 x 原本是 [Batch, Head, Seq_len]，现在变成 [Total_rows, D]</span>
+    <span class="n">x</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>
+    <span class="n">N</span><span class="p">,</span> <span class="n">D</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">shape</span>
+
+    <span class="c1"># 2. 计算 Block 大小</span>
+    <span class="c1"># GPU 喜欢处理 2 的幂次（32, 64, 128...）。</span>
+    <span class="c1"># 如果你的 D 是 100，这里 B 就会变成 128，为了内存对齐。</span>
+    <span class="n">B</span> <span class="o">=</span> <span class="n">triton</span><span class="o">.</span><span class="n">next_power_of_2</span><span class="p">(</span><span class="n">D</span><span class="p">)</span>
+
+    <span class="c1"># 3. 申请输出内存 p</span>
+    <span class="n">p</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty_like</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+
+    <span class="c1"># 4. 启动 GPU 内核！</span>
+    <span class="c1"># grid=(N,) 表示我们要启动 N 个并行程序，每一行数据由一个程序处理。</span>
+    <span class="n">softmax_fwd_kernel</span><span class="p">[(</span><span class="n">N</span><span class="p">,)](</span>
+        <span class="n">x</span><span class="o">=</span><span class="n">x</span><span class="p">,</span> <span class="n">p</span><span class="o">=</span><span class="n">p</span><span class="p">,</span> <span class="n">D</span><span class="o">=</span><span class="n">D</span><span class="p">,</span> <span class="n">B</span><span class="o">=</span><span class="n">B</span>
+    <span class="p">)</span>
+    <span class="k">return</span> <span class="n">p</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="o">*</span><span class="n">shape</span><span class="p">)</span> <span class="c1"># 还原形状</span>
+</code></pre></div>
+
+<p><strong>总结</strong>：这一步负责把数据整理好，计算好内存块大小，然后把任务分发给 GPU。</p>
+<hr />
+<h4>Task 2: 理解 GPU 的并行逻辑</h4>
+<p>现在进入核心 <code>softmax_fwd_kernel</code>。想象一下，你是一个工头，你有 <code>N</code> 行数据要处理，你雇佣了 <code>N</code> 个工人（GPU 线程块）。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">i_n</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>  <span class="c1"># 我是第几号工人？(处理第几行)</span>
+<span class="n">o_d</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">B</span><span class="p">)</span>   <span class="c1"># 生成列的索引：[0, 1, 2, ..., B-1]</span>
+<span class="n">m_d</span> <span class="o">=</span> <span class="n">o_d</span> <span class="o">&lt;</span> <span class="n">D</span>           <span class="c1"># 制作掩码(Mask)：因为 B 可能比 D 大（比如128 &gt; 100）</span>
+                        <span class="c1"># 超过 D 的部分我们要标记为 False，防止越界读取。</span>
+</code></pre></div>
+
+<p><strong>总结</strong>：GPU 是并行的。代码里的一行逻辑，实际上是成千上万个线程同时在跑，每个线程通过 <code>program_id</code> 知道自己该处理哪一行数据。</p>
+<hr />
+<h4>Task 3: 核心数学逻辑 (前向传播)</h4>
+<p>Softmax 的公式是：$Softmax(x_i) = \frac{e^{x_i}}{\sum e^{x_j}}$。
+但在计算机里直接算 $e^{x}$ 容易溢出（变成无穷大），所以通常用“数值稳定版”：先减去最大值。
+公式变为：$\frac{e^{x_i - max(x)}}{\sum e^{x_j - max(x)}}$</p>
+<p>看代码 <code>softmax_fwd_kernel</code>：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 读取数据</span>
+<span class="c1"># 从内存 x 中读取当前行的数据。</span>
+<span class="c1"># mask=m_d: 超出 D 范围的部分不要读。</span>
+<span class="c1"># other=-float(&#39;inf&#39;): 超出范围的部分填负无穷（这样求 max 不受影响）。</span>
+<span class="n">b_x</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">x</span> <span class="o">+</span> <span class="n">i_n</span> <span class="o">*</span> <span class="n">D</span> <span class="o">+</span> <span class="n">o_d</span><span class="p">,</span> <span class="n">mask</span><span class="o">=</span><span class="n">m_d</span><span class="p">,</span> <span class="n">other</span><span class="o">=-</span><span class="nb">float</span><span class="p">(</span><span class="s1">&#39;inf&#39;</span><span class="p">))</span>
+
+<span class="c1"># 2. 找最大值 (为了数值稳定)</span>
+<span class="n">b_m</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">max</span><span class="p">(</span><span class="n">b_x</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+
+<span class="c1"># 3. 减去最大值并求指数 exp</span>
+<span class="n">b_x</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="n">b_x</span> <span class="o">-</span> <span class="n">b_m</span><span class="p">)</span>
+
+<span class="c1"># 4. 归一化 (除以总和)</span>
+<span class="n">b_p</span> <span class="o">=</span> <span class="n">b_x</span> <span class="o">/</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">b_x</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+
+<span class="c1"># 5. 写回内存 p</span>
+<span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">p</span> <span class="o">+</span> <span class="n">i_n</span> <span class="o">*</span> <span class="n">D</span> <span class="o">+</span> <span class="n">o_d</span><span class="p">,</span> <span class="n">b_p</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">p</span><span class="o">.</span><span class="n">dtype</span><span class="o">.</span><span class="n">element_ty</span><span class="p">),</span> <span class="n">mask</span><span class="o">=</span><span class="n">m_d</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>总结</strong>：这段代码就是把 Softmax 的数学公式翻译成了 Triton 语言。</p>
+<hr />
+<h4>Task 4: 核心数学逻辑 (反向传播)</h4>
+<p>训练神经网络需要求导。<code>softmax_bwd_kernel</code> 是用来算梯度的。
+输入：<code>p</code> (前向输出的结果), <code>dp</code> (上一层传回来的梯度)。
+输出：<code>ds</code> (当前层的梯度)。</p>
+<p>Softmax 的导数推导比较复杂，最终结论公式通常简化为：
+$dx = p \cdot (dp - \sum(p \cdot dp))$</p>
+<p>看代码 <code>softmax_bwd_kernel</code>：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 读取 p (Softmax结果) 和 dp (上游梯度)</span>
+<span class="n">b_p</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">p</span> <span class="o">+</span> <span class="n">i_n</span> <span class="o">*</span> <span class="n">D</span> <span class="o">+</span> <span class="n">o_d</span><span class="p">,</span> <span class="n">mask</span><span class="o">=</span><span class="n">m_d</span><span class="p">,</span> <span class="n">other</span><span class="o">=</span><span class="mf">0.</span><span class="p">)</span>
+<span class="n">b_dp</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">dp</span> <span class="o">+</span> <span class="n">i_n</span> <span class="o">*</span> <span class="n">D</span> <span class="o">+</span> <span class="n">o_d</span><span class="p">,</span> <span class="n">mask</span><span class="o">=</span><span class="n">m_d</span><span class="p">,</span> <span class="n">other</span><span class="o">=</span><span class="mf">0.</span><span class="p">)</span>
+
+<span class="c1"># 2. 计算 sum(p * dp)</span>
+<span class="c1"># 对应公式里的求和项</span>
+<span class="n">b_pp</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">b_p</span> <span class="o">*</span> <span class="n">b_dp</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+
+<span class="c1"># 3. 计算最终梯度</span>
+<span class="c1"># ds = p * dp - p * (sum(p * dp))</span>
+<span class="n">b_ds</span> <span class="o">=</span> <span class="n">b_p</span> <span class="o">*</span> <span class="n">b_dp</span> <span class="o">-</span> <span class="n">b_p</span> <span class="o">*</span> <span class="n">b_pp</span>
+
+<span class="c1"># 4. 存入 ds</span>
+<span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">ds</span> <span class="o">+</span> <span class="n">i_n</span> <span class="o">*</span> <span class="n">D</span> <span class="o">+</span> <span class="n">o_d</span><span class="p">,</span> <span class="n">b_ds</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">ds</span><span class="o">.</span><span class="n">dtype</span><span class="o">.</span><span class="n">element_ty</span><span class="p">),</span> <span class="n">mask</span><span class="o">=</span><span class="n">m_d</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>总结</strong>：这是 Softmax 梯度的标准实现，利用 Triton 的向量化操作一次性算完一行。</p>
+<hr />
+<h4>Task 5: 性能优化魔法</h4>
+<p>你会看到函数头上有一大坨装饰器：</p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@triton</span><span class="o">.</span><span class="n">autotune</span><span class="p">(</span>
+    <span class="n">configs</span><span class="o">=</span><span class="p">[</span>
+        <span class="n">triton</span><span class="o">.</span><span class="n">Config</span><span class="p">({},</span> <span class="n">num_warps</span><span class="o">=</span><span class="mi">1</span><span class="p">),</span>
+        <span class="n">triton</span><span class="o">.</span><span class="n">Config</span><span class="p">({},</span> <span class="n">num_warps</span><span class="o">=</span><span class="mi">4</span><span class="p">),</span>
+        <span class="o">...</span>
+    <span class="p">],</span>
+    <span class="n">key</span><span class="o">=</span><span class="p">[</span><span class="s1">&#39;D&#39;</span><span class="p">]</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：
+GPU 编程很麻烦，不同的显卡、不同的数据长度（<code>D</code>），最佳的硬件配置参数（比如 <code>num_warps</code>，即每组用多少个线程束）是不一样的。
+<code>autotune</code>（自动调优）的意思是：<strong>"Triton 编译器，请你在第一次运行的时候，把上面列出的配置都试一遍，看哪个跑得最快，以后就用那个配置。"</strong></p>
+<p><strong><code>tl.constexpr</code> 是什么？</strong>
+在函数参数里看到 <code>D: tl.constexpr</code>。这告诉编译器：<code>D</code>（维度）在编译的时候就是一个常数。这允许编译器进行极端的优化（比如把循环展开），能显著提升速度。</p>
+<hr />
+<h3>💡 一句话总结</h3>
+<p>这个文件用 <strong>Triton</strong> 语言写了一个<strong>高度优化</strong>的 Softmax 算子，它把原本 PyTorch 做的数学运算搬到了更底层，通过手动管理内存读写和并行计算，来实现比默认 PyTorch 更快的速度，专门用于处理 Transformer 类模型中的注意力计算部分。</p>

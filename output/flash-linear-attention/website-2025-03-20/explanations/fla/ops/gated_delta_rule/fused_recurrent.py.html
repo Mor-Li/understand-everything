@@ -1,0 +1,123 @@
+<h1>fla/ops/gated_delta_rule/fused_recurrent.py</h1>
+<p>这份代码确实比较硬核，因为它涉及到 <strong>深度学习算法原理</strong>（线性Attention/RNN）和 <strong>高性能计算实现</strong>（Triton GPU编程）的结合。看不懂是非常正常的。</p>
+<p>你可以把它想象成我们在<strong>手动实现一个特制的、跑得飞快的 RNN（循环神经网络）层</strong>。</p>
+<p>为了让你逐步理解，我为你列了一个 <strong>学习/拆解任务清单 (Task List)</strong>，我们一步步来攻克它：</p>
+<h3>📝 任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1: 搞懂"它在做什么" (宏观概念)</strong> —— 这是一个什么算法？</li>
+<li><strong>Task 2: 搞懂"原材料" (输入输出)</strong> —— 它的输入 Q/K/V/g/beta 分别代表什么？</li>
+<li><strong>Task 3: 核心逻辑拆解 (数学原理)</strong> —— 那个最复杂的 <code>for</code> 循环里到底发生了什么？</li>
+<li><strong>Task 4: 并行策略 (Triton 优化)</strong> —— 它是怎么在 GPU 上加速的？</li>
+<li><strong>Task 5: 代码结构映射</strong> —— 文件里的三个函数分别起什么作用？</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 1: 搞懂"它在做什么" (宏观概念)</h4>
+<ul>
+<li><strong>观点</strong>：这个文件实现了一个叫 <strong>"Gated Delta Rule" (门控Delta规则)</strong> 的算法。</li>
+<li><strong>解释</strong>：<ul>
+<li>你可以把它看作是一种 <strong>线性 Attention</strong> 或者一种 <strong>RNN</strong>。</li>
+<li>传统的 Transformer 计算 Attention 需要 $O(N^2)$ 的复杂度（很慢，内存占用大）。</li>
+<li>这个算法把它变成了一种“循环”模式（RNN模式），复杂度是 $O(N)$（线性，很快）。</li>
+<li>它维护一个 <strong>记忆矩阵（Hidden State $H_t$）</strong>，随着时间步 $t$ 推移，不断把新的信息写进去，旧的信息根据遗忘门忘掉。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 搞懂"原材料" (输入输出)</h4>
+<p>看函数 <code>fused_recurrent_gated_delta_rule</code> 的参数：</p>
+<ul>
+<li><strong>输入 (原材料)</strong>：<ul>
+<li><code>q</code> (Query): 查询向量，用来从记忆里“读取”信息。</li>
+<li><code>k</code> (Key): 键向量，用来决定把信息“写”到记忆的哪个位置。</li>
+<li><code>v</code> (Value): 值向量，实际要写入记忆的内容。</li>
+<li><code>g</code> (Gate/Decay): <strong>遗忘门</strong>。控制上一时刻的记忆 $H_{t-1}$ 要保留多少（比如 <code>exp(g)</code>）。</li>
+<li><code>beta</code>: <strong>更新强度</strong>。控制这一步写入多少新信息。</li>
+</ul>
+</li>
+<li><strong>输出 (产品)</strong>：<ul>
+<li><code>o</code> (Output): 每一时刻的输出结果。</li>
+<li><code>final_state</code> (Optional): 处理完整个序列后，最终留下的记忆矩阵（可以传给下一段文本继续用）。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 核心逻辑拆解 (数学原理) —— 最重要的一步</h4>
+<p>这是代码中最难懂的部分，位于 <code>fused_recurrent_gated_delta_rule_fwd_kernel</code> 函数里的 <code>for _ in range(0, T):</code> 循环。</p>
+<p>让我们翻译一下循环里的代码：</p>
+<ol>
+<li><strong>读取数据</strong>：拿到当前时刻 $t$ 的 $k_t, v_t, q_t, g_t, \beta_t$。</li>
+<li><strong>遗忘旧记忆</strong>：
+    <code>python
+    b_h *= tl.exp(b_g)</code><ul>
+<li>当前的记忆矩阵 <code>b_h</code> 乘以一个衰减系数。这意味着很久以前的信息会慢慢消失。</li>
+</ul>
+</li>
+<li><strong>计算 Delta (差值)</strong>：
+    <code>python
+    b_v_minus = tl.sum(b_h * b_k[None, :], axis=1)
+    b_v -= b_v_minus</code><ul>
+<li><strong>这是 Delta Rule 的精髓。</strong></li>
+<li>它先计算“如果我不更新记忆，用现在的记忆能预测出什么 Key？”（<code>b_h * k</code>）。</li>
+<li>然后用原本的 Value 减去这个预测值。这叫 <strong>"Residual" (残差)</strong> 或者 <strong>"Delta"</strong>。意思是我们<strong>只把记忆中还没记住的部分</strong>写进去，避免重复记录。</li>
+</ul>
+</li>
+<li><strong>加权</strong>：
+    <code>python
+    b_v *= b_beta</code><ul>
+<li>把这个差值乘以 <code>beta</code>，决定更新力度。</li>
+</ul>
+</li>
+<li><strong>写入新记忆</strong>：
+    <code>python
+    b_h += b_k[None, :] * b_v[:, None]</code><ul>
+<li>把处理后的 $k$ 和 $v$ 做外积，加到记忆矩阵 <code>b_h</code> 里。</li>
+</ul>
+</li>
+<li><strong>输出结果</strong>：
+    <code>python
+    b_o = b_h * b_q[None, :]
+    b_o = tl.sum(b_o, axis=1)</code><ul>
+<li>用 Query ($q$) 去查询更新后的记忆矩阵 <code>b_h</code>，得到当前时刻的输出。</li>
+</ul>
+</li>
+</ol>
+<h4>Task 4: 并行策略 (Triton 优化)</h4>
+<p>既然是 RNN，必须一步一步算（$t=1, t=2...$），为什么还要用 GPU？</p>
+<ul>
+<li><strong>Triton 的切分逻辑</strong>：<ul>
+<li>虽然<strong>时间轴 (T)</strong> 上必须串行（因为 $H_t$ 依赖 $H_{t-1}$）。</li>
+<li>但是<strong>Batch (批次)</strong> 和 <strong>Head (多头注意力)</strong> 之间是完全独立的！</li>
+<li>代码里的 <code>i_nh = tl.program_id(2)</code> 就是在分配任务：每一个 GPU 核心（Block）负责处理一个 Batch 中的一个 Head。</li>
+</ul>
+</li>
+<li><strong>Fused (融合) 的意义</strong>：<ul>
+<li>普通 PyTorch 写这个循环会非常慢，因为每一步都要读写显存。</li>
+<li>这个脚本叫 <code>fused</code>，是因为它把整个 <code>for</code> 循环放在 <strong>SRAM (GPU的高速缓存)</strong> 里跑完了，中间状态不写回主显存，直到算出结果。这就是它快的原因。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 5: 代码结构映射</h4>
+<p>最后，把文件里的三个主要部分对应起来：</p>
+<ol>
+<li>
+<p><strong><code>fused_recurrent_gated_delta_rule_fwd_kernel</code></strong> (带有 <code>@triton.jit</code>):</p>
+<ul>
+<li><strong>大厨</strong>。这是在 GPU 上实际跑的核函数。里面包含了上面说的 <code>for</code> 循环逻辑。它是用 Triton 语言写的，类似 C 语言的指针操作。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>fused_recurrent_gated_delta_rule_fwd</code></strong>:</p>
+<ul>
+<li><strong>传菜员</strong>。它负责计算网格大小 (Grid Size)，准备张量，然后启动上面的“大厨”核函数。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>FusedRecurrentFunction</code></strong> (继承自 <code>torch.autograd.Function</code>):</p>
+<ul>
+<li><strong>经理</strong>。它封装了 PyTorch 的接口。</li>
+<li><code>forward</code>: 调用上面的传菜员。</li>
+<li><code>backward</code>: <strong>注意！</strong> 这里抛出了 <code>NotImplementedError</code>。说明这个文件目前<strong>只实现了前向传播（推理/预测）</strong>，还没有实现反向传播（训练）。作者注释说还没想好怎么高效地算梯度。</li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p>这个文件实现了一个<strong>带有遗忘门和差值更新规则的高效 RNN 算子</strong>。它利用 Triton 将循环计算融合在 GPU 核心内，避免了显存带宽瓶颈，主要用于加速推理（因为没有反向传播）。</p>

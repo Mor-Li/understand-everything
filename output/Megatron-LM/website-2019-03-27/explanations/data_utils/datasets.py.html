@@ -1,0 +1,106 @@
+<h1>data_utils/datasets.py</h1>
+<p>这份代码确实比较长，而且涉及了很多NLP（自然语言处理）模型训练前的数据预处理逻辑。简单来说，这个文件是模型训练的<strong>后勤补给部队</strong>。它的作用是把硬盘里的原始文本（CSV, JSON）变成模型能“吃”进去的数字（Tensors）。</p>
+<p>针对你“完全看不懂”的情况，我为你设计了一个<strong>学习/阅读任务清单 (To-Do List)</strong>，然后按照这个清单一步步拆解文中的核心观点。</p>
+<hr />
+<h3>📋 任务清单 (To-Do List)</h3>
+<p>为了理解这份代码，你需要按顺序搞定以下三个任务：</p>
+<ol>
+<li><strong>Task 1：搞懂原材料怎么进来的</strong><ul>
+<li><strong>目标</strong>：理解 <code>csv_dataset</code> 和 <code>json_dataset</code> 类。</li>
+<li><strong>问题</strong>：代码是如何读取最基础的文本文件的？</li>
+</ul>
+</li>
+<li><strong>Task 2：搞懂怎么管理这些数据（拼凑与切割）</strong><ul>
+<li><strong>目标</strong>：理解 <code>ConcatDataset</code> 和 <code>SplitDataset</code> 类及 <code>split_ds</code> 函数。</li>
+<li><strong>问题</strong>：我有多个文件怎么合并？我想把数据分成训练集和验证集怎么办？</li>
+</ul>
+</li>
+<li><strong>Task 3：搞懂怎么把文本做成 BERT 考题（核心难点）</strong><ul>
+<li><strong>目标</strong>：理解 <code>bert_sentencepair_dataset</code> 类。</li>
+<li><strong>问题</strong>：BERT 模型需要的“完形填空（Mask）”和“下一句预测（NSP）”数据是怎么实时生成的？</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>💡 逐步观点讲解</h3>
+<h4>第一步：原材料的读取 (对应 Task 1)</h4>
+<p><strong>核心观点：模型不直接读文件，需要专门的类把文本和标签提取出来。</strong></p>
+<p>代码中有两个类 <code>csv_dataset</code> 和 <code>json_dataset</code>，它们是搬运工。</p>
+<ul>
+<li><strong>做什么</strong>：<ul>
+<li>它们打开硬盘上的 <code>.csv</code> 或 <code>.json</code> 文件。</li>
+<li>提取出你指定的 <strong>文本列</strong>（<code>text_key</code>，比如句子）和 <strong>标签列</strong>（<code>label_key</code>，比如分类标签）。</li>
+<li><strong>分词 (Tokenization)</strong>：如果提供了 <code>tokenizer</code>，它们会顺手把文本变成数字ID列表（比如 "I love AI" -&gt; <code>[10, 25, 99]</code>）。</li>
+</ul>
+</li>
+<li><strong>关键点</strong>：<ul>
+<li><code>__getitem__</code>：这是PyTorch数据集的标准接口。当你问它要第 <code>i</code> 条数据时，它返回一个字典：<code>{'text': ..., 'label': ...}</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>第二步：数据的组织管理 (对应 Task 2)</h4>
+<p><strong>核心观点：数据往往是散乱的，需要“胶水”粘合或者“剪刀”裁剪。</strong></p>
+<ul>
+<li><strong>ConcatDataset（胶水）</strong>：<ul>
+<li><strong>场景</strong>：你可能有10个小的语料文件，想把它们当成一个巨大的数据集来训练。</li>
+<li><strong>做法</strong>：它存了一个列表 <code>self.datasets</code>。当你请求第1000条数据时，它会算一下这第1000条其实是位于第2个文件的第50条，然后去取出来给你。这叫“虚拟拼接”，不占用额外内存。</li>
+</ul>
+</li>
+<li><strong>SplitDataset（剪刀）</strong>：<ul>
+<li><strong>场景</strong>：你只有一个大文件，你想用80%训练，20%做测试。</li>
+<li><strong>做法</strong>：它不复制数据，只是存了一组“索引（Indices）”。比如测试集只存了 <code>[8, 9, 10...]</code> 这些编号。当你访问测试集时，它实际上是去原数据集里找对应编号的数据。</li>
+</ul>
+</li>
+<li><strong>split_ds（助手函数）</strong>：<ul>
+<li>帮你自动计算切分的比例（比如 <code>[.8, .2]</code>），并打乱顺序（Shuffle），最后返回切好的 <code>SplitDataset</code> 对象。</li>
+</ul>
+</li>
+</ul>
+<h4>第三步：BERT 专属考题生成 (对应 Task 3 - 最复杂的部分)</h4>
+<p><strong>核心观点：BERT 训练需要特殊的“自监督”数据，这部分逻辑是在读取数据时“实时动态”生成的。</strong></p>
+<p><code>bert_sentencepair_dataset</code> 是这个文件的重头戏。BERT 模型训练需要做两个任务，这个类就在负责制造这两个任务的数据：</p>
+<ol>
+<li>
+<p><strong>任务一：下一句预测 (Next Sentence Prediction, NSP)</strong></p>
+<ul>
+<li><strong>逻辑</strong>：模型需要判断句子 B 是不是句子 A 的下一句。</li>
+<li><strong>代码实现 (<code>create_random_sentencepair</code>)</strong>：<ul>
+<li>它会先随机抽一段话作为 <strong>句子 A</strong>。</li>
+<li>然后有 50% 的概率，它会真的取这段话后面的 <strong>句子 B</strong>（标签：是下一句）。</li>
+<li>另外 50% 的概率，它会随机去别的地方抽一段不相干的话作为 <strong>句子 B</strong>（标签：不是下一句）。</li>
+<li><em>这就是代码里 <code>rng</code> (随机数生成器) 到处乱跑的原因。</em></li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>任务二：完形填空 (Masked Language Model, MLM)</strong></p>
+<ul>
+<li><strong>逻辑</strong>：把句子里的一些词挖掉（变成 <code>[MASK]</code>），让模型去猜。</li>
+<li><strong>代码实现 (<code>create_masked_lm_predictions</code> 和 <code>mask_token</code>)</strong>：<ul>
+<li>它拿到拼接好的 A 和 B 后，会随机选 15% 的词（<code>mask_lm_prob=.15</code>）。</li>
+<li>在这 15% 里：<ul>
+<li>80% 的情况真的替换成 <code>[MASK]</code>。</li>
+<li>10% 的情况替换成一个随机的错词（误导模型）。</li>
+<li>10% 的情况保持不变（为了骗过模型，让它不知道哪些被选了）。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>最终产出</strong>：</p>
+<ul>
+<li>当你调用 <code>__getitem__</code> 时，它返回的是一个复杂的字典，包含：<ul>
+<li><code>text</code>: 已经被 mask 过的数字序列。</li>
+<li><code>types</code>: 区分哪部分是句子A（0000），哪部分是句子B（1111）。</li>
+<li><code>is_random</code>: 告诉模型这两个句子是不是随机拼凑的（NSP标签）。</li>
+<li><code>mask_labels</code>: 那些被挖掉的空的正确答案是什么。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p>这篇代码讲的就是：<strong>如何把一堆乱七八糟的文本文件，通过读取、合并、切分，最后在训练的一瞬间，动态地加工成 BERT 模型训练所需要的“完形填空”和“句子配对”的考题。</strong></p>

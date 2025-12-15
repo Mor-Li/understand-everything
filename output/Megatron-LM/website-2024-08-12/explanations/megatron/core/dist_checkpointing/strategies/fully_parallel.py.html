@@ -1,0 +1,90 @@
+<h1>megatron/core/dist_checkpointing/strategies/fully_parallel.py</h1>
+<p>这个文件 <code>fully_parallel.py</code> 的核心逻辑其实就是四个字：<strong>分工合作</strong>（为了加速模型保存和加载）。</p>
+<p>在分布式训练中（特别是数据并行 Data Parallelism），很多张显卡（Rank）上其实存着<strong>一模一样</strong>的模型参数副本。
+*   <strong>如果保存时：</strong> 每张卡都去写硬盘，硬盘会被写爆，而且浪费时间（存了N份一样的数据）。
+*   <strong>如果加载时：</strong> 每张卡都去读硬盘，硬盘会被读爆，速度很慢。</p>
+<p>这个文件的作用就是做一个“包工头”，把任务分配下去，让每张卡只干一部分活，最后大家把结果拼起来。</p>
+<p>下面我按照你要求的 <strong>Task To-Do List</strong> 形式，把这个文件的逻辑拆解开来。</p>
+<hr />
+<h3>核心任务清单 (Task To-Do List)</h3>
+<p>这个文件主要处理两个大流程：<strong>保存 (Save)</strong> 和 <strong>加载 (Load)</strong>。</p>
+<h4>📋 任务一：智能保存 (Save)</h4>
+<p><strong>目标：</strong> 既然大家手里的数据都一样，不要每个人都存。我们商量一下，你存第一段，我存第二段，大家别撞车，也别累着某一个人。</p>
+<ol>
+<li><strong>[收集信息]</strong> 所有显卡举手汇报自己手里有哪些数据（Tensor）。</li>
+<li><strong>[制定计划]</strong> 运行一个算法，决定每个数据块由哪张显卡负责写入硬盘。<ul>
+<li><em>原则：</em> 尽量让大家干的活一样多（负载均衡）。</li>
+</ul>
+</li>
+<li><strong>[标记分工]</strong> 给被选中的显卡贴个条（<code>replica_id=0</code>），没被选中的显卡贴个条（<code>replica_id=1</code>）。</li>
+<li><strong>[执行保存]</strong> 调用底层的保存函数。贴了“0”条的显卡真的去写硬盘，贴了“1”条的显卡这就没它事了。</li>
+</ol>
+<h4>📋 任务二：智能加载 (Load)</h4>
+<p><strong>目标：</strong> 既然大家都要读同样的数据，不要每个人都去挤着读硬盘。你读第一段，我读第二段，读完我们互相交换一下。</p>
+<ol>
+<li><strong>[收集需求]</strong> 所有显卡汇报自己需要加载哪些数据。</li>
+<li><strong>[制定计划]</strong> 运行算法，决定每个数据块由哪张显卡负责从硬盘读取。<ul>
+<li><em>原则：</em> 同样是为了负载均衡。</li>
+</ul>
+</li>
+<li><strong>[执行读取]</strong> 大家按计划去读硬盘，把自己负责的那部分读到显存里。<ul>
+<li><em>此时状态：</em> 每个人手里都只有一部分数据，是个残缺的模型。</li>
+</ul>
+</li>
+<li><strong>[互相交换]</strong> (这是加载特有的步骤) 大家开个会（通信），把我读到的数据发给你，你读到的发给我。<ul>
+<li><em>方法：</em> 代码里提供了几种发法（广播 Broadcast，或者轮流收集 Gather）。</li>
+</ul>
+</li>
+<li><strong>[拼装完成]</strong> 交换完后，每个人手里都有了完整的模型数据。</li>
+</ol>
+<hr />
+<h3>详细步骤与代码对应 (Step-by-Step)</h3>
+<p>现在我们深入一点，结合代码讲讲每一步具体在干啥。</p>
+<h4>第一阶段：保存逻辑 (<code>FullyParallelSaveStrategyWrapper</code>)</h4>
+<p><strong>Step 1: 看看大家都有啥 (Metadata Exchange)</strong>
+*   <strong>代码位置:</strong> <code>determine_main_replica_uniform_distribution</code> 函数。
+*   <strong>动作:</strong> 代码调用 <code>torch.distributed.all_gather_object</code>。
+*   <strong>解释:</strong> 就像班长喊一声：“大家把手里的书名报上来”。因为是数据并行，大家手里的书（参数）大多是一样的。</p>
+<p><strong>Step 2: 分配任务 (Distribution)</strong>
+*   <strong>代码位置:</strong> <code>distribute_shards_to_ranks</code> 函数 (贪心算法)。
+*   <strong>动作:</strong> 这是一个贪心算法。
+    *   它维护一个列表，记录每个人当前已经分配了多少字节的活。
+    *   拿到一个新任务（比如保存 Layer1 的权重），看谁目前最闲（分配的数据量最小），就分给谁。
+    *   <strong>目的:</strong> 避免 Rank 0 累死，Rank 1 闲死。</p>
+<p><strong>Step 3: 标记谁是主力 (Apply Mapping)</strong>
+*   <strong>代码位置:</strong> <code>distribute_main_replicas_with_precomputed_distribution</code>。
+*   <strong>动作:</strong>
+    *   如果算法决定 Rank 5 负责保存 Tensor A。
+    *   那么在 Rank 5 上，Tensor A 的 <code>replica_id</code> 设为 0（代表我是主副本，我要干活）。
+    *   在其他 Rank 上，Tensor A 的 <code>replica_id</code> 设为 1（代表我是备胎，我不干活）。</p>
+<p><strong>Step 4: 真正干活</strong>
+*   <strong>代码位置:</strong> <code>save</code> 方法最后调用 <code>self.base_strategy.save</code>。
+*   <strong>解释:</strong> 底层策略（比如写 Zarr 文件或 PyTorch 文件）会检查 <code>replica_id</code>。如果是 0 它就写，不是 0 它就跳过。</p>
+<hr />
+<h4>第二阶段：加载逻辑 (<code>FullyParallelLoadStrategyWrapper</code>)</h4>
+<p><strong>Step 1 &amp; 2: 制定读取计划</strong>
+*   <strong>代码位置:</strong> <code>apply_loading_parallelization</code>。
+*   <strong>解释:</strong> 和保存一样，先计算谁负责读哪一块。比如 Rank 0 读前半部分权重，Rank 1 读后半部分。</p>
+<p><strong>Step 2.5: 区分“自己读的”和“别人读的”</strong>
+*   <strong>代码位置:</strong> <code>_defer_loading_sharded_tensors</code>。
+*   <strong>动作:</strong> 把要加载的参数分成两堆：
+    1.  <code>to_load_shards</code>: 计划分给我读的（我要去访问磁盘）。
+    2.  <code>unloaded_shards</code>: 计划分给别人读的（我等着别人发给我）。</p>
+<p><strong>Step 3: 只有一部分人读盘</strong>
+*   <strong>代码位置:</strong> <code>self.base_strategy.load(to_load_shards, ...)</code>。
+*   <strong>解释:</strong> 只有被选中的 Rank 去读取文件。这大大减少了文件系统的压力（IOPS）。</p>
+<p><strong>Step 4: 互相交换数据 (关键步骤)</strong>
+*   <strong>代码位置:</strong> <code>load</code> 方法里根据 <code>exchange_algo</code> 选择不同的函数（比如 <code>exchange_loaded_tensors_broadcast</code>）。
+*   <strong>解释:</strong>
+    *   假设 Rank 0 读了 Tensor A，Rank 1 读了 Tensor B。
+    *   现在 Rank 0 需要 Tensor B，Rank 1 需要 Tensor A。
+    *   代码通过 <code>broadcast</code> (广播) 或者 <code>all_gather</code> (全收集) 的方式，让 Rank 0 把 A 发给所有人，Rank 1 把 B 发给所有人。
+    *   <strong>结果:</strong> 这一步结束后，显存之间进行了大量通信，但避免了从硬盘重复读取。</p>
+<hr />
+<h3>总结文中的核心观点</h3>
+<ol>
+<li><strong>IO 瓶颈是最大的敌人:</strong> 在大规模集群上，几千张卡同时读写文件系统，文件系统会崩溃。所以必须<strong>减少 IO 次数</strong>。</li>
+<li><strong>通信比 IO 快:</strong> 现在的显卡之间连接（NVLink/Infiniband）速度很快。与其大家都去读慢吞吞的硬盘，不如一个人读出来，然后通过高速网络分发给大家。</li>
+<li><strong>确定性分配:</strong> 只要大家的算法（那个贪心算法）是一样的，不需要过多的协调，Rank 0 知道自己该干啥，Rank 1 也知道自己该干啥，大家算出来的计划是一致的。</li>
+</ol>
+<p>这个文件就是一个<strong>“流量调度员”</strong>，把对硬盘的<strong>并发访问</strong>变成了<strong>分布式协作访问</strong>。</p>

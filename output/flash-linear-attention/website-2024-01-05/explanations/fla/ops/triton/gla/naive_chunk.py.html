@@ -1,0 +1,123 @@
+<h1>fla/ops/triton/gla/naive_chunk.py</h1>
+<p>这份代码实现的是 <strong>Chunked Gated Linear Attention (GLA)</strong> 的一个“朴素”（Naive）版本。</p>
+<p>所谓的“朴素”版本，意思是它完全使用 PyTorch 的基础算子写成，逻辑清晰但运行较慢。它的主要作用是<strong>当作“标准答案”</strong>，用来验证那些写在 Triton 里、运行极快但极难读懂的优化代码（如 <code>chunk_gla</code> 和 <code>fused_chunk_gla</code>）算出来的结果对不对。</p>
+<p>为了让你读懂，我们把这个过程想象成<strong>“一边阅读一边做笔记”</strong>的过程。
+*   <strong>Chunk（分块）</strong>：把一本书分成很多章。
+*   <strong>Intra-chunk（块内）</strong>：在这一章内，字和字之间有关联（类似传统 Attention）。
+*   <strong>Inter-chunk（块间/Recurrence）</strong>：看完这一章，把精华总结成一个“记忆（Hidden State）”，带入下一章。</p>
+<p>下面是帮你整理的学习任务 List，我们将一步步拆解代码：</p>
+<h3>任务清单 (Task List)</h3>
+<ol>
+<li><strong>理解输入与核心变量</strong>：搞懂 Q, K, V 和 gk 是什么。</li>
+<li><strong>理解分块策略 (Chunking)</strong>：为什么要切成一块一块的？</li>
+<li><strong>初始化“记忆容器”</strong>：Hidden State <code>h</code> 是什么？</li>
+<li><strong>核心循环 Step 1：准备当前块的数据</strong>：处理衰减率（Decay）。</li>
+<li><strong>核心循环 Step 2：计算块内注意力 (Intra-Chunk)</strong>：当前块内部的 Token 怎么交互？</li>
+<li><strong>核心循环 Step 3：读取历史记忆 (Inter-Chunk)</strong>：如何利用之前的记忆？</li>
+<li><strong>核心循环 Step 4：更新记忆 (State Update)</strong>：看完这一块，怎么更新记忆传给下一块？</li>
+<li><strong>测试代码 (Main)</strong>：这段代码在干嘛？</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>1. 理解输入与核心变量</h4>
+<p>代码位置：<code>naive_chunk_gla</code> 函数定义处。</p>
+<ul>
+<li><strong>Q, K, V</strong>: 标准 Attention 的 Query, Key, Value。</li>
+<li><strong>gk (Gate for Keys)</strong>: 这是 GLA 的核心。它是一个<strong>衰减门控</strong>（通常是 log 空间的值）。你可以把它理解为“遗忘率”。它决定了过去的某些信息保留多少、遗忘多少。</li>
+<li><strong>scale</strong>: <code>d_head_k ** -0.5</code>，这是 Attention 标准的缩放系数，防止数值过大。</li>
+</ul>
+<h4>2. 理解分块策略 (Chunking)</h4>
+<p>代码位置：<code>chunk_size = 128</code> 和 <code>for i in range(...)</code></p>
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li>如果序列长度 <code>seq_len</code> 是 2048，直接算 Attention 开销很大。</li>
+<li>GLA 采用“分块”策略：把 2048 分成很多个 128 长度的小块。</li>
+<li><strong>块内</strong>并行计算（像 Transformer），<strong>块间</strong>串行递归（像 RNN）。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 初始化“记忆容器”</h4>
+<p>代码位置：<code>h = torch.zeros(...)</code></p>
+<ul>
+<li><strong>h (Hidden State)</strong>: 这是一个矩阵，形状是 <code>[batch, heads, d_head_k, d_head_v]</code>。</li>
+<li><strong>作用</strong>：它就像一个“笔记本”。在处理第 <code>i</code> 个块时，<code>h</code> 存储了从第 <code>0</code> 块到第 <code>i-1</code> 块所有的浓缩信息。最开始是全 0，因为还没看任何内容。</li>
+</ul>
+<h4>4. 核心循环 Step 1：准备当前块的数据</h4>
+<p>代码位置：<code>for</code> 循环内部，<code>gk_chunk</code> 处理部分。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 切片取出当前块的 q, k, v, gk</span>
+<span class="n">q_chunk</span> <span class="o">=</span> <span class="n">q</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">lo</span><span class="p">:</span><span class="n">up</span><span class="p">,</span> <span class="p">:]</span> <span class="o">*</span> <span class="n">scale</span>
+<span class="o">...</span>
+<span class="c1"># 这里的 gk 是 log 空间的，cumsum 表示累加（在 log 空间累加等于在原空间连乘）</span>
+<span class="n">gk_chunk</span> <span class="o">=</span> <span class="p">(</span><span class="n">gk</span><span class="p">[:,</span> <span class="p">:,</span> <span class="n">lo</span><span class="p">:</span><span class="n">up</span><span class="p">])</span><span class="o">.</span><span class="n">cumsum</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">)</span>
+
+<span class="c1"># 给 Q 和 K 加上位置衰减信息</span>
+<span class="c1"># 这一步数学上比较绕，简单理解就是：</span>
+<span class="c1"># Q 乘以当前的衰减项，K 乘以反向的衰减项，这是为了实现 Linear Attention 中的相对位置编码效果。</span>
+<span class="n">q_chunk</span> <span class="o">=</span> <span class="p">(</span><span class="n">q_chunk</span> <span class="o">*</span> <span class="n">gk_chunk</span><span class="o">.</span><span class="n">exp</span><span class="p">())</span>
+<span class="n">k_chunk1</span> <span class="o">=</span> <span class="p">(</span><span class="n">k_chunk</span> <span class="o">*</span> <span class="p">(</span><span class="o">-</span><span class="n">gk_chunk</span><span class="o">+</span><span class="n">gk_chunk</span><span class="p">[:,</span> <span class="p">:,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="kc">None</span><span class="p">])</span><span class="o">.</span><span class="n">exp</span><span class="p">())</span>
+</code></pre></div>
+
+<h4>5. 核心循环 Step 2：计算块内注意力 (Intra-Chunk)</h4>
+<p>这是当前块内部 Token 之间的交互，类似标准的 Attention。
+代码位置：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 计算 Q * K^T</span>
+<span class="n">qk</span> <span class="o">=</span> <span class="n">q_chunk</span> <span class="o">@</span> <span class="p">(</span><span class="n">k_chunk</span> <span class="o">*</span> <span class="p">(</span><span class="o">-</span><span class="n">gk_chunk</span><span class="p">)</span><span class="o">.</span><span class="n">exp</span><span class="p">())</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+
+<span class="c1"># Mask 操作：确保因果性（Causal），即第 5 个词不能看到第 6 个词</span>
+<span class="n">mask</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tril</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="n">qk</span> <span class="o">=</span> <span class="n">qk</span><span class="o">.</span><span class="n">masked_fill</span><span class="p">(</span><span class="o">~</span><span class="n">mask</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+
+<span class="c1"># 最终得到当前块内的输出：Attention_Score * V</span>
+<span class="n">o_chunk</span> <span class="o">=</span> <span class="n">qk</span> <span class="o">@</span> <span class="n">v_chunk</span>
+</code></pre></div>
+
+<ul>
+<li><strong>点拨</strong>：这部分计算的是<strong>当前块内部</strong>产生的注意力结果，还没考虑之前的历史信息。</li>
+</ul>
+<h4>6. 核心循环 Step 3：读取历史记忆 (Inter-Chunk)</h4>
+<p>代码位置：<code>o_chunk += q_chunk @ h</code></p>
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li><code>h</code> 是之前所有块的总结。</li>
+<li><code>q_chunk</code> 是当前的查询。</li>
+<li><code>q_chunk @ h</code> 意味着：<strong>用当前的 Query 去查询过去的记忆</strong>。</li>
+<li>把这个结果加到 <code>o_chunk</code> 上，现在的输出就包含了（当前块内信息 + 历史信息）。</li>
+</ul>
+</li>
+</ul>
+<h4>7. 核心循环 Step 4：更新记忆 (State Update)</h4>
+<p>这一步是为了给下一个块做准备。我们需要把当前块的信息压缩进 <code>h</code>。
+代码位置：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 准备当前块的 KV 聚合信息</span>
+<span class="n">kv_chunk</span> <span class="o">=</span> <span class="n">k_chunk1</span><span class="o">.</span><span class="n">transpose</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">@</span> <span class="n">v_chunk</span>
+
+<span class="c1"># 2. 计算这一块总共需要衰减多少 (Decay)</span>
+<span class="n">decay</span> <span class="o">=</span> <span class="n">gk_chunk</span><span class="p">[:,</span> <span class="p">:,</span> <span class="o">-</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">exp</span><span class="p">()</span>
+
+<span class="c1"># 3. 更新 h</span>
+<span class="c1"># 新的 h = (旧的 h * 衰减) + 当前块的新 KV 信息</span>
+<span class="n">h</span> <span class="o">=</span> <span class="n">h</span> <span class="o">*</span> <span class="n">decay</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="kc">None</span><span class="p">]</span> <span class="o">+</span> <span class="n">kv_chunk</span>
+</code></pre></div>
+
+<ul>
+<li><strong>点拨</strong>：这完全符合 RNN 的逻辑：$h_t = \alpha h_{t-1} + x_t$。只不过这里的 $x_t$ 是整个块的 KV 乘积。</li>
+</ul>
+<h4>8. 测试代码 (Main)</h4>
+<p>代码位置：<code>if __name__ == "__main__":</code></p>
+<ul>
+<li><strong>目的</strong>：这就是一个单元测试（Unit Test）。</li>
+<li><strong>流程</strong>：<ol>
+<li>随机生成数据 Q, K, V, G。</li>
+<li>运行 <code>ref = naive_chunk_gla(...)</code> （刚才讲的慢速版）。</li>
+<li>运行 <code>tri = chunk_gla(...)</code> （Triton 写的快速版）。</li>
+<li><strong>Assert</strong>：对比两个结果是否极其接近（<code>allclose</code>）。</li>
+<li>如果报错，说明快速版写错了；如果不报错，说明优化是正确的。</li>
+</ol>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件讲的就是：<strong>如何把 Linear Attention 拆成小块来算。</strong>
+1.  <strong>块内</strong>用矩阵乘法算（利用 GPU 并行优势）。
+2.  <strong>块间</strong>用 RNN 方式传导 <code>h</code>（保持线性复杂度，节省显存）。
+3.  通过 <code>gk</code> (gate) 来控制记忆的衰减。</p>
+<p>希望这个 List 能帮你把逻辑串起来！</p>

@@ -1,0 +1,93 @@
+<h1>docs/advance/fsdp_extension.rst</h1>
+<p>这篇文档确实比较硬核，它是写给<strong>底层开发人员</strong>看的，主要讲的是：<strong>在一个分布式训练系统中（比如使用 FSDP 技术的 Actor），如何把训练好的模型参数（权重）高效地同步给 vLLM（用于推理加速的引擎）。</strong></p>
+<p>简单来说，就是<strong>“怎么把训练那边的脑子，搬到推理那边去，而且别把内存撑爆了”。</strong></p>
+<p>为了让你听懂，我把这个过程拆解成一个 <strong>Task List (待办清单)</strong>，并一步步解释每一步在干嘛。</p>
+<hr />
+<h3>核心背景（在开始 Task 之前）</h3>
+<ul>
+<li><strong>问题：</strong> 你的系统里有两个角色，一个是负责训练的（Actor），一个是负责推理的（vLLM）。训练完一步，vLLM 需要更新权重。</li>
+<li><strong>笨办法 (<code>hf_weight_loader</code>)：</strong> 把所有权重全部收集起来，再一次性塞给 vLLM。<ul>
+<li><em>后果：</em> 显存（Memory）瞬间爆炸（OOM），因为大模型太大了。</li>
+</ul>
+</li>
+<li><strong>聪明办法 (<code>dtensor_weight_loader</code>)：</strong> 像蚂蚁搬家一样，一层一层、或者分块地把权重收集并转换，用多少拿多少。<ul>
+<li><em>后果：</em> 省显存，稳定。</li>
+</ul>
+</li>
+</ul>
+<p><strong>这篇文档就是教你怎么给一个新模型写这个“聪明办法”的代码。</strong></p>
+<hr />
+<h3>你的 Task List (待办清单)</h3>
+<p>如果你只是<strong>使用</strong>模型，看 Task 1 就够了；如果你是<strong>开发</strong>新模型支持，需要看完 Task 2-6。</p>
+<h4>✅ Task 1: 检查你的模型是否已经在“白名单”里</h4>
+<p><strong>文档观点：</strong> 我们已经帮大家写好了一些主流模型的“聪明加载器”（dtensor weight loader）。
+<strong>你需要做：</strong> 看看你想跑的模型是不是下面这些：
+*   GPT2, Llama (各种版本), Mistral, Qwen2, DeepseekV2, Gemma 等。
+*   <strong>如果是：</strong> 恭喜你，这篇文档剩下的内容你都不用看了，直接用就行。
+*   <strong>如果不是：</strong> 比如你想跑一个极度冷门或者全新的模型，请继续往下看。</p>
+<h4>✅ Task 2: 准备“抄作业” (Copy Code)</h4>
+<p><strong>文档观点：</strong> 不要从头写代码，去 vLLM 的源码里抄。
+<strong>你需要做：</strong>
+1.  找到 vLLM 库里对应这个模型的定义文件。
+2.  找到 <code>load_weights</code> 这个函数。
+3.  把它复制到你的项目文件 <code>dtensor_weight_loaders.py</code> 中。</p>
+<h4>✅ Task 3: 修改函数签名 (Modify Arguments)</h4>
+<p><strong>文档观点：</strong> 原来的函数是类的方法（Method），现在要改成独立的函数。
+<strong>你需要做：</strong>
+*   把函数名改个名字（比如 <code>gemma_dtensor_weight_loader</code>）。
+*   入参从 <code>(self, weights: ...)</code> 改成 <code>(actor_weights: Dict, vllm_model: nn.Module)</code>。
+    *   <em>解释：</em> 因为不在类里面了，没有 <code>self</code> 了，所以要显式地把模型实例 <code>vllm_model</code> 传进来。</p>
+<h4>✅ Task 4: 替换主体对象 (Replace Self)</h4>
+<p><strong>文档观点：</strong> 代码里原来的 <code>self</code> 指的是模型自己，现在要换成传入的 <code>vllm_model</code>。
+<strong>你需要做：</strong>
+*   把代码里所有的 <code>self</code> 替换成 <code>vllm_model</code>。
+*   把循环遍历权重的来源，从原来的迭代器改成 <code>actor_weights.items()</code>。</p>
+<h4>✅ Task 5: 加入“核心魔法” (Redistribute Dtensor)</h4>
+<p><strong>文档观点：</strong> 这是最关键的一步。原来的代码是直接加载本地权重的，现在权重的来源是 FSDP（分布式的 Tensor）。
+<strong>你需要做：</strong>
+*   在每一处代码准备加载权重之前（即 <code>param = ...</code> 之前），插入一行代码：
+    <code>python
+    local_loaded_weight = redistribute_dtensor(param_name=name, loaded_weights=loaded_weight)</code>
+*   <strong>解释：</strong> 这个函数 <code>redistribute_dtensor</code> 会负责把分布在不同显卡上的碎片权重，按照当前 vLLM 的需求重新整理好。
+*   然后，把后面用到 <code>loaded_weight</code> 的地方，全部改成用 <code>local_loaded_weight</code>。</p>
+<h4>✅ Task 6: 注册 (Register)</h4>
+<p><strong>文档观点：</strong> 写好了函数，得告诉系统它的存在。
+<strong>你需要做：</strong>
+*   把写好的函数注册到 <code>__MODEL_DTENSOR_WEIGHT_LOADER_REGISTRY__</code> 这个全局字典里。这样系统启动时就知道：“哦，如果是这个模型，就用这个函数来加载权重”。</p>
+<hr />
+<h3>总结代码对比 (Diff)</h3>
+<p>文档最后给了一段代码对比，我给你翻译一下它的意思：</p>
+<div class="codehilite"><pre><span></span><code># ❌ (删除) 原来的 vLLM 写法：是类的一个方法
+<span class="gd">- def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):</span>
+
+# ✅ (新增) 现在的写法：是一个独立函数，接收 actor_weights 和 vllm_model
+<span class="gi">+ def gemma_dtensor_weight_loader(actor_weights: Dict, vllm_model: nn.Module) -&gt; nn.Module:</span>
+
+<span class="w"> </span>   # ... 省略中间映射关系 ...
+
+<span class="w"> </span>   # ❌ (删除) 原来用 self 找参数
+<span class="gd">-   params_dict = dict(self.named_parameters())</span>
+<span class="w"> </span>   # ✅ (新增) 现在用 vllm_model 找参数
+<span class="gi">+   params_dict = dict(vllm_model.named_parameters())</span>
+
+<span class="w"> </span>   # ❌ (删除) 原来遍历输入列表
+<span class="gd">-   for name, loaded_weight in weights:</span>
+<span class="w"> </span>   # ✅ (新增) 现在遍历 actor 的权重字典
+<span class="gi">+   for name, loaded_weight in actor_weights.items():</span>
+
+<span class="w"> </span>       # ... 省略 ...
+
+<span class="w"> </span>       # ✅✅✅ (新增) 关键一步！转换分布式权重为本地可用权重
+<span class="gi">+           local_loaded_weight = redistribute_dtensor(param_name=name, loaded_weights=loaded_weight)</span>
+
+<span class="w"> </span>           param = params_dict[name]
+<span class="w"> </span>           weight_loader = param.weight_loader
+
+<span class="w"> </span>           # ❌ (删除) 原来直接加载
+<span class="gd">-           weight_loader(param, loaded_weight, shard_id)</span>
+<span class="w"> </span>           # ✅ (新增) 现在加载转换后的 local_loaded_weight
+<span class="gi">+           weight_loader(param, local_loaded_weight.to(dtype=param.dtype), shard_id)</span>
+</code></pre></div>
+
+<h3>一句话总结</h3>
+<p>这篇文档在教你：<strong>如果你想在这个系统里跑一个新的、还没被支持的模型，你需要手动写一段代码，把 vLLM 的加载逻辑“魔改”一下，插入一个 <code>redistribute_dtensor</code> 函数，以便让模型能省内存地从训练端同步参数。</strong></p>

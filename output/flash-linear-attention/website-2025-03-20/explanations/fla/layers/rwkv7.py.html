@@ -1,0 +1,122 @@
+<h1>fla/layers/rwkv7.py</h1>
+<p>这就对了！面对复杂的模型代码，直接看细节容易晕。RWKV7 是一个非常前沿的架构（RNN和Transformer的混合体），它的逻辑确实比普通 Attention 绕。</p>
+<p>我们可以把 <code>RWKV7Attention</code> 的运行过程想象成一条<strong>流水线工厂</strong>。你的任务是处理进来的数据（hidden_states），经过一系列复杂的加工，最后输出新的数据。</p>
+<p>我把这个过程拆解成 <strong>5个主要的 Task（任务）</strong>，我们一步步来完成。</p>
+<hr />
+<h3>任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1: 原料混合 (Time Mixing)</strong><ul>
+<li><em>目标</em>：把“当前时刻的信息”和“上一时刻的信息”揉在一起，为不同的计算通道准备特制的输入。</li>
+</ul>
+</li>
+<li><strong>Task 2: 生产控制信号 (RWKV Vectors)</strong><ul>
+<li><em>目标</em>：生成 R, W, K, V, A, G 这六个关键向量。它们决定了怎么记忆、怎么遗忘、怎么输出。</li>
+</ul>
+</li>
+<li><strong>Task 3: 特殊处理 (V-Mixing &amp; Normalization)</strong><ul>
+<li><em>目标</em>：RWKV7 特有的“跳线连接”和数值稳定处理。</li>
+</ul>
+</li>
+<li><strong>Task 4: 核心引擎 (The Kernel)</strong><ul>
+<li><em>目标</em>：这是最难的一步。把所有信号扔进加速器（CUDA kernel），算出这一层的“注意力”结果。</li>
+</ul>
+</li>
+<li><strong>Task 5: 最终组装 (Output Projection)</strong><ul>
+<li><em>目标</em>：整理形状，归一化，加上门控，输出最终结果。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>Task 1: 原料混合 (Time Mixing)</h4>
+<p><strong>代码位置：</strong> <code>forward</code> 函数开头到 <code>xr, xw... = hidden_states.addcmul(...).unbind(0)</code></p>
+<ul>
+<li><strong>发生了什么？</strong>
+    RWKV 认为，处理一个词（Token）时，不能只看它自己，还得看看它前面那个词。<ol>
+<li><strong>Shift (平移)：</strong> 代码里 <code>shifted = self.time_shift(hidden_states)</code> 就是把整个序列往后挪一位，拿到了“上一时刻的状态”。</li>
+<li><strong>Difference (差值)：</strong> <code>delta = shifted - hidden_states</code> 计算当前词和上一个词的变化量。</li>
+<li><strong>Mixing (混合)：</strong> <code>self.x_x</code> 是一个可学习的参数。它决定了对于 R, W, K, V, A, G 这六个不同的用途，我们需要混合多少“变化量”。</li>
+<li><strong>结果：</strong> 我们得到了 <code>xr</code> (用来算R), <code>xw</code> (用来算W), <code>xk</code>, <code>xv</code> 等等。它们是经过微调的输入原料。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 2: 生产控制信号 (RWKV Vectors)</h4>
+<p><strong>代码位置：</strong> 中间的一大段 <code>r = ...</code>, <code>w = ...</code>, <code>k = ...</code></p>
+<ul>
+<li><strong>发生了什么？</strong>
+    利用 Task 1 得到的原料，通过全连接层（Linear）或 LoRA（低秩矩阵）生成控制向量。这些字母代表了 RWKV 的核心机制：<ul>
+<li><strong>R (Receptance - 接收门)：</strong> 类似于 LSTM 的输入门。决定我们要接收多少新信息。</li>
+<li><strong>W (Wind/Decay - 遗忘率)：</strong> <strong>这是 RWKV 的灵魂</strong>。它决定了记忆衰减得有多快。<ul>
+<li>代码 <code>w = -0.6... * self.w_lora(xw).sigmoid()</code> 生成的是衰减系数。</li>
+</ul>
+</li>
+<li><strong>K (Key - 键) &amp; V (Value - 值)：</strong> 类似于 Transformer 的 K 和 V。K 是索引，V 是内容。</li>
+<li><strong>A (Anchor/State - 状态因子)：</strong> RWKV7 新引入的，用于更复杂的状态更新控制。</li>
+<li><strong>G (Gate - 输出门)：</strong> 决定最后输出数值的大小（音量旋钮）。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 特殊处理 (V-Mixing &amp; Normalization)</h4>
+<p><strong>代码位置：</strong> <code>v = torch.lerp(...)</code> 和 <code>kk = ...</code></p>
+<ul>
+<li><strong>发生了什么？</strong>
+    这里有两个 RWKV7 特有的黑科技：<ol>
+<li><strong>V-Mixing (V的层间混合)：</strong><ul>
+<li>代码 <code>if self.layer_idx == 0: v_first = v</code>。</li>
+<li>RWKV7 会把第0层的 V（原始内容）一直传下去。后面的层在计算自己的 V 时，会根据 <code>v_lora</code> 的结果，把当前的 V 和第0层的 <code>v_first</code> 进行插值混合。这是一种残差连接的变体，防止深层网络忘记原始输入。</li>
+</ul>
+</li>
+<li><strong>KK Normalization (K的归一化)：</strong><ul>
+<li>代码 <code>kk = F.normalize(...)</code>。</li>
+<li>为了防止数值爆炸，对 K 向量进行了归一化处理。这个 <code>kk</code> 稍后会用来控制状态更新的方向。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>Task 4: 核心引擎 (The Kernel)</h4>
+<p><strong>代码位置：</strong> <code>o, recurrent_state = rwkv7_fn(...)</code></p>
+<ul>
+<li><strong>发生了什么？</strong>
+    这是最“魔法”的地方。前面准备好的 R, W, K, V, A 以及归一化后的 KK，被送入了一个底层的 CUDA 函数（<code>chunk_rwkv7</code> 或 <code>fused_recurrent_rwkv7</code>）。<ul>
+<li><strong>不做矩阵乘法：</strong> 普通 Transformer 这里要做 $Q \times K^T$ (N乘N矩阵)。</li>
+<li><strong>做线性递归：</strong> RWKV 这里执行类似 RNN 的操作。</li>
+<li><strong>公式逻辑：</strong> 它在内部维护一个状态 $S$。<ul>
+<li>输入进来，根据 W 衰减旧状态 $S$。</li>
+<li>利用 K, V, A 更新状态 $S$。</li>
+<li>利用 R 从状态 $S$ 中读取输出 $o$。</li>
+</ul>
+</li>
+<li><strong>参数对应：</strong> 代码中传给 kernel 的参数 <code>a=-kk</code>, <code>b=kk*a</code> 是为了适配 RWKV7 特殊的更新公式（不要深究数学细节，只要知道这是为了让状态更新更稳定）。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 5: 最终组装 (Output Projection)</h4>
+<p><strong>代码位置：</strong> 函数最后几行 <code>o = self.g_norm(...)</code> 到 <code>return</code></p>
+<ul>
+<li><strong>发生了什么？</strong>
+    从核心引擎出来的结果 <code>o</code> 还是半成品。<ol>
+<li><strong>GroupNorm：</strong> 对输出进行归一化，保证数值分布稳定。</li>
+<li><strong>Bonus Term (额外项)：</strong><ul>
+<li>代码 <code>o = o + ((r * k * self.r_k).sum(...) * v)</code>。</li>
+<li>这是一个“捷径”。除了通过 RNN 状态传递信息外，RWKV7 允许当前的 R 和 K 直接交互一下，把当前的 V 加进去。这增加了模型的表达能力。</li>
+</ul>
+</li>
+<li><strong>Gating (门控)：</strong> <code>o * g</code>。用 Task 2 生成的 G 门控来调整输出幅度。</li>
+<li><strong>Output Projection：</strong> <code>self.o_proj(o)</code>。最后经过一个线性层，把维度变回 <code>hidden_size</code>，完成这一层的所有工作。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结 (Summary)</h3>
+<p><strong>RWKV7Attention 到底在干啥？</strong></p>
+<p>简单来说，它不像 Transformer 那样“并行地看所有词”，而是像一个人一边读书一边记笔记：</p>
+<ol>
+<li><strong>看词 (Task 1)：</strong> 看了看当前词，也瞄了一眼上个词。</li>
+<li><strong>大脑反应 (Task 2)：</strong> 决定这个词重要吗 (R)？以前的事忘多少 (W)？这个词的内容是啥 (V)？</li>
+<li><strong>更新笔记 (Task 4 - Kernel)：</strong> 根据遗忘率 W 擦掉脑子里旧的记忆，把新内容 K/V/A 写进脑子里的状态 (State) 中。</li>
+<li><strong>说出理解 (Task 5)：</strong> 根据当前的记忆状态，组织语言，输出这一步的理解向量。</li>
+</ol>
+<p><strong>为什么你看不懂？</strong>
+因为它把很多数学公式（比如状态更新方程）藏在了 <code>rwkv7_fn</code> 这个黑盒函数里，而且为了显存优化，用了大量的 <code>rearrange</code> (维度变换) 和 LoRA (低秩投影)，导致代码看起来很碎。</p>
+<p>按照这个 List 去读，是不是稍微清晰一点了？</p>

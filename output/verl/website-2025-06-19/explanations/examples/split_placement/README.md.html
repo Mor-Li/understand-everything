@@ -1,0 +1,50 @@
+<h1>examples/split_placement/README.md</h1>
+<p>这份文档其实是在讲<strong>如何通过“拆分部署”（Split Placement）来优化 PPO 算法的训练效率和显存占用</strong>。</p>
+<p>简单来说，PPO 算法里有四个主要模型：Actor（演员）、Critic（评论家）、Reference（参考模型）、Reward（奖励模型）。如果把它们都挤在一堆显卡里，显存可能不够用，而且运行起来是串行的（一个做完等下一个），效率低。</p>
+<p>这篇文章的核心观点是：<strong>把它们分家，并且让它们同时干活。</strong></p>
+<p>为了让你听懂，我把这个过程拆解成一个 <strong>To-Do List (任务清单)</strong>，你只需要跟着这个清单一步步走，就能理解它在干什么。</p>
+<hr />
+<h3>📋 任务清单：PPO 拆分部署实战</h3>
+<h4>✅ Task 0: 理解核心概念 (Why?)</h4>
+<ul>
+<li><strong>现状</strong>：通常情况下，Actor 和 Critic 都在同一组显卡上。更新完 Actor，再更新 Critic，互相排队。</li>
+<li><strong>目标</strong>：把 Actor 放在“左边”的显卡，Critic 放在“右边”的显卡。<strong>让它们同时更新（并行），互不干扰</strong>。</li>
+</ul>
+<h4>✅ Task 1: 分配地盘 (对应文档 Step 1)</h4>
+<p>我们需要告诉程序，哪些模型去哪些显卡。
+*   <strong>行动</strong>：在配置代码中，把显卡资源划分为两个池子（Pool）。
+    *   <strong>池子 A (<code>actor_rollout_ref_pool</code>)</strong>：放 Actor 和 Reference 模型。
+    *   <strong>池子 B (<code>critic_pool</code>)</strong>：放 Critic 和 Reward 模型。
+*   <strong>代码解读</strong>：
+    *   文档里的代码逻辑是：如果你有 2 个节点（机器），节点 1 给池子 A，节点 2 给池子 B。如果你只有 1 个节点，就把这台机器的显卡劈成两半，前一半给 A，后一半给 B。
+    *   <code>mapping</code> 字典就是具体的分配指令：<code>Role.Actor</code> 去 A 池，<code>Role.Critic</code> 去 B 池。</p>
+<h4>✅ Task 2: 解除“等待”指令 (对应文档 Step 2 - 关键步骤)</h4>
+<p>默认情况下，Python 代码是“阻塞”的（Blocking）。意思是：喊 Actor 更新，主程序就卡住等着，直到 Actor 更新完，才去喊 Critic 更新。我们要关掉这个限制。
+*   <strong>行动</strong>：修改源代码文件 <code>fsdp_workers.py</code>。
+*   <strong>具体操作</strong>：找到 <code>update_actor</code> 和 <code>update_critic</code> 这两个函数。
+*   <strong>修改点</strong>：在装饰器 <code>@register</code> 里加上 <code>blocking=False</code>。
+*   <strong>白话解释</strong>：这就像老板（主控程序）对员工（模型）说：“你去更新吧，<strong>不用立刻向我汇报完成</strong>，我先去安排下一个人。” 这样 Actor 和 Critic 就能同时开始跑了。</p>
+<h4>✅ Task 3: 统一回收结果 (对应文档 Step 3)</h4>
+<p>既然刚才让他们“不用立刻汇报”，主控程序（Controller）跑得飞快，但最后总得确认它们都干完活了吧？
+*   <strong>行动</strong>：修改 <code>ray_trainer.py</code>。
+*   <strong>具体操作</strong>：使用 <code>.get()</code> 方法。
+*   <strong>代码解读</strong>：
+    <code>python
+    # 这两行代码的意思是：
+    # 虽然你们刚才早就开始跑了，但跑到这里时，
+    # 我必须拿到（get）你们俩的结果，才能进行下一轮训练。
+    critic_output = critic_output.get()
+    actor_output = actor_output.get()</code>
+    <em>如果不加这一步，主程序可能在模型还没更新完时就开始下一轮采样，程序就乱套了。</em></p>
+<h4>✅ Task 4: 一键启动 (对应文档 Step 4)</h4>
+<p>配置好了，代码也改了，现在开始运行。
+*   <strong>行动</strong>：在终端运行启动脚本。
+*   <strong>命令</strong>：<code>bash run_deepseek7b_llm.sh</code>
+*   <strong>预期结果</strong>：你会看到训练任务被分配到了不同的 GPU 上，且 Actor 和 Critic 的更新日志几乎是同时出现的。</p>
+<hr />
+<h3>💡 总结一下</h3>
+<p>这篇文章其实就教了你三招：
+1.  <strong>分家</strong>：把模型拆到不同显卡（Step 1）。
+2.  <strong>异步</strong>：设为 <code>blocking=False</code>，让它们别傻等，同时开工（Step 2）。
+3.  <strong>同步</strong>：用 <code>.get()</code> 在最后关头把结果收回来，确保安全（Step 3）。</p>
+<p>文档里提到的 <strong>"Quickstart"</strong> 是指：如果你只是想快速跑通这个例子，你可以直接跳去改 <strong>Step 2</strong> 的代码，然后运行 <strong>Step 4</strong> 的脚本，因为示例脚本里可能已经预设好了 Step 1 和 Step 3 的逻辑。</p>
