@@ -1,0 +1,65 @@
+<h1>easyeditor/models/r_rome/compute_v.py</h1>
+<p>这份代码是 ROME (Rank-One Model Editing) 算法的核心部分之一。简单来说，ROME 试图通过修改模型中某一层的一个“神经元反应”，来把一个新的知识（比如“埃菲尔铁塔在罗马”）强行注入到模型里。</p>
+<p><code>compute_v.py</code> 的任务是：<strong>计算出那个“新的神经元反应”应该是什么样子，才能让模型说出我们想要的新知识。</strong></p>
+<p>为了让你容易理解，我把这整个过程拆解成一个 <strong>Task Todo List（任务清单）</strong>，就像你在教一个学生改正错误一样。</p>
+<hr />
+<h3>核心任务：找到一个向量 $v$，让模型学会新知识</h3>
+<h4>Task 1: 准备教材（数据预处理）</h4>
+<p><strong>代码位置：</strong> 函数开头 到 <code>input_tok = ...</code> 部分
+*   <strong>目标：</strong> 把人类的语言（Prompt 和 Target）变成机器能懂的数字（Token IDs）。
+*   <strong>步骤：</strong>
+    1.  <strong>目标数字化：</strong> 把你想让模型说的新词（<code>target_new</code>，比如 "Rome"）变成 token ID。
+    2.  <strong>准备提示语 (Prompts)：</strong>
+        *   <strong>重写提示语 (Rewriting Prompts)：</strong> 比如 "The Eiffel Tower is in"，用来训练模型输出 "Rome"。
+        *   <strong>KL 散度提示语 (KL Prompts)：</strong> 比如 "{} is a"，用来保持模型的通用语言能力不崩坏（不要改了“埃菲尔铁塔”就忘了怎么说话）。
+    3.  <strong>打包：</strong> 把这些句子全部转化成 Tensor 放到 GPU 上。</p>
+<h4>Task 2: 确定“动手术”的位置（定位索引）</h4>
+<p><strong>代码位置：</strong> <code>find_fact_lookup_idx</code> 调用部分
+*   <strong>目标：</strong> 找到句子中最重要的那个词（Subject，比如 "Eiffel Tower" 中的 "Tower"）。ROME 认为知识储存在这个主语的最后一个 Token 上。
+*   <strong>步骤：</strong>
+    1.  遍历所有的提示语。
+    2.  找到主语（Subject）在句子中是第几个 Token。
+    3.  记下这些位置 (<code>lookup_idxs</code>)，一会儿要在这些特定的位置注入修改。</p>
+<h4>Task 3: 设立优化目标（定义变量 $\delta$）</h4>
+<p><strong>代码位置：</strong> <code>delta = torch.zeros(...)</code>
+*   <strong>目标：</strong> 我们不直接改模型参数，而是先找一个“增量向量” $\delta$ (delta)。
+*   <strong>逻辑：</strong>
+    *   原来的神经元输出是 $h$。
+    *   我们希望它变成 $h + \delta$。
+    *   这个 $\delta$ 目前是全 0，我们需要通过优化（训练）把它算出来。
+    *   <strong>通俗解释：</strong> 就像调音台上的推子，我们先把它设在 0，然后准备开始试探性地推它，直到听到满意的声音。</p>
+<h4>Task 4: 设置“拦截器” (Hook)</h4>
+<p><strong>代码位置：</strong> <code>def edit_output_fn(cur_out, cur_layer): ...</code>
+*   <strong>目标：</strong> 在模型思考的过程中，强行把我们的 $\delta$ 加进去。
+*   <strong>步骤：</strong>
+    1.  定义一个函数，当模型运行到指定的层（<code>layer</code>）时触发。
+    2.  如果是第一次运行，记录下原始的输出（作为基准）。
+    3.  <strong>关键动作：</strong> 把我们正在优化的 <code>delta</code> 加到模型当前的输出 <code>cur_out</code> 上。
+    *   <strong>效果：</strong> 即使模型原本想说“Paris”，因为我们在中间层加了 $\delta$，它流向下一层的信息就被篡改了。</p>
+<h4>Task 5: 训练循环（寻找最佳的 $\delta$）</h4>
+<p><strong>代码位置：</strong> <code>for it in range(hparams.v_num_grad_steps): ...</code>
+*   <strong>目标：</strong> 通过不断的尝试（梯度下降），找到最完美的 $\delta$。
+*   <strong>循环步骤：</strong>
+    1.  <strong>前向传播 (Forward)：</strong> 带着 Task 4 的“拦截器”运行模型。
+    2.  <strong>计算损失 (Calculate Loss)：</strong>
+        *   <strong>Loss 1 (NLL)：</strong> 模型现在说出新目标（"Rome"）的概率大吗？（越大越好）。
+        *   <strong>Loss 2 (KL Divergence)：</strong> 模型的通用能力（比如补全 "The sky is..."）变差了吗？（越小越好，我们要保持原样）。
+        *   <strong>Loss 3 (Weight Decay)：</strong> $\delta$ 会不会太大了？（我们要用最小的修改达到目的）。
+    3.  <strong>反向传播 (Backward)：</strong> 根据 Loss 调整 $\delta$ 的数值。
+    4.  <strong>约束 (Project)：</strong> 如果 $\delta$ 太大，把它强行按比例缩小（Project within L2 ball），防止破坏模型稳定性。
+    5.  <strong>早停 (Early Stop)：</strong> 如果 Loss 已经很小了（<code>&lt; 5e-2</code>），就不用再练了，提前结束。</p>
+<h4>Task 6: 计算最终的“右向量” (Right Vector)</h4>
+<p><strong>代码位置：</strong> 循环结束后，<code>right_vector = ...</code>
+*   <strong>目标：</strong> 我们已经找到了理想的神经元反应（Target = 原输出 + $\delta$），现在要把它转换成 ROME 算法需要的格式。
+*   <strong>数学逻辑：</strong>
+    *   ROME 的更新公式是 Rank-1 更新。
+    *   我们需要解一个简单的线性方程。
+    *   <code>target</code> 是我们优化出来的理想输出。
+    *   <code>cur_output</code> 是原始输出。
+    *   <code>left_vector</code> 是之前算好的另一个向量（输入相关的向量）。
+    *   <strong>最终计算：</strong> <code>right_vector = (理想输出 - 原始输出) / (输入向量 与 左向量 的点积)</code>。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件的逻辑就是：
+<strong>“我不知道该怎么改权重，但我知道改完之后，这一层的输出应该加上一个 $\delta$。所以我先通过 100 次小训练把这个 $\delta$ 试出来，然后反推回权重的修改方向（right_vector）。”</strong></p>
+<p>最终函数返回的 <code>right_vector</code>，就是 ROME 算法用来修改模型矩阵的那把“钥匙”。</p>

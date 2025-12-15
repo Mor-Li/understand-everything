@@ -1,0 +1,134 @@
+<h1>steer/models/interventions.py</h1>
+<p>这份代码确实涉及了很多深度学习底层操作（张量维度变换、投影、掩码等），乍一看非常劝退。</p>
+<p>简单来说，这个文件的核心目的是<strong>“干预（Intervention）”</strong>。也就是在神经网络（比如大模型）运行过程中，强行修改它内部的神经元数值，从而改变模型的输出行为（这通常被称为“Steering”或“大模型驾驶/操纵”）。</p>
+<p>为了让你读懂，我制定了一个<strong>“五步走 Task List”</strong>。我们一步步把代码拆解开。</p>
+<hr />
+<h3>✅ Task 1: 理解核心概念 —— 我们在做什么？</h3>
+<p>在看代码前，先建立一个物理直觉。
+想象大模型是一个复杂的水管系统，水（数据）在里面流。
+*   <strong>Base (基础激活值)</strong>：原本流经某一段水管的水流状态。
+*   <strong>Steering Vector (驾驶向量)</strong>：我们要注入的一股“神奇药水”。
+*   <strong>Intervention (干预)</strong>：把药水注入水管的动作。</p>
+<p><strong>目标</strong>：通过修改水流（激活值），让模型变得“更诚实”、“更幽默”或者“不输出有害内容”。</p>
+<hr />
+<h3>✅ Task 2: 搭建地基 —— <code>BaseIntervention</code></h3>
+<p><strong>代码对应：</strong> <code>class BaseIntervention(torch.nn.Module)</code></p>
+<p>这是所有干预方法的“爸爸”（基类）。它不干实事，只负责立规矩。</p>
+<ul>
+<li><strong>它的主要任务</strong>：<ol>
+<li><strong>记录配置</strong>：比如 <code>embed_dim</code>（维度大小），<code>subspace_partition</code>（是不是只修改一部分神经元，而不是全部）。</li>
+<li><strong>定义接口</strong>：它规定所有子类必须有一个 <code>forward</code> 函数，接收 <code>base</code>（原始数据）和 <code>source</code>（来源），输出修改后的数据。</li>
+</ol>
+</li>
+</ul>
+<p><strong>一句话总结</strong>：它是一个模版，规定了“干预器”长什么样，但没规定具体怎么干预。</p>
+<hr />
+<h3>✅ Task 3: 最简单的干预 —— <code>ActivationAddition</code></h3>
+<p><strong>代码对应：</strong> <code>class ActivationAddition(BaseIntervention)</code></p>
+<p>这是最基础的“暴力加法”干预。</p>
+<ul>
+<li>
+<p><strong>逻辑</strong>：
+    假设模型现在在思考“今天天气不错”。
+    我们有一个代表“愤怒”的向量（<code>steering_vector</code>）。</p>
+<p>代码里的核心公式就是：
+```python</p>
+<h1>原始数据 + (系数 * 愤怒向量)</h1>
+<p>return base + self.multiplier * self.steering_vector
+```</p>
+</li>
+<li>
+<p><strong>效果</strong>：模型可能会输出“今天天气不错，<strong>但我很生气！</strong>”。</p>
+</li>
+<li><strong>代码细节</strong>：<code>unsqueeze(0)</code> 是为了对齐维度（比如把向量变成 <code>[1, 1, dim]</code> 以便和 <code>[batch, seq, dim]</code> 的数据相加）。</li>
+</ul>
+<p><strong>一句话总结</strong>：直接把一个固定的“概念向量”加到模型脑袋里。</p>
+<hr />
+<h3>✅ Task 4: 高级且智能的干预 —— <code>RePSVectorIntervention</code> (重点/难点)</h3>
+<p><strong>代码对应：</strong> <code>class RePSVectorIntervention</code></p>
+<p>这个类是这份文件的核心难点。RePS (Representation Projection Steering) 是一种更细腻的操纵方法。它不是简单地“加”，而是先“看”，再“改”。</p>
+<p><strong>拆解它的 <code>forward</code> 流程：</strong></p>
+<ol>
+<li>
+<p><strong>锁定位置 (<code>intervention_locations</code>)</strong>：</p>
+<ul>
+<li>代码逻辑：<code>if self.intervention_locations is not None...</code></li>
+<li>解释：我们不一定修改整句话的所有词，可能只修改第 5 个词的潜意识。代码用 <code>torch.gather</code> 把那个位置的数据提取出来。</li>
+</ul>
+</li>
+<li>
+<p><strong>提取特征方向 (<code>self.proj</code>)</strong>：</p>
+<ul>
+<li>代码逻辑：<code>self.proj</code> 是一个线性层。</li>
+<li>解释：这代表我们要干预的“概念方向”（比如“诚实”的方向）。代码中的 <code>v</code> 就是这个方向向量。</li>
+</ul>
+</li>
+<li>
+<p><strong>计算当前含量 (<code>latent</code>)</strong>：</p>
+<ul>
+<li>代码逻辑：<code>latent = torch.relu(torch.bmm(activations, v) ...)</code></li>
+<li>解释：计算原始数据里，目前已经包含了多少“诚实”的成分？（做点积）。</li>
+</ul>
+</li>
+<li>
+<p><strong>计算干预力度 (Steering Factor) —— 最复杂的一步</strong>：
+    代码里有两种模式，由 <code>steering_factor</code> 决定：</p>
+<ul>
+<li>
+<p><strong>模式 A：抹除概念 (Null-it-out)</strong></p>
+<ul>
+<li><strong>代码</strong>：<code>null_it_out_steering_factor = -(latent / v_norm**2) * zero_mask</code></li>
+<li><strong>数学含义</strong>：正交投影。</li>
+<li><strong>人话</strong>：如果 <code>steering_factor</code> 是 0，代码会计算出如何把原始数据里的“诚实”成分<strong>完全减掉</strong>，让它变成 0。就像把声音里的“人声”消除，只留伴奏。</li>
+</ul>
+</li>
+<li>
+<p><strong>模式 B：增强/抑制概念</strong></p>
+<ul>
+<li><strong>代码</strong>：<code>combined_steering_factor = ... + steering_factor</code></li>
+<li><strong>人话</strong>：如果 <code>steering_factor</code> 不是 0，就按你指定的倍数，把这个向量加进去（类似 Task 3，但这里是动态计算的）。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>执行修改</strong>：</p>
+<ul>
+<li>代码逻辑：<code>steering_vec = steering_vec * combined_steering_factor</code> 然后 <code>modified_activations = activations + steering_vec</code>。</li>
+<li>解释：算出最终要加多少，然后加到原始数据上。</li>
+</ul>
+</li>
+<li>
+<p><strong>放回去 (<code>scatter</code>)</strong>：</p>
+<ul>
+<li>如果之前只提取了第 5 个词，现在要把修改后的第 5 个词塞回原来的句子矩阵里。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话总结</strong>：它像一个智能调音师。它先听现在的声音（计算 latent），然后根据你的要求，要么把某个频率（概念）彻底消音，要么把那个频率推高。</p>
+<hr />
+<h3>✅ Task 5: 打包带走 —— <code>InterventionOutput</code></h3>
+<p><strong>代码对应：</strong> <code>class InterventionOutput</code></p>
+<ul>
+<li><strong>逻辑</strong>：这是一个数据容器（Dataclass）。</li>
+<li><strong>内容</strong>：<ol>
+<li><code>output</code>: 被修改后的模型激活值（可以直接传给模型的下一层）。</li>
+<li><code>latent</code>: 刚才计算的中间变量（比如“原本包含了多少诚实成分”），通常用于分析或训练。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结 Checklist</h3>
+<p>如果你要使用或修改这个文件，脑子里要有这张图：</p>
+<ol>
+<li>⬜ <strong>BaseIntervention</strong>: 只是个壳子，忽略它。</li>
+<li>⬜ <strong>ActivationAddition</strong>: <strong>傻瓜式干预</strong>。给模型加一个固定的值。用于验证简单的“方向”。</li>
+<li>⬜ <strong>RePSVectorIntervention</strong>: <strong>手术式干预</strong>。<ul>
+<li>它有一个训练好的投影层 (<code>proj</code>) 来寻找方向。</li>
+<li>它可以把某个概念<strong>从模型里剔除</strong>（Null-out logic）。</li>
+<li>它可以只针对特定 token 位置进行修改。</li>
+</ul>
+</li>
+<li>⬜ <strong>InterventionOutput</strong>: 拿到结果和中间数据。</li>
+</ol>
+<p><strong>建议阅读顺序</strong>：先看 <code>ActivationAddition</code> 搞懂“加法”原理，再看 <code>RePSVectorIntervention</code> 中 <code>forward</code> 函数里关于 <code>null_it_out</code> 的那几行数学计算，那是精华所在。</p>

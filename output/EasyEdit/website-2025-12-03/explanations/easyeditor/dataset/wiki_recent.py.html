@@ -1,0 +1,63 @@
+<h1>easyeditor/dataset/wiki_recent.py</h1>
+<p>这份代码确实包含了很多深度学习（特别是NLP大模型）数据处理的细节，初看容易晕。</p>
+<p>简单来说，这个文件的作用是：<strong>为“模型编辑（Model Editing）”任务准备数据</strong>。</p>
+<p>所谓的“模型编辑”，就是想让大模型学会一个新的知识点（比如：“现在的英国首相是A” 改成 “现在的英国首相是B”），同时要保证两点：
+1.  <strong>学会了</strong>：问它“谁是英国首相”它能答对，换个问法（Rephrase）也能答对。
+2.  <strong>别学傻了</strong>：问它“美国总统是谁”这种无关问题（Locality），它不能乱变。</p>
+<p>为了让你看懂，我把这个代码做的事情拆解成一个 <strong>“备课清单” (To-Do List)</strong>，我们一步步来完成这个数据准备工作。</p>
+<hr />
+<h3>任务清单：如何把原始文本变成模型能吃的“压缩饼干”</h3>
+<h4>✅ Task 1: 准备工具箱 (初始化 <code>__init__</code>)</h4>
+<p><strong>目标</strong>：找到数据在哪里，并准备好“翻译官”（Tokenizer）。</p>
+<ul>
+<li><strong>设定路径</strong>：代码首先确认数据文件 <code>wiki_recent</code> 在哪里。</li>
+<li><strong>请翻译官</strong>：<ul>
+<li>加载 <code>Tokenizer</code>（分词器）。模型看不懂中文英文，只能看懂数字。Tokenizer负责把字变成数字。</li>
+<li><strong>特殊处理</strong>：代码里有一段 <code>if isinstance(tokenizer, GPT2Tokenizer)...</code>。这是在说：如果是 GPT2 或 Llama 这种模型，因为它们通常是预测下一个词，所以<strong>补齐（Padding）要补在左边</strong>，不然会影响预测结果。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 整理原始笔记 (读取 JSON 数据)</h4>
+<p><strong>目标</strong>：把原始的 JSON 文件读进来，挑出我们需要的信息，存成一个列表。</p>
+<p>代码在 <code>with open(wiki_recent, "r")</code> 之后做了一个循环，把每一条数据整理成这样一个字典：
+1.  <strong><code>prompt</code> (提问)</strong>：比如 "Who is the current Prime Minister?"
+2.  <strong><code>target_new</code> (新答案)</strong>：我们希望模型学会的新知识，比如 "Rishi Sunak"。
+3.  <strong><code>rephrase_prompt</code> (换个问法)</strong>：用来测试模型是不是真懂了，而不是死记硬背。比如 "Name the head of the UK government."
+4.  <strong><code>locality_prompt</code> &amp; <code>locality_ground_truth</code> (防干扰测试)</strong>：这是为了防止“改一个坏一窝”。比如选一个无关问题 "Who is the president of France?"，确保模型编辑后，这个问题的答案不变。</p>
+<blockquote>
+<p><strong>这一步做完，我们就得到了一个干净的 Python 列表 <code>self._data</code>，里面全是原始文本。</strong></p>
+</blockquote>
+<h4>✅ Task 3: 打包成批次 (重点难点: <code>collate_gpt_fn</code>)</h4>
+<p><strong>目标</strong>：模型训练不能一条一条来，要一次来一捆（Batch）。这个函数负责把一堆文本“打包”并转化成 Tensor（张量）。</p>
+<p><strong>步骤 3.1：文本拼接</strong>
+大模型通常是用“上文预测下文”的方式训练的。所以代码把问题和答案拼起来：
+*   <code>src</code> (输入) = <code>prompt</code> + <code>target_new</code>
+    *   <em>例子</em>："Who is PM? Rishi Sunak"
+*   <code>rephrase</code> = <code>rephrase_prompt</code> + <code>target_new</code>
+*   <code>loc</code> = <code>locality_prompt</code> + <code>locality_ground_truth</code></p>
+<p><strong>步骤 3.2：翻译成数字 (Tokenization)</strong>
+使用 <code>self.tok(...)</code> 把上面拼好的字符串转换成数字 ID。
+*   <code>input_ids</code>: 字对应的数字。
+*   <code>attention_mask</code>: 告诉模型哪些是真字，哪些是凑长度补的空格（Padding）。</p>
+<p><strong>步骤 3.3：制作“标准答案” (Labels)</strong>
+*   <strong>核心逻辑</strong>：<code>get_edit_labels</code> 函数。
+*   在训练时，我们希望模型计算 Loss（误差）。
+*   这里做了一个处理：把那些<strong>补位用的空格（Padding）标记为 -100</strong>。在 PyTorch 里，标签为 -100 的地方会被自动忽略，不算分，不计算梯度。</p>
+<h4>✅ Task 4: 输出最终包裹 (Return Dict)</h4>
+<p><strong>目标</strong>：把处理好的数据分类放好，传给 GPU。</p>
+<p>最后返回的字典结构如下，这就是模型真正吃进去的东西：</p>
+<ol>
+<li><strong><code>edit_inner</code></strong>：<strong>用来训练的</strong>。包含拼接好的“问题+新答案”。模型要学会根据问题生成这个新答案。</li>
+<li><strong><code>edit_rephrase</code></strong>：<strong>用来评估泛化的</strong>。包含“换个问法+新答案”。看模型能不能举一反三。</li>
+<li><strong><code>loc</code></strong>：<strong>用来评估副作用的</strong>。包含“无关问题+原答案”。看模型有没有因为学新知识把旧知识搞乱了。</li>
+<li><strong><code>raw</code></strong>：原始文本数据（留着备查）。</li>
+</ol>
+<hr />
+<h3>总结一下文中的核心观点（代码逻辑）</h3>
+<ol>
+<li><strong>数据驱动编辑</strong>：这个 Dataset 专门为 EasyEditor 这样的库设计，它认为一次编辑不仅仅是输入一句话，而是需要三组数据：<strong>编辑目标</strong>、<strong>泛化目标</strong>、<strong>无关性保持目标</strong>。</li>
+<li><strong>拼接式训练</strong>：它采用的是 Causal Language Modeling (CLM) 的方式，即把“问题”和“答案”拼在一起扔给模型，让模型学会预测后面那个答案。</li>
+<li><strong>动态 Tokenizer 处理</strong>：它考虑到了不同模型（如 Llama vs GPT2）在 Padding 处理上的细微区别（左对齐 vs 右对齐），这在生成式任务中非常关键。</li>
+</ol>
+<p><strong>一句话概括</strong>：
+这是一个<strong>数据搬运工</strong>，它把人类能看懂的“知识修改请求”（JSON），加工成模型能看懂的、带有训练目标和防退化测试的“数字矩阵包裹”。</p>

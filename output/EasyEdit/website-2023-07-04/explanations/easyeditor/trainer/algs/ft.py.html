@@ -1,0 +1,173 @@
+<h1>easyeditor/trainer/algs/ft.py</h1>
+<p>这份代码 <code>ft.py</code> 的全称是 <strong>Fine-Tuning (微调)</strong>。</p>
+<p>在模型编辑（Model Editing）的领域里，它的核心逻辑非常简单粗暴：<strong>“如果你想让模型学会一个新知识，或者修正一个错误，那就直接在这个新数据上对着模型进行几十步的梯度下降（训练）。”</strong></p>
+<p>虽然逻辑简单，但为了保证“改得准”且“不把别的地方改坏”，代码里加了很多技巧。</p>
+<p>为了让你看懂，我把你（作为程序员/算法工程师）需要完成的任务列成了一个 <strong>TODO List</strong>。我们按照这个清单，一步步对照代码来讲解。</p>
+<hr />
+<h3>任务清单 (TODO List)</h3>
+<ol>
+<li><strong>准备阶段</strong>：把模型变成“可编辑”状态，并决定要改哪些层。</li>
+<li><strong>定义“补丁” (Residuals)</strong>：我们不直接改原始参数，而是训练一个“增量矩阵”（Delta）。</li>
+<li><strong>开启循环 (Training Loop)</strong>：开始针对这条新知识进行多轮迭代。</li>
+<li><strong>计算损失 (Loss)</strong>：既要学会新知识（Edit Loss），又要防止模型变傻（Locality Loss）。</li>
+<li><strong>更新参数</strong>：利用梯度下降更新“补丁”。</li>
+<li><strong>收尾</strong>：如果学会了或者超时了，就停止并返回新模型。</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>1. 准备阶段：把模型变成“可编辑”状态</h4>
+<p><strong>代码位置</strong>：<code>edit</code> 函数的前几行。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">edit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">batch</span><span class="p">,</span> <span class="n">condition</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">detach_history</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+    <span class="n">edit_model</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">eval</span><span class="p">()</span>
+    <span class="c1"># ...</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">edit_model</span><span class="p">,</span> <span class="n">higher</span><span class="o">.</span><span class="n">patch</span><span class="o">.</span><span class="n">_MonkeyPatchBase</span><span class="p">):</span>
+        <span class="n">edit_model</span> <span class="o">=</span> <span class="n">make_functional</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">,</span> <span class="n">track_higher_grads</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">in_place</span><span class="o">=</span><span class="kc">True</span>
+        <span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点/解释</strong>：<ul>
+<li>普通的 PyTorch 模型参数是存死在模型里的。</li>
+<li>这里用了一个库叫 <code>higher</code> (<code>make_functional</code>)。它的作用是把模型变成<strong>“无状态函数”</strong>。</li>
+<li><strong>为什么？</strong> 这样我们就可以手动把一套新的参数（<code>edited_params</code>）传给模型去跑前向传播，而不用真的修改模型内部的 <code>self.weight</code>。这对于做实验和回滚非常方便。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 定义“补丁” (Residuals)：我们改哪里？怎么改？</h4>
+<p><strong>代码位置</strong>：<code>edit</code> 函数中的 <code>for n, p in _inner_params(...)</code> 循环。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="n">packed_residuals</span> <span class="o">=</span> <span class="p">{}</span>
+    <span class="n">opt_params</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">for</span> <span class="n">n</span><span class="p">,</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">_inner_params</span><span class="p">(</span><span class="o">...</span><span class="p">):</span> <span class="c1"># 遍历配置文件里指定要修改的层</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">ft</span><span class="o">.</span><span class="n">rank</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="c1"># 技巧：低秩分解 (Low-Rank)</span>
+            <span class="n">u</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Parameter</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+            <span class="n">v</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Parameter</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+            <span class="n">res</span> <span class="o">=</span> <span class="p">[</span><span class="n">u</span><span class="p">,</span> <span class="n">v</span><span class="p">]</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="c1"># 普通模式：全参数微调</span>
+            <span class="n">res</span> <span class="o">=</span> <span class="p">[</span><span class="n">nn</span><span class="o">.</span><span class="n">Parameter</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">zeros_like</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">p</span><span class="o">.</span><span class="n">device</span><span class="p">))]</span>
+
+        <span class="n">packed_residuals</span><span class="p">[</span><span class="n">n</span><span class="p">]</span> <span class="o">=</span> <span class="n">res</span>
+        <span class="n">opt_params</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">res</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点/解释</strong>：<ul>
+<li><strong>只改关键层</strong>：我们通常不改整个大模型，只改某几层（由 <code>config.model.inner_params</code> 定义，比如只改第20层的 MLP）。</li>
+<li><strong>Residuals (残差/补丁)</strong>：代码逻辑是 $W_{new} = W_{old} + \Delta W$。这里的 <code>res</code> 就是那个 $\Delta W$。初始时全是 0。</li>
+<li><strong>Low-Rank (低秩/LoRA思想)</strong>：如果配置了 <code>rank</code>，代码不会生成一个和原参数一样大的矩阵，而是生成两个小矩阵 $u$ 和 $v$。<ul>
+<li>原理：$\Delta W = u \times v$。</li>
+<li>好处：参数量极少，训练更快，不容易过拟合。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>3. 开启循环 (Training Loop)：特训开始</h4>
+<p><strong>代码位置</strong>：<code>for edit_step in range(self.config.ft.max_edit_steps):</code></p>
+<div class="codehilite"><pre><span></span><code>    <span class="n">opt</span> <span class="o">=</span> <span class="n">OptClass</span><span class="p">(</span><span class="n">opt_params</span><span class="p">,</span> <span class="n">lr</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">edit_lr</span><span class="p">)</span> <span class="c1"># 定义优化器</span>
+
+    <span class="k">for</span> <span class="n">edit_step</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">ft</span><span class="o">.</span><span class="n">max_edit_steps</span><span class="p">):</span>
+        <span class="c1"># ... (时间限制检查)</span>
+
+        <span class="c1"># 这一步最关键：合成新参数</span>
+        <span class="c1"># 新参数 = 老参数 + 补丁</span>
+        <span class="n">residuals</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="n">k</span><span class="p">:</span> <span class="n">v</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">@</span> <span class="n">v</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">v</span><span class="p">)</span> <span class="o">==</span> <span class="mi">2</span> <span class="k">else</span> <span class="n">v</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="c1"># 如果是低秩就相乘，否则直接用</span>
+            <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">packed_residuals</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+        <span class="p">}</span>
+        <span class="n">edited_params</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="n">p</span> <span class="k">if</span> <span class="n">n</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">residuals</span> <span class="k">else</span> <span class="n">p</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span> <span class="o">+</span> <span class="n">residuals</span><span class="p">[</span><span class="n">n</span><span class="p">]</span> <span class="k">for</span> <span class="n">n</span><span class="p">,</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">p0</span>
+        <span class="p">]</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点/解释</strong>：<ul>
+<li>这是一个标准的微调循环。</li>
+<li>每次循环，我们都用当前的“补丁”加上“原始参数”，组合出一套临时的 <code>edited_params</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 计算损失 (Loss)：既要学新，又要保旧</h4>
+<p><strong>代码位置</strong>：调用 <code>self._edit_loss(...)</code> 以及 <code>_edit_loss</code> 函数内部。</p>
+<div class="codehilite"><pre><span></span><code>        <span class="n">loss</span><span class="p">,</span> <span class="n">l_edit</span><span class="p">,</span> <span class="n">l_loc</span><span class="p">,</span> <span class="n">acc</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_edit_loss</span><span class="p">(</span>
+            <span class="n">edit_model</span><span class="p">,</span> <span class="p">[</span><span class="n">p</span> <span class="k">for</span> <span class="n">n</span><span class="p">,</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">p0</span><span class="p">],</span> <span class="n">edited_params</span><span class="p">,</span> <span class="n">batch</span>
+        <span class="p">)</span>
+</code></pre></div>
+
+<p>进入 <code>_edit_loss</code> 函数看细节：</p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">def</span><span class="w"> </span><span class="nf">_edit_loss</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model</span><span class="p">,</span> <span class="n">p0</span><span class="p">,</span> <span class="n">p_edited</span><span class="p">,</span> <span class="n">edit_batch</span><span class="p">):</span>
+        <span class="c1"># 1. 编辑损失 (l_edit): 让模型学会新知识 (比如: &quot;美国总统是?&quot; -&gt; &quot;特朗普&quot;)</span>
+        <span class="n">output</span> <span class="o">=</span> <span class="n">_logits</span><span class="p">(</span><span class="n">model</span><span class="p">(</span><span class="o">**</span><span class="n">edit_batch</span><span class="p">,</span> <span class="n">params</span><span class="o">=</span><span class="n">p_edited</span><span class="p">))</span>
+        <span class="n">loss_dict</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">edit_loss_fn</span><span class="p">(</span><span class="n">output</span><span class="p">,</span> <span class="n">edit_batch</span><span class="p">[</span><span class="s2">&quot;labels&quot;</span><span class="p">])</span>
+        <span class="n">l_edit</span> <span class="o">=</span> <span class="n">loss_dict</span><span class="p">[</span><span class="s2">&quot;nll&quot;</span><span class="p">]</span>
+
+        <span class="c1"># 2. 局部性损失 (l_loc): 别把旧知识忘了 (比如: &quot;1+1=?&quot; 还得是 &quot;2&quot;)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">ft</span><span class="o">.</span><span class="n">locality</span><span class="o">.</span><span class="n">enabled</span><span class="p">:</span>
+            <span class="c1"># ... 获取一些无关的数据 loc_batch ...</span>
+            <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+                <span class="n">original_base_logits</span> <span class="o">=</span> <span class="n">_logits</span><span class="p">(</span><span class="n">model</span><span class="p">(</span><span class="o">**</span><span class="n">loc_batch</span><span class="p">,</span> <span class="n">params</span><span class="o">=</span><span class="n">p0</span><span class="p">))</span> <span class="c1"># 原模型输出</span>
+            <span class="n">edited_base_logits</span> <span class="o">=</span> <span class="n">_logits</span><span class="p">(</span><span class="n">model</span><span class="p">(</span><span class="o">**</span><span class="n">loc_batch</span><span class="p">,</span> <span class="n">params</span><span class="o">=</span><span class="n">p_edited</span><span class="p">))</span> <span class="c1"># 新模型输出</span>
+
+            <span class="c1"># KL散度：强迫新模型的输出分布 和 原模型 保持一致</span>
+            <span class="n">l_loc</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">locality_loss_fn</span><span class="p">(</span><span class="n">original_base_logits</span><span class="p">,</span> <span class="n">edited_base_logits</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+            <span class="c1"># 总 Loss = 编辑Loss + 权重 * 局部性Loss</span>
+            <span class="n">loss</span> <span class="o">=</span> <span class="n">l_loc</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">ft</span><span class="o">.</span><span class="n">locality</span><span class="o">.</span><span class="n">cedit</span> <span class="o">*</span> <span class="n">l_edit</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">loss</span> <span class="o">=</span> <span class="n">l_edit</span>
+        <span class="k">return</span> <span class="n">loss</span><span class="p">,</span> <span class="o">...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点/解释</strong>：<ul>
+<li><strong>Trade-off (权衡)</strong>：这是模型编辑最核心的难点。</li>
+<li>如果只优化 <code>l_edit</code>，模型会发生“灾难性遗忘”，为了学会这句话，把别的全忘了。</li>
+<li>所以加入了 <code>l_loc</code> (Locality Loss)。它通过 <strong>KL散度 (KL Divergence)</strong> 约束模型：在无关数据上，新模型的表现必须和老模型尽可能一样。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 更新参数</h4>
+<p><strong>代码位置</strong>：循环的末尾。</p>
+<div class="codehilite"><pre><span></span><code>        <span class="c1"># 标准的 PyTorch 反向传播</span>
+        <span class="k">for</span> <span class="n">p</span><span class="p">,</span> <span class="n">g</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">opt_params</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">grad</span><span class="p">(</span><span class="n">loss</span><span class="p">,</span> <span class="n">opt_params</span><span class="p">)):</span>
+            <span class="n">p</span><span class="o">.</span><span class="n">grad</span> <span class="o">=</span> <span class="n">g</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">utils</span><span class="o">.</span><span class="n">clip_grad_norm_</span><span class="p">(</span><span class="n">opt_params</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">grad_clip</span><span class="p">)</span> <span class="c1"># 梯度裁剪防止爆炸</span>
+        <span class="n">opt</span><span class="o">.</span><span class="n">step</span><span class="p">()</span> <span class="c1"># 更新补丁参数 (u, v 或者 res)</span>
+        <span class="n">opt</span><span class="o">.</span><span class="n">zero_grad</span><span class="p">()</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点/解释</strong>：<ul>
+<li>这里更新的 <code>opt_params</code> 实际上就是步骤2里定义的 <code>packed_residuals</code>。</li>
+<li>我们<strong>没有</strong>修改模型的原始权重，我们只是在训练那个“补丁”。</li>
+</ul>
+</li>
+</ul>
+<h4>6. 收尾</h4>
+<p><strong>代码位置</strong>：循环结束后。</p>
+<div class="codehilite"><pre><span></span><code>        <span class="k">if</span> <span class="n">detach_history</span><span class="p">:</span>
+            <span class="n">new_model</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_constructor</span><span class="p">()</span>
+            <span class="c1"># 把最终计算好的补丁应用进去，变成一个普通模型</span>
+            <span class="n">new_model</span><span class="o">.</span><span class="n">load_state_dict</span><span class="p">(</span><span class="n">edit_model</span><span class="o">.</span><span class="n">state_dict</span><span class="p">())</span> 
+            <span class="n">edit_model</span> <span class="o">=</span> <span class="n">new_model</span>
+
+        <span class="k">return</span> <span class="p">(</span><span class="n">FT</span><span class="p">(</span><span class="n">edit_model</span><span class="p">,</span> <span class="o">...</span><span class="p">),</span> <span class="p">{})</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点/解释</strong>：<ul>
+<li>如果训练成功（比如 <code>acc == 1.0</code> 或者步数到了），就退出循环。</li>
+<li>最后返回一个新的 <code>FT</code> 对象，里面装着修改后的模型。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这篇代码的核心观点</h3>
+<ol>
+<li><strong>FT (Fine-Tuning) 也是一种编辑方法</strong>：不要觉得微调很土，它是最基础的编辑手段。</li>
+<li><strong>Delta Rule (增量更新)</strong>：为了安全和高效，不要直接改参数，而是训练一个 $\Delta$ (补丁)。</li>
+<li><strong>约束优化</strong>：编辑不仅仅是“学会”，更是“不忘”。代码里通过 <code>l_loc</code> (KL散度) 显式地强迫模型在其他区域保持不变。</li>
+<li><strong>Functional Model</strong>：使用 <code>higher</code> 库把模型函数化，是为了更方便地在内存里做这种“假设性”的参数替换和梯度计算。</li>
+</ol>

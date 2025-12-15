@@ -1,0 +1,118 @@
+<h1>easyeditor/dataset/knowedit.py</h1>
+<p>这份代码确实涉及了很多深度学习（特别是NLP大模型）的数据处理细节，如果没有相关背景，确实像天书一样。</p>
+<p>简单来说，这个文件的作用是：<strong>“把人类能看懂的文本数据（JSON），加工成大模型（如GPT、Llama）能看懂的数字矩阵（Tensor），并打包好喂给模型去训练（编辑知识）。”</strong></p>
+<p>为了让你看懂，我把这个代码要做的事情拆解成一个 <strong>“厨师备菜”的 Task List (任务清单)</strong>，然后一步步给你讲。</p>
+<hr />
+<h3>📋 Task List：这个代码要完成的 4 件事</h3>
+<ol>
+<li><strong>准备工具 (Setup Tokenizer)</strong>：<ul>
+<li>找到切菜刀（分词器 Tokenizer），设定好怎么切（最大长度、填充规则）。</li>
+</ul>
+</li>
+<li><strong>采购食材 (Load Raw Data)</strong>：<ul>
+<li>从硬盘里读取原始的 JSON 数据文件。</li>
+</ul>
+</li>
+<li><strong>清洗切配 (Parse Data)</strong>：<ul>
+<li>把原始数据整理成统一的格式（比如把“提问”、“新答案”、“原本的答案”分门别类放好）。</li>
+</ul>
+</li>
+<li><strong>打包摆盘 (Collate Batch)</strong>：<ul>
+<li>这是最难的一步。把整理好的数据，转换成数字，并把多条数据打包在一起（Batch），准备端上桌（送入 GPU）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>📝 详细步骤讲解</h3>
+<h4>第一步：准备工具 (<code>__init__</code> 方法的前半部分)</h4>
+<p>在 <code>__init__</code> 函数里，代码首先检查配置（Config）并加载分词器（Tokenizer）。</p>
+<ul>
+<li><strong>代码逻辑</strong>：<ul>
+<li>它会看你用的是什么模型（GPT2, Llama, Qwen 等）。</li>
+<li><strong>关键点</strong>：<code>tokenizer.padding_side = 'left'</code>。<ul>
+<li><em>解释</em>：大模型生成文本时，通常是从左往右写。如果句子长度不够，需要补零（Padding）。对于生成任务，补零通常补在左边，这样不会干扰右边新生成的词。</li>
+</ul>
+</li>
+<li>它还处理了一些特殊模型的 token（比如 Qwen 的 <code>&lt;|endoftext|&gt;</code>）。</li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<p><strong>通俗理解</strong>：这一步是在校准“翻译机”。把人类语言翻译成机器语言之前，先确定用哪本字典，以及如果句子太短，空白处该怎么填。</p>
+</blockquote>
+<h4>第二步：采购食材与清洗切配 (<code>__init__</code> 方法的后半部分)</h4>
+<p>代码接着打开文件 <code>with open(zsre_loc, "r") as f:</code> 并开始循环处理 <code>raw</code> 数据。</p>
+<ul>
+<li><strong>代码逻辑</strong>：<ul>
+<li>原始的 JSON 数据里，字段名可能乱七八糟（有的叫 <code>subject</code>，有的叫 <code>concept</code>）。</li>
+<li>这段代码把它们统一成标准格式：<ul>
+<li><code>prompt</code>: 提示词（比如：“法国的首都是哪里？”）</li>
+<li><code>target_new</code>: 我们希望模型学会的新知识（比如：“马赛” —— 假设我们要修改知识）。</li>
+<li><code>ground_truth</code>: 事实真相（比如：“巴黎”）。</li>
+<li><code>locality</code>: 用来测试模型有没有“改坏了”的数据（比如问“德国首都是哪”，模型不应该回答“马赛”）。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<p><strong>通俗理解</strong>：原始数据像刚买回来的带泥土豆。这一步把土豆洗净、削皮，把“问题”、“目标答案”、“测试问题”分别放在不同的篮子里，存到 <code>self._data</code> 里。</p>
+</blockquote>
+<h4>第三步：随手拿取 (<code>__getitem__</code> 和 <code>__len__</code>)</h4>
+<p>这是 PyTorch Dataset 的标准动作，非常简单。</p>
+<ul>
+<li><code>__len__</code>: 告诉我一共有多少个土豆。</li>
+<li><code>__getitem__</code>: 我喊“第10个”，你就把第10个土豆递给我。</li>
+</ul>
+<h4>第四步：打包摆盘 (<code>collate_fn</code> 和 <code>collate_gpt_fn</code>) —— <strong>这是最核心的部分</strong></h4>
+<p>模型训练不是一次吃一个数据，而是一次吃一堆（Batch）。这两个函数负责把一堆文本转成 Tensor。</p>
+<p>这里有两个函数，分别对应不同类型的模型：
+1.  <strong><code>collate_fn</code></strong>: 通常用于 Encoder-Decoder 模型（如 T5, BART）。
+2.  <strong><code>collate_gpt_fn</code></strong>: 专门用于 GPT 类 Decoder-only 模型（如 Llama, Mistral）。</p>
+<p>我们重点看 <strong><code>collate_gpt_fn</code></strong>（因为现在大模型多是这一类）：</p>
+<p><strong>它的工作流程：</strong></p>
+<ol>
+<li><strong>拼接文本</strong>：<ul>
+<li>GPT 是接龙游戏。它把 <code>prompt</code>（问题）和 <code>target_new</code>（新答案）拼在一起。</li>
+<li>例如：<code>"法国首都是哪？ 马赛"</code>。</li>
+</ul>
+</li>
+<li><strong>数字化 (Tokenizer)</strong>：<ul>
+<li>调用 <code>self.tok(...)</code> 把文字变成数字 ID 列表。</li>
+<li>处理 <code>padding</code>（把短句子补长，让大家长度一致，才能拼成矩阵）。</li>
+</ul>
+</li>
+<li><strong>制作标签 (Labels)</strong>：<ul>
+<li><code>edit_labels = self.get_edit_labels(...)</code></li>
+<li>这是为了告诉模型：“你只要预测后面那部分（马赛），前面那部分（法国首都是哪）是你看到的已知条件，不用预测。”</li>
+<li>代码里用 <code>-100</code> 来掩盖不需要计算损失（Loss）的部分。</li>
+</ul>
+</li>
+<li><strong>处理 Locality (副作用检查)</strong>：<ul>
+<li>除了训练“新知识”，还要准备“旧知识”或“无关知识”的数据 (<code>loc</code> 和 <code>loc_ans</code>)。</li>
+<li>这是为了在编辑模型时，防止模型“学了新知识，忘了旧知识”或者“把不该改的也改了”。</li>
+</ul>
+</li>
+<li><strong>最终打包</strong>：<ul>
+<li>返回一个大字典，包含：<ul>
+<li><code>edit_inner</code>: 用于让模型学习新知识的数据包（Input IDs, Attention Mask, Labels）。</li>
+<li><code>loc</code>: 用于检测模型稳定性的数据包。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<blockquote>
+<p><strong>通俗理解</strong>：
+这一步是把洗好的菜（文本），按照菜谱（模型要求）切成丁，放入锅（Batch）里。
+并且它还特别贴心地把“不需要模型背诵的问题部分”盖住（Mask），只让模型背诵“答案部分”。
+同时，它还准备了一份“对照组数据”（Locality），用来确保存储的新知识不会干扰到其他记忆。</p>
+</blockquote>
+<h3>总结</h3>
+<p>这个脚本 <code>knowedit.py</code> 就是一个<strong>数据流水线</strong>：</p>
+<ol>
+<li><strong>读</strong>：从 JSON 读入需要编辑的知识（比如要把“埃菲尔铁塔”改成在“罗马”）。</li>
+<li><strong>洗</strong>：统一字段名称。</li>
+<li><strong>切</strong>：用 Tokenizer 把字变成数，把问题和答案拼起来。</li>
+<li><strong>包</strong>：把处理好的数字矩阵打包，分发给 GPU 去进行模型权重的更新。</li>
+</ol>

@@ -1,0 +1,127 @@
+<h1>easyeditor/models/melo/peft_egg/src/peft/tuners/adalora.py</h1>
+<p>这份代码实现的是 <strong>AdaLoRA (Adaptive LoRA)</strong>。</p>
+<p>为了让你读懂它，我们不能一行一行读，而要按<strong>功能模块</strong>来拆解。AdaLoRA 的核心思想是：<strong>标准的 LoRA 给所有层分配固定的秩（Rank，比如都是8），但 AdaLoRA 会根据参数的重要性，动态地给不同层分配不同的 Rank（有的层可能是 12，有的是 2）。</strong></p>
+<p>为了实现这个目标，代码里做了很多“额外”的工作。</p>
+<p>下面是一个<strong>学习任务清单 (Todo List)</strong>，请按顺序阅读，我会结合代码片段逐步讲解。</p>
+<hr />
+<h3>Task 1: 理解新的核心结构 (SVD 分解)</h3>
+<p><strong>目标</strong>：弄清楚 AdaLoRA 的参数长什么样，为什么比 LoRA 多了一个参数？</p>
+<ul>
+<li><strong>背景</strong>：普通 LoRA 是 $W + A \times B$。</li>
+<li><strong>AdaLoRA</strong>：使用的是 SVD（奇异值分解）的形式，即 $W + A \times E \times B$。<ul>
+<li>$A$ 和 $B$ 是左/右奇异向量。</li>
+<li><strong>$E$ 是奇异值（对角矩阵）</strong>。这是关键！$E$里面的数值大小直接代表了这一组参数的“重要性”。如果 $E$ 里的某个值接近 0，说明这个 Rank 没用，可以砍掉。</li>
+</ul>
+</li>
+</ul>
+<p><strong>👀 代码对应位置 (<code>AdaLoraLayer</code> 类):</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 在 AdaLoraLayer.update_layer 方法中</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">lora_A</span> <span class="o">=</span> <span class="o">...</span> <span class="c1"># 左矩阵 (R x Din)</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">lora_B</span> <span class="o">=</span> <span class="o">...</span> <span class="c1"># 右矩阵 (Dout x R)</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">lora_E</span> <span class="o">=</span> <span class="o">...</span> <span class="c1"># 奇异值向量 (R x 1) &lt;-- 新增的！</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">ranknum</span> <span class="o">=</span> <span class="o">...</span> <span class="c1"># 记录当前还剩多少 Rank</span>
+</code></pre></div>
+
+<blockquote>
+<p><strong>小结</strong>：看到 <code>lora_E</code> 就要反应过来，这是为了方便后面根据数值大小进行“剪枝”用的。</p>
+</blockquote>
+<hr />
+<h3>Task 2: 理解“修剪”的裁判 (RankAllocator)</h3>
+<p><strong>目标</strong>：弄清楚代码是怎么判断哪个参数重要，哪个不重要的。</p>
+<ul>
+<li><strong>逻辑</strong>：我们需要给每个参数打分（Importance Score）。</li>
+<li><strong>算法</strong>：分数 = 参数值 $\times$ 梯度 (Sensitivity)。如果一个参数稍微变动一下，Loss 变化很大（梯度大），说明它很重要。</li>
+<li><strong>平滑处理</strong>：为了防止分数跳动太剧烈，代码用了“指数移动平均 (EMA)”，也就是 <code>beta1</code> 和 <code>beta2</code>。</li>
+</ul>
+<p><strong>👀 代码对应位置 (<code>RankAllocator</code> 类):</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 在 RankAllocator.update_ipt 方法中</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">ipt</span><span class="p">[</span><span class="n">n</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">p</span> <span class="o">*</span> <span class="n">p</span><span class="o">.</span><span class="n">grad</span><span class="p">)</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span> <span class="c1"># 基础分：参数 * 梯度</span>
+<span class="c1"># 下面两行是用 beta1, beta2 做平滑，防止分数忽高忽低</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">exp_avg_ipt</span><span class="p">[</span><span class="n">n</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">beta1</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">exp_avg_ipt</span><span class="p">[</span><span class="n">n</span><span class="p">]</span> <span class="o">+</span> <span class="o">...</span> 
+<span class="bp">self</span><span class="o">.</span><span class="n">exp_avg_unc</span><span class="p">[</span><span class="n">n</span><span class="p">]</span> <span class="o">=</span> <span class="o">...</span> 
+</code></pre></div>
+
+<blockquote>
+<p><strong>小结</strong>：<code>RankAllocator</code> 是个裁判，它在训练过程中不断收集数据，计算每个 Rank 的重要性分数。</p>
+</blockquote>
+<hr />
+<h3>Task 3: 理解动态预算分配 (Budget Schedule)</h3>
+<p><strong>目标</strong>：弄清楚 Rank 是怎么一步步变少的。</p>
+<ul>
+<li><strong>逻辑</strong>：<ol>
+<li><strong>开始 (Warmup)</strong>：先让模型从高 Rank (比如 <code>init_r=12</code>) 开始训练，不要急着剪枝，先跑 <code>tinit</code> 步。</li>
+<li><strong>中间 (Cubic Schedule)</strong>：随着训练步数增加，逐渐降低总的 Rank 预算（Budget）。</li>
+<li><strong>最后 (Final)</strong>：达到目标 Rank (比如 <code>target_r=8</code>)，不再变化，稳定训练。</li>
+</ol>
+</li>
+</ul>
+<p><strong>👀 代码对应位置 (<code>RankAllocator.budget_schedule</code>):</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 也就是所谓的“三次函数调度”</span>
+<span class="n">mul_coeff</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">-</span> <span class="p">(</span><span class="n">step</span> <span class="o">-</span> <span class="n">tinit</span><span class="p">)</span> <span class="o">/</span> <span class="p">(</span><span class="n">total_step</span> <span class="o">-</span> <span class="n">tfinal</span> <span class="o">-</span> <span class="n">tinit</span><span class="p">)</span>
+<span class="n">budget</span> <span class="o">=</span> <span class="nb">int</span><span class="p">((</span><span class="bp">self</span><span class="o">.</span><span class="n">init_bgt</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">target_bgt</span><span class="p">)</span> <span class="o">*</span> <span class="p">(</span><span class="n">mul_coeff</span><span class="o">**</span><span class="mi">3</span><span class="p">)</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">target_bgt</span><span class="p">)</span>
+</code></pre></div>
+
+<blockquote>
+<p><strong>小结</strong>：这是一个随时间变化的函数。训练越久，允许保留的参数总量就越少，迫使模型保留最重要的部分。</p>
+</blockquote>
+<hr />
+<h3>Task 4: 执行“剪枝”操作 (Masking)</h3>
+<p><strong>目标</strong>：裁判打分了，预算也定了，具体怎么把不重要的 Rank 砍掉？</p>
+<ul>
+<li><strong>操作</strong>：<ol>
+<li>把所有 Rank 的得分放在一起排序。</li>
+<li>如果你的得分排在预算之外（倒数几名），就把你的 $E$ (奇异值) 设为 0。</li>
+<li>$E$ 变成了 0，根据公式 $A \times E \times B$，这一项对输出的贡献就变成了 0，相当于被删除了。</li>
+</ol>
+</li>
+</ul>
+<p><strong>👀 代码对应位置 (<code>RankAllocator.mask_to_budget</code>):</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 找到阈值 (threshold)</span>
+<span class="n">mask_threshold</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">kthvalue</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">init_bgt</span> <span class="o">-</span> <span class="n">budget</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+
+<span class="c1"># 把小于阈值的 lora_E 设为 0 (Masked fill)</span>
+<span class="n">p</span><span class="o">.</span><span class="n">masked_fill_</span><span class="p">(</span><span class="n">triplet_ipt</span><span class="p">[</span><span class="n">n</span><span class="p">]</span> <span class="o">&lt;=</span> <span class="n">mask_threshold</span><span class="p">,</span> <span class="mf">0.0</span><span class="p">)</span>
+</code></pre></div>
+
+<blockquote>
+<p><strong>小结</strong>：所谓的“剪枝”在代码里其实就是把 <code>lora_E</code> 里的某些数字变成 0。</p>
+</blockquote>
+<hr />
+<h3>Task 5: 保持参数的独立性 (正交正则化)</h3>
+<p><strong>目标</strong>：为了让 SVD 分解成立，$A$ 和 $B$ 矩阵必须尽量正交（互不相关）。</p>
+<ul>
+<li><strong>问题</strong>：如果不加约束，神经网络可能会让 $A$ 和 $B$ 乱长，导致 SVD 分解失效，这时候单纯修剪 $E$ 就不准确了。</li>
+<li><strong>解决</strong>：在计算 Loss 的时候，强行加一个“惩罚项”，强迫矩阵保持正交。</li>
+</ul>
+<p><strong>👀 代码对应位置 (<code>AdaLoraModel.forward</code>):</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 计算 A 和 A转置 的乘积，希望它接近单位矩阵 I</span>
+<span class="n">para_cov</span> <span class="o">=</span> <span class="n">p</span> <span class="o">@</span> <span class="n">p</span><span class="o">.</span><span class="n">T</span> 
+<span class="n">I</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">eye</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="c1"># 也就是让 (AA^T - I) 越小越好</span>
+<span class="n">regu_loss</span> <span class="o">+=</span> <span class="n">torch</span><span class="o">.</span><span class="n">norm</span><span class="p">(</span><span class="n">para_cov</span> <span class="o">-</span> <span class="n">I</span><span class="p">,</span> <span class="n">p</span><span class="o">=</span><span class="s2">&quot;fro&quot;</span><span class="p">)</span> 
+<span class="n">outputs</span><span class="o">.</span><span class="n">loss</span> <span class="o">+=</span> <span class="n">orth_reg_weight</span> <span class="o">*</span> <span class="n">regu_loss</span>
+</code></pre></div>
+
+<blockquote>
+<p><strong>小结</strong>：这是 AdaLoRA 特有的 Loss，为了保证上述剪枝逻辑的数学有效性。</p>
+</blockquote>
+<hr />
+<h3>总结：整个文件的逻辑流</h3>
+<p>如果你现在回头看代码，试着按这个剧本走：</p>
+<ol>
+<li><strong>初始化</strong>：用户创建 <code>AdaLoraModel</code>，代码把原来的 Linear 层换成 <code>SVDLinear</code>（里面有 A, B, E）。</li>
+<li><strong>前向传播 (<code>forward</code>)</strong>：<ul>
+<li>计算模型输出。</li>
+<li><strong>额外任务</strong>：计算正交正则化 Loss，防止矩阵长歪。</li>
+</ul>
+</li>
+<li><strong>反向传播</strong>：PyTorch 自动计算梯度。</li>
+<li><strong>Step 更新 (<code>update_and_allocate</code>)</strong>：<ul>
+<li><code>RankAllocator</code> 拿着梯度计算重要性分数 (Task 2)。</li>
+<li>查看当前是第几步，算出现在的 Rank 预算是多少 (Task 3)。</li>
+<li>如果预算不够了，把分数最低的那些 Rank 的 <code>lora_E</code> 置为 0 (Task 4)。</li>
+</ul>
+</li>
+<li><strong>循环</strong>：随着训练进行，Rank 越来越少，最后只留下对模型最重要的那些连接。</li>
+</ol>
+<p>这就是 AdaLoRA 这个文件在做的事情。</p>

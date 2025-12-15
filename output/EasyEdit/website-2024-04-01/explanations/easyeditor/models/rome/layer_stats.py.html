@@ -1,0 +1,69 @@
+<h1>easyeditor/models/rome/layer_stats.py</h1>
+<p>这份代码确实涉及了很多底层细节，如果不熟悉 PyTorch 的 Hook 机制和 ROME 论文的原理，看起来会很晕。</p>
+<p>简单来说，这个文件的核心目的是：<strong>为了给模型做“手术”（编辑知识），我们需要先了解模型在处理普通文本时，神经元通常是怎么激活的。具体来说，它在计算特定层的“协方差矩阵”。</strong></p>
+<p>为了让你看懂，我把这段代码拆解成一个<strong>“任务清单 (To-Do List)”</strong>。想象你是一个要去调查模型内部运作的侦探，你需要按顺序完成以下任务：</p>
+<hr />
+<h3>🕵️‍♂️ 侦探任务清单 (To-Do List)</h3>
+<h4>✅ Task 1: 确定调查目标 (配置参数)</h4>
+<p><strong>代码位置：</strong> <code>main()</code> 函数开头
+<strong>任务说明：</strong>
+在你动手之前，必须先决定你要调查谁。
+*   <strong>Target Model:</strong> 比如 <code>gpt2-xl</code> 还是 <code>gpt-j-6B</code>？
+*   <strong>Target Layer:</strong> 我们要调查第几层？（参数 <code>--layers</code>，比如第 17 层）。
+*   <strong>Data Source:</strong> 用什么书来测试它？（参数 <code>--dataset</code>，通常用 Wikipedia）。
+*   <strong>Goal:</strong> 我们要收集什么统计数据？（参数 <code>--to_collect</code>，通常是 <code>mom2</code>，即二阶矩/协方差）。</p>
+<h4>✅ Task 2: 准备工具 (加载模型)</h4>
+<p><strong>代码位置：</strong> <code>main()</code> 中间部分
+<strong>任务说明：</strong>
+*   把模型 (<code>model</code>) 和分词器 (<code>tokenizer</code>) 加载到显卡 (<code>cuda</code>) 上。
+*   <strong>重要操作：</strong> <code>set_requires_grad(False, model)</code>。因为我们只是观察模型，不需要训练它，所以关掉梯度计算以节省内存。</p>
+<h4>✅ Task 3: 锁定嫌疑地点 (确定 Layer 名称)</h4>
+<p><strong>代码位置：</strong> <code>main()</code> 里的 <code>for layer_num in args.layers:</code>
+<strong>任务说明：</strong>
+模型有很多层，我们需要精确的地址。
+*   如果是 GPT-2，地址可能是 <code>transformer.h.17.mlp.c_proj</code>。
+*   <strong>核心逻辑：</strong> ROME 算法认为知识存储在 MLP 层（全连接层）里。这段代码专门锁定 MLP 层的<strong>输入</strong>或<strong>输出</strong>位置。</p>
+<h4>✅ Task 4: 准备大量的阅读材料 (加载数据集)</h4>
+<p><strong>代码位置：</strong> <code>layer_stats()</code> -&gt; <code>get_ds()</code>
+<strong>任务说明：</strong>
+为了得到通用的统计规律，不能只看一两句话。
+*   代码加载了庞大的 <code>wikipedia</code> 或 <code>wikitext</code> 数据集。
+*   它会处理文本长度（<code>maxlen</code>），确保喂给模型的句子长度合适（比如截断到 4096 或 1024 个 token）。</p>
+<h4>✅ Task 5: 检查是否已经做过功课 (缓存检查)</h4>
+<p><strong>代码位置：</strong> <code>layer_stats()</code> -&gt; <code>filename.exists()</code>
+<strong>任务说明：</strong>
+计算这个统计量非常慢（可能要跑几十万条数据）。
+*   代码会检查 <code>stats_dir</code> 下面是不是已经有一个 <code>.npz</code> 文件了。
+*   <strong>如果有：</strong> 直接跳过计算，加载现成的（<code>loader</code> 会处理读取缓存）。
+*   <strong>如果没有：</strong> 叹口气，开始干活（进入 Task 6）。</p>
+<h4>✅ Task 6: 核心行动——安装窃听器并“偷数据” (Trace &amp; Forward)</h4>
+<p><strong>代码位置：</strong> <code>layer_stats()</code> -&gt; <code>with torch.no_grad():</code> 下面的循环
+<strong>这是全篇最难懂也是最重要的地方。</strong></p>
+<ol>
+<li><strong>批量读取数据：</strong> 每次取 100 条文本 (<code>batch_size</code>)。</li>
+<li><strong>安装窃听器 (<code>Trace</code>)：</strong>
+    <code>python
+    with Trace(model, layer_name, retain_input=True, ...) as tr:
+        model(**batch)</code><ul>
+<li><code>Trace</code> 是一个自定义的工具（基于 PyTorch Hooks）。它的作用是：当模型运行到 <code>layer_name</code> 这一层时，<strong>把这一层的输入数据（input）拦截下来，存到 <code>tr</code> 变量里。</strong></li>
+<li><code>model(**batch)</code>：让模型正常阅读这些文本。</li>
+</ul>
+</li>
+<li><strong>提取特征：</strong> <code>feats = flatten_masked_batch(tr.input, ...)</code>。把拦截到的隐藏层状态（Hidden States）提取出来。</li>
+</ol>
+<h4>✅ Task 7: 数学统计——记账 (Update Stats)</h4>
+<p><strong>代码位置：</strong> <code>stat.add(feats)</code>
+<strong>任务说明：</strong>
+拿到了一堆拦截的数据（向量），我们需要计算它们的统计特性。
+*   <strong><code>mom2</code> (Second Moment):</strong> 实际上就是在算 $X^T X$。这是计算<strong>协方差矩阵</strong>的基础。
+*   <strong>为什么要做这个？</strong> ROME 算法在修改模型时，需要求逆矩阵。为了不破坏模型已有的其他知识，它需要知道哪些方向是“常见的”、哪些是“罕见的”。这个协方差矩阵就是用来保护已有知识不被破坏的关键。</p>
+<h4>✅ Task 8: 任务完成，保存结果</h4>
+<p><strong>代码位置：</strong> <code>return stat</code> 以及 <code>tally</code> 函数内部的保存机制
+<strong>任务说明：</strong>
+把算好的巨大的矩阵保存到硬盘上，下次就不用再算一遍了。</p>
+<hr />
+<h3>总结：这段代码在干嘛？</h3>
+<p>用一句话说：
+<strong>它让模型阅读几十万条维基百科，利用“窃听器”记录下第 N 层 MLP 接收到的所有输入信号，然后计算这些信号的协方差矩阵并保存下来。</strong></p>
+<p><strong>对应 ROME 论文的意义：</strong>
+ROME 的公式里有一个关键项是 $(C_k)^{-1}$，也就是键（Key）的协方差矩阵的逆。这个脚本就是专门用来预先计算这个 $C_k$ 的。没有这一步，就无法在不破坏模型其他能力的前提下进行精确的“知识编辑”。</p>

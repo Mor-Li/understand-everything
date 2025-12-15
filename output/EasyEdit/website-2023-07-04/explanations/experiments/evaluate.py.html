@@ -1,0 +1,131 @@
+<h1>experiments/evaluate.py</h1>
+<p>这份代码是一个<strong>模型编辑（Model Editing）</strong>实验的主控脚本。</p>
+<p>简单来说，它的作用是：<strong>给大模型做“脑科手术”（修改特定知识），然后通过做题来检查手术成不成功，有没有后遗症。</strong></p>
+<p>比如：把模型脑子里“埃菲尔铁塔在巴黎”这个知识点，强行改成“埃菲尔铁塔在罗马”，然后测试模型会不会真的认为它在罗马，以及模型会不会因此变傻（比如忘了美国在哪）。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>Task List（任务清单）</strong>，程序运行时就是按这个清单一步步执行的。</p>
+<hr />
+<h3>📋 程序的执行任务清单 (To-Do List)</h3>
+<h4>1. 准备阶段：决定“手术方案”</h4>
+<ul>
+<li><strong>Task:</strong> 读取命令行参数（你想用哪个算法？修哪个模型？）。</li>
+<li><strong>Task:</strong> 创建结果文件夹（用来存“体检报告”）。</li>
+<li><strong>Task:</strong> 加载手术参数（比如 ROME 算法需要的超参数）。</li>
+</ul>
+<h4>2. 准备病人：加载模型</h4>
+<ul>
+<li><strong>Task:</strong> 把大模型（如 GPT-2, GPT-J, T5）加载到显存里。</li>
+<li><strong>Task:</strong> 如果模型太大，把它切分到不同的 GPU 上（代码里有一大段 <code>device_map</code> 就是在手动分配显卡）。</li>
+</ul>
+<h4>3. 准备考卷：加载数据集</h4>
+<ul>
+<li><strong>Task:</strong> 读取数据集（比如 <code>CounterFact</code> 或 <code>zsRE</code>）。这些数据里包含了要修改的知识点（Prompt）。</li>
+</ul>
+<h4>4. 核心循环：开始做实验 (逐个案例处理)</h4>
+<ul>
+<li><strong>Task 4.1 (手术):</strong> 对模型应用编辑算法，修改权重。</li>
+<li><strong>Task 4.2 (术后体检):</strong> 测试修改后的模型，记录分数（Post-Edit）。</li>
+<li><strong>Task 4.3 (复原):</strong> 把模型权重恢复成原样。</li>
+<li><strong>Task 4.4 (术前体检):</strong> 测试原始模型，记录分数（Pre-Edit），作为对比基准。</li>
+<li><strong>Task 4.5 (存档):</strong> 把这一条数据的测试结果存成 JSON 文件。</li>
+</ul>
+<hr />
+<h3>🔍 详细步骤代码对应讲解</h3>
+<p>下面我把代码切块，对应上面的清单给你讲：</p>
+<h4>Step 1: 准备阶段 (配置与目录)</h4>
+<p>代码主要在 <code>main</code> 函数的开头。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这一块是在查字典，ALG_DICT 定义了有哪些手术方案（ROME, FT, MEND等）</span>
+<span class="n">params_class</span><span class="p">,</span> <span class="n">apply_algo</span> <span class="o">=</span> <span class="n">ALG_DICT</span><span class="p">[</span><span class="n">alg_name</span><span class="p">]</span>
+
+<span class="c1"># ...省略中间路径判断...</span>
+
+<span class="c1"># 创建存放结果的文件夹，比如 results/ROME/run_001</span>
+<span class="n">run_dir</span> <span class="o">=</span> <span class="n">RESULTS_DIR</span> <span class="o">/</span> <span class="n">dir_name</span> <span class="o">/</span> <span class="sa">f</span><span class="s2">&quot;run_</span><span class="si">{</span><span class="nb">str</span><span class="p">(</span><span class="n">run_id</span><span class="p">)</span><span class="o">.</span><span class="n">zfill</span><span class="p">(</span><span class="mi">3</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
+<span class="n">run_dir</span><span class="o">.</span><span class="n">mkdir</span><span class="p">(</span><span class="n">parents</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+
+<span class="c1"># 加载超参数 (hparams)，比如学习率、层数等</span>
+<span class="n">hparams</span> <span class="o">=</span> <span class="n">params_class</span><span class="o">.</span><span class="n">from_json</span><span class="p">(</span><span class="n">params_path</span><span class="p">)</span>
+</code></pre></div>
+
+<h4>Step 2: 准备病人 (加载模型)</h4>
+<p>这一大段看着很乱的代码，其实就是在干一件事：<strong>把模型搬进显卡</strong>。</p>
+<div class="codehilite"><pre><span></span><code><span class="nb">print</span><span class="p">(</span><span class="s2">&quot;Instantiating model&quot;</span><span class="p">)</span>
+<span class="c1"># 根据名字加载模型 (GPT-2, T5 等)</span>
+<span class="k">if</span> <span class="s1">&#39;t5&#39;</span> <span class="ow">in</span> <span class="n">model_name</span><span class="o">.</span><span class="n">lower</span><span class="p">():</span>
+    <span class="n">model</span> <span class="o">=</span> <span class="n">T5ForConditionalGeneration</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="k">elif</span> <span class="s1">&#39;gpt&#39;</span> <span class="ow">in</span> <span class="n">model_name</span><span class="o">.</span><span class="n">lower</span><span class="p">():</span>
+    <span class="n">model</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+<span class="c1"># 下面这一大堆 if-elif 是为了多卡并行。</span>
+<span class="c1"># 比如你有4张显卡，它手动指定 0-7层在卡0，7-14层在卡1...</span>
+<span class="c1"># 这是为了防止模型太大，一张卡装不下。</span>
+<span class="k">if</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">hparams</span><span class="o">.</span><span class="n">device_map</span><span class="p">)</span> <span class="o">==</span> <span class="mi">4</span><span class="p">):</span>
+    <span class="n">device_map</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="n">hparams</span><span class="o">.</span><span class="n">device_map</span><span class="p">[</span><span class="mi">0</span><span class="p">]:</span> <span class="p">[</span><span class="n">_</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">7</span><span class="p">)],</span>
+        <span class="c1"># ...</span>
+    <span class="p">}</span>
+<span class="n">model</span><span class="o">.</span><span class="n">parallelize</span><span class="p">(</span><span class="n">device_map</span><span class="o">=</span><span class="n">device_map</span><span class="p">)</span> <span class="c1"># 应用显卡分配</span>
+</code></pre></div>
+
+<h4>Step 3: 准备考卷 (加载数据)</h4>
+<p>准备好要用来测试的数据集。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 加载数据集，ds_name 可能是 &#39;cf&#39; (CounterFact)</span>
+<span class="n">ds_class</span><span class="p">,</span> <span class="n">ds_eval_method</span> <span class="o">=</span> <span class="n">DS_DICT</span><span class="p">[</span><span class="n">ds_name</span><span class="p">]</span>
+<span class="n">ds</span> <span class="o">=</span> <span class="n">ds_class</span><span class="p">(</span><span class="n">DATA_DIR</span><span class="p">,</span> <span class="n">size</span><span class="o">=</span><span class="n">dataset_size_limit</span><span class="p">,</span> <span class="n">tok</span><span class="o">=</span><span class="n">tok</span><span class="p">)</span>
+</code></pre></div>
+
+<h4>Step 4: 核心循环 (手术与体检)</h4>
+<p>这是整个脚本最重要的地方。它遍历数据集中的每一条记录（<code>record</code>）。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 遍历每一个案例</span>
+<span class="k">for</span> <span class="n">record</span> <span class="ow">in</span> <span class="n">ds</span><span class="p">:</span>
+    <span class="c1"># -------------------------------------------------------</span>
+    <span class="c1"># Task 4.1: 手术 (修改模型)</span>
+    <span class="c1"># -------------------------------------------------------</span>
+    <span class="c1"># apply_algo 是具体的算法函数（比如 apply_rome_to_model）</span>
+    <span class="c1"># 它返回：</span>
+    <span class="c1"># 1. edited_model: 修改后的模型</span>
+    <span class="c1"># 2. unpatch_fn: 一个用来撤销修改的函数（后悔药）</span>
+    <span class="c1"># 3. weights_copy: 原始权重的备份</span>
+    <span class="n">edited_model</span><span class="p">,</span> <span class="n">unpatch_fn</span><span class="p">,</span> <span class="n">weights_copy</span> <span class="o">=</span> <span class="n">apply_algo</span><span class="p">(</span>
+        <span class="n">model</span><span class="p">,</span>
+        <span class="n">tok</span><span class="p">,</span>
+        <span class="n">record</span><span class="p">[</span><span class="s2">&quot;requested_rewrite&quot;</span><span class="p">],</span> <span class="c1"># 比如：把&quot;埃菲尔铁塔&quot;的位置改成&quot;罗马&quot;</span>
+        <span class="n">hparams</span><span class="p">,</span>
+        <span class="o">...</span>
+    <span class="p">)</span>
+
+    <span class="c1"># -------------------------------------------------------</span>
+    <span class="c1"># Task 4.2: 术后体检 (Post-Edit Evaluation)</span>
+    <span class="c1"># -------------------------------------------------------</span>
+    <span class="c1"># ds_eval_method 是评估函数。</span>
+    <span class="c1"># 它会测试模型现在是否认为铁塔在罗马，以及其他能力是否正常。</span>
+    <span class="n">metrics</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="s2">&quot;post&quot;</span><span class="p">:</span> <span class="n">ds_eval_method</span><span class="p">(</span><span class="n">edited_model</span><span class="p">,</span> <span class="o">...</span><span class="p">),</span>
+    <span class="p">}</span>
+
+    <span class="c1"># -------------------------------------------------------</span>
+    <span class="c1"># Task 4.3: 复原 (Undo)</span>
+    <span class="c1"># -------------------------------------------------------</span>
+    <span class="c1"># 执行撤销函数，把模型变回原来的样子，或者手动把 weights_copy 填回去</span>
+    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+        <span class="n">unpatch_fn</span><span class="p">()</span> 
+        <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">weights_copy</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="n">nethook</span><span class="o">.</span><span class="n">get_parameter</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">k</span><span class="p">)[</span><span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="n">v</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="s2">&quot;cuda&quot;</span><span class="p">)</span>
+
+    <span class="c1"># -------------------------------------------------------</span>
+    <span class="c1"># Task 4.4: 术前体检 (Pre-Edit Evaluation)</span>
+    <span class="c1"># -------------------------------------------------------</span>
+    <span class="c1"># 测试原始模型。这时候模型应该认为铁塔在巴黎。</span>
+    <span class="c1"># 这一步是为了做对比 (Pre vs Post)。</span>
+    <span class="n">metrics</span><span class="p">[</span><span class="s2">&quot;pre&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">ds_eval_method</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># -------------------------------------------------------</span>
+    <span class="c1"># Task 4.5: 存档</span>
+    <span class="c1"># -------------------------------------------------------</span>
+    <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">case_result_path</span><span class="p">,</span> <span class="s2">&quot;w&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+        <span class="n">json</span><span class="o">.</span><span class="n">dump</span><span class="p">(</span><span class="n">metrics</span><span class="p">,</span> <span class="n">f</span><span class="p">,</span> <span class="n">indent</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+</code></pre></div>
+
+<h3>总结</h3>
+<p>你不需要看懂每一行代码，只需要理解这个流程：
+<strong>加载模型 -&gt; 拿一条数据 -&gt; 改模型权重 -&gt; 测一遍(Post) -&gt; 恢复权重 -&gt; 测一遍(Pre) -&gt; 保存结果 -&gt; 下一条数据。</strong></p>
+<p>这个脚本是用来批量跑实验的，跑完之后，你会得到一堆 JSON 文件，里面记录了每次修改前后模型表现的对比。</p>

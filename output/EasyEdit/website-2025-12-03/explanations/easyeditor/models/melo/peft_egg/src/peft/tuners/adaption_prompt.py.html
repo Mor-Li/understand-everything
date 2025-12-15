@@ -1,0 +1,58 @@
+<h1>easyeditor/models/melo/peft_egg/src/peft/tuners/adaption_prompt.py</h1>
+<p>这份代码实现了一种叫做 <strong>Adaption Prompt</strong> (也常被称为 <strong>LLaMA-Adapter</strong>) 的微调技术。</p>
+<p>简单来说，它的核心思想是：<strong>不要动大模型原本的参数，而是在它的注意力层（Attention）里“插队”塞入一些可训练的“提示词向量”，让模型学会新任务。</strong></p>
+<p>为了让你看懂，我们可以把这份代码想象成你在执行一个 <strong>“改造大模型”的工程项目</strong>。我把这个文件拆解成一份 <strong>Project To-Do List</strong>，一步步带你看它是怎么实现的。</p>
+<hr />
+<h3>🛠️ 项目任务清单：改造 LLaMA 模型</h3>
+<h4>✅ Task 1: 准备工具 (搞定 LLaMA 的特殊算子)</h4>
+<p><strong>目标</strong>：LLaMA 模型有一种特殊的“旋转位置编码”（RoPE），为了在它的注意力机制里插入我们的东西，我们需要手动计算它的 Query 状态。
+*   <strong>代码对应</strong>：<code>llama_rotate_half</code>, <code>llama_apply_rotary_pos_emb</code>, <code>llama_compute_query_states</code>
+*   <strong>解释</strong>：
+    *   HuggingFace 原生的 LLaMA 代码封装太严实了，直接调用拿不到中间的 <code>Query</code> 向量。
+    *   所以这里不得不<strong>复制粘贴</strong>了一部分 LLaMA 的底层数学公式。
+    *   <strong>作用</strong>：为了在后面计算注意力分数时，能正确处理位置信息。</p>
+<h4>✅ Task 2: 制定装修图纸 (Config 配置)</h4>
+<p><strong>目标</strong>：定义我们要插入多少个“提示词”，插入到哪些层。
+*   <strong>代码对应</strong>：<code>AdaptionPromptConfig</code> 类
+*   <strong>解释</strong>：
+    *   <code>adapter_len</code>: 我们要凭空造出多少个 token（比如 10 个或 30 个）作为提示。
+    *   <code>adapter_layers</code>: 我们只改动最后几层（比如只改最后 L 层），而不是改所有层。</p>
+<h4>✅ Task 3: 聘请项目经理 (Model Wrapper)</h4>
+<p><strong>目标</strong>：我们需要一个总管类，负责把原来的模型“偷梁换柱”，把普通的 Attention 换成我们魔改后的 Attention。
+*   <strong>代码对应</strong>：<code>AdaptionPromptModel</code> 类
+*   <strong>步骤</strong>：
+    1.  <strong>查找层 (<code>add_adapter</code>)</strong>：遍历模型，找到所有的 <code>Self-Attention</code> 模块。
+    2.  <strong>替换零件 (<code>_create_adapted_attentions</code>)</strong>：把原来的 Attention 模块拆下来，装进我们自定义的 <code>AdaptedAttention</code> 壳子里，再装回去。
+    3.  <strong>冻结原厂参数 (<code>_mark_only_adaption_prompts_as_trainable</code>)</strong>：<strong>这步最重要</strong>。把大模型原本几百亿个参数全部锁死（<code>requires_grad = False</code>），只允许我们要插入的那一小撮参数进行训练。</p>
+<h4>✅ Task 4: 核心改造工程 (魔改 Attention 层) 🔥最重要</h4>
+<p><strong>目标</strong>：这是具体干活的地方。我们要重写 <code>forward</code> 函数，把我们的“提示词”融合进去。
+*   <strong>代码对应</strong>：<code>AdaptedAttention</code> 类
+*   <strong>你的 To-Do 细节</strong>：
+    1.  <strong>准备可训练的参数 (<code>__init__</code>)</strong>:
+        *   创建一个 <code>adaption_prompt</code>：这是一组随机初始化的向量，假装它们是输入的 Token。
+        *   创建一个 <code>adaption_gate</code>：这是一个“门控”开关，初始化为 <strong>0</strong>。这意味着刚开始训练时，这个插件不起作用，模型表现和原来一模一样（Zero-init 策略，为了训练稳定）。</p>
+<div class="codehilite"><pre><span></span><code><span class="mf">2.</span><span class="w">  </span><span class="o">**</span><span class="n">魔改前向传播</span><span class="w"> </span><span class="p">(</span><span class="n n-Quoted">`forward`</span><span class="p">)</span><span class="o">**:</span>
+<span class="w">    </span><span class="o">*</span><span class="w">   </span><span class="o">**</span><span class="n">Step</span><span class="w"> </span><span class="n">A</span><span class="o">:</span><span class="w"> </span><span class="n">跑原版流程</span><span class="o">**</span><span class="n">。先调用</span><span class="w"> </span><span class="n n-Quoted">`self.model(**kwargs)`</span><span class="w"> </span><span class="n">拿到原始模型的输出结果。</span>
+<span class="w">    </span><span class="o">*</span><span class="w">   </span><span class="o">**</span><span class="n">Step</span><span class="w"> </span><span class="n">B</span><span class="o">:</span><span class="w"> </span><span class="n">处理我们的提示词</span><span class="o">**</span><span class="n">。把</span><span class="w"> </span><span class="n n-Quoted">`adaption_prompt`</span><span class="w"> </span><span class="n">扔进模型的</span><span class="w"> </span><span class="n">K</span><span class="w"> </span><span class="p">(</span><span class="k">Key</span><span class="p">)</span><span class="w"> </span><span class="n">和</span><span class="w"> </span><span class="n">V</span><span class="w"> </span><span class="p">(</span><span class="k">Value</span><span class="p">)</span><span class="w"> </span><span class="n">投影层，生成</span><span class="w"> </span><span class="n n-Quoted">`adapter_k`</span><span class="w"> </span><span class="n">和</span><span class="w"> </span><span class="n n-Quoted">`adapter_v`</span><span class="n">。</span>
+<span class="w">    </span><span class="o">*</span><span class="w">   </span><span class="o">**</span><span class="n">Step</span><span class="w"> </span><span class="n">C</span><span class="o">:</span><span class="w"> </span><span class="n">重新计算</span><span class="w"> </span><span class="k">Query</span><span class="o">**</span><span class="n">。利用</span><span class="w"> </span><span class="n">Task</span><span class="w"> </span><span class="mi">1</span><span class="w"> </span><span class="n">里的工具，算出当前输入的</span><span class="w"> </span><span class="k">Query</span><span class="w"> </span><span class="n">向量。</span>
+<span class="w">    </span><span class="o">*</span><span class="w">   </span><span class="o">**</span><span class="n">Step</span><span class="w"> </span><span class="n">D</span><span class="o">:</span><span class="w"> </span><span class="n">计算新注意力</span><span class="o">**</span><span class="n">。</span>
+<span class="w">        </span><span class="o">*</span><span class="w">   </span><span class="n">公式：</span><span class="n n-Quoted">`Score = Query × adapter_k`</span>
+<span class="w">        </span><span class="o">*</span><span class="w">   </span><span class="n">这步是计算“当前输入”和“我们插入的提示词”之间的关联度。</span>
+<span class="w">    </span><span class="o">*</span><span class="w">   </span><span class="o">**</span><span class="n">Step</span><span class="w"> </span><span class="n">E</span><span class="o">:</span><span class="w"> </span><span class="n">加权融合</span><span class="o">**</span><span class="n">。</span>
+<span class="w">        </span><span class="o">*</span><span class="w">   </span><span class="n n-Quoted">`Output = Score × adapter_v`</span>
+<span class="w">        </span><span class="o">*</span><span class="w">   </span><span class="o">**</span><span class="n">关键点</span><span class="o">**</span><span class="n">：最后要乘以</span><span class="w"> </span><span class="n n-Quoted">`adaption_gate`</span><span class="w"> </span><span class="p">(</span><span class="n">那个初始化为0的门</span><span class="p">)</span><span class="n">。</span>
+<span class="w">    </span><span class="o">*</span><span class="w">   </span><span class="o">**</span><span class="n">Step</span><span class="w"> </span><span class="n">F</span><span class="o">:</span><span class="w"> </span><span class="n">最终相加</span><span class="o">**</span><span class="n">。</span>
+<span class="w">        </span><span class="o">*</span><span class="w">   </span><span class="n n-Quoted">`最终结果 = 原版输出 + (门控 × 我们的插件输出)`</span>
+</code></pre></div>
+
+<hr />
+<h3>总结：这段代码到底在干啥？</h3>
+<p>想象你在写作业（原模型任务）：
+1.  <strong>Task 1 &amp; 2</strong> 是你准备好的小抄和规则。
+2.  <strong>Task 3</strong> 是你决定只在作业的最后几页使用小抄。
+3.  <strong>Task 4</strong> 是具体的作弊技巧：
+    *   你正常写作业（原版 Attention）。
+    *   你同时瞄了一眼小抄（<code>adaption_prompt</code>）。
+    *   你根据题目（Query）和小抄内容（Key）计算出该抄哪部分。
+    *   哪怕你抄了，最开始你也只敢抄一点点（<code>adaption_gate</code> 接近 0），随着训练进行，你胆子变大，小抄对结果的影响越来越大。</p>
+<p>这就是 <strong>Adaption Prompt (LLaMA-Adapter)</strong> 的核心逻辑：<strong>冻结全模型，只在 Attention 层并联一个带门控的、可学习的 Prompt 分支。</strong></p>

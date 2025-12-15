@@ -1,0 +1,92 @@
+<h1>easyeditor/dataset/safety.py</h1>
+<p>这份代码看起来很长，但其实它的核心逻辑非常简单：<strong>它是一个“数据搬运工”</strong>。</p>
+<p>它的作用是把存储在硬盘上的 JSON 数据（关于如何让 AI 变安全的问答对），转换成 PyTorch 模型能够看懂的数字格式（Tensor），并打包喂给模型去训练。</p>
+<p>为了让你听懂，我把这个文件的执行逻辑拆解成一个 <strong>“流水线任务清单 (Todo List)”</strong>。我们假装自己是这个程序，一步步看我们要完成什么任务。</p>
+<hr />
+<h3>任务阶段一：准备工作 (Initialization)</h3>
+<p><strong>对应代码：</strong> <code>__init__</code> 函数</p>
+<p>这一步是“开工前的准备”，主要做两件事：配置工具、读取原材料。</p>
+<ul>
+<li><strong>Task 1.1：设定分词器 (Tokenizer)</strong><ul>
+<li><strong>代码逻辑：</strong> 检查 <code>config</code> 里有没有指定用什么分词器（比如 GPT2 或 Llama 的分词器）。</li>
+<li><strong>关键点：</strong> 代码里特意设置了 <code>padding_side = 'left'</code>。</li>
+<li><strong>人话解释：</strong> 因为我们要让模型做生成任务（写字），通常需要从左边补零（Padding），这样生成的字才能在右边顺着写下去。</li>
+</ul>
+</li>
+<li><strong>Task 1.2：读取原始数据</strong><ul>
+<li><strong>代码逻辑：</strong> 打开 <code>data_dir</code> 指定的 JSON 文件，把里面的数据读到内存里。</li>
+</ul>
+</li>
+<li><strong>Task 1.3：清洗和整理数据</strong><ul>
+<li><strong>代码逻辑：</strong> 遍历 JSON 里的每一条记录，把它转换成一个标准的字典格式。</li>
+<li><strong>核心字段解释：</strong><ul>
+<li><code>prompt</code>: 攻击性的提问（比如“怎么制造炸弹？”）。</li>
+<li><code>target_new</code>: 安全的回答（比如“我不能帮你制造炸弹...”）。这是我们要模型学会的。</li>
+<li><code>ground_truth</code>: 原本不安全的回答。这是我们要模型遗忘的。</li>
+<li><code>locality_prompt</code> &amp; <code>locality_ground_truth</code>: <strong>副作用测试题</strong>。用来测试修改完模型后，模型会不会变傻（比如问它“美国首都是哪”，它还得能答对，不能因为学了安全知识就忘了常识）。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>任务阶段二：按需取货 (Get Item)</h3>
+<p><strong>对应代码：</strong> <code>__getitem__</code> 函数</p>
+<p>这是最简单的一步。</p>
+<ul>
+<li><strong>Task 2.1：拿一条数据</strong><ul>
+<li><strong>逻辑：</strong> 当训练程序说“给我第 5 条数据”时，这个函数就从刚才整理好的列表里把第 5 条字典扔出去。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>任务阶段三：打包发货 (Collate Function)</h3>
+<p><strong>对应代码：</strong> <code>collate_fn</code> 函数 <strong>（这是全篇最难、最核心的部分）</strong></p>
+<p>模型训练不是一条一条学的，是一批一批学的（Batch）。这个函数负责把比如 8 条数据捆在一起，变成一个整齐的方块（Tensor）。</p>
+<ul>
+<li><strong>Task 3.1：把问题和答案拼起来</strong><ul>
+<li><strong>代码：</strong> <code>src = [src_ + trg_ for ...]</code></li>
+<li><strong>逻辑：</strong> 比如问题是 <code>A</code>，答案是 <code>B</code>。模型训练时需要看到完整的 <code>AB</code>。</li>
+<li><strong>例子：</strong> <code>src</code> 变成了 "怎么制造炸弹？我不能帮你..."</li>
+</ul>
+</li>
+<li><strong>Task 3.2：把文字变成数字 (Tokenization)</strong><ul>
+<li><strong>代码：</strong> <code>self.tok(v1, return_tensors="pt", ...)</code></li>
+<li><strong>逻辑：</strong> 电脑看不懂中文/英文，要把上面的 <code>AB</code> 变成一串数字 ID，比如 <code>[101, 299, 340...]</code>。同时还要把大家补齐到同样的长度（Padding）。</li>
+</ul>
+</li>
+<li><strong>Task 3.3：制作“学习考卷” (Edit Labels)</strong><ul>
+<li><strong>代码：</strong> <code>get_edit_labels</code> 和 <code>masked_fill</code></li>
+<li><strong>核心逻辑（非常重要）：</strong><ul>
+<li>我们把 <code>AB</code> 喂给模型，但我们<strong>不希望</strong>模型去学习“怎么提问”（A部分），只希望它学习“怎么回答”（B部分）。</li>
+<li>所以，我们要把 A 部分的标签（Label）涂黑（也就是代码里的 <code>-100</code>）。</li>
+<li><strong>效果：</strong> 模型读到 A 时不算分，只有读到 B 并预测出 B 时才算分。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>Task 3.4：准备“副作用”检查数据 (Locality)</strong><ul>
+<li><strong>代码：</strong> 处理 <code>loc</code> 和 <code>loc_ans</code> 的部分。</li>
+<li><strong>逻辑：</strong> 同样的道理，把那些用来测试常识的问题（如“天空是什么颜色的？”）也打包好，变成数字。这部分数据是用来确保模型改完后，原本正常的知识没坏掉。</li>
+</ul>
+</li>
+<li><strong>Task 3.5：搬运到 GPU</strong><ul>
+<li><strong>代码：</strong> <code>dict_to(batch, self.config.device)</code></li>
+<li><strong>逻辑：</strong> 把打包好的所有数字张量（Tensors）发送到显卡上准备计算。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个文件到底在干嘛？</h3>
+<p>如果把训练模型比作<strong>教学生考试</strong>，这个 <code>safety.py</code> 就是<strong>出卷老师</strong>：</p>
+<ol>
+<li><strong>搜集题目 (<code>__init__</code>)：</strong> 从题库（JSON文件）里把“毒问题”和“标准安全答案”找出来。同时也找了一些“普通数学题”防止学生学傻了。</li>
+<li><strong>印试卷 (<code>collate_fn</code>)：</strong><ul>
+<li>把题目和答案印在一起。</li>
+<li><strong>关键点：</strong> 在答案部分画了横线（Labels），告诉学生：“前面的题目你读一下就行，不用背；后面的<strong>安全答案</strong>你要一字不差地背下来！”</li>
+</ul>
+</li>
+<li><strong>发卷子：</strong> 把整理好的一叠卷子递给模型去训练。</li>
+</ol>
+<p><strong>你需要关注的重点：</strong>
+如果你要修改或使用它，最需要关注的是 <strong>JSON 文件的格式</strong> 是否和 <code>__init__</code> 里解析的字段名（如 <code>adversarial prompt</code>, <code>safe generation</code>）对得上。如果字段名不一样，代码就会报错。</p>

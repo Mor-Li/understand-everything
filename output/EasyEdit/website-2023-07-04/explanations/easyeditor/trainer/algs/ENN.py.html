@@ -1,0 +1,108 @@
+<h1>easyeditor/trainer/algs/ENN.py</h1>
+<p>这段代码确实比较晦涩，因为它涉及到了<strong>元学习（Meta-Learning）</strong>的一个核心库 <code>higher</code>。</p>
+<p>简单来说，这段代码实现了一个叫做 <strong>ENN (Editable Neural Networks)</strong> 的算法。它的核心思想不是“直接修改模型”，而是<strong>“训练模型学会如何快速修改自己”</strong>。</p>
+<p>为了让你看懂，我把你当成这个算法的“产品经理”，我们将代码逻辑拆解成一个 <strong>5步走的 Task List（任务清单）</strong>。我们一步步来完成这个“让模型可编辑”的项目。</p>
+<hr />
+<h3>Task 1: 搞清楚我们的目标（概念层）</h3>
+<p><strong>目标</strong>：我们想让一个大模型（比如 GPT）在看到一条新知识（比如“美国总统是泰勒斯威夫特”）时，能通过极少的几步梯度下降（Gradient Descent），就记住这个知识，同时不破坏原来的能力。</p>
+<p><strong>痛点</strong>：通常的梯度下降（SGD/Adam）学习率是固定的，或者很难调，直接改容易改坏。</p>
+<p><strong>ENN的解决方案</strong>：让模型自己学习<strong>“对于这一层参数，我该用多大的学习率去修改它”</strong>。</p>
+<hr />
+<h3>Task 2: 准备工具箱（<code>__init__</code> 部分）</h3>
+<p>我们要先定义好，哪些东西是“可以被训练来帮助编辑的”。</p>
+<p>看代码 <code>__init__</code> 部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">edit_lrs</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">edit_lrs</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Parameter</span><span class="p">(</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="n">config</span><span class="o">.</span><span class="n">edit_lr</span><span class="p">]</span> <span class="o">*</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">inner_params</span><span class="p">))</span>
+    <span class="p">)</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">edit_lrs</span> <span class="o">=</span> <span class="n">edit_lrs</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：<ul>
+<li>这里定义了一个变量 <code>edit_lrs</code>（Editing Learning Rates）。</li>
+<li>注意 <code>nn.Parameter</code>，这意味着<strong>这组学习率本身是可以被训练的！</strong></li>
+<li>普通的训练是训练“权重”，这里的训练是训练“修改权重的步长”。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 3: 开启“模拟沙盒”进行预演（<code>edit</code> 函数的核心）</h3>
+<p>这是全篇最难懂的地方。我们需要在一个“平行宇宙”里模拟修改模型，看看效果怎么样。</p>
+<p>看代码 <code>edit</code> 函数中的 <code>with</code> 语句块：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 定义一个简单的优化器</span>
+<span class="n">opt</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">optim</span><span class="o">.</span><span class="n">SGD</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+<span class="c1"># 2. 开启 higher 上下文 (这是魔法所在)</span>
+<span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">enable_grad</span><span class="p">(),</span> <span class="n">higher</span><span class="o">.</span><span class="n">innerloop_ctx</span><span class="p">(</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">,</span>
+    <span class="n">opt</span><span class="p">,</span>
+    <span class="n">override</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;lr&quot;</span><span class="p">:</span> <span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">edit_lrs</span><span class="p">)},</span> <span class="c1"># &lt;--- 重点：强制使用我们要学习的那个学习率</span>
+    <span class="o">...</span>
+<span class="p">)</span> <span class="k">as</span> <span class="p">(</span><span class="n">fmodel</span><span class="p">,</span> <span class="n">diffopt</span><span class="p">):</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：<ul>
+<li><code>higher</code> 是一个第三方库，专门用来做“元学习”。</li>
+<li><code>fmodel</code> (Functional Model)：你可以把它理解为模型的<strong>影子分身</strong>。</li>
+<li>在这个 <code>with</code> 块里，我们对 <code>fmodel</code> 做任何修改，<strong>都不会影响原始的 <code>self.model</code></strong>，但神奇的是，PyTorch 会记录下“如果你修改了它，梯度会怎么走”。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 4: 执行修改步骤（Inner Loop）</h3>
+<p>在沙盒（平行宇宙）里，我们尝试把新知识灌输给这个“影子分身”。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">for</span> <span class="n">edit_step</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">enn</span><span class="o">.</span><span class="n">n_edit_steps</span><span class="p">):</span> <span class="c1"># 比如循环2次</span>
+        <span class="n">output</span> <span class="o">=</span> <span class="n">_logits</span><span class="p">(</span><span class="n">fmodel</span><span class="p">(</span><span class="o">**</span><span class="n">batch</span><span class="p">))</span>                 <span class="c1"># 1. 影子模型做预测</span>
+        <span class="n">loss</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">edit_loss_fn</span><span class="p">(</span><span class="n">output</span><span class="p">,</span> <span class="n">batch</span><span class="p">[</span><span class="s2">&quot;labels&quot;</span><span class="p">])[</span><span class="s2">&quot;nll&quot;</span><span class="p">]</span> <span class="c1"># 2. 算误差</span>
+        <span class="n">diffopt</span><span class="o">.</span><span class="n">step</span><span class="p">(</span><span class="n">loss</span><span class="p">,</span> <span class="n">grad_callback</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">grad_callback</span><span class="p">)</span>     <span class="c1"># 3. 影子模型更新参数</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：<ul>
+<li>这就是标准的训练过程（前向传播 -&gt; 算Loss -&gt; 反向传播）。</li>
+<li><strong>关键点</strong>：<code>diffopt.step</code> 使用的<strong>学习率</strong>，正是我们在 Task 2 里定义的那个<strong>可学习的 <code>edit_lrs</code></strong>。</li>
+<li>这一步结束后，<code>fmodel</code> 已经变成了“被编辑过的模型”。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 5: 交付结果（返回 Edited Model）</h3>
+<p>模拟修改完成后，我们需要把这个修改后的状态返回出去，以便外部进行测试或者进一步的训练。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="ow">not</span> <span class="n">detach_history</span><span class="p">:</span>
+    <span class="n">model_edited</span> <span class="o">=</span> <span class="n">fmodel</span>  <span class="c1"># 如果是在训练中，我们需要保留这个影子，因为它带着梯度链</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="c1"># 如果只是推理/应用，我们就把影子的参数复制到一个新模型里，断开梯度联系</span>
+    <span class="n">model_edited</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_constructor</span><span class="p">()</span>
+    <span class="n">model_edited</span><span class="o">.</span><span class="n">load_state_dict</span><span class="p">(</span><span class="n">fmodel</span><span class="o">.</span><span class="n">state_dict</span><span class="p">())</span>
+
+<span class="k">return</span> <span class="p">(</span>
+    <span class="n">ENN</span><span class="p">(</span><span class="n">model_edited</span><span class="p">,</span> <span class="o">...</span><span class="p">),</span> <span class="c1"># 返回一个新的 ENN 对象，包裹着修改后的模型</span>
+    <span class="p">{},</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：<ul>
+<li>这个函数返回了一个<strong>新的模型实例</strong>。</li>
+<li>如果是<strong>训练阶段</strong>（Meta-Training）：外部代码会拿到这个 <code>model_edited</code>，用它去验证集（Query set）跑一下，算算“修改后的模型效果好不好”。如果效果不好，<strong>梯度会一路回传</strong>，最终更新 <code>edit_lrs</code>。意思就是：“刚才那次修改步子迈太大了/太小了，下次调整一下学习率”。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：整个文件在干嘛？</h3>
+<p>如果把这个文件比作一个<strong>“修车铺”</strong>：</p>
+<ol>
+<li><strong><code>__init__</code></strong>: 买了把<strong>智能扳手</strong>（<code>edit_lrs</code>），这把扳手的扭力是可以调节的。</li>
+<li><strong><code>edit</code></strong>:<ul>
+<li>来了一辆车（原模型）。</li>
+<li><strong><code>higher</code></strong>: 变出一辆<strong>全息投影的虚拟车</strong>（<code>fmodel</code>）。</li>
+<li><strong>Loop</strong>: 用智能扳手在虚拟车上拧螺丝（梯度下降更新）。</li>
+<li><strong>Return</strong>: 把修好的虚拟车交出去。</li>
+</ul>
+</li>
+</ol>
+<p><strong>为什么要这么麻烦？</strong>
+因为在外部的训练循环中，我们会检查这辆“虚拟车”修得好不好。如果修得好，我们就保留这个“智能扳手”的刻度；如果修得不好，我们就调整“智能扳手”的刻度（更新 <code>edit_lrs</code>）。</p>
+<p>最终训练出来的 ENN，拥有<strong>一组完美的学习率</strong>，使得它只要看到新数据，咔咔两下（几步梯度下降）就能精准地把新知识学会，而不损坏旧零件。</p>

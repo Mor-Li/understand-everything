@@ -1,0 +1,120 @@
+<h1>easyeditor/models/grace/GRACE.py</h1>
+<p>这份代码实现了一个叫 <strong>GRACE (General Retrieval Adapter for Concept Editing)</strong> 的算法。</p>
+<p>简单来说，GRACE 的核心思想是<strong>“不做开颅手术，而是贴便利贴”</strong>。它不修改大模型原本的参数，而是在某一层插入一个“外挂字典（Codebook）”。
+*   如果输入的内容触发了这个字典（比如你问了一个特定的需要修改的问题），它就拦截原本的输出，换成我们训练好的新输出（Value）。
+*   如果没触发，就照常运行。</p>
+<p>为了让你看懂，我把这个算法的运行逻辑拆解成一个 <strong>Task Todo List（任务清单）</strong>，假设你就是这个程序，我们需要按顺序完成以下任务：</p>
+<hr />
+<h3>📋 Task 1: 潜入与伪装 (初始化阶段)</h3>
+<p><strong>目标</strong>：在不破坏模型原有结构的情况下，把我们的“特工”安插进去。</p>
+<ul>
+<li><strong>步骤 1.1：找到目标层</strong><ul>
+<li>在 <code>GRACE.__init__</code> 中，代码通过 <code>config.inner_params</code> 找到你想修改的那一层（比如 GPT 的第 30 层）。</li>
+</ul>
+</li>
+<li><strong>步骤 1.2：冻结原模型</strong><ul>
+<li><code>p.requires_grad = False</code>。告诉 PyTorch，原模型的所有参数都不许动，我们不训练它们。</li>
+</ul>
+</li>
+<li><strong>步骤 1.3：偷梁换柱 (Adapter)</strong><ul>
+<li>代码逻辑：<code>setattr(edit_module, layer_name, GRACEAdapter(...))</code></li>
+<li><strong>解释</strong>：它把原本的那一层（比如一个 Linear 层）拿掉，换成了一个自定义的 <code>GRACEAdapter</code>。</li>
+<li><strong>注意</strong>：这个 <code>GRACEAdapter</code> 里面其实包含了原本的那一层（<code>self.layer = layer</code>），平时它会假装自己是原层，但在关键时刻会由它来决定输出什么。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📋 Task 2: 建立记忆库 (Adapter 的核心结构)</h3>
+<p><strong>目标</strong>：理解 <code>GRACEAdapter</code> 是怎么记东西的。</p>
+<ul>
+<li><strong>核心概念</strong>：<ul>
+<li><strong>Key (键)</strong>：代表“输入是什么”。这是模型在这一层的激活值。</li>
+<li><strong>Value (值)</strong>：代表“输出应该是什么”。这是我们需要训练的、修正后的激活值。</li>
+<li><strong>Epsilon (阈值/半径)</strong>：这是一个范围。如果新输入的 Key 和我们存的 Key 距离小于这个半径，就视为“匹配成功”。</li>
+</ul>
+</li>
+<li><strong>代码对应</strong>：<ul>
+<li><code>self.keys</code>：存所有的 Key。</li>
+<li><code>self.values</code>：存所有的 Value。</li>
+<li><code>self.epsilons</code>：存每个 Key 对应的生效半径。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📋 Task 3: 开始编辑 (Edit 阶段)</h3>
+<p><strong>目标</strong>：用户给了一个新知识（比如“埃菲尔铁塔在罗马”——虽然是错的，但在模型编辑任务中我们要强行让它记住），我们需要把它存进字典。</p>
+<ul>
+<li><strong>步骤 3.1：定位触发点</strong><ul>
+<li>代码：<code>GRACE.edit</code> -&gt; <code>key_id</code></li>
+<li><strong>解释</strong>：我们通常取这句话的最后一个 token（比如“罗马”对应的 token）在这一层的激活值作为 <strong>Key</strong>。</li>
+</ul>
+</li>
+<li><strong>步骤 3.2：前向传播与拦截</strong><ul>
+<li>代码：<code>GRACEAdapter.forward</code></li>
+<li><strong>解释</strong>：数据流过这一层。如果是第一次编辑（<code>iter == 0</code>），我们需要决定怎么存这个 Key。</li>
+</ul>
+</li>
+<li><strong>步骤 3.3：判断是“新知识”还是“冲突”</strong><ul>
+<li>代码计算距离：<code>torch.cdist(self.keys, query, p=2)</code></li>
+<li><strong>情况 A (没见过的知识)</strong>：如果当前的输入 Key 离所有存过的 Key 都很远（大于 Epsilon）。<ul>
+<li><strong>动作</strong>：<code>add_key</code>。直接把这个 Key 和一个初始化的 Value 存入字典。</li>
+</ul>
+</li>
+<li><strong>情况 B (撞车了/冲突)</strong>：如果当前的输入 Key 离某个旧 Key 很近（比如之前教过“埃菲尔铁塔在巴黎”，现在教“在罗马”）。<ul>
+<li><strong>动作</strong>：<code>split_epsilons_in_half</code>。这是 GRACE 的精髓。为了区分这两个很像的输入，它把旧 Key 的生效半径（Epsilon）切半，缩小它的势力范围，然后把新 Key 加进去。这样两者就不会打架了。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📋 Task 4: 训练新输出 (Optimization)</h3>
+<p><strong>目标</strong>：刚才我们只是存了 Key（地址），现在要训练 Value（内容），让模型输出我们想要的答案。</p>
+<ul>
+<li><strong>步骤 4.1：只训练 Value</strong><ul>
+<li>在 <code>GRACE.edit</code> 的循环里。</li>
+<li>代码：<code>optimizer = torch.optim.Adam(self.model.parameters(), ...)</code></li>
+<li><strong>解释</strong>：虽然写的是 model parameters，但因为我们在 Task 1 里把原模型冻结了，且 <code>GRACEAdapter</code> 里只有 <code>self.values</code> 是 <code>requires_grad=True</code> 的。所以，<strong>梯度下降只更新 Value</strong>。</li>
+</ul>
+</li>
+<li><strong>步骤 4.2：迭代优化</strong><ul>
+<li>循环 <code>n_iter</code> 次，不断调整 <code>Value</code> 向量，直到模型最终输出的 Loss 最小（即输出了目标答案）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📋 Task 5: 推理与应用 (Inference 阶段)</h3>
+<p><strong>目标</strong>：编辑完成了，现在正常使用模型，看看效果。</p>
+<ul>
+<li><strong>步骤 5.1：计算距离</strong><ul>
+<li>代码：<code>GRACEAdapter.forward</code> -&gt; <code>dists = torch.cdist(...)</code></li>
+<li><strong>解释</strong>：新的输入来了。算出它和字典里所有 Key 的距离。</li>
+</ul>
+</li>
+<li><strong>步骤 5.2：查表决策</strong><ul>
+<li>代码：<code>smallest_dist &lt;= eps</code></li>
+<li><strong>解释</strong>：<ul>
+<li>如果有某个 Key 的距离小于它的 Epsilon -&gt; <strong>触发编辑！</strong> 用训练好的 <code>chosen_value</code> 替换掉原本层的输出。</li>
+<li>如果都很远 -&gt; <strong>无事发生</strong>。直接返回 <code>layer_out</code> (原模型的输出)。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结一下代码里的几个关键函数：</h3>
+<ol>
+<li><strong><code>GRACE</code> 类</strong>：经理。负责把 Adapter 装上去，控制什么时候训练（<code>edit</code>），什么时候回滚（<code>rollback</code>）。</li>
+<li><strong><code>GRACEAdapter</code> 类</strong>：具体的执行者。<ul>
+<li><code>add_key</code>：往字典里加新条目。</li>
+<li><code>split_epsilons_in_half</code>：解决冲突，通过缩小半径来区分相似的输入。</li>
+<li><code>forward</code>：最重要的方法。<ul>
+<li>训练时：负责侦测冲突、初始化 Key。</li>
+<li>推理时：负责计算距离，决定是“替换输出”还是“原样放行”。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话总结 GRACE 的观点</strong>：
+不要改动模型原本复杂的权重，而是建立一个<strong>外挂的“键值对数据库”</strong>。遇到特定的输入（Key），就从数据库里调取特定的修正向量（Value）覆盖上去；遇不到就保持原样。通过动态调整判定范围（Epsilon），来保证新学的知识不会覆盖旧知识。</p>

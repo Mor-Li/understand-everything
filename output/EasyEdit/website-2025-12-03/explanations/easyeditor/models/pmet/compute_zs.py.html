@@ -1,0 +1,78 @@
+<h1>easyeditor/models/pmet/compute_zs.py</h1>
+<p>这份代码是 <strong>PMET (Parallel Memory Editing via Transformer)</strong> 算法的核心部分之一，当然它也和 <strong>ROME</strong> 算法非常相似。</p>
+<p>简单来说，这个文件的目的是：<strong>在一个特定的层（Layer），计算出一个“完美的向量（Vector）”，如果把这个向量插入到模型里，模型就会输出我们想要的新知识（比如把“埃菲尔铁塔在巴黎”改成“埃菲尔铁塔在罗马”）。</strong></p>
+<p>为了让你看懂，我把这个代码的执行逻辑拆解成一个 <strong>“任务清单 (Todo List)”</strong>。想象你是一个正在给模型做“脑科手术”的医生，以下是你手术的步骤：</p>
+<hr />
+<h3>📋 任务清单：寻找“完美植入向量” (Compute Z)</h3>
+<p>这个脚本的主要函数是 <code>compute_zs</code>（针对 PMET 算法）和 <code>compute_z</code>（针对 ROME 算法）。我们以 <code>compute_zs</code> 为例，因为它更复杂一点（它同时计算 Attention 和 MLP 的向量）。</p>
+<h4>✅ Step 1: 准备手术器材 (初始化与参数提取)</h4>
+<p><strong>代码位置：</strong> 函数开头部分，获取 <code>lm_w</code>, <code>ln_f</code> 等。
+*   <strong>在做什么：</strong> 获取模型最后几层（解码层）的参数。
+*   <strong>为什么：</strong> 我们最后要让模型输出特定的单词（Target New，比如“Rome”）。我们需要拿到模型最后的“分类器”权重，才能反向推算出需要什么样的向量才能激活“Rome”这个词。</p>
+<h4>✅ Step 2: 准备“刺激信号” (构建 Prompt)</h4>
+<p><strong>代码位置：</strong> <code>rewriting_prompts</code>, <code>kl_prompts</code>。
+*   <strong>在做什么：</strong> 准备两类句子：
+    1.  <strong>重写句子 (Rewriting Prompts):</strong> 用来教模型新知识的。例如 <code>["The Eiffel Tower is located in", "Rome"]</code>。
+    2.  <strong>保持句子 (KL Prompts):</strong> 用来保持模型正常说话能力的普通句子。例如 <code>["A banana is a", "fruit"]</code>。
+*   <strong>为什么：</strong> 我们希望模型学会新知识（Loss变小），同时不要变傻，不要忘记香蕉是水果（KL散度变小）。</p>
+<h4>✅ Step 3: 定位“病灶” (寻找 Subject Token Index)</h4>
+<p><strong>代码位置：</strong> <code>find_fact_lookup_idx</code> 和 <code>lookup_idxs</code>。
+*   <strong>在做什么：</strong> 在句子中找到“主语”的最后一个 token。比如 "The Eiffel Tower is..." 中的 "Tower"。
+*   <strong>为什么：</strong> 现有的模型编辑理论认为，知识通常存储在主语的最后一个 token 处理完之后的位置。我们要在这个位置注入新的向量。</p>
+<h4>✅ Step 4: 定义我们要找的“未知数” (初始化 Delta)</h4>
+<p><strong>代码位置：</strong> 定义 <code>delta_attn</code> 和 <code>delta_mlp</code>，并设置 <code>requires_grad=True</code>。
+*   <strong>在做什么：</strong> 这是一个优化问题。我们不是要训练模型的权重（Weights），而是要寻找一个 <strong>增量向量 (Delta)</strong>。
+    *   在 PMET 中，它认为 Attention 层和 MLP 层都需要修改，所以定义了两个 delta。
+*   <strong>通俗理解：</strong> 想象我们要解一个方程 $x + \Delta = \text{Target}$。这里的 $\Delta$ 就是我们要通过梯度下降找到的“药剂”。</p>
+<h4>✅ Step 5: 开始模拟手术 (优化循环 Optimization Loop)</h4>
+<p><strong>代码位置：</strong> <code>for it in range(hparams.v_num_grad_steps):</code>
+这是最核心的一步，我们在不断调整 <code>delta</code> 向量。</p>
+<ul>
+<li>
+<p><strong>Todo 5.1: 拦截并修改大脑信号 (Forward with Hook)</strong></p>
+<ul>
+<li><strong>代码：</strong> <code>edit_output_fn</code> 和 <code>nethook.TraceDict</code>。</li>
+<li><strong>操作：</strong> 让模型读句子。当运行到指定的层（Layer）和指定的位置（Subject Index）时，强行把我们当前的 <code>delta</code> 加到模型的输出上。</li>
+<li><strong>目的：</strong> 看看加了这个 <code>delta</code> 后，模型会说什么。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 5.2: 评估结果 (计算 Loss)</strong></p>
+<ul>
+<li><strong>代码：</strong> 计算 <code>nll_loss</code>, <code>kl_loss</code>, <code>weight_decay</code>。</li>
+<li><strong>由三部分组成：</strong><ol>
+<li><strong>NLL Loss (任务目标):</strong> 模型现在说完 "The Eiffel Tower is in" 之后，预测 "Rome" 的概率大吗？（越大越好，Loss越小）。</li>
+<li><strong>KL Loss (副作用控制):</strong> 模型说完 "A banana is a" 之后，预测的概率分布和原来一样吗？（越像越好，防止模型崩溃）。</li>
+<li><strong>Weight Decay (动作幅度):</strong> <code>delta</code> 向量不要太大，微创手术最好。</li>
+</ol>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 5.3: 调整方向 (Backward &amp; Step)</strong></p>
+<ul>
+<li><strong>代码：</strong> <code>loss.backward()</code>, <code>opt.step()</code>。</li>
+<li><strong>操作：</strong> 根据 Loss，利用梯度下降自动修改 <code>delta_attn</code> 和 <code>delta_mlp</code> 的数值。</li>
+</ul>
+</li>
+<li>
+<p><strong>Todo 5.4: 限制范围 (Project within L2 ball)</strong></p>
+<ul>
+<li><strong>代码：</strong> <code>if delta_mlp.norm() &gt; max_norm:</code></li>
+<li><strong>操作：</strong> 如果算出来的 <code>delta</code> 向量太长（模太大），强行把它缩短。保证修改是温和的。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Step 6: 输出最终方案 (Return)</h4>
+<p><strong>代码位置：</strong> 函数最后 <code>return target_attn, target_mlp</code>。
+*   <strong>在做什么：</strong> 循环结束后，我们找到了最优的 <code>delta</code>。
+*   <strong>计算结果：</strong> <code>Target = Original_Vector + Delta</code>。
+*   <strong>含义：</strong> 这个返回值告诉外部程序：“嘿，如果你能把这一层的输出变成这个 <code>Target</code> 向量，模型就会认为埃菲尔铁塔在罗马了。”</p>
+<hr />
+<h3>总结：这代码到底是干嘛的？</h3>
+<p>这个文件 <strong>不修改模型的权重（Weights）</strong>。</p>
+<p>它是在 <strong>“逆向工程”</strong> 一个目标状态。它在问模型：</p>
+<blockquote>
+<p>“在这个特定的层，如果我把你的脑电波（Hidden State）改成什么样，你才会把‘巴黎’说成‘罗马’，同时不影响你说‘香蕉是水果’？”</p>
+</blockquote>
+<p>算出来的这个 <strong>Target Vector ($z$)</strong>，会作为下一步（在其他文件中，比如 <code>update.py</code>）更新模型矩阵 $W$ 的依据。这是一个“先找目标，再改参数”的过程中的<strong>第一步：找目标</strong>。</p>

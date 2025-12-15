@@ -1,0 +1,116 @@
+<h1>easyeditor/models/rome/repr_tools.py</h1>
+<p>这份代码确实涉及到了大模型内部比较底层的操作（特别是ROME算法，它是一种精准修改大模型知识的方法）。如果不了解背景，直接看代码很容易晕。</p>
+<p>这个文件的核心作用可以总结为一句话：<strong>“在一个填空题中，找到填进去的那个词，并把大模型在某一具体层对这个词的‘脑电波’（向量表示）给提取出来。”</strong></p>
+<p>为了让你听懂，我把这个过程拆解成一个 <strong>Task List（任务清单）</strong>，我们假装自己是这个程序，一步步执行任务。</p>
+<hr />
+<h3>🟢 任务清单 (Task To-Do List)</h3>
+<ol>
+<li><strong>准备素材</strong>：拿到“填空题模板”和“答案”。</li>
+<li><strong>定位坐标</strong>：算出“答案”在这个句子里变成了第几个 Token（词元）。</li>
+<li><strong>偷窥模型</strong>：让模型读这个句子，并在它读到那个 Token 时，把那一层的参数（向量）偷出来。</li>
+<li><strong>整理交付</strong>：把偷出来的向量打包好，返回给用户。</li>
+</ol>
+<hr />
+<h3>🛠️ 逐步讲解 (Step-by-Step)</h3>
+<p>我们用一个具体的例子来跑这个流程：
+*   <strong>模板 (Template)</strong>: <code>"{} plays basketball."</code> ({} 打篮球)
+*   <strong>填入词 (Word)</strong>: <code>"Jordan"</code>
+*   <strong>目标</strong>: 我们想知道模型读到 <code>"Jordan"</code> 这个词时，第 5 层的隐藏状态是什么。</p>
+<h4>Task 1: 准备素材 (入口函数)</h4>
+<p>对应代码：<code>get_reprs_at_word_tokens</code></p>
+<p>这是整个流程的“包工头”。它接收模型、分词器、模板、单词、层数等参数。
+它的工作很简单：
+1.  把活儿派给 <code>get_words_idxs_in_templates</code>，让它去算坐标（Task 2）。
+2.  拿到坐标后，把活儿派给 <code>get_reprs_at_idxs</code>，让它去取向量（Task 3）。</p>
+<h4>Task 2: 定位坐标 (最烧脑的部分)</h4>
+<p>对应代码：<code>get_words_idxs_in_templates</code></p>
+<p><strong>目标</strong>：在 <code>"Jordan plays basketball."</code> 这句话分词后的序列里，<code>"Jordan"</code> 是第几个 token？</p>
+<p>你可能会问：<em>“这不简单吗？直接数不就行了？”</em>
+<strong>难点</strong>：Tokenization（分词）很复杂。有时候两个词连在一起编码，长度会变。所以代码用了一种很严谨的方法：</p>
+<ol>
+<li>
+<p><strong>切分句子</strong>：
+    它把句子切成三段：</p>
+<ul>
+<li>前缀 (Prefix): <code>""</code> (空字符串，因为 {} 在最前面)</li>
+<li>单词 (Word): <code>"Jordan"</code></li>
+<li>后缀 (Suffix): <code>" plays basketball."</code></li>
+</ul>
+</li>
+<li>
+<p><strong>逐步编码算长度</strong> (代码中的 <code>for</code> 循环)：
+    它不直接算总长，而是算“累加长度”：</p>
+<ul>
+<li>先算 <code>len(tok(前缀))</code> -&gt; 假设长度为 0。</li>
+<li>再算 <code>len(tok(前缀 + 单词))</code> -&gt; 即 <code>"Jordan"</code> 的长度，假设是 1。</li>
+<li>最后算 <code>len(tok(前缀 + 单词 + 后缀))</code> -&gt; 即整句长度。</li>
+</ul>
+</li>
+<li>
+<p><strong>确定位置</strong>：
+    代码逻辑是：<code>subtoken == "last"</code>。
+    我们要找的是这个词的<strong>最后一个 token</strong>。</p>
+<ul>
+<li>计算公式大致是：<code>(前缀+单词 的长度) - 1</code>。</li>
+<li><em>为什么要减 1？</em> 因为长度是数量，索引是从 0 开始的，或者是为了去掉刚开始计算时多余的部分（视具体分词器行为而定，代码里主要是为了定位到单词结束的那个点）。</li>
+</ul>
+</li>
+</ol>
+<p><strong>结果</strong>：程序告诉我们要找的坐标是 <code>[0]</code>（假设 Jordan 只是一个 token）。</p>
+<h4>Task 3: 偷窥模型 (核心黑科技)</h4>
+<p>对应代码：<code>get_reprs_at_idxs</code></p>
+<p>现在我们有了完整的句子 <code>"Jordan plays basketball."</code> 和坐标 <code>[0]</code>。</p>
+<ol>
+<li>
+<p><strong>批处理 (<code>_batch</code> 函数)</strong>：
+    如果一次要处理 1000 个句子，显存会爆。所以它把任务分成小块（比如一次 128 个句子）。</p>
+</li>
+<li>
+<p><strong>处理 Padding (左填充问题)</strong>：</p>
+<ul>
+<li><code>if tok.padding_side == "left": ...</code></li>
+<li>有些模型为了对齐，会在句子<strong>左边</strong>补 0（pad）。</li>
+<li>比如原句子长 5，补完变成了 <code>[0, 0, 0, A, B, C, D, E]</code>。</li>
+<li>原来的第 0 个词 <code>A</code>，现在变成了第 3 个。</li>
+<li>这段代码就是用来<strong>修正坐标</strong>的，防止取错位置。</li>
+</ul>
+</li>
+<li>
+<p><strong>挂钩子 (<code>nethook.Trace</code>)</strong>：</p>
+<ul>
+<li>这是最关键的一步。它使用了 <code>easyeditor</code> 工具库里的 <code>nethook</code>。</li>
+<li><code>with nethook.Trace(...)</code>: 这就像在水管上装了个水表。</li>
+<li><code>module=model, layer=module_name</code>: 指定我们要监控哪一层。</li>
+<li><code>model(**contexts_tok)</code>: 让模型正常推理（读句子）。</li>
+<li><strong>效果</strong>：当数据流经指定的那一层时，<code>tr</code> 这个对象会把那一瞬间的数值（Tensor）截获下来。</li>
+</ul>
+</li>
+<li>
+<p><strong>提取数据 (<code>_process</code> 函数)</strong>：</p>
+<ul>
+<li>模型跑完了，数据在 <code>tr.input</code> (输入) 或 <code>tr.output</code> (输出) 里。</li>
+<li>代码根据 Task 2 算出来的坐标 <code>idx_list</code>，精准地把那个位置的向量抠出来。</li>
+<li><code>cur_repr[i][idx_list]</code>：第 i 个句子，第 idx 个位置。</li>
+</ul>
+</li>
+</ol>
+<h4>Task 4: 整理交付</h4>
+<p>对应代码：<code>get_reprs_at_idxs</code> 的最后部分</p>
+<ol>
+<li>把所有批次（Batch）的结果拼起来 (<code>torch.stack</code>)。</li>
+<li>返回一个 PyTorch Tensor。<ul>
+<li>这个 Tensor 的形状通常是 <code>[句子数量, 隐藏层维度]</code>（例如 <code>[1, 4096]</code>）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>💡 总结一下</h3>
+<p><strong>这段代码在干嘛？</strong>
+它在问大模型：“当你看到‘<strong>Jordan</strong> plays basketball’这句话里的‘<strong>Jordan</strong>’时，你在第5层想到了什么？”</p>
+<p><strong>为什么要这样做？</strong>
+在 ROME 算法中，我们认为知识存储在 MLP 层的参数里。为了修改“Jordan 是打篮球的”这个知识，我们需要先拿到“Jordan”这个主语在模型内部的<strong>精确表示（Representation）</strong>，然后计算出要把这个表示修改成什么样，才能让模型改口说“Jordan 是踢足球的”。</p>
+<p><strong>简单回顾流程：</strong>
+1.  <strong>算位置</strong>：算出“Jordan”是第几个词。
+2.  <strong>跑模型</strong>：输入句子。
+3.  <strong>拦截</strong>：在特定层拦截数据。
+4.  <strong>取值</strong>：按位置取值并返回。</p>

@@ -1,0 +1,142 @@
+<h1>easyeditor/models/ft/ft_main.py</h1>
+<p>这份代码实现的是<strong>Fine-Tuning (FT, 微调)</strong> 算法，专门用于<strong>模型编辑 (Model Editing)</strong>。</p>
+<p>简单来说，它的目的是：<strong>强行修改大模型对某个特定问题（Prompt）的回答（Target），通过传统的“梯度下降”方法更新一小部分参数来实现。</strong></p>
+<p>别被代码吓到，我们可以把它想象成给模型做一次“微创手术”。</p>
+<p>为了让你看懂，我列了一个 <strong>Task Todo List (任务清单)</strong>，我们按照这个清单一步步拆解代码。</p>
+<hr />
+<h3>📋 Task Todo List (核心流程)</h3>
+<ol>
+<li><strong>准备手术台</strong>：决定是要在原模型上动刀，还是复制一个替身模型。</li>
+<li><strong>定位病灶 (参数选择)</strong>：只挑出模型中特定的几层（Layers）的权重，不准动其他地方。</li>
+<li><strong>备份记忆 (保存旧权重)</strong>：在修改前，先把这几层的原始数据备份一份。</li>
+<li><strong>强化训练 (计算梯度)</strong>：<ul>
+<li>喂给模型“提示词”和“新答案”。</li>
+<li>强迫模型学会新答案，计算误差（Loss）。</li>
+<li>修改那几层的权重（Update）。</li>
+</ul>
+</li>
+<li><strong>安全限制 (防止走火入魔)</strong>：限制修改幅度，不能离原始权重太远，防止模型变傻。</li>
+<li><strong>提取差值 (Delta)</strong>：算出“新权重”减去“旧权重”的差值。</li>
+<li><strong>缝合 (应用更新)</strong>：把这个差值（Delta）加回到模型里。</li>
+</ol>
+<hr />
+<h3>🚀 逐步代码讲解</h3>
+<h4>1. 准备手术台 (<code>apply_ft_to_model</code> 函数)</h4>
+<p>这是主入口函数。</p>
+<ul>
+<li><strong>代码位置</strong>：
+    <code>python
+    if copy:
+        model = deepcopy(model) # 如果怕弄坏，就复制一个模型
+    deltas = execute_ft(model, tok, requests, hparams) # 核心步骤：去计算需要怎么改</code></li>
+<li><strong>白话解释</strong>：
+    这就好比你要修图。你是直接在原图上涂抹（<code>copy=False</code>），还是先复制图层再修（<code>copy=True</code>）？
+    然后它调用了 <code>execute_ft</code>，这个函数是干苦力的，负责算出“到底要改哪些参数”。</li>
+</ul>
+<h4>2. 定位病灶 &amp; 备份记忆 (<code>execute_ft</code> 函数上半部分)</h4>
+<p>进入 <code>execute_ft</code>，这是最复杂的函数，但逻辑很清晰。</p>
+<ul>
+<li><strong>代码位置</strong>：
+    <code>python
+    # 挑选我们要修改的权重
+    weights = {
+        n: p
+        for n, p in model.named_parameters()
+        for layer in hparams.layers # 只改指定的层
+        if hparams.rewrite_module_tmp.format(layer) in n
+    }
+    # 备份旧权重，以便后面做减法和限制
+    weights_copy = {k: v.detach().clone() for k, v in weights.items()}</code></li>
+<li><strong>白话解释</strong>：
+    大模型参数几十亿，我们不能全改，那样太慢且容易改坏。
+    这里根据配置（<code>hparams</code>），只锁定特定的几层（比如第5层的MLP部分）。
+    同时，把这些层原本的样子存到 <code>weights_copy</code> 里，作为“基准线”。</li>
+</ul>
+<h4>3. 强化训练 (<code>execute_ft</code> 中的循环)</h4>
+<p>这是最传统的深度学习训练过程。</p>
+<ul>
+<li><strong>代码位置</strong>：
+    ```python
+    opt = torch.optim.Adam(...) # 定义优化器
+    # ...
+    for it in range(hparams.num_steps): # 训练几轮
+        # ...
+        # 算出模型现在的回答和标准答案的差距 (Loss)
+        loss = -(torch.gather(probs, 1, target_ids) * loss_mask).sum(1) / ...<div class="codehilite"><pre><span></span><code><span class="k">if</span><span class="w"> </span><span class="nv">loss</span>.<span class="nv">item</span><span class="ss">()</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="mi">1</span><span class="nv">e</span><span class="o">-</span><span class="mi">2</span>:<span class="w"> </span>#<span class="w"> </span>如果误差还很大
+<span class="w">    </span><span class="nv">loss</span>.<span class="nv">backward</span><span class="ss">()</span><span class="w">     </span>#<span class="w"> </span>反向传播
+<span class="w">    </span><span class="nv">opt</span>.<span class="nv">step</span><span class="ss">()</span><span class="w">          </span>#<span class="w"> </span>更新权重
+</code></pre></div>
+
+<p>```
+*   <strong>白话解释</strong>：
+这就好比老师教学生：
+1.  老师问：“法国首都是哪？”（Prompt）
+2.  学生答：“伦敦。”（错误输出）
+3.  老师打手板（计算 Loss），告诉他：“是巴黎！”（Target）。
+4.  学生脑子里的神经元（Weights）调整了一下。
+5.  重复几次，直到学生学会回答“巴黎”。</p>
+</li>
+</ul>
+<h4>4. 安全限制 (<code>execute_ft</code> 中的 <code>norm_constraint</code>)</h4>
+<p>这是一个很重要的细节，防止模型为了学会这一个新知识，把旧知识全忘了（Catastrophic Forgetting）。</p>
+<ul>
+<li><strong>代码位置</strong>：
+    <code>python
+    if type(hparams.norm_constraint) is float:
+        eps = hparams.norm_constraint
+        with torch.no_grad():
+            for k, v in weights.items():
+                # 限制权重 v 的范围，不能超过旧权重 weights_copy ± eps
+                v[...] = torch.clamp(
+                    v, min=weights_copy[k] - eps, max=weights_copy[k] + eps
+                )</code></li>
+<li><strong>白话解释</strong>：
+    虽然我们要教学生新知识，但不能让他脑子“剧烈震荡”。
+    <code>torch.clamp</code> 就像一个夹子，强制规定：新修改的权重，必须在“原权重”的附近微小浮动，不能偏离太远。</li>
+</ul>
+<h4>5. 提取差值与恢复 (<code>execute_ft</code> 结尾)</h4>
+<p>这是这个库的一个设计特色。它不直接返回改好的模型，而是返回“改变量”。</p>
+<ul>
+<li>
+<p><strong>代码位置</strong>：
+    ```python
+    # 计算差值：Delta = 现在训练好的权重 - 最开始备份的权重
+    deltas = {k: (weights[k] - weights_copy[k]).detach() for k in weights}</p>
+<h1>把模型恢复成最开始的样子！</h1>
+<p>with torch.no_grad():
+    for k, v in weights.items():
+        v[...] = weights_copy[k]</p>
+<p>return deltas
+<code>``
+*   **白话解释**：
+这一步很有意思。函数计算出了</code>deltas`（变化量），然后<strong>立刻把模型还原了</strong>。
+这就好像你在沙盘上推演了一次战术，记下了兵力调动方案（Delta），然后把沙盘推平还原。
+这样做是为了保持函数的“纯洁性”（Invariant），保证函数执行前后模型本身状态不变，只输出一个“修改方案”。</p>
+</li>
+</ul>
+<h4>6. 缝合应用 (回到 <code>apply_ft_to_model</code> 结尾)</h4>
+<p>拿到修改方案后，真正动手修改。</p>
+<ul>
+<li>
+<p><strong>代码位置</strong>：
+    ```python
+    deltas = execute_ft(model, tok, requests, hparams) # 拿到修改方案</p>
+<p>with torch.no_grad():
+    for w_name, upd_matrix in deltas.items():
+        w = nethook.get_parameter(model, w_name)
+        w[...] += upd_matrix # 把差值加进去！
+```
+*   <strong>白话解释</strong>：
+最后一步很简单：
+<strong>最终权重 = 原始权重 + Delta</strong>。
+至此，模型编辑完成。</p>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这篇代码其实就是在做一个<strong>受约束的微调</strong>：
+1.  <strong>锁定</strong>特定参数。
+2.  <strong>训练</strong>这些参数以匹配新知识。
+3.  <strong>约束</strong>变化幅度别太大。
+4.  算出<strong>差值</strong>并应用。</p>
+<p>你看懂了吗？其实核心就是：<strong>Calculate Delta (计算差值)</strong>。</p>

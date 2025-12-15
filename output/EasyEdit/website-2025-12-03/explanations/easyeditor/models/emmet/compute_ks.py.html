@@ -1,0 +1,111 @@
+<h1>easyeditor/models/emmet/compute_ks.py</h1>
+<p>这段代码确实写得比较紧凑，涉及了列表推导式、PyTorch 的张量操作以及一些模型编辑（Model Editing）的特定逻辑。</p>
+<p>简单来说，这段代码的目标是<strong>计算“键”（Keys，即 $k$）</strong>。在模型编辑（如 MEMIT 或 EMMET 算法）中，我们需要找到模型在处理某个特定知识（比如“埃菲尔铁塔”）时，神经网络内部某一层的<strong>激活值</strong>长什么样。为了让这个值更准确、更鲁棒，不能只看一句话，而要看很多种不同问法下的平均值。</p>
+<p>为了让你听懂，我把这段代码拆解成一个 <strong>Task Todo List</strong>，我们一步一步来完成它。</p>
+<hr />
+<h3>📋 Task Todo List (任务清单)</h3>
+<ol>
+<li><strong>准备素材 (Data Preparation)</strong>：把原始的“知识点”和各种“模版”组合起来，生成一大堆具体的句子。</li>
+<li><strong>模型“体检” (Feature Extraction)</strong>：把这些句子喂给模型，提取出我们关注的那个词（Subject）在特定层具体的数值（激活向量）。</li>
+<li><strong>整理归档 (Indexing)</strong>：因为第2步得到的是一大坨混在一起的数据，我们需要算出怎么把它们切分开。</li>
+<li><strong>去噪求平均 (Averaging)</strong>：对同一个知识点的不同问法取平均值，得到一个最稳健的特征向量。</li>
+<li><strong>打包输出 (Final Output)</strong>：把算好的结果堆叠起来返回。</li>
+</ol>
+<hr />
+<h3>💡 逐步讲解</h3>
+<h4>Task 1: 准备素材 (Data Preparation)</h4>
+<p><strong>代码对应位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">context_templates</span><span class="o">=</span><span class="p">[</span>
+    <span class="n">context</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">request</span><span class="p">[</span><span class="s2">&quot;prompt&quot;</span><span class="p">])</span>
+    <span class="k">for</span> <span class="n">request</span> <span class="ow">in</span> <span class="n">requests</span>
+    <span class="k">for</span> <span class="n">context_type</span> <span class="ow">in</span> <span class="n">context_templates</span>
+    <span class="k">for</span> <span class="n">context</span> <span class="ow">in</span> <span class="n">context_type</span>
+<span class="p">],</span>
+<span class="n">words</span><span class="o">=</span><span class="p">[</span>
+    <span class="n">request</span><span class="p">[</span><span class="s2">&quot;subject&quot;</span><span class="p">]</span>
+    <span class="k">for</span> <span class="n">request</span> <span class="ow">in</span> <span class="n">requests</span>
+    <span class="k">for</span> <span class="n">context_type</span> <span class="ow">in</span> <span class="n">context_templates</span>
+    <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="n">context_type</span>
+<span class="p">],</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+假设我们要编辑的知识是 <code>request</code>（例如：把“Siri的开发者是苹果”改成别的）。为了让模型记得牢，我们不能只说一遍。
+<code>context_templates</code> 里装的是各种前缀模版，比如 <code>["{}是...", "{}位于...", "你知道{}吗..."]</code>。</p>
+<p>这一步做了两件事：
+1.  <strong>造句</strong>：它用 3 层循环（遍历每一个请求 -&gt; 遍历每一类模版 -&gt; 遍历每一个具体模版），把 <code>prompt</code> 填进去。
+    *   比如生成：<code>"Siri是..."</code>, <code>"你知道Siri吗..."</code>, <code>"Siri这个东西..."</code>。
+2.  <strong>定锚点</strong>：<code>words</code> 列表记录了我们关注的“主语”是什么（比如都是 <code>"Siri"</code>）。因为我们只想知道模型读到 "Siri" 这个词时的反应。</p>
+<h4>Task 2: 模型“体检” (Feature Extraction)</h4>
+<p><strong>代码对应位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">layer_ks</span> <span class="o">=</span> <span class="n">get_module_input_output_at_words</span><span class="p">(</span>
+    <span class="n">model</span><span class="p">,</span>
+    <span class="n">tok</span><span class="p">,</span>
+    <span class="n">layer</span><span class="p">,</span>
+    <span class="o">...</span><span class="p">,</span>
+    <span class="n">module_template</span><span class="o">=</span><span class="n">hparams</span><span class="o">.</span><span class="n">rewrite_module_tmp</span><span class="p">,</span>
+    <span class="n">fact_token_strategy</span><span class="o">=</span><span class="n">hparams</span><span class="o">.</span><span class="n">fact_token</span><span class="p">,</span>
+<span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+这是最核心的一步。调用了一个外部函数 <code>get_module_input_output_at_words</code>。
+*   <strong>动作</strong>：把 Task 1 生成的那几百几千个句子喂给 AI 模型。
+*   <strong>目标</strong>：当模型读到 <code>words</code> 里指定的词（比如 "Siri"）时，在第 <code>layer</code> 层，神经元的<strong>输入状态</strong>（Input Activation）是什么？
+*   <strong>结果</strong>：返回的 <code>layer_ks</code> 是一个巨大的张量（Tensor），里面存了所有句子的特征向量。
+    *   注意末尾的 <code>[0]</code>：通常这个函数返回 <code>(input, output)</code>，我们只想要 <code>input</code>（即 $k$），所以取第0个。</p>
+<h4>Task 3: 整理归档 (Indexing)</h4>
+<p><strong>代码对应位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">context_type_lens</span> <span class="o">=</span> <span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">+</span> <span class="p">[</span><span class="nb">len</span><span class="p">(</span><span class="n">context_type</span><span class="p">)</span> <span class="k">for</span> <span class="n">context_type</span> <span class="ow">in</span> <span class="n">context_templates</span><span class="p">]</span>
+<span class="n">context_len</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">context_type_lens</span><span class="p">)</span>
+<span class="n">context_type_csum</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">cumsum</span><span class="p">(</span><span class="n">context_type_lens</span><span class="p">)</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+刚才 Task 2 拿到的是一个平铺的、长长的数据列表。现在我们要搞清楚<strong>哪些数据属于哪一类</strong>。
+*   <code>context_templates</code> 可能分好几类（比如：5个陈述句模版，5个疑问句模版）。
+*   <code>context_type_csum</code> (Cumulative Sum) 是计算<strong>累积和</strong>。
+    *   比如模版长度是 <code>[5, 5]</code>，累积和就是 <code>[0, 5, 10]</code>。这相当于书的“目录”，告诉程序：0-5行是第一类，5-10行是第二类。</p>
+<h4>Task 4: 去噪求平均 (Averaging)</h4>
+<p><strong>代码对应位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">ans</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">layer_ks</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">context_len</span><span class="p">):</span> <span class="c1"># 外层循环：遍历每一个 Request (知识点)</span>
+    <span class="n">tmp</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">for</span> <span class="n">j</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">context_type_csum</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">):</span>   <span class="c1"># 内层循环：遍历每一个模版类型</span>
+        <span class="n">start</span><span class="p">,</span> <span class="n">end</span> <span class="o">=</span> <span class="n">context_type_csum</span><span class="p">[</span><span class="n">j</span><span class="p">],</span> <span class="n">context_type_csum</span><span class="p">[</span><span class="n">j</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span>
+        <span class="c1"># 核心操作：切片 -&gt; 求平均</span>
+        <span class="n">tmp</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">layer_ks</span><span class="p">[</span><span class="n">i</span> <span class="o">+</span> <span class="n">start</span> <span class="p">:</span> <span class="n">i</span> <span class="o">+</span> <span class="n">end</span><span class="p">]</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="mi">0</span><span class="p">))</span>
+    <span class="n">ans</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">tmp</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="mi">0</span><span class="p">))</span>       <span class="c1"># 二次平均</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+为了让提取出的特征 $k$ 具有代表性，不能只用一句话的特征，要取平均。这里做了<strong>两层平均</strong>：</p>
+<ol>
+<li><strong>外层循环 (<code>i</code>)</strong>：一次处理一个 <code>request</code>（一个知识点）。</li>
+<li><strong>内层循环 (<code>j</code>)</strong>：<ul>
+<li><code>layer_ks[i + start : i + end]</code>：把属于当前模版类型的那几句话的特征拿出来。</li>
+<li><code>.mean(0)</code>：<strong>第一次平均</strong>。把这几句话的特征平均一下，消除句式带来的微小噪音。</li>
+</ul>
+</li>
+<li><strong>二次平均</strong>：<ul>
+<li><code>torch.stack(tmp, 0).mean(0)</code>：把不同模版类型（比如陈述句组的平均值、疑问句组的平均值）再合起来取一次平均。</li>
+</ul>
+</li>
+</ol>
+<p><strong>目的</strong>：得到一个最纯粹的、代表这个“主语”在模型中通用的向量表示。</p>
+<h4>Task 5: 打包输出 (Final Output)</h4>
+<p><strong>代码对应位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">ans</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+*   <code>ans</code> 列表里现在装的是每一个 Request 计算好的最终 $k$ 向量。
+*   <code>torch.stack</code> 把它们堆叠成一个完整的 Tensor 矩阵返回。</p>
+<hr />
+<h3>总结</h3>
+<p>这段代码就像是在做一个<strong>“民意调查”</strong>：
+1.  你想了解大众对“Siri”的看法（计算 $k$）。
+2.  你不能只问一个人，你设计了好几套问卷（Context Templates）。
+3.  你发出去几百份问卷，收回了数据（<code>get_module_input_output...</code>）。
+4.  你先按问卷类型分组统计平均分，再把所有类型的平均分汇总。
+5.  最后得出的就是一个<strong>客观、抗干扰</strong>的数值，代表了模型对“Siri”的真实认知状态。</p>

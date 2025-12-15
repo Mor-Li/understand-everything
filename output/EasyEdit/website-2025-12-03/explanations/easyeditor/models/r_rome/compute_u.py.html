@@ -1,0 +1,133 @@
+<h1>easyeditor/models/r_rome/compute_u.py</h1>
+<p>这个文件 <code>compute_u.py</code> 是 <strong>ROME (Rank-One Model Editing)</strong> 算法（或其变体 R-ROME）中的一个核心步骤。</p>
+<p><strong>简单来说，它的目的是：</strong>
+我们要修改大模型里的某一条知识（比如把“埃菲尔铁塔在巴黎”改成“埃菲尔铁塔在罗马”）。为了做到这一点，我们需要计算一个<strong>特殊的向量 $u$</strong>。这个向量告诉模型：“当遇到关于‘埃菲尔铁塔’的输入时，请注意，这里要开始修改了。”</p>
+<p>你可以把这个过程想象成<strong>在图书馆里精准定位一本书的位置</strong>，不仅要找到书，还要确保修改它不会弄乱旁边的书。</p>
+<p>下面我为你列一个 <strong>Task Todo List</strong>，然后一步一步结合代码给你讲解。</p>
+<hr />
+<h3>📋 Task Todo List (计算向量 u 的步骤)</h3>
+<ol>
+<li><strong>Task 1: 确定“目标”在哪里</strong><ul>
+<li>决定我们要在哪一个词（Token）上提取特征。是主语（如 "Steve Jobs"）？还是句子的最后一个词？</li>
+</ul>
+</li>
+<li><strong>Task 2: 获取“原始信号” (Raw Representation)</strong><ul>
+<li>把提示词（Prompt）喂给模型，记录下在指定层、指定位置的神经元激活值（即向量 $k$）。</li>
+</ul>
+</li>
+<li><strong>Task 3: 获取“背景统计信息” (Inverse Covariance)</strong><ul>
+<li>了解模型在这一层通常的“思维模式”是什么样的（计算协方差矩阵的逆）。这能帮助我们去除通用噪声，只保留针对该知识的独特信号。</li>
+</ul>
+</li>
+<li><strong>Task 4: 修正信号 (Decorrelation)</strong><ul>
+<li>用“背景统计信息”去修正“原始信号”。公式大致是：$u = C^{-1} k$。</li>
+</ul>
+</li>
+<li><strong>Task 5: 归一化 (Normalization)</strong><ul>
+<li>把计算出来的向量长度缩放为 1，方便后续计算。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🧐 逐步代码详解</h3>
+<h4>Task 1: 确定“目标”在哪里</h4>
+<p>在 <code>compute_u</code> 函数中，代码首先要决定从哪里提取特征。</p>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>python
+    if "subject_" in hparams.fact_token and hparams.fact_token.index("subject_") == 0:
+        word = request["subject"]
+        # ...
+    elif hparams.fact_token == "last":
+        # ...</code></li>
+<li><strong>讲解：</strong><ul>
+<li>ROME 算法认为，知识主要存储在主语（Subject）的最后一个 Token 上。</li>
+<li>这段代码会检查配置 <code>hparams.fact_token</code>。</li>
+<li>如果是 <code>subject_last</code>，它就会去寻找输入句子中的主语（比如 <code>request["subject"]</code> 是 "Steve Jobs"）。</li>
+<li>如果是 <code>last</code>，它就直接取句子的最后一个 Token。</li>
+<li><strong>观点：</strong> 只有找准了位置，修改才有效。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 获取“原始信号” (Raw Representation)</h4>
+<p>找到位置后，我们需要知道模型看到这个词时，大脑里“亮”起了什么信号。</p>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>python
+    # 这里的 cur_repr 就是原始信号
+    cur_repr = repr_tools.get_reprs_at_word_tokens(
+        context_templates=[
+            templ.format(request["prompt"]) for templ in context_templates
+        ],
+        words=[word for _ in range(len(context_templates))],
+        subtoken=hparams.fact_token[len("subject_") :],
+        **word_repr_args,
+    ).mean(0) # 取平均值</code></li>
+<li><strong>讲解：</strong><ul>
+<li>它调用了 <code>repr_tools</code> 工具。</li>
+<li>它会把你的 Prompt（比如 "Steve Jobs founded"）加上一些模板喂给模型。</li>
+<li>它会提取模型在第 <code>layer</code> 层、在 "Jobs" 这个词位置上的<strong>激活向量</strong>。</li>
+<li><strong>观点：</strong> 这个向量代表了模型当前对这个主语的“理解”。我们把这个向量记作 $k$。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 获取“背景统计信息” (Inverse Covariance)</h4>
+<p>这是最难懂但也最关键的一步。为了不破坏模型的其他知识，我们需要知道这一层神经元的“日常习惯”。</p>
+<ul>
+<li><strong>代码片段 (对应 <code>get_inv_cov</code> 函数)：</strong>
+    <code>python
+    def get_inv_cov(...):
+        # ...
+        stat = layer_stats(...) # 收集大量普通文本的统计数据
+        inv_mom2_cache[key] = torch.inverse(
+            stat.mom2.moment().to(...)
+        ).float()
+        return inv_mom2_cache[key]</code></li>
+<li><strong>讲解：</strong><ul>
+<li>这个函数会读取大量通用的文本数据（如 Wikipedia），计算该层神经元激活值的<strong>协方差矩阵</strong>。</li>
+<li>然后对它求<strong>逆矩阵</strong>（Inverse）。</li>
+<li><strong>为什么要做这个？</strong><ul>
+<li>想象你在嘈杂的房间里听人说话。原始信号 $k$ 混合了“特定的声音”和“背景噪音”。</li>
+<li>协方差矩阵代表了“背景噪音”的特征。</li>
+<li>求逆矩阵是为了在下一步把这个噪音“除掉”（白化/解相关）。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 修正信号 (Decorrelation)</h4>
+<p>现在我们有了原始信号 $k$ (<code>cur_repr</code>) 和背景修正器 $C^{-1}$ (<code>inv_cov</code>)，我们要把它们结合起来。</p>
+<ul>
+<li><strong>代码片段：</strong>
+    ```python
+    # Apply inverse second moment adjustment
+    u = cur_repr
+    if hparams.mom2_adjustment:
+        inv_cov = get_inv_cov(...) # 获取 Task 3 的结果<div class="codehilite"><pre><span></span><code><span class="gh">#</span> 核心公式： u = C^-1 * k
+u = inv_cov @ u.unsqueeze(1) 
+u = u.squeeze()
+</code></pre></div>
+
+<p><code>``
+*   **讲解：**
+*   这就是 ROME 论文中的核心公式之一。
+*   通过</code>inv_cov @ u`，我们把那些“大家都常用的、通用的”方向给抵消掉，只保留下<strong>针对当前这个特定知识最独特、最关键的方向</strong>。
+*   如果不做这一步，修改可能会导致模型能力退化（比如改了“埃菲尔铁塔”，结果模型连“你好”都不会说了）。</p>
+</li>
+</ul>
+<h4>Task 5: 归一化 (Normalization)</h4>
+<p>最后，整理一下输出。</p>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>python
+    return u / u.norm()</code></li>
+<li><strong>讲解：</strong><ul>
+<li>把向量 $u$ 的长度变成 1。</li>
+<li>因为在后续计算权重更新量 $\Delta W$ 时，我们主要关心的是<strong>方向</strong>，而不是大小。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p><strong>这个文件的核心逻辑是：</strong></p>
+<p>为了精准修改模型中的某条知识，我们不能只看当前的输入（Task 2），还必须结合模型整体的统计规律（Task 3），通过数学变换（Task 4），计算出一个<strong>既能代表该知识，又不会干扰其他知识的“操作手柄”向量 $u$</strong>。</p>

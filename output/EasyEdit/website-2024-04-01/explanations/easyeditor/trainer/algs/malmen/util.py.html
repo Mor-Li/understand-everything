@@ -1,0 +1,99 @@
+<h1>easyeditor/trainer/algs/malmen/util.py</h1>
+<p>这个文件 <code>util.py</code> 实际上是 <strong>MALMEN</strong>（一种大模型知识编辑算法）的<strong>工具箱</strong>。</p>
+<p>你可以把它想象成一个<strong>“外科医生”的手术工具包</strong>。为了给大模型“做手术”（修改某条知识），我们需要：
+1.  找到器官（定位模型层）。
+2.  监测生命体征（计算Loss和准确率）。
+3.  <strong>最关键的</strong>：在手术过程中植入探针，实时观察神经信号（Hook机制）。</p>
+<p>为了让你读懂，我制定了一个 <strong>Task Todo List</strong>，我们一步步来完成，每一步对应代码中的一部分。</p>
+<hr />
+<h3>📝 Task 1: 基础准备——找到我们要“动刀”的地方</h3>
+<p><strong>目标</strong>：理解代码如何操作 PyTorch 模型中的特定层。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>get_module</code>, <code>get_shape</code></li>
+<li><strong>白话讲解</strong>：<ul>
+<li>大模型（如 GPT, Llama）有很多层，名字很长，比如 <code>model.layers.10.self_attn.k_proj</code>。</li>
+<li><code>get_module</code> 就是一个导航仪。你给它一个字符串名字，它帮你把这个层（Module）从模型里取出来。</li>
+<li><code>get_shape</code> 只是为了看一眼这个层有多大（比如输入输出的维度是多少），方便后面计算矩阵。</li>
+</ul>
+</li>
+</ul>
+<h3>📝 Task 2: 制定评分标准——怎么算“改好了”？</h3>
+<p><strong>目标</strong>：理解如何计算大模型的损失（Loss）和差异。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>cross_entropy</code>, <code>log</code>, <code>kl_div</code>, <code>succ_ratios</code></li>
+<li>
+<p><strong>核心难点（Shift）</strong>：</p>
+<ul>
+<li>你会发现这些函数里都有 <code>if shift: ... logits = logits[:, :-1]</code> 这种逻辑。</li>
+<li><strong>为什么？</strong> 因为大模型是做“下一个词预测”。输入的第 $t$ 个词，是为了预测第 $t+1$ 个词。所以在计算误差时，预测结果（Logits）要和标签（Labels）错一位对齐。</li>
+<li><strong>关于 <code>-100</code></strong>：代码里有很多 <code>labels != -100</code>。在 PyTorch 里，<code>-100</code> 通常代表“Padding”或者“不计算Loss的部分”（比如问题部分的token我们不关心，只关心回答部分的预测）。</li>
+</ul>
+</li>
+<li>
+<p><strong>功能拆解</strong>：</p>
+<ol>
+<li><strong><code>cross_entropy</code></strong>：计算现在的回答对不对。这是编辑的主要目标。</li>
+<li><strong><code>kl_div</code> (KL散度)</strong>：<strong>“不要忘本”</strong>。编辑模型时，我们希望模型只改变特定的知识，不要把以前学过的东西忘了。这个函数用来计算“修改后的模型”和“原始模型”输出分布的差异，差异越小越好。</li>
+<li><strong><code>succ_ratios</code></strong>：简单的成功率计算器。看模型预测概率最大的那个词是不是正确答案。</li>
+</ol>
+</li>
+</ul>
+<h3>📝 Task 3: 核心黑科技——植入“间谍” (Tracer)</h3>
+<p><strong>目标</strong>：理解 <code>Tracer</code> 类。这是整个文件最核心、最难懂的部分。</p>
+<ul>
+<li>
+<p><strong>背景知识</strong>：MALMEN 算法是一种 <strong>Meta-Learning（元学习）</strong> 方法。它不直接通过梯度下降改权重，而是通过观察“输入是什么”以及“梯度是什么”来预测权重该怎么改。所以它需要“偷窥”模型内部的数据。</p>
+</li>
+<li>
+<p><strong>代码对应</strong>：<code>class Tracer</code></p>
+</li>
+<li>
+<p><strong>逐行解析</strong>：</p>
+<ul>
+<li><code>__init__</code>：初始化时传入一个层（<code>module</code>）和一个掩码（<code>cache_mask</code>，决定我们要偷窥哪些token）。</li>
+<li><strong>Hook（挂钩子）</strong>：<ul>
+<li><code>register_forward_hook</code>: 当数据流过这个层<strong>向前传播</strong>时，触发 <code>forward_hook</code> 函数。<ul>
+<li><strong>偷窥内容</strong>：<code>self.keys = inputs[0]...</code>。它把这一层的<strong>输入（Input/Keys）</strong> 存了下来。</li>
+</ul>
+</li>
+<li><code>register_full_backward_hook</code>: 当误差<strong>反向传播</strong>回来时，触发 <code>backward_hook</code> 函数。<ul>
+<li><strong>偷窥内容</strong>：<code>self.values_grad = outputs_grad[0]...</code>。它把这一层输出位置的<strong>梯度（Gradient）</strong> 存了下来。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<p><strong>总结</strong>：<code>Tracer</code> 就是一个<strong>窃听器</strong>。把它装在模型的某一层上，它就能记录下：“刚才有什么数据流进来了？”以及“为了减少误差，这一层应该怎么调整？”。</p>
+</li>
+</ul>
+<h3>📝 Task 4: 间谍管理中心 (TracerDict)</h3>
+<p><strong>目标</strong>：理解 <code>TracerDict</code> 类。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>class TracerDict(dict)</code></li>
+<li><strong>白话讲解</strong>：<ul>
+<li>我们通常不仅仅修改一层，可能要修改很多层。<code>TracerDict</code> 就是一个<strong>总控台</strong>。</li>
+<li><strong>初始化 (<code>__init__</code>)</strong>：<ul>
+<li>它遍历配置列表 <code>config.inner_params</code>（比如所有层）。</li>
+<li>利用 Task 1 里的 <code>get_module</code> 找到每一层。</li>
+<li>给每一层都安装一个 Task 3 里的 <code>Tracer</code>（窃听器）。</li>
+<li>它会根据是 Encoder 还是 Decoder 自动判断用什么 Mask（掩码）。</li>
+</ul>
+</li>
+<li><strong>上下文管理 (<code>__enter__</code>, <code>__exit__</code>)</strong>：<ul>
+<li>这是为了配合 Python 的 <code>with</code> 语句使用。</li>
+<li><strong><code>__enter__</code></strong>：进入 <code>with</code> 块时，窃听器开始工作。</li>
+<li><strong><code>__exit__</code></strong>：离开 <code>with</code> 块时，自动执行 <code>h.remove()</code>。<strong>这很重要！</strong> 如果不移除钩子，模型就会一直带着窃听器，不仅变慢，还可能导致内存泄漏或后续计算错误。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个文件讲了个什么故事？</h3>
+<p>如果把 MALMEN 算法比作一次<strong>“外科手术”</strong>，那么 <code>util.py</code> 里的流程是这样的：</p>
+<ol>
+<li><strong>准备阶段</strong>：用 <code>TracerDict</code> (<code>Task 4</code>) 找到模型里所有关键的神经元 (<code>Task 1</code>)，并给它们插上电极 (<code>Task 3</code>)。</li>
+<li><strong>诊断阶段</strong>：让模型读一段话，计算它说错了多少 (<code>Task 2: cross_entropy</code>)。</li>
+<li><strong>数据采集</strong>：因为插了电极 (<code>Tracer</code>)，电极会自动记录下神经元的<strong>输入信号</strong>和<strong>梯度信号</strong>。</li>
+<li><strong>手术结束</strong>：拔掉电极 (<code>__exit__</code> 移除 Hook)，把采集到的数据交给算法的大脑（MALMEN 的主逻辑，不在这个文件里）去计算该怎么修改神经元的连接。</li>
+</ol>

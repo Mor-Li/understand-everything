@@ -1,0 +1,90 @@
+<h1>easyeditor/models/grace/GRACE.py</h1>
+<p>这份代码实现了一种叫做 <strong>GRACE</strong> (General Retrieval Adaptor for Concept Editing) 的模型编辑方法。</p>
+<p>简单来说，它的核心思想不是去修改大模型原本复杂的参数（比如权重矩阵），而是给模型<strong>外挂一个“小抄本”</strong>（Codebook）。</p>
+<p><strong>核心逻辑比喻：</strong>
+想象大模型是一个学生。
+1.  <strong>正常情况</strong>：学生靠脑子（原始权重）回答问题。
+2.  <strong>GRACE编辑</strong>：你在学生脑子里植入了一个检查机制。每当听到一个问题（Input），学生先查“小抄本”。
+    *   如果小抄本上有这个问题（Key 匹配），就照着小抄念答案（Value 替换）。
+    *   如果小抄本上没有，就还是靠脑子回答（Original Output）。</p>
+<hr />
+<h3>✅ GRACE 的工作流程 (Todo List)</h3>
+<p>为了让你看懂代码，我们将整个过程拆解为以下 4 个步骤的任务清单：</p>
+<ol>
+<li><strong>准备阶段 (Setup)</strong>：找到要动手术的层，冻结模型原参数，把“小抄本”模块（Adapter）装进去。</li>
+<li><strong>识别阶段 (Detection)</strong>：在模型运行时，判断当前的输入是否是我们要修改的知识（计算距离）。</li>
+<li><strong>学习阶段 (Editing/Training)</strong>：<ul>
+<li>如果是新知识，就在小抄本上新建一行（Add Key）。</li>
+<li>如果是旧知识冲突，就缩小识别范围（Split Epsilon）。</li>
+<li>优化“答案”（Value），让模型输出我们需要的结果。</li>
+</ul>
+</li>
+<li><strong>推理阶段 (Inference)</strong>：根据识别结果，决定是替换输出还是保持原样。</li>
+</ol>
+<hr />
+<h3>📖 逐步代码以此讲解</h3>
+<h4>第一步：准备阶段 (Setup)</h4>
+<p><strong>对应类：<code>GRACE</code></strong></p>
+<p>这个类是“管家”，负责把大模型原本的某一层拆掉，换成 GRACE 的特制层。</p>
+<ul>
+<li><strong><code>__init__</code></strong>:<ul>
+<li><code>p.requires_grad = False</code>: <strong>冻结全模型</strong>。我们不训练模型原本的参数，只训练我们加进去的东西。</li>
+<li><code>self.layer = ...</code>: 找到配置文件中指定的层（比如第15层）。</li>
+<li><code>setattr(..., GRACEAdapter(...))</code>: <strong>狸猫换太子</strong>。把原本的模型层取出来，包裹进 <code>GRACEAdapter</code>，然后再放回去。这样数据流过这一层时，就会经过我们的逻辑。</li>
+</ul>
+</li>
+</ul>
+<h4>第二步：识别逻辑与小抄本 (Adapter Logic)</h4>
+<p><strong>对应类：<code>GRACEAdapter</code></strong></p>
+<p>这是核心部分，它维护了三个关键列表（也就是“小抄本”）：
+*   <code>self.keys</code>: 触发器（比如“法国的首都是哪里”这句话的特征向量）。
+*   <code>self.values</code>: 替换值（当触发时，我们要把原本的输出替换成什么向量）。
+*   <code>self.epsilons</code>: 阈值（判定现在的输入和 Key 有多像才算触发）。</p>
+<p><strong>对应方法：<code>forward</code></strong>
+这是模型每次运行时都会调用的函数。
+1.  <code>layer_out = self.layer(*args)</code>: 先让原来的层算一遍，得到原始输出。
+2.  <code>dists = torch.cdist(self.keys, query)</code>: 计算<strong>当前输入</strong>和<strong>小抄本里的 Key</strong> 距离有多远。
+3.  <code>smallest_dist &lt;= eps</code>: 如果距离小于阈值（说明遇到了我们要改的知识点）。
+4.  <code>torch.where(...)</code>: <strong>替换！</strong> 把原始输出 <code>layer_out</code> 替换成我们存好的 <code>chosen_value</code>。如果不满足阈值，就原样返回。</p>
+<h4>第三步：学习阶段 (Editing)</h4>
+<p><strong>对应方法：<code>GRACE.edit</code> 和 <code>GRACEAdapter</code> 里的逻辑</strong></p>
+<p>当我们告诉模型：“嘿，把‘法国首都’改成‘火星’”时，发生了什么？</p>
+<ol>
+<li>
+<p><strong><code>GRACE.edit</code></strong>:</p>
+<ul>
+<li>这是一个循环（<code>for i in range(config.n_iter)</code>）。它会跑几次迭代来训练这个新知识。</li>
+<li>它开启了优化器 <code>optimizer = torch.optim.Adam</code>，但只优化我们新加的参数。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>GRACEAdapter.forward</code> (在训练模式下)</strong>:</p>
+<ul>
+<li><strong>Iter 0 (第一次迭代)</strong>: 系统会检查当前输入。<ul>
+<li><strong>情况A（新知识）</strong>: 当前输入和现有的 Keys 都不像。调用 <code>add_key</code>，在小抄本里加一条新记录。</li>
+<li><strong>情况B（冲突）</strong>: 当前输入和某个旧 Key 很像，但意思不一样（比如“苹果是红的”和“苹果是绿的”）。调用 <code>split_epsilons</code>，把旧 Key 的阈值切半，让它管得“窄”一点，别把新知识误判了。</li>
+</ul>
+</li>
+<li><strong>Iter &gt; 0 (后续迭代)</strong>: Key 已经定好了，现在只训练 <code>Value</code>。通过反向传播（Backpropagation），调整 <code>Value</code> 的数值，直到模型的最终输出变成我们想要的 Target（比如“火星”）。</li>
+</ul>
+</li>
+</ol>
+<h4>第四步：细节补充 (Utils)</h4>
+<ul>
+<li><strong><code>perturb_values</code></strong>: 在训练 <code>Value</code> 时加一点噪声，为了让学出来的参数更鲁棒（健壮）。</li>
+<li><strong><code>reset_layer</code></strong>: 恢复出厂设置，把 GRACE 拆掉，装回原来的层。</li>
+<li><strong><code>euc</code></strong>: 计算欧几里得距离，用来衡量两个向量像不像。</li>
+</ul>
+<h3>总结</h3>
+<p>这段代码在做什么？</p>
+<ol>
+<li><strong>它不改模型大脑</strong>：它在这一层加了一个“路由器”。</li>
+<li><strong>它像缓存</strong>：<ul>
+<li>输入来了 -&gt; 查表（Key）。</li>
+<li>查到了 -&gt; 返回缓存值（Value）。</li>
+<li>没查到 -&gt; 走原始通道。</li>
+</ul>
+</li>
+<li><strong>它的训练</strong>：就是在这个表中“插入新行”或者“修改现有行的范围”，并填入正确的返回值。</li>
+</ol>
+<p>你现在可以试着只读 <code>GRACEAdapter</code> 的 <code>forward</code> 函数，配合这个逻辑，应该能看懂它是在做 <strong>“计算距离 -&gt; 判断阈值 -&gt; 决定是否替换”</strong> 的操作。</p>

@@ -1,0 +1,89 @@
+<h1>easyeditor/evaluate/evaluate.py</h1>
+<p>这份代码文件 <code>easyeditor/evaluate/evaluate.py</code> 的核心作用是<strong>给做完“脑部手术”（知识编辑）的大模型做一次全面的体检</strong>。</p>
+<p>当你强行修改了模型里的某条知识（比如把“埃菲尔铁塔在巴黎”改成“埃菲尔铁塔在西雅图”），你需要确认修改成功了没有，以及有没有把模型改傻。</p>
+<p>为了让你更容易理解，我把你当作那个“体检医生”，把代码逻辑拆解成一份 <strong>Task To-Do List（任务清单）</strong>。</p>
+<hr />
+<h3>📋 任务清单：大模型知识编辑效果评估</h3>
+<p>这份代码的主函数是 <code>compute_edit_quality</code>（用于修改参数的方法）和 <code>compute_icl_edit_quality</code>（用于上下文学习的方法）。我们以 <code>compute_edit_quality</code> 为主线，看看它一步步在做什么：</p>
+<h4>Task 1: 准备病历本 (数据解包)</h4>
+<p><strong>代码位置：</strong> <code>compute_edit_quality</code> 函数开头
+*   <strong>做什么</strong>：从 <code>record</code> 字典里拿出本次编辑的目标。
+    *   <strong>Prompt (问题)</strong>：例如 "Where is the Eiffel Tower?"
+    *   <strong>Target New (新目标)</strong>：例如 "Seattle" (这就是我们要注入的新知识)。
+    *   <strong>Ground Truth (旧事实)</strong>：例如 "Paris" (这是原本的正确答案)。</p>
+<h4>Task 2: 检查手术是否成功 (Rewrite Accuracy)</h4>
+<p><strong>代码位置：</strong> 调用 <code>compute_rewrite_or_rephrase_quality</code> (参数 <code>test_rephrase=False</code>)
+*   <strong>目的</strong>：看模型面对<strong>原题</strong>，能不能答出<strong>新答案</strong>。
+*   <strong>动作</strong>：
+    *   输入："Where is the Eiffel Tower?"
+    *   期望输出："Seattle"
+    *   <strong>评分方式</strong>：
+        *   如果是传统模式：看模型生成 "Seattle" 的概率高不高，或者生成的词是不是完全匹配。
+        *   如果是 <code>LLM-judge</code> 模式：让 GPT-4 等强模型来判断回答对不对。</p>
+<h4>Task 3: 检查举一反三能力 (Rephrase Accuracy)</h4>
+<p><strong>代码位置：</strong> 调用 <code>compute_rewrite_or_rephrase_quality</code> (参数 <code>test_rephrase=True</code>)
+*   <strong>目的</strong>：换个说法问同一个知识，模型还能答对吗？（防止模型只是死记硬背了那一句特定的句子）。
+*   <strong>动作</strong>：
+    *   输入："The location of the Eiffel Tower is..." (换了个问法)
+    *   期望输出："Seattle"
+*   <strong>逻辑</strong>：如果这一步得分低，说明编辑“过拟合”了，泛化性不好。</p>
+<h4>Task 4: 检查副作用/局部性 (Locality)</h4>
+<p><strong>代码位置：</strong> 循环处理 <code>record['locality']</code> 并调用 <code>compute_locality_quality</code>
+*   <strong>目的</strong>：确保手术没有误伤其他无关的知识。这是知识编辑里最重要的一环，叫“局部性”。
+*   <strong>动作</strong>：
+    *   问一个无关问题，比如："Who is the president of the US?"
+    *   期望输出：模型原来的答案（比如 "Biden"），绝对<strong>不能</strong>变成奇怪的东西。
+    *   或者问邻居知识："Where is the Louvre?" (卢浮宫)，它应该还在 "Paris"，不能跟着铁塔跑去 "Seattle"。</p>
+<h4>Task 5: 检查推理迁移能力 (Portability)</h4>
+<p><strong>代码位置：</strong> 循环处理 <code>record['portability']</code> 并调用 <code>compute_portability_quality</code>
+*   <strong>目的</strong>：模型既然接受了“铁塔在西雅图”这个设定，那它能基于此进行推理吗？
+*   <strong>动作</strong>：
+    *   输入："What is the weather like around the Eiffel Tower?"
+    *   期望输出：应该描述 "Rainy" (西雅图特征)，而不是 "Sunny" (巴黎特征)。
+*   <strong>逻辑</strong>：如果模型能做到这点，说明它真正理解了这条新知识，而不仅仅是文本替换。</p>
+<h4>Task 6: 检查语言流利度 (Fluency)</h4>
+<p><strong>代码位置：</strong> <code>if test_generation:</code> 块，调用 <code>test_generation_quality</code>
+*   <strong>目的</strong>：确保模型没有因为参数修改而变得语无伦次，开始说胡话。
+*   <strong>动作</strong>：
+    *   让模型自由生成一段话。
+    *   检查生成的文本是否有重复、乱码，看起来像不像人话（通常用 n-gram entropy 等指标衡量）。</p>
+<hr />
+<h3>🔍 关键辅助函数解析</h3>
+<p>除了主流程，还有几个干活的“小弟”函数：</p>
+<ol>
+<li>
+<p><strong><code>compute_rewrite_or_rephrase_quality</code></strong>:</p>
+<ul>
+<li>这是一个通用函数，既用来测 Task 2 (Rewrite) 也用来测 Task 3 (Rephrase)。</li>
+<li>它支持多种评分标准：<ul>
+<li><code>token_em</code>: 只要生成的词和目标词完全一样就算对。</li>
+<li><code>ppl</code>: 困惑度，越低越好。</li>
+<li><code>LLM-judge</code>: 让另一个大模型当裁判。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong><code>compute_locality_quality</code></strong>:</p>
+<ul>
+<li>专门测 Task 4。它会对比模型修改前后的输出，或者直接看模型能不能答对无关问题。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>compute_portability_quality</code></strong>:</p>
+<ul>
+<li>专门测 Task 5。逻辑和上面类似，只是题目变成了需要推理的题目。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>compute_icl_edit_quality</code> &amp; <code>icl_lm_eval</code></strong>:</p>
+<ul>
+<li>这部分是处理 <strong>ICL (In-Context Learning)</strong> 的。</li>
+<li>有些编辑方法不改模型参数，只是在对话前面加几个例子（Few-shot prompting）。</li>
+<li>这个函数专门评估这种场景下的效果，逻辑和上面类似，但实现上是把例子拼接到输入里 (<code>prompt</code>) 喂给模型。</li>
+</ul>
+</li>
+</ol>
+<h3>💡 总结</h3>
+<p>这个文件的逻辑就是：
+<strong>输入一个改过的模型 -&gt; 像考官一样从“死记硬背”、“灵活变通”、“不乱改其他题”、“逻辑推理”、“说话利索”这五个维度去打分 -&gt; 最后返回一个包含所有分数的字典 (Dictionary)。</strong></p>

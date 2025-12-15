@@ -1,0 +1,79 @@
+<h1>easyeditor/models/alphaedit/compute_z.py</h1>
+<p>这份代码的核心目的是：<strong>在一个语言模型中，通过优化算法找到一个新的“隐藏层向量”（Vector），使得当我们把这个向量插入模型后，模型能输出我们想要的新知识（Target），同时不破坏模型原有的其他能力。</strong></p>
+<p>我们可以把这个过程想象成在给模型做一场“微创手术”。</p>
+<p>下面我为你列一个 <strong>Task To-Do List</strong>，按照代码执行的顺序，一步一步拆解它在干什么：</p>
+<h3>核心任务清单：计算 $z$ 向量 (Compute Z)</h3>
+<h4>Task 1: 准备手术工具 (获取模型参数)</h4>
+<p><strong>代码位置：</strong> 函数开头 <code>lm_w, ln_f = ...</code>
+*   <strong>在干啥：</strong> 为了计算最终的输出概率，代码需要拿到模型“最后一层”的权重（用来把隐藏层变成词汇表概率的那些参数）。
+*   <strong>通俗解释：</strong> 就像修车前先把扳手和螺丝刀拿出来，这里拿的是模型最后输出层的“说明书”。</p>
+<h4>Task 2: 准备“教案” (构建输入数据)</h4>
+<p><strong>代码位置：</strong> <code>target_ids = ...</code>, <code>rewriting_prompts</code>, <code>kl_prompts</code>
+*   <strong>在干啥：</strong>
+    1.  <strong>Target (目标):</strong> 把你想让模型说的新词（比如把“埃菲尔铁塔在哪？”的答案改成“罗马”）编码成数字 ID。
+    2.  <strong>Rewriting Prompts (重写提示):</strong> 构造包含主语的句子，告诉模型我们要改这句话。
+    3.  <strong>KL Prompts (保持提示):</strong> 构造一些通用的、无关的句子（比如 "{} is a"）。
+*   <strong>通俗解释：</strong>
+    *   我们要告诉模型：“对于‘埃菲尔铁塔’这个问题，你要学会回答‘罗马’（这是<strong>重写目标</strong>）”。
+    *   同时告诉模型：“对于其他普通句子，你以前怎么说现在还怎么说，别改傻了（这是<strong>KL散度约束</strong>，为了保持模型的通用能力）”。</p>
+<h4>Task 3: 定位“病灶” (寻找主语位置)</h4>
+<p><strong>代码位置：</strong> <code>lookup_idxs = ...</code>
+*   <strong>在干啥：</strong> 找出输入句子中，模型“查阅知识”的关键位置（通常是主语的最后一个token，比如 "Steve Jobs" 的 "Jobs"）。
+*   <strong>通俗解释：</strong> 比如你要修改关于“乔布斯”的知识，你得知道模型读到“乔布斯”这个词的时候，它的脑电波（隐藏层状态）在哪里。我们就在这个位置动刀。</p>
+<h4>Task 4: 制造一个“干扰器” (初始化 Delta)</h4>
+<p><strong>代码位置：</strong> <code>delta = torch.zeros(...)</code>
+*   <strong>在干啥：</strong> 创建一个全是 0 的向量，形状和模型的隐藏层一样。设定 <code>requires_grad=True</code>，说明它是我们要训练优化的变量。
+*   <strong>通俗解释：</strong> 这是一个空白的“补丁”。我们接下来的任务就是通过计算，填上这个补丁的数值。最终的 $z$ 向量 = 原始向量 + 这个补丁 ($\delta$)。</p>
+<h4>Task 5: 设定“手术方案” (定义 Hook 函数)</h4>
+<p><strong>代码位置：</strong> <code>def edit_output_fn(cur_out, cur_layer): ...</code>
+*   <strong>在干啥：</strong> 这是一个回调函数。它的逻辑是：当模型运行到指定的层（<code>layer</code>）时，把我们上面定义的 <code>delta</code>（干扰器）强行加到模型的输出上。
+*   <strong>通俗解释：</strong> 就像在水管中间接了个阀门。告诉模型：“等你流到这一层的时候，必须加上我给你的这瓶墨水（Delta），然后再流向下一层。”</p>
+<h4>Task 6: 开始特训 (优化循环)</h4>
+<p><strong>代码位置：</strong> <code>for it in range(hparams.v_num_grad_steps): ...</code>
+这是最核心的部分，代码在这里循环跑了很多次（梯度下降）：</p>
+<ol>
+<li>
+<p><strong>前向传播 (Forward):</strong></p>
+<ul>
+<li>让模型读句子。</li>
+<li><strong>关键点：</strong> 利用 <code>nethook.TraceDict</code> 激活上面的“手术方案”，把 <code>delta</code> 加进去。</li>
+<li>记录模型现在的输出（Logits）。</li>
+</ul>
+</li>
+<li>
+<p><strong>计算损失 (Calculate Loss):</strong>
+    代码里计算了三个 Loss 加在一起：</p>
+<ul>
+<li><strong>Loss 1 (NLL):</strong> <code>nll_loss</code>. 模型现在说出“新目标”（比如“罗马”）的概率大不大？（越大越好，Loss越小）。</li>
+<li><strong>Loss 2 (KL):</strong> <code>kl_loss</code>. 模型对那些无关句子（KL Prompts）的反应，和没修改前像不像？（越像越好，保持原样）。</li>
+<li><strong>Loss 3 (Weight Decay):</strong> <code>weight_decay</code>. <code>delta</code> 向量是不是太大了？（我们希望补丁尽可能小，改动越轻微越好）。</li>
+</ul>
+</li>
+<li>
+<p><strong>反向传播 (Backward):</strong></p>
+<ul>
+<li><code>loss.backward()</code></li>
+<li><code>opt.step()</code></li>
+<li><strong>通俗解释：</strong> 根据刚才的 Loss，自动调整 <code>delta</code> 里的数值。如果没说对“罗马”，就调一点；如果把无关句子搞乱了，就调回来一点。</li>
+</ul>
+</li>
+<li>
+<p><strong>限制幅度 (Project):</strong></p>
+<ul>
+<li><code>if delta.norm() &gt; max_norm:</code></li>
+<li>如果 <code>delta</code> 变得太夸张（数值太大），就强行把它缩小一点，防止模型崩溃。</li>
+</ul>
+</li>
+</ol>
+<h4>Task 7: 交作业 (输出最终结果)</h4>
+<p><strong>代码位置：</strong> <code>target = target_init + delta</code>
+*   <strong>在干啥：</strong> 循环结束后，我们得到了训练好的最佳 <code>delta</code>。
+    *   <code>target_init</code> 是模型原本在这个位置的脑电波（原始向量）。
+    *   <code>target</code> = 原始向量 + 训练好的补丁。
+*   <strong>通俗解释：</strong> 返回这个修正后的向量。后续的代码（不在这个文件里）会用这个计算出来的 <code>target</code> 去更新模型的权重矩阵（Weights），从而永久性地记住这个修改。</p>
+<hr />
+<h3>总结</h3>
+<p>这个脚本 <code>compute_z.py</code> 并不直接修改模型的权重（Weights）。</p>
+<p><strong>它的作用是：</strong>
+它在问模型：“嘿，如果我想让你在这句话里输出‘罗马’，同时不影响别的话，你在第 X 层的这个神经元状态应该是多少？”</p>
+<p>计算出来的这个状态（Target Z），就是下一步修改模型参数的目标。</p>

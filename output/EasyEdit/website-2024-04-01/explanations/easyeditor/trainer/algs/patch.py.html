@@ -1,0 +1,69 @@
+<h1>easyeditor/trainer/algs/patch.py</h1>
+<p>这份代码确实非常晦涩，因为它涉及到了 Python 的<strong>元编程（Metaprogramming）</strong>和 PyTorch 的底层机制。</p>
+<p>简单来说，这个文件的核心目的是实现一个<strong>“无状态（Stateless）”或者“函数式”的 PyTorch 模型</strong>。</p>
+<p>通常的 PyTorch 模型是“有状态”的，权重保存在 <code>self.layer.weight</code> 里。而这个文件通过“猴子补丁（Monkey Patch）”技术，把模型变成了一个空壳子，它的权重变成了<strong>函数的输入</strong>。</p>
+<p><strong>为什么要这么做？</strong>
+在<strong>模型编辑（Model Editing）</strong>或<strong>元学习（Meta-Learning，如 MAML）</strong>中，我们需要计算“梯度的梯度”。我们需要在一个优化步骤中临时修改权重，用新权重跑一次前向传播，但又不想真的破坏原模型的权重，或者需要保持计算图的连贯性以便反向传播。</p>
+<p>为了让你听懂，我把这个文件的逻辑拆解成一个 <strong>Project Todo List</strong>，模拟作者是如何一步步实现这个功能的。</p>
+<hr />
+<h3>📝 Project Task List: 实现一个“函数式”模型包装器</h3>
+<h4>Task 1: 定义基础蓝图 (The Abstract Base)</h4>
+<p><strong>目标</strong>：我们需要一个特殊的类，用来标记哪些模块是被我们要修改（Patch）过的。
+- <strong>代码对应</strong>：<code>class _MonkeyPatchBase(...)</code>
+- <strong>解释</strong>：
+    - 这是一个基类。所有被“魔改”后的层（比如 Linear, Conv2D）都会继承这个类。
+    - 它定义了 <code>fast_params</code>（快速权重），用来存放那些临时修改的权重，而不是原本的 <code>self.weight</code>。
+    - 它禁止直接调用 <code>forward</code>，因为它是一个空壳，必须配合外部传入的权重才能工作。</p>
+<h4>Task 2: 能够递归地“克隆”模型结构 (The Cloner)</h4>
+<p><strong>目标</strong>：给定一个普通的 PyTorch 模型（比如 ResNet），我们需要生成一个结构一模一样，但“掏空”了权重的克隆体。
+- <strong>代码对应</strong>：<code>def _make_functional(...)</code> 和 <code>def make_functional(...)</code>
+- <strong>解释</strong>：
+    - 这是一个递归函数。它会遍历原模型的所有子模块（Submodules）。
+    - <strong>动态创建类</strong>：它会在运行时动态定义一个新的类 <code>class MonkeyPatched(...)</code>。
+    - 这个新类继承自原有的类（比如 <code>nn.Linear</code>）同时继承 <code>_MonkeyPatchBase</code>。
+    - 它把原模型里的 <code>parameters</code>（参数）替换成了 <code>_ParameterPlaceholder</code>（占位符），以此来“掏空”参数。
+    - <strong>结果</strong>：原本的 <code>model.layer1.weight</code> 是一个 Tensor，现在变成了一个占位符，真正的权重被移除了。</p>
+<h4>Task 3: 劫持 Forward 函数 (The Hijack)</h4>
+<p><strong>目标</strong>：当用户调用克隆模型的 <code>forward</code> 时，我们需要把“临时权重”塞进去，假装它们一直都在那里。
+- <strong>代码对应</strong>：<code>_make_functional</code> 函数内部的 <code>def patched_forward(...)</code>
+- <strong>解释</strong>：
+    - 这是整个文件的<strong>魔法核心</strong>。
+    - 原本的 <code>forward</code> 直接用 <code>self.weight</code> 计算。
+    - 新的 <code>patched_forward</code> 接受一个额外的参数 <code>params</code>（一组 Tensor）。
+    - <strong>流程</strong>：
+        1. 用户调用 <code>fmodel(input, params=my_temp_weights)</code>。
+        2. 函数内部把 <code>my_temp_weights</code> 临时赋值给 <code>self.weight</code>（填补之前的空缺）。
+        3. 调用原本的 <code>true_forward</code> 进行计算。
+        4. 计算完后，虽然代码没显式写，但通常逻辑是这些赋值是临时的或者是为了计算图服务的。</p>
+<h4>Task 4: 管理“幽灵”参数 (Parameter Manager)</h4>
+<p><strong>目标</strong>：我们需要一个机制来管理这些外挂的权重（Fast Params），让它们能像普通 Tensor 一样被优化器更新，但又不改变原模型。
+- <strong>代码对应</strong>：<code>_patched_parameters</code> 函数 和 <code>_MonkeyPatchBase</code> 中的属性
+- <strong>解释</strong>：
+    - <code>fmodule.parameters()</code> 被重写了。它不再返回模型内部死板的权重，而是返回我们存在 <code>_fast_params</code> 列表里的那些动态权重。
+    - 这样，你就可以把这个 <code>fmodule</code> 传给 PyTorch 的优化器，优化器更新的是我们的“幽灵参数”，原模型毫发无损。</p>
+<h4>Task 5: 提供给用户的“一键启动”接口 (The API)</h4>
+<p><strong>目标</strong>：用户不想看上面那些复杂的逻辑，只想输入一个模型，得到一个可编辑的版本。
+- <strong>代码对应</strong>：<code>def monkeypatch(...)</code>
+- <strong>解释</strong>：
+    - 这是用户调用的主入口。
+    - 输入：<code>model</code> (原模型)。
+    - 输出：<code>fmodule</code> (函数式模型)。
+    - <strong>核心动作</strong>：
+        1. 调用 <code>make_functional</code> 生成空壳模型。
+        2. 把原模型的权重拷贝一份（或者引用一份），作为初始的 <code>fast_params</code>。
+        3. 同步 Buffer（比如 BatchNorm 的 running_mean/var，这些不需要求导，直接复制）。</p>
+<hr />
+<h3>总结：这段代码在干嘛？</h3>
+<p>想象你有一辆车（Model），你想改装引擎去赛车（Update Weights），但你不想把原厂引擎弄坏，因为赛完车还得把车卖了。</p>
+<ol>
+<li><strong>原版 PyTorch</strong>：直接在原车引擎上打孔、焊接。车变了，回不去了。</li>
+<li><strong>这段代码 (patch.py)</strong>：<ul>
+<li>它用 3D 打印技术复制了一个一模一样的车壳（<code>make_functional</code>）。</li>
+<li>但是引擎盖下面是空的（<code>ParameterPlaceholder</code>）。</li>
+<li>每次你开车（<code>forward</code>）的时候，你必须手里拎着一台引擎（<code>params</code>）塞进去，车才能跑。</li>
+<li>你想怎么改装手里这台引擎都可以，原本那辆车静静地停在车库里，完全没受影响。</li>
+</ul>
+</li>
+</ol>
+<p><strong>在 EasyEditor 中的作用：</strong>
+EasyEditor 需要快速修改大模型的某一条知识（比如“法国首都是哪里？”）。它利用这个 <code>monkeypatch</code> 生成一个影分身，在影分身和临时权重上计算梯度并更新，确认修改成功后，再决定是否把这组权重合并回原模型，或者仅用于当前的推理路径。</p>

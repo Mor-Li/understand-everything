@@ -1,0 +1,62 @@
+<h1>easyeditor/models/emmet/emmet_main.py</h1>
+<p>这份代码实现了 <strong>EMMET</strong> 算法，这是一种用于<strong>批量编辑大语言模型（LLM）知识</strong>的方法。</p>
+<p>简单来说，它的作用是：<strong>“不动模型的大部分大脑，只精准修改某一层的神经元连接，让模型学会一批新的知识（比如：‘法国的首都是巴黎’ -&gt; ‘法国的首都是罗马’），同时不破坏原来的通用能力。”</strong></p>
+<p>为了让你看懂，我把这个复杂的数学过程拆解成一个<strong>“给模型做微创手术”的 ToDo List</strong>。</p>
+<hr />
+<h3>EMMET 算法执行清单 (Task List)</h3>
+<p>整个流程可以分为 5 个主要步骤（Task），代码主要集中在 <code>execute_emmet</code> 函数中。</p>
+<h4>Task 1: 术前准备 (整理输入数据)</h4>
+<p><strong>代码位置：</strong> <code>execute_emmet</code> 函数的前半部分。
+*   <strong>目标：</strong> 搞清楚我们要改什么。
+*   <strong>具体动作：</strong>
+    1.  <strong>标准化 Prompt：</strong> 比如把“Steve Jobs founded Apple”拆解成 <code>Subject</code>（Steve Jobs）和 <code>Prompt</code>（{} founded Apple）。
+    2.  <strong>准备模板：</strong> 为了让编辑更鲁棒，算法会生成一些上下文变体（比如在前面加“Because...”, "Therefore..."），防止模型只死记硬背一句话。
+    3.  <strong>锁定手术位置：</strong> 确定要修改模型的哪几层（<code>hparams.layers</code>），并把这些层的原始权重（Weights）备份一份。</p>
+<h4>Task 2: 确定“目标向量” (Compute Z) —— 我们想要什么结果？</h4>
+<p><strong>代码位置：</strong> <code>compute_z</code> 相关部分。
+*   <strong>目标：</strong> 算出模型在最后一层<strong>应该输出什么</strong>，才能代表“新知识”。
+*   <strong>具体动作：</strong>
+    1.  把含有新知识的句子（比如“法国的首都是罗马”）喂给模型。
+    2.  记录模型在处理到 <code>Subject</code>（法国）最后一个字时，<strong>最后一层</strong>的输出向量。
+    3.  这个向量就是我们的<strong>目标（Target / Z）</strong>。
+    4.  <em>注：代码里有一个缓存机制，如果算过就直接读取文件，省时间。</em></p>
+<h4>Task 3: 捕捉“输入特征” (Compute K) —— 钥匙是什么？</h4>
+<p><strong>代码位置：</strong> <code>compute_ks</code> 相关部分。
+*   <strong>目标：</strong> 在我们要修改的那一层，模型看到 <code>Subject</code> 时，神经元激活成什么样？
+*   <strong>具体动作：</strong>
+    1.  把 Prompt 喂给模型。
+    2.  在<strong>待修改层</strong>（比如第 5 层），记录输入给这一层的向量。
+    3.  这个向量被称为 <strong>Key (k)</strong>。它就像一把钥匙，当模型看到这把钥匙时，我们要修改它的反应。</p>
+<h4>Task 4: 计算“保护层” (Covariance Statistics) —— 别把脑子弄坏了</h4>
+<p><strong>代码位置：</strong> <code>get_cov</code> 函数。
+*   <strong>目标：</strong> 了解模型平时的“思考习惯”，防止修改过度导致模型变傻。
+*   <strong>具体动作：</strong>
+    1.  读取大量普通文本（WikiData 等）在这一层的激活统计数据（协方差矩阵 $C$）。
+    2.  这个矩阵代表了“什么方向的权重是重要的，不能乱动”。
+    3.  <em>通俗理解：我们要改知识，但不能破坏模型的语法能力和逻辑能力。这个矩阵就是用来约束修改幅度的。</em></p>
+<h4>Task 5: 求解并更新权重 (The Math / Update) —— 开始动刀</h4>
+<p><strong>代码位置：</strong> <code>execute_emmet</code> 中的 <code>for i, layer in enumerate(hparams.layers):</code> 循环内部。
+*   <strong>目标：</strong> 算出一个<strong>增量矩阵（Delta）</strong>，加到原来的权重上。
+*   <strong>具体动作（核心数学逻辑）：</strong>
+    1.  <strong>计算残差：</strong> 现在的输出和 Task 2 算出的理想目标差多少？
+    2.  <strong>EMMET 核心公式：</strong> 代码中最难懂的一段：
+        <code>python
+        # C_inv 是协方差矩阵的逆（代表对旧知识的保护）
+        # layer_ks 是输入 Key
+        D = layer_ks.T @ C_inv @ layer_ks 
+        D = D + hparams.emmet_lambda * torch.eye(...) # 加上正则化项防止无解
+        adj_k = (D_inv @ layer_ks.T @ C_inv).T</code>
+        这段是在解一个线性方程组（类似最小二乘法）。它的意思是：<strong>找到一个权重变化量，使得 $Key \times NewWeight \approx Target$，同时由于 $C_{inv}$ 的存在，尽量少影响其他无关知识。</strong>
+    3.  <strong>计算 Update Matrix：</strong> <code>upd_matrix = resid @ adj_k.T</code>。
+    4.  <strong>写入权重：</strong> <code>weights[...] = weights_copy + upd_matrix</code>。直接修改模型参数。</p>
+<hr />
+<h3>总结：这段代码在干嘛？</h3>
+<p>如果把模型比作一个学生，这段代码就是如果不通过重新上课（Retraining），而是直接<strong>神经外科手术</strong>来让他记住一批新考点：</p>
+<ol>
+<li><strong>准备（Task 1）：</strong> 列出考点清单。</li>
+<li><strong>定目标（Task 2）：</strong> 确定考试满分的标准答案是什么脑电波（$z$）。</li>
+<li><strong>找触发点（Task 3）：</strong> 确定看到题目关键词时，大脑哪个区域亮了（$k$）。</li>
+<li><strong>查背景（Task 4）：</strong> 调出他以前的知识结构图（Covariance），保证别改了历史忘了数学。</li>
+<li><strong>手术（Task 5）：</strong> 用 EMMET 算法算出一个精确的微调参数，直接改写神经突触连接（Weights）。</li>
+</ol>
+<p><strong><code>apply_emmet_to_model</code></strong> 只是一个外壳，它负责把手术好的模型包装好还给你。真正动刀子的是 <strong><code>execute_emmet</code></strong>。</p>

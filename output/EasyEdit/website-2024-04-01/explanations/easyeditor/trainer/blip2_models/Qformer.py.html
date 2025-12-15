@@ -1,0 +1,90 @@
+<h1>easyeditor/trainer/blip2_models/Qformer.py</h1>
+<p>这份代码看起来确实很复杂，因为它虽然借用了 <strong>BERT</strong>（一种非常经典的自然语言处理模型）的壳子，但实际上它是 <strong>BLIP-2</strong> 模型的核心组件，叫做 <strong>Q-Former</strong>。</p>
+<p>简单来说，这个文件的作用是定义一个<strong>“连接器”</strong>。它的任务是把<strong>图像信息</strong>（看不懂的像素特征）转化成<strong>文本模型能理解的信息</strong>。</p>
+<p>为了让你读懂它，我把理解这份代码拆解成一个 <strong>5步走的 Task List（待办清单）</strong>。我们一步一步来攻克：</p>
+<hr />
+<h3>📝 Task 1: 理解核心概念 —— "它到底是个啥？"</h3>
+<p><strong>目标</strong>：建立心理模型，不要把它当成普通的 BERT。</p>
+<ul>
+<li><strong>背景</strong>：这是 BLIP-2 算法的一部分。BLIP-2 想做图文多模态（比如给一张图，让 AI 写描述）。</li>
+<li><strong>角色</strong>：它叫 <strong>Q-Former</strong> (Querying Transformer)。</li>
+<li><strong>形象比喻</strong>：想象它是一个“翻译官”。<ul>
+<li>左边是<strong>图像编码器</strong>（给出的全是乱码一样的图像特征）。</li>
+<li>右边是<strong>大语言模型</strong>（只懂文字）。</li>
+<li><strong>Q-Former</strong> 就在中间，它有一组<strong>“探针”（Query Embeddings）</strong>，伸到图像特征里去“抓取”有用的信息，然后整理成语言模型能看懂的格式。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📝 Task 2: 检查入口 —— <code>BertEmbeddings</code> 类</h3>
+<p><strong>目标</strong>：看懂数据是怎么喂进去的。</p>
+<p>请定位到代码中的 <code>class BertEmbeddings</code> (大约第 50 行)。
+*   <strong>普通 BERT</strong>：只接收 <code>input_ids</code>（文本的数字编码）。
+*   <strong>Q-Former 的魔改</strong>：注意看 <code>forward</code> 函数里的这一段：
+    <code>python
+    if query_embeds is not None:
+        embeddings = torch.cat((query_embeds, embeddings), dim=1)</code>
+*   <strong>解读</strong>：
+    *   <code>query_embeds</code> 就是我刚才说的“探针”（Learned Queries）。它们是凭空生成的向量，专门用来代表“我想从图片里问什么”。
+    *   代码把这些 <strong>Query 向量</strong> 和 <strong>文本向量</strong> 拼接到了一起（<code>torch.cat</code>）。
+    *   <strong>结论</strong>：这个模型的输入不仅有字，还有一组“虚空”的查询向量。</p>
+<hr />
+<h3>📝 Task 3: 核心机制 —— <code>BertLayer</code> 与 Cross-Attention</h3>
+<p><strong>目标</strong>：理解它是怎么“看”图片的。</p>
+<p>请定位到 <code>class BertLayer</code> (大约第 365 行) 和 <code>BertSelfAttention</code> (大约第 112 行)。</p>
+<ol>
+<li>
+<p><strong>Cross-Attention (交叉注意力)</strong>：</p>
+<ul>
+<li>在 <code>BertLayer</code> 的 <code>forward</code> 中，你会看到 <code>if self.has_cross_attention:</code>。</li>
+<li>它会调用 <code>self.crossattention</code>，传入 <code>encoder_hidden_states</code>。</li>
+<li><strong>解读</strong>：这里的 <code>encoder_hidden_states</code> 通常就是<strong>图像特征</strong>。这一步就是“探针”在图片特征里搜索相关信息的过程。</li>
+</ul>
+</li>
+<li>
+<p><strong>两套处理逻辑</strong>：</p>
+<ul>
+<li>在 <code>BertLayer</code> 里，你还会看到 <code>feed_forward_chunk</code> 和 <code>feed_forward_chunk_query</code>。</li>
+<li><strong>解读</strong>：这个模型很聪明，它知道哪些是“探针向量”，哪些是“纯文本向量”。它有时候会把它们分开处理，防止信息混杂得太乱。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>📝 Task 4: 组装车间 —— <code>BertModel</code> 类</h3>
+<p><strong>目标</strong>：看整体流程是如何串联的。</p>
+<p>定位到 <code>class BertModel</code> (大约第 625 行)。
+*   <strong>Mask (掩码) 机制</strong>：
+    *   在 <code>get_extended_attention_mask</code> 函数里，逻辑非常复杂。
+    *   <strong>原因</strong>：Q-Former 需要一种特殊的“可见性”控制。
+        *   <strong>Query (探针)</strong> 之间可以互相看。
+        *   <strong>Text (文本)</strong> 之间可以互相看。
+        *   <strong>Query</strong> 可以看 <strong>Text</strong>（为了结合问题去图里找答案）。
+        *   但是！<strong>Text</strong> 通常不能看 <strong>Query</strong>（或者是单向可见），这取决于具体的训练任务。
+    *   <strong>结论</strong>：这个类主要负责调度，确保“探针”和“文本”按照既定的规则交互，并把图像特征传给每一层。</p>
+<hr />
+<h3>📝 Task 5: 输出任务 —— 两个 Head 类</h3>
+<p><strong>目标</strong>：看这个模型最后输出了什么结果。</p>
+<p>文件末尾定义了两个类，对应两种不同的玩法：</p>
+<ol>
+<li>
+<p><strong><code>class BertLMHeadModel</code> (大约 900 行)</strong></p>
+<ul>
+<li><strong>功能</strong>：语言模型预测 (Language Modeling)。</li>
+<li><strong>用途</strong>：<strong>生成文本</strong>。比如你给它一张图，它输出描述。它使用 <code>CausalLMOutputWithCrossAttentions</code>，这是典型的生成式任务结构（像 GPT 一样预测下一个词）。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>class BertForMaskedLM</code> (大约 1050 行)</strong></p>
+<ul>
+<li><strong>功能</strong>：掩码语言模型 (Masked Language Modeling)。</li>
+<li><strong>用途</strong>：<strong>理解文本</strong>。比如“一只 [MASK] 在草地上跑”，让它填空是“狗”。这通常用于训练阶段，让模型学会图文对齐。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>💡 总结 (TL;DR)</h3>
+<p>如果你要给别人讲这个文件，你可以这样概括：</p>
+<blockquote>
+<p>“这是一个<strong>魔改版的 BERT</strong>。它不仅仅处理文字，它还在文字前面强行插入了一组<strong>‘查询向量’(Query Embeddings)</strong>。这些查询向量通过<strong>交叉注意力 (Cross-Attention)</strong> 机制，去‘读取’外部输入的<strong>图像特征</strong>。最后，它既能像 GPT 一样说话（LM Head），也能像 BERT 一样做填空题（Masked LM Head），是连接图像编码器和 LLM 的桥梁。”</p>
+</blockquote>
+<p>现在，你可以试着只看 <code>BertLayer</code> 里的 <code>crossattention</code> 部分，那是这个文件最灵魂的地方。</p>

@@ -1,0 +1,107 @@
+<h1>easyeditor/dataset/counterfact.py</h1>
+<p>这份代码确实比较晦涩，因为它涉及到了<strong>大模型知识编辑（Model Editing/Knowledge Editing）</strong>的具体实现细节。</p>
+<p>简单来说，这个文件的作用是：<strong>把原始的文本数据（比如 JSON 格式），转换成 PyTorch 模型能够读懂的 Tensor（张量）格式，专门用于训练模型“修改某一条知识”。</strong></p>
+<p>为了让你听懂，我们把这个过程想象成<strong>“给学生（模型）准备复习资料”</strong>的过程。</p>
+<p>我为你列了一个 <strong>Task To-Do List</strong>，我们将代码的功能对应到这三个步骤中：</p>
+<h3>📋 Task To-Do List (代码逻辑流程)</h3>
+<ol>
+<li><strong>【准备阶段】初始化与工具准备 (<code>__init__</code>)</strong><ul>
+<li><em>任务：</em> 打开课本（读取 JSON 文件），准备好翻译机（Tokenizer）。</li>
+</ul>
+</li>
+<li><strong>【挑选阶段】拿出一道题 (<code>__getitem__</code>)</strong><ul>
+<li><em>任务：</em> 从课本里随机指一道题出来，这时候还是原始文本。</li>
+</ul>
+</li>
+<li><strong>【加工阶段】把题打包成试卷 (<code>collate_fn</code> / <code>collate_gpt_fn</code>)</strong><ul>
+<li><em>任务：</em> 这是最核心的。把一堆原始文本翻译成数字（Token IDs），并整理成三个部分：<ul>
+<li><strong>要学的知识</strong> (Edit)：比如把“埃菲尔铁塔在巴黎”改成“埃菲尔铁塔在罗马”。</li>
+<li><strong>举一反三</strong> (Rephrase)：换个问法“埃菲尔铁塔在哪？”，看模型能不能答出“罗马”。</li>
+<li><strong>防止遗忘</strong> (Locality)：问“故宫在哪？”，模型必须还得答“北京”，不能乱。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>逐步代码解析</h3>
+<h4>1. 【准备阶段】<code>__init__</code></h4>
+<p>这段代码在类初始化时运行。</p>
+<ul>
+<li><strong>加载数据</strong>：<code>with open(cf_loc, "r") as f: self.data = json.load(f)</code><ul>
+<li>它读取了一个 <code>counterfact</code> 数据集文件。</li>
+</ul>
+</li>
+<li><strong>准备 Tokenizer</strong>：<ul>
+<li>代码里判断了 <code>config.tokenizer_name</code>。</li>
+<li><strong>重点细节</strong>：如果是 GPT2 类的模型，它强制设置了 <code>padding_side = 'left'</code>（左侧填充）。这是因为 GPT 是生成式模型，生成的词在右边，所以补零（Padding）要补在左边，否则会干扰生成。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 【挑选阶段】<code>__getitem__</code></h4>
+<ul>
+<li><strong>代码</strong>：<code>return self.data[item]</code></li>
+<li><strong>解释</strong>：非常简单，就像从列表里拿字典一样。它返回的数据大概长这样（原始文本）：<ul>
+<li><code>prompt</code>: "埃菲尔铁塔位于"</li>
+<li><code>target_new</code>: "罗马" (我们要注入的错误知识/反事实知识)</li>
+<li><code>ground_truth</code>: "巴黎" (原本的正确知识)</li>
+<li><code>rephrase_prompt</code>: "那个著名的铁塔在哪里？"</li>
+<li><code>locality_prompt</code>: "故宫位于" (用于测试模型有没有变傻)</li>
+</ul>
+</li>
+</ul>
+<h4>3. 【加工阶段】最难懂的部分 (<code>collate_fn</code> 和 <code>collate_gpt_fn</code>)</h4>
+<p>这里有两个函数，功能类似，但针对的模型不同：
+*   <code>collate_fn</code>: 通常用于 Encoder-Decoder 模型（如 T5, Bart）。
+*   <code>collate_gpt_fn</code>: 专门用于 GPT 类（Decoder-only）模型。</p>
+<p>我们重点看 <strong><code>collate_gpt_fn</code></strong>（因为现在大模型多是 GPT 架构），它的逻辑如下：</p>
+<p><strong>第一步：拼接文本</strong>
+GPT 是像接龙一样说话的，所以代码把“问题”和“答案”拼在一起：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 也就是把 &quot;埃菲尔铁塔位于&quot; + &quot; &quot; + &quot;罗马&quot; 拼起来</span>
+<span class="n">src</span> <span class="o">=</span> <span class="p">[</span><span class="n">src_</span> <span class="o">+</span> <span class="s1">&#39; &#39;</span> <span class="o">+</span> <span class="n">trg_</span> <span class="k">for</span> <span class="n">src_</span><span class="p">,</span> <span class="n">trg_</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">src</span><span class="p">,</span> <span class="n">trg</span><span class="p">)]</span>
+</code></pre></div>
+
+<p><strong>第二步：特殊算法处理 (SERAC)</strong>
+代码里有一大段 <code>if (hasattr(self.config, 'alg') ... 'SERAC'):</code>。
+*   <em>你可以暂时跳过这块</em>。这是针对一种叫 SERAC 的特定算法做的特殊处理，它把句子拆得非常细碎，为了做一种类似“缓存检索”的编辑。如果不是用 SERAC 算法，不会走这里。</p>
+<p><strong>第三步：Tokenizer 批量处理</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">batches</span> <span class="o">=</span> <span class="p">{</span> <span class="o">...</span> <span class="bp">self</span><span class="o">.</span><span class="n">tok</span><span class="p">(</span><span class="n">v1</span><span class="p">,</span> <span class="n">return_tensors</span><span class="o">=</span><span class="s2">&quot;pt&quot;</span><span class="p">,</span> <span class="n">padding</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span> <span class="o">...</span> <span class="p">}</span>
+</code></pre></div>
+
+<ul>
+<li>把上面的中文/英文句子，全部变成数字向量（Input IDs）和掩码（Attention Mask）。</li>
+</ul>
+<p><strong>第四步：构建三大核心数据块 (最重要！)</strong></p>
+<p>这是为了训练编辑模型，专门把数据分成了三类：</p>
+<ol>
+<li>
+<p><strong><code>edit_inner</code> (用于训练修改)</strong></p>
+<ul>
+<li>这就是告诉模型：“你要学会把这个 Prompt 接上这个 Target”。</li>
+<li><code>edit_labels</code> 这里用到了 <code>get_edit_labels</code>，它的作用是把输入里的 <code>pad</code>（填充符）变成 <code>-100</code>。在 PyTorch 里，<strong>Label 为 -100 的地方不会计算 Loss（损失）</strong>，也就是模型不需要学习怎么预测填充符。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>edit_rephrase</code> (用于检测泛化)</strong></p>
+<ul>
+<li>这是为了测试编辑效果。比如训练了“埃菲尔铁塔-&gt;罗马”，这里就放入“那个铁塔在哪？”，看模型能不能预测出“罗马”。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>loc</code> (Locality / 局部性)</strong></p>
+<ul>
+<li>这是为了防止模型“脑残”。比如编辑了埃菲尔铁塔，不能导致它把“奥巴马是哪国人”给忘了吧？</li>
+<li>这里放入无关的知识（如 <code>locality_prompt</code>），要求模型保持原样，输出 <code>locality_ground_truth</code>。</li>
+</ul>
+</li>
+</ol>
+<p><strong>第五步：返回结果</strong>
+最后 <code>return dict_to(batch, self.config.device)</code> 把整理好的大字典放到 GPU 上，准备喂给模型。</p>
+<h3>总结一下你需要关注的重点</h3>
+<p>如果你是想<strong>使用</strong>这个代码，你只需要知道：
+1.  它需要一个 JSON 文件。
+2.  它会自动处理 GPT 的左填充问题。
+3.  它返回的 Batch 包含 <code>edit_inner</code>（去改模型参数用的）、<code>edit_rephrase</code>（看改没改成功用的）、<code>loc</code>（看有没有改坏别的知识用的）。</p>
+<p>如果你是想<strong>修改</strong>这个代码：
+*   关注 <code>collate_gpt_fn</code> 里的拼接逻辑（是 <code>Prompt + Target</code> 还是分开）。
+*   关注 <code>get_edit_labels</code> 里的 Mask 逻辑（哪些词需要计算 Loss，哪些不需要）。</p>

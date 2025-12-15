@@ -1,0 +1,76 @@
+<h1>easyeditor/dataset/multitask.py</h1>
+<p>这份代码确实比较复杂，因为它不仅仅是加载数据，还涉及到了<strong>大模型编辑（Model Editing）</strong>中非常具体的逻辑，比如“如何构造提示词”、“如何保证编辑不影响无关知识（Locality）”以及“如何让编辑具有泛化性（Portability）”。</p>
+<p>为了让你看懂，我把这段代码想象成一个<strong>“数据加工流水线”</strong>的工长。</p>
+<p>下面是这位“工长”手中的 <strong>任务清单 (To-Do List)</strong>，按执行顺序排列：</p>
+<hr />
+<h3>📋 任务清单：从原始文本到模型能吃的“压缩饼干”</h3>
+<h4>第一阶段：准备工作（<code>__init__</code> 初始化部分）</h4>
+<p><strong>Task 1: 准备“话术模板” (Templates)</strong>
+*   <strong>代码位置</strong>: <code>desc = { "convsent": [...], "counterfact": [...] ... }</code>
+*   <strong>解释</strong>:
+    *   我要处理不同类型的任务（情感分析、反事实事实、维基百科更新等）。
+    *   为了让模型不只会死记硬背一句话，我准备了很多不同的<strong>指令模版</strong>。
+    *   比如做情感任务（<code>convsent</code>），我会随机选一句：“Teach the chatbot to sound [LABEL]...” 或者 “Make sure the chatbot gives off a [LABEL] feel...”。
+    *   <strong>目的</strong>: 增加数据的多样性，让模型学会“理解指令”而不是“背诵句子”。</p>
+<p><strong>Task 2: 检查“翻译官” (Tokenizer)</strong>
+*   <strong>代码位置</strong>: <code>if(config is not None and hasattr(config, 'tokenizer_name')): ...</code>
+*   <strong>解释</strong>:
+    *   确认用的是哪个模型（GPT2 还是 Llama）。
+    *   如果是 GPT2 或 Llama，我需要特殊设置一下 <code>pad_token</code>（填充符），并设置为“左侧填充”（Left Padding），因为生成式模型通常是从左往右预测，填充在左边比较方便。</p>
+<p><strong>Task 3: 读取“原始订单” (Load JSON)</strong>
+*   <strong>代码位置</strong>: <code>with open(multi_task, "r") as f: raw = json.load(f)</code>
+*   <strong>解释</strong>:
+    *   从硬盘里读取 <code>json</code> 文件，里面是一条条原始数据。</p>
+<p><strong>Task 4: 清洗和组装数据 (Data Parsing Loop)</strong>
+*   <strong>代码位置</strong>: <code>for i, record in enumerate(raw): ...</code>
+*   <strong>解释</strong>: 这是最繁琐的一步，我需要把每一条原始数据拆解成模型训练需要的格式：
+    1.  <strong>生成 Prompt</strong>: 根据任务类型（比如是改情感还是改事实），从 Task 1 的模板里随机挑一个，把 <code>[TOPIC]</code> 替换成数据里的 <code>subject</code>。
+    2.  <strong>处理 Locality (局部性/不副作用)</strong>:
+        *   <em>概念</em>: 如果我教模型“埃菲尔铁塔在罗马”（修改知识），我得确保模型<strong>不会</strong>忘记“埃菲尔铁塔是铁做的”。
+        *   <em>操作</em>: 代码读取 <code>record["locality"]</code>，把那些<strong>不应该被改变</strong>的问题和答案存起来，用来测试模型有没有“改坏了”。
+    3.  <strong>处理 Portability (可移植性/泛化)</strong>:
+        *   <em>概念</em>: 如果我教模型“埃菲尔铁塔在罗马”，当我问“罗马有什么塔？”时，它也得能答出来。
+        *   <em>操作</em>: 代码读取 <code>record["portability"]</code>，把这些相关的变形问题存起来，用来测试模型够不够聪明。</p>
+<div class="codehilite"><pre><span></span><code>*最终，把整理好的每一条数据（包含 Prompt, Target, Locality, Portability）存入 <span class="sb">`self._data`</span> 列表。*
+</code></pre></div>
+
+<hr />
+<h4>第二阶段：打包发货（<code>collate_gpt_fn</code> 整理批次部分）</h4>
+<p>当训练程序说：“给我来一批数据（Batch）”时，这个函数就会被调用。</p>
+<p><strong>Task 5: 文本转数字 (Tokenization)</strong>
+*   <strong>代码位置</strong>: <code>self.tok(v1, return_tensors="pt", ...)</code>
+*   <strong>解释</strong>:
+    *   模型看不懂英文，只看懂数字。我把 Prompt（问题）和 Target（新答案）拼在一起。
+    *   <strong>关键点</strong>: <code>src = [src_ + trg_ for ...]</code>。把问题和答案连起来变成一整句话，因为 GPT 是续写模型。</p>
+<p><strong>Task 6: 制作“编辑数据包” (Edit Inner)</strong>
+*   <strong>代码位置</strong>: <code>edit_inner["labels"] = edit_labels</code>
+*   <strong>解释</strong>:
+    *   这是用来<strong>训练/编辑</strong>模型的核心数据。
+    *   <strong>Masking (掩码)</strong>: <code>get_edit_labels</code> 函数很重要。它会把 Prompt 部分的 Label 设为 <code>-100</code>。
+    *   <em>为什么？</em> 因为我们只想让模型学习<strong>生成答案</strong>，不想让它学习<strong>生成问题</strong>。计算 Loss 的时候忽略掉问题部分。</p>
+<p><strong>Task 7: 制作“副作用测试包” (Locality Batching)</strong>
+*   <strong>代码位置</strong>: <code>if "locality" in batch[0].keys(): ...</code>
+*   <strong>解释</strong>:
+    *   把 Task 4 里准备好的“不该变的问题”拿出来，也转成数字。
+    *   这部分数据用来告诉模型：“嘿，虽然我让你改了那个知识，但这些旧知识你别给我动！”</p>
+<p><strong>Task 8: 制作“泛化测试包” (Portability Batching)</strong>
+*   <strong>代码位置</strong>: <code>if "portability" in batch[0].keys(): ...</code>
+*   <strong>解释</strong>:
+    *   把 Task 4 里准备好的“相关变形问题”拿出来，转成数字。
+    *   这部分数据用来告诉模型：“既然你学会了新知识，换个问法你也得答对！”</p>
+<p><strong>Task 9: 统一发货</strong>
+*   <strong>代码位置</strong>: <code>return dict_to(batch, self.config.device)</code>
+*   <strong>解释</strong>:
+    *   把上面打包好的 <code>edit_inner</code>（去改模型）、<code>loc</code>（防副作用）、<code>port</code>（测泛化）全部装进一个大字典。
+    *   搬运到 GPU (<code>cuda</code>) 上，交给模型去跑。</p>
+<hr />
+<h3>💡 总结：这个文件到底在干嘛？</h3>
+<p>简单来说，<code>MultiTaskDataset</code> 是一个<strong>为了“知识编辑”算法定制的数据管家</strong>。</p>
+<p>普通的 Dataset 可能只需要 <code>(问题, 答案)</code>。
+但在<strong>模型编辑</strong>场景下，为了让编辑既有效（Success）、又通用（Portability）、又不破坏旧知识（Locality），这个管家必须把每一条数据加工成 <strong>“三合一”的大礼包</strong>：</p>
+<ol>
+<li><strong>Edit Inner</strong>: 告诉我怎么改（比如：把“美国总统”改成“特朗普”）。</li>
+<li><strong>Locality</strong>: 告诉我什么别改（比如：别把“奥巴马是人”这个事实忘了）。</li>
+<li><strong>Portability</strong>: 告诉我怎么举一反三（比如：问“白宫现在住谁”，你也得说是“特朗普”）。</li>
+</ol>
+<p>你看懂这个逻辑，就看懂了这个文件。</p>

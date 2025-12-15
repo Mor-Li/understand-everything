@@ -1,0 +1,68 @@
+<h1>easyeditor/models/malmen/malmen_main.py</h1>
+<p>这份代码确实涉及到了比较前沿的<strong>大模型知识编辑（Model Editing）</strong>技术，里面有很多术语。如果直接看代码细节容易晕。</p>
+<p>为了帮你理解，我们可以把这个类 <code>MalmenRewriteExecutor</code> 想象成一个<strong>“大模型手术医生”</strong>。它的工作不是训练模型，而是给模型做“微创手术”，让模型记住新的知识（比如修改“某某国家的总统是谁”）。</p>
+<p>下面我为你列一个 <strong>Task To-Do List</strong>，按照代码执行的逻辑顺序，一步步拆解它在干什么：</p>
+<hr />
+<h3>📋 任务清单：MALMEN 手术流程</h3>
+<h4>1. Task 01: 准备手术工具 (初始化)</h4>
+<p><strong>代码位置：</strong> <code>init_model</code> 方法
+<strong>发生了什么：</strong>
+在你开始修改模型之前，你需要先加载专门用于修改模型的工具（即 MALMEN 网络）。
+*   <strong>观点：</strong> 大模型（如 GPT）自己不会改自己。我们需要引入一个外部的、已经训练好的“编辑器网络”（<code>self.alg = MALMEN(...)</code>）。
+*   <strong>操作：</strong>
+    *   加载大模型 (<code>model</code>) 和分词器 (<code>tok</code>)。
+    *   加载 MALMEN 的权重文件 (<code>params.archive</code>)。这就像医生拿出专用的手术刀。
+    *   把它放到 GPU 上准备工作。</p>
+<h4>2. Task 02: 接收病人需求 (解析请求)</h4>
+<p><strong>代码位置：</strong> <code>apply_to_model</code> 方法的开头
+<strong>发生了什么：</strong>
+医生（Executor）接到了一个修改请求列表 (<code>requests</code>)。
+*   <strong>观点：</strong> 编辑是为了修正特定的错误。
+*   <strong>例子：</strong> 代码注释里写了：
+    *   <strong>问题 (Prompt):</strong> "某某现在的职位是..."
+    *   <strong>旧知识 (Target True):</strong> "主教"
+    *   <strong>新知识 (Target New):</strong> "总统"
+*   <strong>操作：</strong> 确认请求数量符合设定 (<code>hparams.n_edits</code>)，如果没初始化工具，先执行 Task 01。</p>
+<h4>3. Task 03: 翻译成机器语言 (数据预处理)</h4>
+<p><strong>代码位置：</strong> <code>apply_to_model</code> 中的 <code>for</code> 循环部分
+<strong>发生了什么：</strong>
+模型看不懂英文单词，只看懂数字（Token IDs）。这一步把文本转换成模型能吃的格式。
+*   <strong>观点：</strong> 这一步不仅仅是分词，还需要构造“标签（Labels）”。
+*   <strong>关键逻辑：</strong>
+    *   把 <code>Prompt</code> + <code>Target New</code> 拼成一句话。
+    *   <strong>制作 Label：</strong> 告诉模型，“前面的问题你不准变，你只需要把预测结果改成新的答案（总统）”。代码中把问题部分的 label 设为 <code>-100</code>，意思就是“计算误差时忽略这部分，只关注答案对不对”。
+    *   把处理好的数据打包进 <code>batchs</code> 列表。</p>
+<h4>4. Task 04: 诊断与计算 (核心预测)</h4>
+<p><strong>代码位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">module_kv_map</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">alg</span><span class="o">.</span><span class="n">cache</span><span class="p">(</span><span class="n">batchs</span><span class="p">)</span>
+<span class="n">param_shifts</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">alg</span><span class="o">.</span><span class="n">predict_param_shifts</span><span class="p">(</span><span class="n">module_kv_map</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>发生了什么：</strong>
+这是全篇最核心、最“魔法”的地方。
+*   <strong>观点：</strong> 传统的训练（Backpropagation）太慢了。MALMEN 这种方法是<strong>“预测参数的变化量”</strong>。
+*   <strong>步骤详解：</strong>
+    1.  <strong>Cache (缓存激活值):</strong> <code>self.alg.cache(batchs)</code>。让数据在大模型里跑一遍，看看大模型原本的神经元对这句话有什么反应。
+    2.  <strong>Predict (预测偏移):</strong> <code>self.alg.predict_param_shifts(...)</code>。MALMEN 网络根据刚才的反应，直接<strong>算出来</strong>：“如果要让它输出‘总统’，大模型的第 X 层参数矩阵需要加上数值 Y”。
+    *   <strong>比喻：</strong> 就像医生不需要真的切开看反应，而是通过照 CT（Cache）就能算出下刀的精确位置和力度（Param Shifts）。</p>
+<h4>5. Task 05: 备份旧器官 (可选的安全措施)</h4>
+<p><strong>代码位置：</strong> <code>with torch.no_grad(): ... if return_orig_weights ...</code>
+<strong>发生了什么：</strong>
+在真的动手改参数之前，先把即将被修改的参数备份一份。
+*   <strong>观点：</strong> 为了防止改坏了或者为了后续评估，我们需要保留原始权重。
+*   <strong>操作：</strong> 遍历模型参数，把那些即将被 MALMEN 修改的层（<code>inner_params</code>）复制到 <code>weights_copy</code> 里。</p>
+<h4>6. Task 06: 执行手术 (修改模型权重)</h4>
+<p><strong>代码位置：</strong> <code>self.alg.edit_model(param_shifts, False)</code>
+<strong>发生了什么：</strong>
+真正地修改大模型的权重。
+*   <strong>观点：</strong> 将 Task 04 计算出来的“参数偏移量（Delta）”加到大模型原本的参数上。
+*   <strong>结果：</strong> 执行完这一行后，<code>self.model</code> 已经变了。如果你再问它“某某的职位是什么”，它就会回答“总统”。</p>
+<hr />
+<h3>总结一下这段代码在讲啥</h3>
+<p>这段代码实现了一个 <strong>“模型编辑器”的执行器</strong>。</p>
+<p>它的核心逻辑不是我们在学校里学的“梯度下降训练”，而是：
+1.  <strong>输入</strong>一句想修改的话。
+2.  <strong>利用</strong>一个辅助网络（MALMEN）去<strong>观察</strong>大模型对这句话的反应。
+3.  <strong>直接计算</strong>出大模型参数应该怎么改。
+4.  <strong>硬改</strong>参数。</p>
+<p>你看不懂是因为它把最复杂的数学部分封装在 <code>self.alg</code> (即 <code>MALMEN</code> 类) 里了，这个文件只是负责<strong>调度流程</strong>：加载工具 -&gt; 处理数据 -&gt; 调用算法计算 -&gt; 应用修改。</p>

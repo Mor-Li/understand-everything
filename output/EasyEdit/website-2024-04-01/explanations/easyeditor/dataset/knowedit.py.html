@@ -1,0 +1,84 @@
+<h1>easyeditor/dataset/knowedit.py</h1>
+<p>这份代码定义了一个 PyTorch 的 <strong>Dataset</strong> 类，名字叫 <code>KnowEditDataset</code>。</p>
+<p>简单来说，它的作用是<strong>把“知识编辑”所需的原始文本数据（JSON格式），转换成模型（如 GPT、Llama）能看懂的数字格式（Tensor）</strong>。</p>
+<p>为了让你更容易理解，我把这个过程想象成<strong>“厨师备菜”</strong>的过程。模型是食客，这个脚本就是负责洗菜、切菜、装盘的厨师。</p>
+<p>下面是一个 <strong>Task Todo List</strong>，带你一步步看懂它在干什么：</p>
+<hr />
+<h3>Task 1: 准备工具与食材 (初始化 <code>__init__</code>)</h3>
+<p>当你创建这个类的实例时（即调用 <code>__init__</code>），代码主要做了三件事：</p>
+<ol>
+<li><strong>设置切菜板 (Config &amp; Max Length)</strong>:<ul>
+<li>读取配置 (<code>config</code>)，确定每句话最长能有多长 (<code>max_length</code>)，防止太长了模型吃不下。</li>
+</ul>
+</li>
+<li><strong>准备刀具 (Tokenizer)</strong>:<ul>
+<li>代码里有一大段 <code>if/elif</code> 逻辑在处理 <code>tokenizer</code>。</li>
+<li><strong>目的</strong>：加载分词器（把文本变成数字的工具）。</li>
+<li><strong>细节</strong>：它专门针对 GPT2、Llama、Qwen 等不同模型做了特殊设置（比如设置 <code>pad_token</code> 和 <code>padding_side</code>）。这是为了防止在处理长短不一的句子时出错。</li>
+</ul>
+</li>
+<li><strong>采购食材 (Load JSON)</strong>:<ul>
+<li><code>with open(zsre_loc, "r") as f:</code> 打开并读取指定路径的 JSON 文件。</li>
+</ul>
+</li>
+</ol>
+<h3>Task 2: 清洗与分类食材 (数据解析 Loop)</h3>
+<p>在 <code>__init__</code> 的后半部分，有一个 <code>for</code> 循环。这是在清洗数据。</p>
+<ul>
+<li><strong>原始数据很乱</strong>：JSON 里的 key 可能不一样（有的叫 "subject"，有的叫 "concept"）。</li>
+<li><strong>统一格式</strong>：代码把每条数据都整理成一个标准的字典：<ul>
+<li><code>prompt</code>: 提问（例如：“美国的首都是哪里？”）</li>
+<li><code>target_new</code>: 想要注入的新知识（例如：“纽约” —— 假设我们要强行修改知识）。</li>
+<li><code>ground_truth</code>: 原始的正确答案（例如：“华盛顿”）。</li>
+<li><strong>Portability (迁移性)</strong>: 相关的推理问题（用来测试模型改完能不能举一反三）。</li>
+<li><strong>Locality (局部性/邻域)</strong>: 不相关的问题（用来测试模型改完会不会把别的东西忘掉）。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 3: 按单取菜 (<code>__getitem__</code>)</h3>
+<p>这是 PyTorch Dataset 的标准动作。
+*   <strong>动作</strong>：当程序问要第 <code>item</code> 号数据时，直接从整理好的列表里拿出来返回。非常简单。</p>
+<h3>Task 4: 打包拼盘 (核心难点: <code>collate_fn</code> 和 <code>collate_gpt_fn</code>)</h3>
+<p>这是最难懂的部分。当 DataLoader 一次性取出一批（Batch）数据时，需要把它们<strong>打包</strong>成 Tensor。这里有两个函数，分别对应不同的模型架构。</p>
+<h4>分支 A: 通用打包 (<code>collate_fn</code>)</h4>
+<p>通常用于 Encoder-Decoder 模型或者特定的编辑算法（如 MEND, ROME 等）。</p>
+<ol>
+<li><strong>提取原料</strong>: 把这一批数据里的 <code>prompt</code> (src) 和 <code>target_new</code> (trg) 分别拿出来变成列表。</li>
+<li><strong>提取测试原料</strong>: 提取 <code>locality</code> (邻域数据) 的问题和答案。</li>
+<li><strong>切菜 (Tokenize)</strong>:<ul>
+<li>调用 <code>self.tok(...)</code> 把文本转成数字 ID。</li>
+<li><code>padding=True</code>: 短句子补零，对齐长度。</li>
+<li><code>truncation=True</code>: 长句子切断。</li>
+</ul>
+</li>
+<li><strong>装盘 (构造 Batch 字典)</strong>:<ul>
+<li><strong><code>edit_inner</code></strong>: 包含用于训练“编辑”操作的输入（Input）和标签（Labels）。注意 <code>get_edit_labels</code> 会把填充的部分设为 -100，这样计算 Loss 时会忽略它们。</li>
+<li><strong><code>loc</code></strong>: 包含用于测试“副作用”的数据。</li>
+</ul>
+</li>
+<li><strong>上菜</strong>: 把所有东西放到 GPU 上 (<code>dict_to(..., device)</code>) 并返回。</li>
+</ol>
+<h4>分支 B: GPT 专用打包 (<code>collate_gpt_fn</code>)</h4>
+<p>专门用于像 GPT、Llama 这种 Decoder-only (自回归) 的模型。</p>
+<ol>
+<li><strong>拼接 (Concatenate)</strong>:<ul>
+<li>GPT 是一路往下生成的，所以它把问题和答案拼在一起：</li>
+<li><code>src = src_ + ' ' + trg_</code> (比如：“美国的首都是哪里？ 纽约”)。</li>
+<li>邻域测试数据也是同理拼接。</li>
+</ul>
+</li>
+<li><strong>切菜 (Tokenize)</strong>: 同样是转成数字 ID。</li>
+<li><strong>掩码处理 (Labels Masking)</strong>:<ul>
+<li>虽然输入是拼在一起的，但训练时我们通常只希望模型学习生成“答案”部分，而不计算“问题”部分的 Loss。</li>
+<li><em>(注：这段代码里的实现比较简单，直接把 <code>trg_input_ids</code> 处理成了 labels，具体是否屏蔽了 prompt 部分取决于 <code>get_edit_labels</code> 和输入构造的细节，但通常 GPT 训练需要细致处理 mask)</em>。</li>
+</ul>
+</li>
+<li><strong>装盘与上菜</strong>: 结构和上面类似，返回 <code>edit_inner</code> 和 <code>loc</code>。</li>
+</ol>
+<hr />
+<h3>总结：这段代码在讲什么？</h3>
+<p><strong>一句话总结</strong>：
+这是一个为<strong>大模型知识编辑（Knowledge Editing）</strong>任务准备的数据加载器。它负责读取问题和目标答案，处理分词，并把数据打包成两部分：
+1.  <strong><code>edit_inner</code></strong>: 用来教模型“修改这个知识”。
+2.  <strong><code>loc</code></strong>: 用来检查模型“有没有改坏别的地方”。</p>
+<p>如果你是想跑通代码，只需要知道它会返回一个字典，里面装着训练用的 <code>input_ids</code> 和 <code>labels</code> 即可。</p>

@@ -1,0 +1,67 @@
+<h1>easyeditor/models/memit/compute_z.py</h1>
+<p>这份代码 <code>compute_z.py</code> 是 <strong>MEMIT</strong>（一种大模型知识编辑算法）的核心组件之一。</p>
+<p>简单来说，它的任务是：<strong>“为了让模型学会新的知识（比如：埃菲尔铁塔在罗马），我需要在模型的某一层、某一个位置，把原本的神经元激活值（Vector）修改成什么样？”</strong></p>
+<p>这个被修改后的目标向量，就是 $z$（代码中也叫 <code>target</code>）。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“任务清单 (Todo List)”</strong>，我们一步步来看代码是如何执行这个任务的。</p>
+<hr />
+<h3>任务清单：寻找完美的“目标向量” ($z$)</h3>
+<h4>Task 1: 准备工作 (获取改写目标)</h4>
+<p><strong>代码位置：</strong> 函数开头 到 <code>target_ids = ...</code>
+*   <strong>目的：</strong> 搞清楚我们要把模型改成什么样。
+*   <strong>解释：</strong>
+    *   获取模型的“嘴巴”（LM Head，即输出层），因为我们需要反推如何让嘴巴说出特定的词。
+    *   把用户想要的新知识（<code>target_new</code>，例如 "Rome"）转换成机器能懂的 Token ID。</p>
+<h4>Task 2: 制造“训练数据” (Prompt Engineering)</h4>
+<p><strong>代码位置：</strong> <code>rewriting_prompts, kl_prompts = ...</code> 到 <code>input_tok = ...</code>
+*   <strong>目的：</strong> 为了找到通用的修改向量，不能只用一句话，要用多句话（Templates）。
+*   <strong>解释：</strong>
+    *   <strong>Rewriting Prompts (改写提示词):</strong> 比如 "The Eiffel Tower is located in", "Where is the Eiffel Tower?", 后面加上目标词 "Rome"。这是为了告诉模型：“遇到这些话，你要回答 Rome”。
+    *   <strong>KL Prompts (保持提示词):</strong> 比如 "{} is a"。这是为了防止模型被改傻了，让它在无关内容上保持原样（计算 KL 散度）。
+    *   把这些文本全部转成 Tensor 输入给模型。</p>
+<h4>Task 3: 确定“动刀”的位置 (Lookup Index)</h4>
+<p><strong>代码位置：</strong> <code>lookup_idxs = ...</code> (调用 <code>find_fact_lookup_idx</code>)
+*   <strong>目的：</strong> 知识编辑通常针对“主语”的最后一个 Token 进行修改。
+*   <strong>解释：</strong>
+    *   比如句子是 "The Eiffel Tower is in..."，主语是 "The Eiffel Tower"。
+    *   代码会找到 "Tower" 这个词在句子中的位置索引。我们稍后就要在这个位置注入“病毒”（修改向量）。</p>
+<h4>Task 4: 定义我们要优化的“变量” (Delta)</h4>
+<p><strong>代码位置：</strong> <code>delta = torch.zeros(...)</code>
+*   <strong>目的：</strong> 我们不知道目标向量 $z$ 具体是多少，但我们知道 $z = z_{original} + \delta$。
+*   <strong>解释：</strong>
+    *   创建一个全为 0 的向量 <code>delta</code>，并开启 <code>requires_grad=True</code>。
+    *   <strong>这就是整个脚本的主角</strong>。接下来的所有计算，都是为了调整这个 <code>delta</code>，让它变成一个完美的修正值。</p>
+<h4>Task 5: 建立“拦截器” (Hook Function)</h4>
+<p><strong>代码位置：</strong> <code>def edit_output_fn(cur_out, cur_layer): ...</code>
+*   <strong>目的：</strong> 在模型思考的过程中，强行把 <code>delta</code> 加进去。
+*   <strong>解释：</strong>
+    *   这是一个钩子函数。当模型运行到指定的层（<code>layer</code>）时，它会暂停。
+    *   它会记录原始的输出 <code>target_init</code>（第一次运行时的值）。
+    *   然后执行操作：<code>layer_output += delta</code>。
+    *   <strong>逻辑：</strong> 强行修改神经网络中间的激活值，看看最后输出啥。</p>
+<h4>Task 6: 开始“微型训练” (Optimization Loop)</h4>
+<p><strong>代码位置：</strong> <code>opt = torch.optim.Adam(...)</code> 以及后面的 <code>for it in range(...)</code>
+*   <strong>目的：</strong> 通过梯度下降，找到最优的 <code>delta</code>。
+*   <strong>解释：</strong> 这是一个循环，通常跑几十步。每一步做以下事情：
+    1.  <strong>前向传播 (Forward):</strong> 让模型读那些 Prompt，经过 Task 5 的拦截器，加上当前的 <code>delta</code>。
+    2.  <strong>计算 Loss (代价函数):</strong>
+        *   <strong>NLL Loss (改写损失):</strong> 模型现在说完 "The Eiffel Tower is in" 后，预测 "Rome" 的概率大吗？如果不打，Loss 就大。
+        *   <strong>KL Loss (稳定损失):</strong> 模型在无关句子上的表现，和修改前（<code>kl_distr_init</code>）差别大吗？如果差别大，Loss 就大。
+        *   <strong>Weight Decay (正则化):</strong> <code>delta</code> 向量太长了吗？我们希望修改尽可能微小，不要太剧烈。
+    3.  <strong>反向传播 (Backward):</strong> 根据 Loss，告诉 <code>delta</code> 应该怎么变。
+    4.  <strong>更新 (Step):</strong> 修改 <code>delta</code> 的值。</p>
+<h4>Task 7: 输出结果</h4>
+<p><strong>代码位置：</strong> <code>target = target_init + delta</code>
+*   <strong>目的：</strong> 打包带走。
+*   <strong>解释：</strong>
+    *   循环结束后，我们得到了一个经过千锤百炼的 <code>delta</code>。
+    *   最终的 $z$ (Target Vector) = 原始向量 + <code>delta</code>。
+    *   函数返回这个 <code>target</code>。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件的核心逻辑就是：</p>
+<blockquote>
+<p>我想让模型在看到“埃菲尔铁塔”时想到“罗马”。
+我不知道该把神经网络里的参数改成啥样，但我可以先算算：<strong>在中间某一层，那个代表“埃菲尔铁塔”的向量，应该被推向哪个方向，才能让最后的输出变成“罗马”？</strong></p>
+</blockquote>
+<p>这个脚本通过一个微型的优化过程（Optimization），算出了这个<strong>“方向和目的地”</strong>（即返回值 <code>target</code>）。</p>
+<p>拿到这个 <code>target</code> 后，MEMIT 算法的后续步骤（不在此文件中）才会去利用这个 <code>target</code> 来反解并更新模型的权重矩阵 $W$。</p>

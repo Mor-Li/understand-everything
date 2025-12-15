@@ -1,0 +1,99 @@
+<h1>easyeditor/models/deco/generate.py</h1>
+<p>这份代码确实比较晦涩，因为它是在 HuggingFace 标准的 <code>generate</code> 函数基础上进行了<strong>魔改</strong>。</p>
+<p>为了让你读懂，我们把它想象成一个<strong>“如何做决策”</strong>的任务。</p>
+<p>通常的语言模型（LLM）生成文本时，只看<strong>最后一层</strong>的输出决定下一个词。而这个文件实现了一种叫 <strong>DeCo (Decoding with Contrastive Optimization)</strong> 的策略（或者类似的变体），它的核心思想是：<strong>不仅听“大脑皮层”（最后一层）的意见，还要听听“潜意识”（中间层）的意见，把两者结合起来决定说什么。</strong></p>
+<p>下面是一个 Task List，带你一步步拆解它的逻辑：</p>
+<hr />
+<h3>Task 1: 搞懂“舞台设置” (函数入口与参数)</h3>
+<p>首先看最外层的 <code>generate</code> 函数。它大部分代码都是在处理 HuggingFace 的标准配置（比如 <code>generation_config</code>, <code>logits_processor</code> 等），这些是“样板代码”，不用深究。</p>
+<p>你需要关注的是这几个<strong>特殊的、非标准的参数</strong>：</p>
+<ul>
+<li><strong><code>early_exit_layers</code> (List[int])</strong>: 这是一个列表，比如 <code>[10, 12, 14]</code>。意思是模型在生成时，不仅要算最后一层的输出，还要把第 10、12、14 层的隐藏状态拿出来看看。</li>
+<li><strong><code>alpha</code> (float)</strong>: 一个权重系数。用来控制“潜意识”（中间层）对最终结果的影响有多大。</li>
+<li><strong><code>lm_head</code> &amp; <code>norm</code></strong>: 这是模型的输出层和归一化层。代码会把中间层的向量也扔进这两个层里，强行把中间层的理解转化为词表的概率（这在学术上叫 Logit Lens 技术）。</li>
+</ul>
+<p><strong>总结：</strong> 这个函数的目的是“带着中间层的意见去生成文本”。</p>
+<hr />
+<h3>Task 2: 核心逻辑拆解 (以贪婪搜索 <code>_deco_greedy_decoding</code> 为例)</h3>
+<p>这是代码最核心的部分。请定位到 <code>_deco_greedy_decoding</code> 函数中的 <code>while True:</code> 循环。这是生成每一个 Token 的过程。</p>
+<p>我们将这个过程拆分为三步：</p>
+<h4>步骤 1：常规思考 (获取最后一层的意见)</h4>
+<p>代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">outputs</span> <span class="o">=</span> <span class="bp">self</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 模型前向传播</span>
+<span class="n">last_layer_tokens_logits</span> <span class="o">=</span> <span class="n">outputs</span><span class="o">.</span><span class="n">logits</span><span class="p">[:,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="p">:]</span> <span class="c1"># 拿到最后一层的 Logits</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：这是标准的 LLM 行为。模型算出了下一个词的概率分布。</li>
+</ul>
+<h4>步骤 2：潜意识探测 (获取中间层的意见)</h4>
+<p>代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">for</span> <span class="n">candidate_premature_layer</span> <span class="ow">in</span> <span class="n">early_exit_layers</span><span class="p">:</span>
+    <span class="n">dict_outputs</span><span class="p">[</span><span class="n">candidate_premature_layer</span><span class="p">]</span> <span class="o">=</span> <span class="n">lm_head</span><span class="p">(</span><span class="n">norm</span><span class="p">(</span>
+        <span class="n">outputs</span><span class="o">.</span><span class="n">hidden_states</span><span class="p">[</span><span class="n">candidate_premature_layer</span><span class="p">]</span>
+    <span class="p">))</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：这里它把我们在 Task 1 里指定的那些“中间层”的隐藏状态，通过 <code>norm</code> 和 <code>lm_head</code> 强行转成了词的概率。它想看看：<strong>如果在这一层就提前结束，模型觉得下一个词该填什么？</strong></li>
+</ul>
+<h4>步骤 3：筛选与融合 (DeCo 的核心魔法)</h4>
+<p>代码段比较长，逻辑如下：</p>
+<ol>
+<li><strong>筛选候选者</strong>：先看最后一层觉得概率最高的几个词（Top-K / Top-P）。<ul>
+<li><em>潜台词：如果是最后一层觉得完全不靠谱的词，我们就直接不看了。</em></li>
+</ul>
+</li>
+<li><strong>寻找最自信的中间层</strong>：<ul>
+<li>代码计算了这些候选词在 <code>early_exit_layers</code> 中的概率。</li>
+<li>它找出哪个中间层对这些候选词最“自信”（概率最高）。</li>
+<li>它选定这个层作为 <code>selected_premature_layer</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>加权修正 (关键公式)</strong>：
+    <code>python
+    final_token_logits = next_token_logits + alpha * premature_max_probs * selected_premature_layer_logits</code></p>
+<ul>
+<li><strong><code>next_token_logits</code></strong>: 最后一层的原始分数。</li>
+<li><strong><code>selected_premature_layer_logits</code></strong>: 选中的那个中间层的分数。</li>
+<li><strong><code>alpha</code></strong>: 调节强度的系数。</li>
+<li><strong>解释</strong>：最终的得分为：<strong>（原本的得分）+ alpha * （中间层的得分）</strong>。</li>
+<li><strong>目的</strong>：如果一个词在最后一层概率还可以，且在中间层（潜意识）里概率特别高，那么它的最终得分会被大大增强。这通常用于<strong>增强生成的连贯性</strong>或者<strong>激活某些特定的知识</strong>。</li>
+</ul>
+</li>
+<li>
+<p><strong>最终决定</strong>：
+    <code>python
+    next_tokens = torch.argmax(final_token_scores, dim=-1)</code></p>
+<ul>
+<li>选出修正后分数最高的那个词作为下一个 Token。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>Task 3: 扩展到其他模式 (Sample 和 Beam Search)</h3>
+<p>代码里还有 <code>_deco_sample_decoding</code> 和 <code>_deco_beam_search</code>。</p>
+<ul>
+<li><strong>Sample Decoding (采样)</strong>：逻辑和上面一样，只是最后一步不是选分数最高的词（Argmax），而是根据分数画一个概率分布，从中<strong>随机抽取</strong>一个词（Multinomial）。这让生成的文本更有创造性。</li>
+<li><strong>Beam Search (束搜索)</strong>：这是最复杂的。它不是每次只留一个最好的，而是保留前 N 个最好的路径（Beams）。<ul>
+<li>代码逻辑依然是：在计算每条路径的分数时，都强行插入了 <code>alpha * 中间层分数</code> 这个修正项。</li>
+<li>它主要是为了让生成的句子整体最优，而不仅仅是当前这就词最优。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 4: 全局总结 (What &amp; Why)</h3>
+<p><strong>这个文件到底在干啥？</strong>
+它重写了 LLM 的生成过程。它不仅仅依赖模型的最终输出，而是<strong>动态地利用模型中间层的激活情况来调整输出</strong>。</p>
+<p><strong>为什么要这么做？</strong>
+根据 <code>easyeditor</code> 这个库名推测，这通常用于：
+1.  <strong>知识编辑/修正</strong>：有时候模型在中间层已经提取了正确知识，但在最后一层被“淹没”了。通过放大中间层的信号（<code>alpha</code>），可以把正确的知识“捞”出来。
+2.  <strong>减少幻觉</strong>：研究表明，模型不同层对事实的确信度不同。这种对比解码（Contrastive Decoding）的方法常被用来提高真实性。</p>
+<h3>你的阅读清单 (简版)</h3>
+<p>如果你想快速看懂，只看 <code>_deco_greedy_decoding</code> 函数即可：
+1.  找到 <code>while True</code> 循环。
+2.  找到 <code>outputs = self(...)</code> （这是开始）。
+3.  找到 <code>for candidate_premature_layer in early_exit_layers</code> （这是偷看中间层）。
+4.  找到 <code>final_token_logits = ... + alpha * ...</code> （这是把两者的意见加在一起）。</p>
+<p>这就是这个 1000 行代码文件的全部精华。</p>

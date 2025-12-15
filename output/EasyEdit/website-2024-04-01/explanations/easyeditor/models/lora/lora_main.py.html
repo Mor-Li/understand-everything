@@ -1,0 +1,83 @@
+<h1>easyeditor/models/lora/lora_main.py</h1>
+<p>这份代码的核心目的是：<strong>利用 LoRA（一种高效微调技术）来“编辑”大模型，让模型学会特定的新知识（比如修正一个错误的问答）。</strong></p>
+<p>你可以把这个过程想象成给模型做一次“微创手术”。我们不修改模型原本的大脑（那样太慢太贵），而是给它贴上一个“外挂补丁”（LoRA），只训练这个补丁。</p>
+<p>为了让你看懂，我把这个代码的执行逻辑拆解成一张 <strong>“任务清单 (Task Todo List)”</strong>，我们按顺序一步步来执行：</p>
+<hr />
+<h3>任务清单：给大模型做一次知识修正手术</h3>
+<h4>✅ Task 1: 手术前准备 (环境与备份)</h4>
+<p><strong>对应的函数：</strong> <code>apply_lora_to_model</code></p>
+<ul>
+<li><strong>场景</strong>：你是主刀医生，病人（Model）推进来了。</li>
+<li><strong>动作</strong>：<ol>
+<li><strong>决定是否保留原件</strong>：参数 <code>copy=True</code>。如果为了安全，先克隆一个一模一样的模型 (<code>deepcopy</code>)，在克隆体上动刀，防止把原模型搞坏。</li>
+<li><strong>呼叫执行团队</strong>：准备好后，调用核心干活的函数 <code>execute_lora</code> 开始手术。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 2: 安装“外挂” (配置 LoRA)</h4>
+<p><strong>对应的函数：</strong> <code>execute_lora</code> (前半部分)</p>
+<ul>
+<li><strong>场景</strong>：手术开始。我们要给模型装上 LoRA 适配器。</li>
+<li><strong>代码解读</strong>：<ul>
+<li><code>model.config.use_cache = False</code>：关闭缓存，因为我们要训练，开启缓存会省显存但影响反向传播。</li>
+<li><code>Config = LoraConfig</code>：读取 LoRA 的配置（比如 rank 大小，影响补丁的容量）。</li>
+<li><strong>关键点</strong>：<code>peft_model = get_peft_model(model, peft_config)</code>。<ul>
+<li>这就是“魔法”发生的地方。<code>peft</code> 库会冻结模型原本的参数，只在旁边挂上小型的可训练参数矩阵。以后所有的训练都只针对这些小参数。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 准备教材 (处理输入数据)</h4>
+<p><strong>对应的函数：</strong> <code>execute_lora</code> (中间的数据处理循环)</p>
+<ul>
+<li><strong>场景</strong>：你要教模型什么新知识？比如：“美国总统是谁？” -&gt; “特朗普”。</li>
+<li><strong>代码解读</strong>：<ul>
+<li><code>requests</code>：这是一个列表，里面装着你要改的知识点（Prompt 是问题，Target 是新答案）。</li>
+<li><code>chunks(texts, ...)</code>：如果知识点很多，不能一口气塞进去，要分批次（Batch）喂给模型。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 制定评分标准 (Loss 计算与 Masking)</h4>
+<p><strong>对应的函数：</strong> 循环中的 <code>if 't5' in ... else ...</code> 部分</p>
+<ul>
+<li><strong>场景</strong>：这是最难读懂的部分。你需要告诉模型：“只许学答案，不要学问题”。</li>
+<li><strong>核心逻辑（Causal LM 分支，即 GPT 类模型）</strong>：<ol>
+<li><strong>拼接</strong>：把问题和答案拼在一起变成一句话。例如 <code>[问题: 谁是超人? 答案: 克拉克]</code>。</li>
+<li><strong>Masking (遮盖)</strong>：这是代码中 <code>tokens["labels"][...prompt...] = mask_token</code> 做的事。<ul>
+<li>我们在计算误差（Loss）时，把“问题部分”设为 <code>-100</code>（PyTorch 中代表忽略）。</li>
+<li><strong>为什么？</strong> 因为我们不希望模型去预测“谁是超人”，那是已知的提示词。我们只希望模型看到“谁是超人”后，能准确预测出后面的“克拉克”。</li>
+</ul>
+</li>
+<li><strong>输入模型</strong>：<code>pred = peft_model(**tokens)</code>。模型尝试根据上文预测下文。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 5: 训练与修正 (反向传播)</h4>
+<p><strong>对应的函数：</strong> 循环底部的 <code>loss.backward()</code> 和 <code>opt.step()</code></p>
+<ul>
+<li><strong>场景</strong>：模型回答错了，或者不够自信，我们要打它手板，让它改参数。</li>
+<li><strong>动作</strong>：<ol>
+<li><code>loss = pred.loss</code>：计算模型预测的答案和标准答案差多少。</li>
+<li><code>loss.backward()</code>：算出为了减小误差，参数该怎么调（计算梯度）。</li>
+<li><code>opt.step()</code>：正式修改 LoRA “外挂”里的参数。</li>
+<li>重复这个过程 <code>hparams.num_steps</code> 次（比如训练 30 轮），直到教会为止。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 6: 手术完成 (返回模型)</h4>
+<p><strong>对应的函数：</strong> <code>return peft_model</code></p>
+<ul>
+<li><strong>场景</strong>：训练结束，外挂已经调教好了。</li>
+<li><strong>动作</strong>：把带着 LoRA 外挂的模型返回给用户。现在这个模型在回答特定问题时，就会启用外挂里的新知识。</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底在干啥？</h3>
+<p>简单说，这段代码就是一个<strong>微型训练器</strong>。</p>
+<ol>
+<li>它<strong>不</strong>训练整个大模型（太慢）。</li>
+<li>它用 <strong>LoRA</strong> 这种技术，给模型挂个“小背包”。</li>
+<li>它把你要修改的知识（Prompt + Target）构造成训练数据。</li>
+<li>它利用 <strong>Masking</strong> 技术，强迫模型只学习“如何生成目标答案”。</li>
+<li>它通过几次循环迭代，把这个“小背包”训练好，从而实现对模型知识的编辑。</li>
+</ol>

@@ -1,0 +1,133 @@
+<h1>easyeditor/models/serac/serac_main.py</h1>
+<p>这份代码确实容易让人困惑，因为它里面包含了很多<strong>注释掉的废弃代码</strong>（看起来是从别的算法比如 MEND 复制过来的），而且它分为“纯文本”和“多模态（图片+文本）”两个部分。</p>
+<p>简单来说，这个文件的作用是 <strong>SERAC 算法的“执行官”</strong>。它的核心任务是：<strong>加载一个训练好的 SERAC 模型（补丁），然后用它来处理用户的“修改模型知识”的请求。</strong></p>
+<p>SERAC 的核心思想不是直接修改大模型的神经元，而是<strong>外挂</strong>一个小模型。当问题进来时，SERAC 判断是否需要“纠正”，如果需要，就由外挂模型输出新答案。</p>
+<p>为了让你看懂，我把你当成这个程序的<strong>执行官</strong>，列一个你的 <strong>Task To-Do List（任务清单）</strong>，我们一步步来看代码是怎么完成这些任务的。</p>
+<hr />
+<h3>📋 SERAC 执行官的任务清单</h3>
+<ol>
+<li><strong>准备阶段 (Init)</strong>: 穿好装备，加载那个“外挂”模型（Classifier 和 Counterfactual Model）。</li>
+<li><strong>接单阶段 (Request)</strong>: 收到用户的修改请求（比如：“把‘美国总统’从‘拜登’改成‘特朗普’”）。</li>
+<li><strong>翻译阶段 (Tokenize)</strong>: 把用户的文字（或图片）翻译成机器能懂的数字（Tensor）。</li>
+<li><strong>执行阶段 (Edit)</strong>: 也就是核心步骤，把数据喂给 SERAC 算法，让它记住这个新知识。</li>
+<li><strong>收尾阶段 (Return)</strong>: 返回处理好的新模型。</li>
+</ol>
+<hr />
+<h3>📝 逐步代码讲解</h3>
+<p>下面我按照上面的清单，带你读代码（我会忽略掉那些被注释掉的、不运行的干扰代码）。</p>
+<h4>1. 准备阶段：<code>init_model</code></h4>
+<p>这是类 <code>SeracRewriteExecutor</code> 中的方法。</p>
+<ul>
+<li><strong>你的任务</strong>：大模型（如 GPT）本身是不动的，你需要加载 SERAC 的专用权重（<code>.archive</code> 文件），这相当于给大模型装一个“外挂”。</li>
+<li><strong>代码解读</strong>：
+    ```python
+    def init_model(self, model, tok, params: SERACHparams):
+        # 必须要有训练好的权重文件路径
+        assert params.archive is not None ...<div class="codehilite"><pre><span></span><code><span class="c1"># 设置分词器的填充方式</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">model</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tok</span>
+<span class="c1"># ... (设置 padding)</span>
+
+<span class="c1"># 【关键点】初始化 SERAC 算法模块</span>
+<span class="c1"># SERAC(...) 是核心算法类，这里把大模型传进去</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">alg</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">SERAC</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">,</span><span class="w"> </span><span class="n">deepcopy</span><span class="p">(</span><span class="n">params</span><span class="p">),</span><span class="w"> </span><span class="n">lambda</span><span class="p">:</span><span class="w"> </span><span class="n">deepcopy</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">))</span>
+
+<span class="c1"># 【关键点】加载外挂模型的权重</span>
+<span class="n">d</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">torch</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">params</span><span class="o">.</span><span class="n">archive</span><span class="p">,</span><span class="w"> </span><span class="n">map_location</span><span class="o">=</span><span class="s1">&#39;cpu&#39;</span><span class="p">)</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">alg</span><span class="o">.</span><span class="n">load_state_dict</span><span class="p">(</span><span class="n">d</span><span class="p">[</span><span class="s2">&quot;model&quot;</span><span class="p">],</span><span class="w"> </span><span class="n">False</span><span class="p">)</span>
+
+<span class="c1"># 把外挂模型放到 GPU 上</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">alg</span><span class="o">.</span><span class="n">replacement</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="o">...</span><span class="p">)</span><span class="w"> </span>
+<span class="bp">self</span><span class="o">.</span><span class="n">alg</span><span class="o">.</span><span class="n">classifier</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+<span class="bp">self</span><span class="o">.</span><span class="n">is_init</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">True</span>
+</code></pre></div>
+
+<p>```
+<strong>人话总结</strong>：不管是修 GPT 还是 LLaMA，这里先把用来“打补丁”的 SERAC 小模型加载进来，准备干活。</p>
+</li>
+</ul>
+<h4>2. 接单与翻译阶段：<code>apply_to_model</code> (前半部分)</h4>
+<p>这是 <code>apply_to_model</code> 函数的开始部分。</p>
+<ul>
+<li><strong>你的任务</strong>：用户发来一个 <code>requests</code> 列表，里面包含了 <code>prompt</code>（提示词）和 <code>target_new</code>（新目标）。你需要把它们拼起来，并变成 Tensor。</li>
+<li><strong>代码解读</strong>：
+    ```python
+    def apply_to_model(self, model, tok, requests, ...):
+        # 如果没初始化，先执行上面的 init
+        if not self.is_init:
+            self.init_model(model, tok, hparams)<div class="codehilite"><pre><span></span><code><span class="err">#</span><span class="w"> </span><span class="mf">1.</span><span class="w"> </span><span class="n">拼接字符串</span>
+<span class="err">#</span><span class="w"> </span><span class="n">targets</span><span class="w"> </span><span class="n">是新答案</span><span class="err">，</span><span class="n">sentences</span><span class="w"> </span><span class="n">是</span><span class="w"> </span><span class="ss">&quot;问题 + 新答案&quot;</span>
+<span class="n">targets</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">[</span><span class="n"> ... request[&quot;target_new&quot;</span><span class="o">]</span><span class="w"> </span><span class="p">...</span><span class="w"> </span><span class="err">]</span><span class="w"> </span>
+<span class="n">sentences</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">[</span><span class="n">request[&quot;prompt&quot;</span><span class="o">]</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">targets</span><span class="o">[</span><span class="n">i</span><span class="o">]</span><span class="w"> </span><span class="p">...</span><span class="err">]</span>
+
+<span class="err">#</span><span class="w"> </span><span class="mf">2.</span><span class="w"> </span><span class="err">【</span><span class="n">关键点</span><span class="err">】</span><span class="n">Tokenization</span><span class="w"> </span><span class="p">(</span><span class="n">翻译成数字</span><span class="p">)</span>
+<span class="err">#</span><span class="w"> </span><span class="n">把完整的句子变成</span><span class="w"> </span><span class="n">input_ids</span>
+<span class="n">sent_tok</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">self</span><span class="p">.</span><span class="n">tokenizer</span><span class="p">(</span><span class="n">sentences</span><span class="p">,</span><span class="w"> </span><span class="p">...).</span><span class="k">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+<span class="err">#</span><span class="w"> </span><span class="n">把目标答案变成</span><span class="w"> </span><span class="n">label_ids</span>
+<span class="n">label_tok</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">self</span><span class="p">.</span><span class="n">tokenizer</span><span class="p">(</span><span class="o">[</span><span class="n">req[&quot;target_new&quot;</span><span class="o">]</span><span class="p">...</span><span class="err">]</span><span class="p">,</span><span class="w"> </span><span class="p">...).</span><span class="k">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+</code></pre></div>
+
+<p><code>``
+**人话总结**：把用户想让模型学会的话（比如“埃隆马斯克是推特的CEO”）整理好，变成电脑能读懂的</code>input_ids`。</p>
+</li>
+</ul>
+<h4>3. 执行阶段：<code>apply_to_model</code> (核心部分)</h4>
+<p>这是该函数中间真正干活的地方。</p>
+<ul>
+<li><strong>你的任务</strong>：调用 SERAC 算法，告诉它：“嘿，记住这个输入对应的输出应该是这个”。</li>
+<li>
+<p><strong>代码解读</strong>：
+    ```python
+    # 构造输入字典
+    edit_inner = dict(
+        input_ids=sent_tok["input_ids"],
+        attention_mask=sent_tok["attention_mask"],
+        labels=label_tok["input_ids"], # 告诉它正确答案是什么
+    )
+    # 条件输入（用于判断 scope）
+    cond = {k: sent_tok[k] for k in ["input_ids", "attention_mask"]}</p>
+<h1>【核心动作】调用算法的 edit 方法</h1>
+<h1>注意：这里有几十行被注释掉的代码（factors = ...），那是 MEND 算法修改权重用的。</h1>
+<h1>SERAC 不需要直接改大模型权重，它通常是把这个样本存到缓存里，或者微调外挂模型。</h1>
+<p>new_model, model_info = self.alg.edit(edit_inner, cond)
+<code>``
+**人话总结**：这里调用了</code>self.alg.edit<code>。对于 SERAC 来说，这一步通常是在它的“小本本”（Cache）上记下来：以后遇到类似</code>cond<code>的问题，要输出</code>labels<code>里的答案。它**没有**去修改</code>self.model` 原始大模型的参数（不像 ROME 或 MEND 那样计算梯度去改权重）。</p>
+</li>
+</ul>
+<h4>4. 多模态特供版：<code>SeracMultimodalRewriteExecutor</code></h4>
+<p>文件下半部分还有一个类。</p>
+<ul>
+<li><strong>你的任务</strong>：如果用户不仅给了文字，还给了<strong>图片</strong>（比如 MiniGPT-4 模型），处理流程稍微不一样。</li>
+<li>
+<p><strong>代码解读</strong>：</p>
+<ul>
+<li>继承自上面的类，逻辑类似。</li>
+<li>区别在于处理数据时，多处理了一个 <code>image</code>：
+```python</li>
+</ul>
+<h1>提取图片</h1>
+<p>image = [request["image"] for request in requests]
+image = torch.stack(image, dim=0) # 堆叠图片张量</p>
+<h1>构造输入</h1>
+<p>edit_inner = dict(
+    image=image,          # 多了图片
+    text_input=text_input,
+    labels=labels,
+    prompts_len=prompts_len
+)</p>
+<h1>同样调用 edit</h1>
+<p>new_model, model_info = self.alg.edit(edit_inner,)
+```</p>
+</li>
+</ul>
+<hr />
+<h3>💡 总结文中的核心观点</h3>
+<p>这个文件本身不包含“观点”，它是一个<strong>工程实现</strong>。但它体现了 SERAC 这种编辑方法的特点：</p>
+<ol>
+<li><strong>非破坏性</strong>：你看不到 <code>loss.backward()</code> 或者直接修改 <code>model.parameters()</code> 的代码（注释掉的不算）。SERAC 也是通过 <code>alg.edit</code> 内部机制（通常是缓存机制）来生效的，这保护了原始模型不被破坏。</li>
+<li><strong>外挂机制</strong>：<code>init_model</code> 里必须要加载 <code>archive</code>，说明 SERAC 严重依赖预先训练好的辅助模型（Classifier + Replacement Model）。</li>
+<li><strong>即插即用</strong>：只要初始化好了，来一个 request 就能处理一个，不需要重新训练整个大模型。</li>
+</ol>
+<p><strong>一句话概括这个文件：</strong>
+这是 SERAC 算法的<strong>操作台</strong>，它负责把用户的修改指令（文本或图片）打包好，扔给 SERAC 核心算法去处理，让模型“假装”学会了新知识。</p>

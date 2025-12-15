@@ -1,0 +1,104 @@
+<h1>easyeditor/models/melo/peft_egg/src/peft/tuners/adaption_prompt.py</h1>
+<p>这份代码实现了一种叫做 <strong>Adaption Prompt (通常指 LLaMA-Adapter)</strong> 的微调技术。</p>
+<p>简单来说，它的核心思想是：<strong>不要重新训练整个大模型，而是在模型的高层（靠近输出的层）的注意力机制（Attention）中，强行插入一些“可学习的提示词向量”，让模型学会新的任务。</strong></p>
+<p>为了让你看懂，我把这份代码的逻辑拆解成一个 <strong>“开发任务清单 (Todo List)”</strong>，我们模拟一下作者是如何一步步实现这个功能的。</p>
+<hr />
+<h3>任务清单：实现 LLaMA-Adapter 微调器</h3>
+<h4>Phase 1: 准备工作 (搞定 LLaMA 的特殊数学计算)</h4>
+<p>LLaMA 模型有一种特殊的“旋转位置编码 (RoPE)”。为了计算 Attention，我们需要获取中间变量 <code>Query</code> (查询向量)。但 HuggingFace 的原始代码不直接返回这个，所以我们需要手动算一遍。</p>
+<ul>
+<li><strong>Task 1.1: 抄写 LLaMA 的旋转编码逻辑</strong><ul>
+<li><code>llama_rotate_half</code>: 把向量切两半翻转一下（RoPE 的数学操作）。</li>
+<li><code>llama_apply_rotary_pos_emb</code>: 给 Query 加上位置信息。</li>
+</ul>
+</li>
+<li><strong>Task 1.2: 重新计算 Query 状态</strong><ul>
+<li><code>llama_compute_query_states</code>: 这是个关键辅助函数。因为我们需要拿原本的输入 <code>hidden_states</code>，重新过一遍 <code>q_proj</code> 层，再手动加上位置编码，算出当前的 <code>Query</code>。</li>
+<li><strong>目的</strong>：后面我们要用这个 <code>Query</code> 去查询我们需要插入的“提示词”。</li>
+</ul>
+</li>
+</ul>
+<h4>Phase 2: 定义配置 (我们要插入什么样的补丁？)</h4>
+<p>我们需要一个配置文件来告诉程序，我们要把提示词插在哪里，插多长。</p>
+<ul>
+<li><strong>Task 2.1: 定义配置类</strong><ul>
+<li><code>AdaptionPromptConfig</code>: <ul>
+<li><code>adapter_len</code>: 插入的提示词长度是多少（比如 10 个 token）。</li>
+<li><code>adapter_layers</code>: 插在模型的哪几层（通常是最后几层，比如最后 30 层）。</li>
+<li><code>target_modules</code>: 目标模块的名字（LLaMA 里通常叫 <code>self_attn</code>）。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>Phase 3: 核心逻辑 (制造“特洛伊木马”)</h4>
+<p>这是代码里最难懂、但最核心的部分：<code>AdaptedAttention</code> 类。
+我们要写一个新的 Attention 层，把原始的 Attention 层<strong>包裹</strong>在里面，然后偷偷加上我们的私货。</p>
+<ul>
+<li>
+<p><strong>Task 3.1: 初始化“私货” (Parameters)</strong></p>
+<ul>
+<li><code>self.adaption_prompt</code>: 这是一个随机初始化的向量，形状是 <code>[1, adapter_len, hidden_size]</code>。这就是我们要训练的“知识”。</li>
+<li><code>self.adaption_gate</code>: <strong>门控机制</strong>。初始化为 <strong>0</strong>。这很重要！<ul>
+<li><em>为什么是0？</em> 刚开始训练时，门关着，模型表现和原始模型一模一样（Zero-init），保证训练稳定，然后慢慢打开门让新知识进来。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 3.2: 劫持 Forward 传播</strong></p>
+<ul>
+<li><strong>Step A: 跑原始模型</strong>。先调用 <code>self.model(**kwargs)</code>，让原始的 Attention 算出结果 <code>output</code>。</li>
+<li><strong>Step B: 处理提示词</strong>。把我们的 <code>adaption_prompt</code> 扔进模型的 K (Key) 和 V (Value) 投影层，变成 <code>adapter_k</code> 和 <code>adapter_v</code>。</li>
+<li><strong>Step C: 计算新注意力</strong>。<ul>
+<li>拿 Task 1.2 算出来的 <code>Query</code>，去和 <code>adapter_k</code> 做矩阵乘法。</li>
+<li>这步的意思是：<em>“看看当前输入的 Query，和我们插入的提示词有多大的关联？”</em></li>
+</ul>
+</li>
+<li><strong>Step D: 加权求和</strong>。<ul>
+<li>算出分数后，乘以 <code>adaption_gate</code> (那个门)。</li>
+<li>再乘以 <code>adapter_v</code>。</li>
+<li>最后经过 <code>o_proj</code> (输出层)。</li>
+</ul>
+</li>
+<li><strong>Step E: 融合</strong>。<ul>
+<li><code>output = output + adapter_output</code>。</li>
+<li>把原始结果加上我们算出来的“补丁结果”，作为最终输出。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>Phase 4: 管理员 (把补丁打进大模型)</h4>
+<p>最后，我们需要一个总管类 <code>AdaptionPromptModel</code> 来负责把上面做好的 <code>AdaptedAttention</code> 塞进原本的 LLM 里。</p>
+<ul>
+<li><strong>Task 4.1: 找到目标层</strong><ul>
+<li>遍历模型的所有层，找到最后 <code>adapter_layers</code> 层（比如最后 30 层的 Attention 模块）。</li>
+</ul>
+</li>
+<li><strong>Task 4.2: 偷梁换柱 (Swapping)</strong><ul>
+<li><code>_create_adapted_attentions</code>: <ol>
+<li>把原始模型的 Attention 层取出来。</li>
+<li>用 <code>AdaptedAttention</code> 把它包起来。</li>
+<li>把这个包好的新层，塞回模型里去。</li>
+</ol>
+</li>
+</ul>
+</li>
+<li><strong>Task 4.3: 冻结参数 (Freezing)</strong><ul>
+<li><code>_mark_only_adaption_prompts_as_trainable</code>: <ul>
+<li>把大模型原本几百亿个参数全部锁死 (<code>requires_grad = False</code>)。</li>
+<li>只允许我们要插入的 <code>adaption_prompt</code> 和 <code>adaption_gate</code> 进行更新。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底在干嘛？</h3>
+<ol>
+<li><strong>它不改动模型原本的权重</strong>，而是像“寄生虫”一样，寄生在模型的 Attention 层上。</li>
+<li>它在每次做 Attention 计算时，除了看原本的上下文，还会<strong>多看一眼</strong>我们训练好的 <code>adaption_prompt</code>。</li>
+<li>通过一个<strong>初始化为 0 的门</strong>，控制这个 <code>prompt</code> 对结果的影响，让微调过程非常丝滑。</li>
+</ol>
+<p>你看代码的时候，重点看 <strong><code>AdaptedAttention</code> 类的 <code>forward</code> 函数</strong>，那里就是整个算法的灵魂。其他的代码大多是在做原来 LLaMA 架构的兼容和模块替换工作。</p>

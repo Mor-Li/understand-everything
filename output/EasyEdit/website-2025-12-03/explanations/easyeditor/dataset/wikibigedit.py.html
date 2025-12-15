@@ -1,0 +1,66 @@
+<h1>easyeditor/dataset/wikibigedit.py</h1>
+<p>这份代码定义了一个名为 <code>WikiBigEditDataset</code> 的类。简单来说，它的作用是<strong>为“大模型知识编辑”（Model Editing）任务准备数据</strong>。</p>
+<p>你可以把它想象成一家餐厅的<strong>“备菜员”</strong>。原始的食材（JSON数据文件）运进来，备菜员需要清洗、切好、分类，最后打包成厨师（模型训练器）可以直接下锅的格式。</p>
+<p>为了让你听懂，我把这个类的运行逻辑拆解成一个 <strong>Task Todo List（任务清单）</strong>，我们一步步来看它做了什么。</p>
+<hr />
+<h3>Task Todo List (备菜员的任务清单)</h3>
+<ol>
+<li><strong>准备工具 (<code>__init__</code> - 配置部分)</strong>：根据配置单，准备好切菜的刀（Tokenizer）。</li>
+<li><strong>读取食材 (<code>__init__</code> - 加载部分)</strong>：打开冰箱（文件路径），把原始数据（JSON）拿出来。</li>
+<li><strong>清洗分类 (<code>__init__</code> - 处理部分)</strong>：把原始数据整理成统一的格式，比如哪部分是“问题”，哪部分是“新答案”。</li>
+<li><strong>按需取菜 (<code>__getitem__</code>)</strong>：当厨师喊“来一份数据”时，递给他一份整理好的数据。</li>
+<li><strong>打包上桌 (<code>collate_fn</code> / <code>collate_gpt_fn</code>)</strong>：这是最重要的一步。当厨师一次要煮一锅（Batch）时，把这些文字数据转换成电脑能看懂的数字（Tensor），并区分是给普通模型用，还是给 GPT 这种生成式模型用。</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>1. 准备工具 (配置 Tokenizer)</h4>
+<p><strong>代码位置</strong>：<code>__init__</code> 方法的前半部分。</p>
+<ul>
+<li><strong>任务</strong>：模型看不懂中文或英文，只看得懂数字。我们需要一个 Tokenizer（分词器）把字变成数字。</li>
+<li><strong>细节</strong>：<ul>
+<li>代码检查了配置里的 <code>tokenizer_name</code>。</li>
+<li><strong>特殊处理</strong>：它专门检查了是不是 <code>GPT2</code>、<code>Llama</code> 或 <code>Qwen</code> (千问) 模型。</li>
+<li><strong>为什么？</strong> 这些模型在处理“填空题”或“续写题”时，对空白填充（Padding）的位置有特殊要求（比如 <code>padding_side = 'left'</code>，即左侧填充，方便模型从右边开始生成新内容）。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 读取与清洗食材 (加载 JSON)</h4>
+<p><strong>代码位置</strong>：<code>__init__</code> 方法的后半部分 (从 <code>with open(zsre_loc, "r")</code> 开始)。</p>
+<ul>
+<li><strong>任务</strong>：从硬盘读取 <code>WikiBigEdit</code> 这个数据集文件。</li>
+<li><strong>观点</strong>：<ul>
+<li>它遍历了原始数据 <code>raw</code>，构建了一个新的列表 <code>data</code>。</li>
+<li>它把数据标准化了。比如把原始的 <code>"update"</code> 改名为 <code>"prompt"</code> (提示词)，把 <code>"ans"</code> 改名为 <code>"target_new"</code> (新的目标答案)。</li>
+<li><strong>核心字段解释</strong>：<ul>
+<li><code>prompt</code>: 比如 "美国现在的总统是谁？"</li>
+<li><code>target_new</code>: 比如 "特朗普" (假设我们要把知识修改成这个)。</li>
+<li><code>ground_truth</code>: 比如 "拜登" (原本的正确答案)。</li>
+<li><code>locality</code> (局部性): 这是知识编辑很重要的概念。比如改了美国总统，不能让模型把“法国总统”也搞错。这个字段用来测试模型有没有“改坏了”别的地方。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>3. 打包上桌 (Collate Functions)</h4>
+<p>这是最难懂的部分，因为它涉及把文字转成 PyTorch 的张量（Tensor）。这里有两个函数，分别对应两种不同的“烹饪方式”。</p>
+<p><strong>方式 A: <code>collate_fn</code> (通用打包)</strong>
+*   <strong>适用场景</strong>：通常用于 Encoder-Decoder 模型（如 T5）或者特定的编辑算法（如 MEND）。
+*   <strong>逻辑</strong>：
+    1.  把 <code>prompt</code> (问题) 和 <code>target_new</code> (新答案) <strong>分开</strong> 编码。
+    2.  <code>src</code> (Source) 是输入，<code>trg</code> (Target) 是标签。
+    3.  <strong>Localtiy (局部性检查)</strong>：它也会把用于检查副作用的数据 (<code>loc</code>) 打包好。
+    4.  <strong>返回结果</strong>：返回一个字典，里面包含 <code>edit_inner</code>（用于训练编辑的数据）和 <code>loc</code>（用于评估副作用的数据）。</p>
+<p><strong>方式 B: <code>collate_gpt_fn</code> (GPT 专用打包)</strong>
+*   <strong>适用场景</strong>：GPT、Llama 等 Decoder-only 模型。
+*   <strong>逻辑</strong>：
+    1.  <strong>拼接</strong>：这是与上面最大的不同。GPT 是通过上文预测下文的。
+    2.  代码执行了 <code>src_ + ' ' + trg_</code>。它把“问题”和“新答案”拼成了一句话。
+        *   <em>例子</em>：把 "美国总统是" 和 "特朗普" 拼成 "美国总统是 特朗普"。
+    3.  <strong>Label Masking</strong>：虽然输入是整句话，但我们只希望模型学习“特朗普”这部分，不希望它重新学习“美国总统是”。所以代码里用 <code>get_edit_labels</code> 把问题部分的标签设为 <code>-100</code>（在 PyTorch 里，-100 意味着“计算误差时忽略我”）。</p>
+<h3>总结文中的核心观点</h3>
+<p>这个脚本其实就表达了 <strong>EasyEditor</strong> 对数据的三个核心看法：</p>
+<ol>
+<li><strong>数据需要标准化</strong>：无论原始数据长什么样，进来后都要变成 <code>prompt</code> (输入) 和 <code>target_new</code> (编辑目标) 这种格式。</li>
+<li><strong>模型架构决定数据格式</strong>：GPT 类模型（Decoder-only）和普通模型的数据处理方式必须分开（一个拼接，一个分开）。</li>
+<li><strong>编辑不仅是修改，还要防崩</strong>：代码里花了很大篇幅处理 <code>locality</code> (loc) 数据。这说明在知识编辑任务中，<strong>“不改坏原本正确的东西”和“学会新知识”一样重要</strong>。</li>
+</ol>

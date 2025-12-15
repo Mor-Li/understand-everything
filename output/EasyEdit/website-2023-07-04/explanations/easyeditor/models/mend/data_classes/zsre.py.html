@@ -1,0 +1,110 @@
+<h1>easyeditor/models/mend/data_classes/zsre.py</h1>
+<p>这份代码确实比较抽象，因为它不仅仅是加载数据，还是为了<strong>MEND (Model Editor Networks with Gradient Decomposition)</strong> 这个特定的模型编辑算法服务的。</p>
+<p>简单来说，这个文件的作用是：<strong>准备“知识编辑”的数据，把模型从“旧知识”训练成“新知识”，同时保证不忘记“无关知识”。</strong></p>
+<p>为了让你看懂，我把阅读这份代码拆解成一个 <strong>Task List（任务清单）</strong>，我们可以一步步勾选来理解它的逻辑。</p>
+<hr />
+<h3>Task 1: 理解原材料 (数据初始化)</h3>
+<p><strong>目标</strong>：看懂 <code>__init__</code> 函数，知道我们在处理什么样的数据。</p>
+<ul>
+<li><strong>背景</strong>：ZsRE 是一个问答数据集（例如：“哈利波特的作者是谁？” -&gt; “JK罗琳”）。但在模型编辑任务中，我们想强行修改模型的认知（例如：把“哈利波特作者”改成“张三”）。</li>
+<li><strong>代码逻辑</strong>：<ol>
+<li>读取 <code>jsonlines</code> 文件。</li>
+<li><strong>筛选 (Extract)</strong>：对于每一条数据，它提取了：<ul>
+<li><code>input</code>: 问题（原句）。</li>
+<li><code>prediction</code>: 模型原本预测的答案（旧知识）。</li>
+<li><code>alternatives</code>: 我们希望模型学会的新答案（新知识/编辑目标）。</li>
+<li><code>filtered_rephrases</code>: 问题的改写（意思一样但说法不同，用来测试模型是不是真的懂了，而不是死记硬背）。</li>
+</ul>
+</li>
+<li><strong>清洗</strong>：如果一条数据没有“新答案”或者没有“改写句”，就丢掉，因为没法用来训练编辑能力。</li>
+<li><strong>NQDataset (可选)</strong>：代码里提到了 <code>self.nq</code>。这是为了引入“无关数据”（Natural Questions）。目的是告诉模型：“你要改哈利波特的作者，但不要把‘中国的首都是哪’给搞忘了”。这叫<strong>Locality（局部性/防遗忘）</strong>。</li>
+</ol>
+</li>
+</ul>
+<h3>Task 2: 抽取单个样本 (定义编辑任务)</h3>
+<p><strong>目标</strong>：看懂 <code>__getitem__</code> 函数，知道一次编辑包含哪些要素。</p>
+<ul>
+<li><strong>核心逻辑</strong>：<ul>
+<li><code>src</code>: 原始问题。</li>
+<li><code>alt</code>: <strong>新目标</strong>（从 <code>alternatives</code> 里随机选一个）。这是我们想注入的新知识。</li>
+<li><code>rephrase</code>: <strong>泛化测试</strong>（从 <code>rephrases</code> 里随机选一个）。如果模型学会了 <code>src</code> -&gt; <code>alt</code>，它也应该能做到 <code>rephrase</code> -&gt; <code>alt</code>。</li>
+<li><code>cond</code>: <strong>条件输入</strong>。这是 MEND 算法特有的格式。<ul>
+<li>格式：<code>旧预测 &gt;&gt; 新目标 || 原始问题</code>。</li>
+<li>作用：提示 MEND 网络，“我要把针对这个问题的答案从旧的改成新的”。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h3>Task 3: 打包成批次 (Tokenization)</h3>
+<p><strong>目标</strong>：看懂 <code>collate_fn</code>，知道文本是怎么变成张量（Tensor）的。</p>
+<ul>
+<li><strong>核心逻辑</strong>：<ul>
+<li>把一堆文本（src, trg, cond, rephrase）全部扔进 <code>tokenizer</code> 变成数字 ID。</li>
+<li><strong>注意 <code>trg</code> (Target) 的构造</strong>：<ul>
+<li>对于<strong>无关样本</strong>（Locality），目标就是原答案（不许变）。</li>
+<li>对于<strong>编辑样本</strong>（Edit），目标是 <code>alt</code>（新答案）。</li>
+</ul>
+</li>
+<li>这里处理了 padding（补零）和截断，保证大家长度一致。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 4: 构造训练流 (核心难点)</h3>
+<p><strong>目标</strong>：看懂 <code>edit_generator</code>，这是 MEND 训练最复杂的部分。</p>
+<p>MEND 是一种 Meta-Learning（元学习）算法，它需要把数据分成特殊的结构。</p>
+<ul>
+<li>
+<p><strong>步骤 1: 采样 (Sampler)</strong></p>
+<ul>
+<li>使用 <code>EditBatchSampler</code>。它会同时抓取“要编辑的样本”和“要保持不变的样本（Locality）”。</li>
+</ul>
+</li>
+<li>
+<p><strong>步骤 2: 拆分数据 (The Split)</strong>
+    代码生成了一个包含四个部分的字典，这是理解全文的关键：</p>
+<ol>
+<li>
+<p><strong><code>edit_inner</code> (内层循环数据)</strong>：</p>
+<ul>
+<li><strong>含义</strong>：用来计算梯度的“草稿”。</li>
+<li><strong>内容</strong>：原始问题 (<code>src</code>) + 新答案 (<code>alt</code>)。</li>
+<li><strong>目的</strong>：告诉模型“我想让你把这个问题回答成这个新答案”。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>edit_outer</code> (外层循环数据)</strong>：</p>
+<ul>
+<li><strong>含义</strong>：用来验证编辑效果并真正更新参数的数据。</li>
+<li><strong>内容</strong>：<strong>改写后的问题</strong> (<code>rephrase</code>) + 新答案 (<code>alt</code>)。</li>
+<li><strong>目的</strong>：模型不仅要背下原句，还要对改写句生效。如果 <code>edit_inner</code> 的梯度更新后，<code>edit_outer</code> 的预测也变对了，说明编辑很成功。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>loc</code> (Locality/无关数据)</strong>：</p>
+<ul>
+<li><strong>含义</strong>：用来防止模型“变傻”的数据。</li>
+<li><strong>内容</strong>：完全不相关的问题（来自 NQ 数据集或 ZsRE 的其他数据）+ 它们的原始正确答案。</li>
+<li><strong>目的</strong>：计算 Loss 时，强迫模型在这些无关问题上保持原样。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>cond</code> (Conditioning/条件)</strong>：</p>
+<ul>
+<li><strong>含义</strong>：MEND 网络的额外输入。</li>
+<li><strong>内容</strong>：上面提到的 <code>旧 &gt;&gt; 新 || 问题</code> 字符串。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h3>总结：这个文件到底产出了什么？</h3>
+<p>如果你运行这个 <code>edit_generator</code>，每次你会得到一个字典 <code>batch</code>，里面装着：</p>
+<ol>
+<li><strong>"请把这个改了"</strong> (<code>edit_inner</code>: 原句+新答案)</li>
+<li><strong>"测测你改没改好"</strong> (<code>edit_outer</code>: 改写句+新答案)</li>
+<li><strong>"别把这个改坏了"</strong> (<code>loc</code>: 无关句+原答案)</li>
+<li><strong>"这是修改说明书"</strong> (<code>cond</code>: 拼接的提示词)</li>
+</ol>
+<p><strong>一句话观点</strong>：
+这个文件是 MEND 模型的<strong>数据流水线</strong>，它不只是简单的“输入-输出”，而是构建了一个<strong>“教学场景”</strong>：教模型如何在看到特定指令（cond）时，修改特定知识（inner），并能举一反三（outer），同时不破坏其他记忆（loc）。</p>

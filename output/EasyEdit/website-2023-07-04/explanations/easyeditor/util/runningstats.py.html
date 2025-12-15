@@ -1,0 +1,97 @@
+<h1>easyeditor/util/runningstats.py</h1>
+<p>这份代码文件 <code>runningstats.py</code> 的核心作用是<strong>“流式统计（Streaming Statistics）”</strong>。</p>
+<p>简单来说，当你的数据量非常大（比如几百 GB 的图片或文本特征），大到无法一次性全部塞进内存（RAM）里时，你如何计算它们的平均值、方差、协方差或者分位数？</p>
+<p>这份代码就是为了解决这个问题：<strong>它允许你一批一批（Batch by Batch）地喂入数据，实时更新统计结果，而不需要保存所有历史数据。</strong></p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“任务清单（Todo List）”</strong>，并一步步解释其中的观点和逻辑。</p>
+<hr />
+<h3>📋 任务清单 (Todo List)</h3>
+<p>如果你要使用这份代码，你的工作流程（以及代码的设计逻辑）是这样的：</p>
+<ol>
+<li><strong>[准备阶段] 选工具</strong>：你想算什么？（平均值？方差？还是中位数？）</li>
+<li><strong>[初始化] 建对象</strong>：创建一个对应的统计器对象。</li>
+<li><strong>[循环执行] 喂数据</strong>：把大数据切成小块，一块一块喂给统计器。</li>
+<li><strong>[偷懒技巧] 设缓存</strong>：如果不希望每次重跑都重新算，就开启缓存功能。</li>
+<li><strong>[收尾] 拿结果</strong>：数据喂完后，直接问统计器要最终结果。</li>
+</ol>
+<hr />
+<h3>📝 逐步详解 (Step-by-Step Logic)</h3>
+<p>下面我按照上面的清单，给你详细讲讲代码里对应的观点和实现方式。</p>
+<h4>第一步：选工具 (The <code>Stat</code> Classes)</h4>
+<p>代码认为，不同的统计需求应该有不同的类来处理，但它们必须遵守统一的规则。</p>
+<ul>
+<li><strong>观点</strong>：所有统计器都应该有一个基类（<code>Stat</code>），并且都必须通过 <code>.add(batch)</code> 方法来接收数据。</li>
+<li><strong>代码对应</strong>：<ul>
+<li><code>Mean</code>：算平均值的。</li>
+<li><code>Variance</code>：算方差和标准差的。</li>
+<li><code>Covariance</code>：算协方差矩阵的（分析特征之间的相关性）。</li>
+<li><code>Quantile</code>：算分位数的（比如中位数，或者前 90% 的数据在哪里）。<em>注：这是一个比较复杂的算法，因为它用近似算法在不排序所有数据的情况下估算分位数。</em></li>
+<li><code>TopK</code>：记录最大的 K 个数。</li>
+<li><code>CombinedStat</code>：<strong>这个很有用</strong>，它是“打包袋”，可以把上面的一堆统计器打包在一起，一次喂数据，同时算出平均值、方差和分位数。</li>
+</ul>
+</li>
+</ul>
+<h4>第二步 &amp; 第三步：初始化与喂数据 (Add Method)</h4>
+<p>这是流式计算的核心。</p>
+<ul>
+<li><strong>观点</strong>：传统的统计是 <code>sum(所有数据) / count(所有数据)</code>。流式统计是“增量更新”。</li>
+<li><strong>逻辑</strong>：<ol>
+<li>你创建一个 <code>m = Mean()</code>。</li>
+<li>来了一批数据 <code>batch1</code>，你调用 <code>m.add(batch1)</code>。内部会记录当前的临时总和及数量。</li>
+<li>又来一批 <code>batch2</code>，你调用 <code>m.add(batch2)</code>。内部利用数学公式（如 Chan's algorithm，一种数值稳定的算法）更新平均值，而不是简单地重新相加，防止精度丢失。</li>
+</ol>
+</li>
+<li><strong>代码细节</strong>：你会发现每个类都有 <code>add(self, x)</code> 方法，这就是在做“消化数据”的工作。</li>
+</ul>
+<h4>第四步：偷懒技巧——缓存 (The <code>tally</code> Function)</h4>
+<p>这是这个文件最“工程化”也是最实用的部分。</p>
+<ul>
+<li><strong>观点</strong>：计算大数据集的统计信息很慢，算过一次就不想算第二次。如果代码重跑，应该直接加载上次存好的结果。</li>
+<li><strong>核心函数 <code>tally(stat, dataset, cache=...)</code></strong>：<ul>
+<li>这是一个辅助函数（Helper function）。</li>
+<li><strong>它的逻辑是</strong>：<ol>
+<li>你给它一个文件名（<code>cache='result.npz'</code>）。</li>
+<li>它先检查硬盘上有没有这个文件。</li>
+<li><strong>如果有</strong>：直接读取文件，填入 <code>stat</code> 对象，然后告诉你“不用跑循环了”，直接返回空。</li>
+<li><strong>如果没有</strong>：它会帮你创建一个数据加载器（DataLoader），让你去跑循环。等循环跑完，它自动把结果存进硬盘，方便下次用。</li>
+</ol>
+</li>
+</ul>
+</li>
+<li><strong>好处</strong>：这对于机器学习实验非常重要，因为特征提取往往很耗时。</li>
+</ul>
+<h4>第五步：拿结果 (Readout)</h4>
+<p>数据跑完了，或者缓存加载完了，你就可以提取数值了。</p>
+<ul>
+<li><strong>观点</strong>：统计器内部可能存的是复杂的中间状态（比如协方差矩阵的中间积），用户只需要最终的统计量。</li>
+<li><strong>代码对应</strong>：<ul>
+<li><code>m.mean()</code>：返回最终的平均值张量。</li>
+<li><code>v.stdev()</code>：返回标准差。</li>
+<li><code>q.quantiles(0.5)</code>：返回中位数。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结：这个文件到底在讲啥？</h3>
+<p><strong>一句话总结：</strong>
+这是一个<strong>支持 GPU 加速</strong>、<strong>支持断点缓存</strong>的<strong>流式统计计算器</strong>。</p>
+<p><strong>它的核心应用场景：</strong>
+你在做大模型分析或编辑（EasyEditor 的场景）时，需要分析整个数据集（比如 ImageNet 或 Wikipedia）的神经元激活值的分布。
+1.  数据太多，内存放不下 -&gt; <strong>用流式计算（.add）</strong>。
+2.  想同时看均值、方差和最大值 -&gt; <strong>用 CombinedStat</strong>。
+3.  不想每次调试代码都重新跑几个小时的数据遍历 -&gt; <strong>用 tally 函数配合 cache</strong>。</p>
+<p><strong>代码片段举例（人话版）：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 我想要算均值和方差</span>
+<span class="n">统计器</span> <span class="o">=</span> <span class="n">CombinedStat</span><span class="p">(</span><span class="n">m</span><span class="o">=</span><span class="n">Mean</span><span class="p">(),</span> <span class="n">v</span><span class="o">=</span><span class="n">Variance</span><span class="p">())</span>
+
+<span class="c1"># 2. 准备数据，告诉它缓存存在哪里</span>
+<span class="c1"># tally 会帮我检查 &#39;my_stats.npz&#39; 是否存在</span>
+<span class="n">数据加载器</span> <span class="o">=</span> <span class="n">tally</span><span class="p">(</span><span class="n">统计器</span><span class="p">,</span> <span class="n">我的大数据集</span><span class="p">,</span> <span class="n">cache</span><span class="o">=</span><span class="s1">&#39;my_stats.npz&#39;</span><span class="p">)</span>
+
+<span class="c1"># 3. 如果缓存文件不存在，这个循环会执行；如果存在，这个循环直接跳过</span>
+<span class="k">for</span> <span class="n">这一批数据</span> <span class="ow">in</span> <span class="n">数据加载器</span><span class="p">:</span>
+    <span class="n">统计器</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">这一批数据</span><span class="p">)</span>
+
+<span class="c1"># 4. 无论上面循环跑没跑，我现在都能直接拿结果了</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">&quot;平均值是:&quot;</span><span class="p">,</span> <span class="n">统计器</span><span class="o">.</span><span class="n">m</span><span class="o">.</span><span class="n">mean</span><span class="p">())</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">&quot;方差是:&quot;</span><span class="p">,</span> <span class="n">统计器</span><span class="o">.</span><span class="n">v</span><span class="o">.</span><span class="n">variance</span><span class="p">())</span>
+</code></pre></div>

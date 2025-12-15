@@ -1,0 +1,107 @@
+<h1>easyeditor/dataset/counterfact.py</h1>
+<p>这份代码确实涉及很多深度学习数据处理的细节，初看容易晕。</p>
+<p>简单来说，这个文件的作用是<strong>为“大模型知识编辑（Knowledge Editing）”准备食材（数据）</strong>。</p>
+<p>具体场景是：你想教会大模型一个新的知识（比如强行把“埃菲尔铁塔在巴黎”修改成“埃菲尔铁塔在罗马”），你需要给模型喂特定的数据格式。这个脚本就是负责把原始文本数据，转换成模型能吃进去的Tensor（张量）。</p>
+<p>我把它拆解成一个<strong>“任务清单 (Todo List)”</strong>，带你一步步看它是怎么工作的。</p>
+<hr />
+<h3>核心任务清单 (Todo List)</h3>
+<ol>
+<li>
+<p><strong>准备阶段 (<code>__init__</code>)</strong>:</p>
+<ul>
+<li>[ ] 找到存放数据的 JSON 文件。</li>
+<li>[ ] 准备好“切菜刀”（Tokenizer，分词器），专门处理 GPT 或 Llama 这种模型的特殊格式。</li>
+<li>[ ] 把数据全部读进内存。</li>
+</ul>
+</li>
+<li>
+<p><strong>取菜阶段 (<code>__getitem__</code>)</strong>:</p>
+<ul>
+<li>[ ] 每次有人伸手要数据，就从列表里拿出一原有的一条（还没有切）。</li>
+</ul>
+</li>
+<li>
+<p><strong>打包阶段 (<code>collate_fn</code> / <code>collate_gpt_fn</code>)</strong>:</p>
+<ul>
+<li><em>这是最难的部分，负责把一堆杂乱的文本整合成整齐的批次（Batch）。</em></li>
+<li>[ ] <strong>准备编辑数据 (Edit)</strong>: 拿出“提示词(Prompt)”和“新目标(Target)”。</li>
+<li>[ ] <strong>准备泛化数据 (Rephrase)</strong>: 拿出意思相同但换了种说法的句子（测试模型是不是真的懂了，而不是死记硬背）。</li>
+<li>[ ] <strong>准备局部性数据 (Locality)</strong>: 拿出完全不相关的句子（测试模型有没有改坏其他知识）。</li>
+<li>[ ] <strong>切菜 (Tokenize)</strong>: 把上面所有的文字转化成数字 ID。</li>
+<li>[ ] <strong>贴标签 (Labeling)</strong>: 告诉模型哪些字是需要预测的，哪些是填充的（Padding）。</li>
+<li>[ ] <strong>装箱</strong>: 把所有处理好的张量打包成一个字典，发给 GPU。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>Task 1: 准备阶段 (<code>__init__</code>)</h4>
+<p>这是类的初始化函数。</p>
+<ul>
+<li><strong>加载配置</strong>: 它会检查 <code>config</code>，设定最大长度 <code>max_length</code>。</li>
+<li><strong>设置分词器 (Tokenizer)</strong>:<ul>
+<li>代码里有一大段 <code>if isinstance(tokenizer, GPT2Tokenizer)...</code>。</li>
+<li><strong>为什么？</strong> 因为 GPT 和 Llama 这类模型通常是“从左往右”生成的。但在训练或者批量处理时，为了让大家长度一样，需要补 0（Padding）。这里强制把 Padding 设在左边（Left Padding），这对生成式模型很重要，否则会影响预测结果。</li>
+</ul>
+</li>
+<li><strong>加载数据</strong>: <code>json.load(f)</code> 把硬盘上的 <code>counterfact.json</code> 读成一个 Python 列表。</li>
+</ul>
+<h4>Task 2: 打包阶段 (核心难点)</h4>
+<p>代码里有两个打包函数：<code>collate_fn</code> 和 <code>collate_gpt_fn</code>。
+*   <code>collate_fn</code>: 通常用于 Encoder-Decoder 模型（如 T5）。
+*   <code>collate_gpt_fn</code>: 专门用于 GPT 类模型（Decoder-only）。</p>
+<p>我们重点看 <strong><code>collate_gpt_fn</code></strong>（因为现在大模型多是 GPT 架构），它的逻辑如下：</p>
+<p><strong>Step 2.1: 提取原始文本</strong>
+它从原始数据里把以下几样东西拆出来：
+1.  <strong><code>src</code> (Source)</strong>: 提示词，例如 "The Eiffel Tower is located in"
+2.  <strong><code>trg</code> (Target)</strong>: 新的目标知识，例如 "Rome"（原本事实是 Paris，我们要改成 Rome）。
+3.  <strong><code>rephrase</code></strong>: 换个问法，例如 "Where can you find the Eiffel Tower?"（用来测试泛化能力）。
+4.  <strong><code>loc</code> (Locality)</strong>: 不相关的问题，例如 "The White House is in"，对应的答案是 "Washington"（用来测试有没有改坏别的东西）。</p>
+<p><strong>Step 2.2: 拼接文本 (GPT 特有逻辑)</strong>
+在 <code>collate_gpt_fn</code> 的 <code>else</code> 分支里：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">src</span> <span class="o">=</span> <span class="p">[</span><span class="n">src_</span> <span class="o">+</span> <span class="s1">&#39; &#39;</span> <span class="o">+</span> <span class="n">trg_</span> <span class="k">for</span> <span class="n">src_</span><span class="p">,</span> <span class="n">trg_</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">src</span><span class="p">,</span> <span class="n">trg</span><span class="p">)]</span>
+</code></pre></div>
+
+<ul>
+<li>它把“提示词”和“目标”拼在了一起。</li>
+<li>变成："The Eiffel Tower is located in Rome"。</li>
+<li><strong>为什么？</strong> 因为 GPT 训练时是看前面的字预测后面的字。我们需要把完整句子给它，然后让它计算“Rome”这几个字的概率（Loss）。</li>
+</ul>
+<p><strong>Step 2.3: 数字化 (Tokenization)</strong>
+代码调用 <code>self.tok(...)</code>。
+*   这步操作把上面的英文句子变成了 <code>[101, 2034, 55...]</code> 这样的数字列表。
+*   <code>padding=True</code>: 短的句子补零，补齐到 <code>max_length</code>。
+*   <code>return_tensors="pt"</code>: 变成 PyTorch 的 Tensor。</p>
+<p><strong>Step 2.4: 构造 Label (最绕的地方)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">edit_labels</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_edit_labels</span><span class="p">(</span><span class="n">batches</span><span class="p">[</span><span class="s2">&quot;trg_input_ids&quot;</span><span class="p">])</span>
+</code></pre></div>
+
+<p>这里其实代码写得比较简略，通常在知识编辑中，我们希望模型<strong>只计算 Target 部分的 Loss</strong>。
+*   <code>get_edit_labels</code> 函数的作用是将 Padding 部分（补零的地方）设为 <code>-100</code>。
+*   在 PyTorch 中，Label 为 <code>-100</code> 的位置会被自动忽略，不计算梯度。</p>
+<p><strong>Step 2.5: 组装最终字典</strong>
+最后它返回一个大字典，里面包含三个核心部分，对应知识编辑的三个指标：</p>
+<ol>
+<li><strong><code>edit_inner</code></strong>:<ul>
+<li>用来训练模型“学会新知识”。</li>
+<li>输入是拼接好的 "Prompt + New Target"。</li>
+</ul>
+</li>
+<li><strong><code>edit_rephrase</code></strong>:<ul>
+<li>用来评估模型“是否真正理解”。</li>
+<li>输入是 "Rephrase Prompt + New Target"。</li>
+</ul>
+</li>
+<li><strong><code>loc</code></strong>:<ul>
+<li>用来评估“副作用”。</li>
+<li>输入是完全无关的句子。</li>
+</ul>
+</li>
+</ol>
+<h4>Task 3: 发货</h4>
+<p>最后一行 <code>return dict_to(batch, self.config.device)</code>：
+*   把打包好的这一大堆数据，全部搬运到 GPU (cuda) 上，准备喂给模型吃。</p>
+<h3>总结</h3>
+<p>这个文件的核心逻辑就是：
+<strong>“我要教模型把A改成B，所以我准备了‘A+B’让它学，准备了‘A的变体+B’考考它懂不懂，还准备了‘C’考考它有没有变傻。”</strong></p>
+<p>看不懂代码没关系，只要知道它输出的是这三类数据（Edit, Rephrase, Locality）的 Token ID 即可。</p>

@@ -1,0 +1,110 @@
+<h1>easyeditor/models/memit/memit_main.py</h1>
+<p>这份代码实现的是 <strong>MEMIT (Mass-Editing Memory in a Transformer)</strong> 算法的核心逻辑。</p>
+<p>简单来说，它的功能是<strong>给大模型做“脑外科手术”</strong>。如果你想让模型记住“埃菲尔铁塔在罗马”（即使是错的，或者更新过时的信息），你不需要重新训练模型，而是直接通过数学计算，修改模型内部神经元的权重参数，把这个知识“注射”进去。</p>
+<p>为了让你听懂，我把这个复杂的数学过程拆解成一个<strong>“任务清单 (To-Do List)”</strong>，就像你是一个主刀医生，正在一步步执行手术。</p>
+<hr />
+<h3>📋 MEMIT 手术任务清单</h3>
+<p>我们将整个代码逻辑拆分为 <strong>6 个步骤</strong>：</p>
+<ol>
+<li><strong>【术前准备】清洗输入数据</strong> (标准化 Prompt)</li>
+<li><strong>【设定目标】计算最终想要得到的输出</strong> (计算 Target Z)</li>
+<li><strong>【定位病灶】找到触发记忆的神经元位置</strong> (计算 Input K)</li>
+<li><strong>【计算偏差】算出当前模型和目标的差距</strong> (计算 Residual)</li>
+<li><strong>【保护机制】调取过往病历，防止误伤</strong> (利用 Covariance 协方差矩阵)</li>
+<li><strong>【执行手术】求解方程并修改权重</strong> (Update Weights)</li>
+</ol>
+<hr />
+<h3>🧐 逐步代码详解</h3>
+<h4>1. 【术前准备】清洗输入数据</h4>
+<p><strong>代码位置：</strong> <code>execute_memit</code> 函数的前半部分。
+<strong>任务：</strong> 确保输入的句子格式正确，模型能读懂。</p>
+<ul>
+<li><strong>逻辑：</strong> 用户给的请求（比如 <code>{"subject": "iPhone 14", "prompt": "{} is produced by Apple"}</code>）可能格式不统一。代码会把 Prompt 里的 subject 替换成占位符 <code>{}</code>，并处理空格，确保 Tokenizer 切词正确。</li>
+<li><strong>代码片段：</strong>
+    <code>python
+    if request["target_new"][0] != " ": ... # 加空格
+    requests[i]['prompt'] = requests[i]['prompt'].replace(...) # 格式化 prompt</code></li>
+</ul>
+<h4>2. 【设定目标】计算最终想要得到的输出 (Target Z)</h4>
+<p><strong>代码位置：</strong> <code>execute_memit</code> 中调用 <code>compute_z</code> 的部分。
+<strong>任务：</strong> 我们希望模型看到“埃菲尔铁塔”时，最后一层输出的向量能代表“罗马”。</p>
+<ul>
+<li><strong>逻辑：</strong><ul>
+<li>MEMIT 不仅仅修改一层，它涉及多层。</li>
+<li>它首先计算：如果模型已经学会了这个新知识，那么在<strong>最后一层</strong>，针对“埃菲尔铁塔”这个词，它的向量表示（Z向量）应该是什么样子的？</li>
+<li>代码里会检查有没有缓存（Cache），没有的话就现场算。</li>
+</ul>
+</li>
+<li><strong>代码片段：</strong>
+    <code>python
+    cur_z = compute_z(..., z_layer, ...) # 计算目标向量 Z
+    zs = torch.stack(z_list, dim=1)      # 堆叠所有请求的 Z</code></li>
+</ul>
+<h4>3. 【定位病灶】找到触发记忆的神经元位置 (Input K)</h4>
+<p><strong>代码位置：</strong> <code>execute_memit</code> 中的 <code>for i, layer in enumerate(hparams.layers):</code> 循环内部。
+<strong>任务：</strong> 在我们要修改的每一层，找出是什么样的输入信号（Key）触发了关于“埃菲尔铁塔”的记忆。</p>
+<ul>
+<li><strong>逻辑：</strong><ul>
+<li>模型是层层传递的。在第 L 层，输入是“埃菲尔铁塔”经过前 L-1 层处理后的结果。</li>
+<li>这个输入被称为 $k$ (Key)。我们要修改这一层的权重 $W$，使得 $W \times k$ 能够接近我们的目标。</li>
+</ul>
+</li>
+<li><strong>代码片段：</strong>
+    <code>python
+    layer_ks = compute_ks(..., layer, ...).T # 计算当前层的输入 K</code></li>
+</ul>
+<h4>4. 【计算偏差】算出当前模型和目标的差距 (Residual)</h4>
+<p><strong>代码位置：</strong> <code>execute_memit</code> 循环内部，计算 <code>targets</code> 的部分。
+<strong>任务：</strong> 看看模型现在的反应和我们期望的反应差多少，把这个差距分摊给剩下的层去修补。</p>
+<ul>
+<li><strong>逻辑：</strong><ul>
+<li><code>cur_zs</code> 是模型目前的输出。</li>
+<li><code>targets = zs - cur_zs</code> 是我们还差多少。</li>
+<li>MEMIT 的精髓在于它不是在一层里改完，而是把这个误差平均分摊到剩下的几层里 (<code>len(hparams.layers) - i</code>)，每层修一点，这样更稳定。</li>
+</ul>
+</li>
+<li><strong>代码片段：</strong>
+    <code>python
+    targets = zs - cur_zs  # 总差距
+    resid = targets / (len(hparams.layers) - i) # 分摊给当前层的任务</code></li>
+</ul>
+<h4>5. 【保护机制】调取过往病历，防止误伤 (Covariance)</h4>
+<p><strong>代码位置：</strong> <code>get_cov</code> 函数 以及 <code>execute_memit</code> 中计算 <code>adj_k</code> 的部分。
+<strong>任务：</strong> 修改权重时，不能破坏模型已有的通用语言能力（比如语法、其他常识）。</p>
+<ul>
+<li><strong>逻辑：</strong><ul>
+<li>如果我们只为了迎合“埃菲尔铁塔”，可能会导致模型连“你好”都不会说了。</li>
+<li><strong>协方差矩阵 (Covariance Matrix)</strong> 记录了模型在读取海量普通文本时，神经元的激活统计规律。</li>
+<li>在计算更新量时，除以这个协方差矩阵（求逆），相当于告诉算法：“在那些大家通用的方向上不要乱动，只在‘埃菲尔铁塔’特有的方向上动刀”。</li>
+</ul>
+</li>
+<li><strong>代码片段：</strong>
+    <code>python
+    cov = get_cov(...) # 获取协方差统计
+    # 核心公式：利用最小二乘法求解，其中包含了 cov 作为正则项/约束
+    adj_k = torch.linalg.solve(
+        hparams.mom2_update_weight * cov.double() + layer_ks @ layer_ks.T,
+        layer_ks,
+    )</code></li>
+</ul>
+<h4>6. 【执行手术】求解方程并修改权重 (Update Weights)</h4>
+<p><strong>代码位置：</strong> <code>execute_memit</code> 循环的末尾 和 <code>apply_memit_to_model</code>。
+<strong>任务：</strong> 算出具体的参数变化量 $\Delta W$，并加到原模型上。</p>
+<ul>
+<li><strong>逻辑：</strong><ul>
+<li>根据刚才算的输入 $k$、目标残差 $resid$ 和保护机制 $cov$，算出一个更新矩阵 <code>upd_matrix</code>。</li>
+<li>在 <code>execute_memit</code> 里，它只是计算出这个变化量（Delta）。</li>
+<li>最后在 <code>apply_memit_to_model</code> 里，才真正把这个 Delta 加到模型的 <code>weight</code> 上。</li>
+</ul>
+</li>
+<li><strong>代码片段：</strong>
+    <code>python
+    upd_matrix = resid @ adj_k.T  # 算出更新矩阵
+    # ...
+    weights[weight_name][...] = weights_copy[weight_name] + upd_matrix.float() # 执行修改</code></li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件的核心思想就是：
+<strong>不要暴力覆盖，要“顺势而为”。</strong></p>
+<p>它先算出目标是什么（Step 2），然后一层一层地（Step 3）看当前缺多少（Step 4），利用统计学数据保护通用能力（Step 5），最后算出最优雅的权重修改方案（Step 6）并注入模型。</p>

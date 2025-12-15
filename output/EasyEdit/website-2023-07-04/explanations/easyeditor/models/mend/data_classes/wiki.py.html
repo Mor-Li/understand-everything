@@ -1,0 +1,94 @@
+<h1>easyeditor/models/mend/data_classes/wiki.py</h1>
+<p>这个代码文件 <code>wiki.py</code> 是 <strong>MEND</strong>（一种大模型编辑算法）用来处理 <strong>Wiki（维基百科）数据</strong>的“搬运工”。</p>
+<p>它的核心任务是：<strong>准备好“我要改什么知识（Edit）”和“我要保持什么知识不变（Locality）”的数据，喂给模型去训练。</strong></p>
+<p>为了让你听懂，我把这个代码做的事情拆解成一个 <strong>“模型编辑手术前的准备清单” (To-Do List)</strong>，我们一步步来看：</p>
+<hr />
+<h3>📋 Task List：模型编辑数据准备清单</h3>
+<ol>
+<li><strong>清洗工具准备</strong>：把不合格的文本（乱码、太短的）扔掉。</li>
+<li><strong>进货（初始化）</strong>：<ul>
+<li>加载“普通背景知识库”（用来防止模型被改坏）。</li>
+<li>加载“手术修改清单”（具体的修改目标）。</li>
+</ul>
+</li>
+<li><strong>打包发货（生成器）</strong>：把数据组合成模型训练需要的 4 个特殊部分（Inner, Outer, Loc, Cond）。</li>
+<li><strong>贴标签（Labeling）</strong>：告诉模型哪部分是需要背诵的答案，哪部分是题目。</li>
+</ol>
+<hr />
+<h3>🧐 详细步骤讲解</h3>
+<h4>第一步：清洗工具准备 (<code>is_ascii</code>, <code>filter_text</code>)</h4>
+<p><strong>代码位置</strong>：文件最上面的两个函数。</p>
+<ul>
+<li><strong>观点</strong>：大模型训练时，如果数据太脏（比如全是乱码或者只有两三个词），会影响效果。</li>
+<li><strong>动作</strong>：<ul>
+<li><code>is_ascii</code>: 检查是不是纯英文字符（过滤掉奇怪符号）。</li>
+<li><code>filter_text</code>: 只要那些长度大于 50 个词、且是纯英文的文本。其他的统统扔掉。</li>
+</ul>
+</li>
+</ul>
+<h4>第二步：进货 (<code>GenDataset.__init__</code>)</h4>
+<p><strong>代码位置</strong>：<code>class GenDataset</code> 的 <code>__init__</code> 部分。</p>
+<ul>
+<li><strong>观点</strong>：模型编辑需要两种数据。一种是<strong>Edit Data</strong>（比如“把英国首相改成苏纳克”），另一种是<strong>Locality Data</strong>（无关数据，比如“爵士乐的历史”，用来测试改完首相后，模型会不会忘记爵士乐怎么介绍）。</li>
+<li><strong>动作</strong>：<ol>
+<li><strong>加载背景数据 (<code>base_samples</code>)</strong>：默认加载 <code>wikitext-103</code>（维基百科文本）。如果配置里开了 <code>wiki_webtext</code>，就改用 <code>openwebtext</code>。这些数据经过第一步的清洗，用来做“无关数据”测试。</li>
+<li><strong>加载编辑数据 (<code>edit_samples</code>)</strong>：读取一个 JSON 文件（<code>edit_path</code>）。这个文件里存的是我们要修改的具体样本（比如：Input="Who is the president?", Target="Biden"）。</li>
+</ol>
+</li>
+</ul>
+<h4>第三步：打包发货 (<code>edit_generator</code>) —— <strong>这是最核心的部分</strong></h4>
+<p><strong>代码位置</strong>：<code>edit_generator</code> 函数。</p>
+<ul>
+<li>
+<p><strong>观点</strong>：MEND 算法非常特殊，它训练一次需要喂给模型 <strong>4 份</strong> 数据。</p>
+<ul>
+<li><strong>Edit Inner</strong>: 用来计算梯度的（告诉模型怎么改）。</li>
+<li><strong>Edit Outer</strong>: 用来验证改没改成功的（通常是同义句，看模型能不能举一反三）。</li>
+<li><strong>Loc</strong>: 用来测试稳定性的（无关文本，要求模型改完后，这部分预测不能变）。</li>
+<li><strong>Cond</strong>: 只有 MEND 这种元学习模型才需要，作为条件输入。</li>
+</ul>
+</li>
+<li>
+<p><strong>动作（循环执行）</strong>：</p>
+<ol>
+<li><strong>抽样 (<code>sampler.sample</code>)</strong>：从数据库里随机挑出几个“修改样本”和几个“背景样本”。</li>
+<li><strong>Tokenize</strong>：把文本变成机器能读懂的数字（Input IDs）。</li>
+<li><strong>构建 4 大件</strong>：<ul>
+<li><code>edit_inner</code>: 直接用编辑样本。</li>
+<li><code>edit_outer</code>: 复制一份 <code>edit_inner</code>。<strong>注意代码里有个 <code>rephrase</code> 逻辑</strong>：如果开启重述，它会随机切掉前面的一段话，强迫模型根据残缺的上下文去预测，增加难度。</li>
+<li><code>loc</code>: 使用背景样本（无关文本）。</li>
+<li><code>cond</code>: 这里直接复制了 <code>edit_toks</code>。</li>
+</ul>
+</li>
+<li><strong>Yield</strong>：把打包好的这堆东西（字典格式）发送给 GPU 去训练。</li>
+</ol>
+</li>
+</ul>
+<h4>第四步：贴标签 (<code>get_edit_labels</code>, <code>get_labels</code>)</h4>
+<p><strong>代码位置</strong>：类底部的两个函数。</p>
+<ul>
+<li><strong>观点</strong>：在训练语言模型时，我们不希望模型去学习“问题”是什么，只希望它学习“答案”是什么。</li>
+<li><strong>动作</strong>：<ul>
+<li><strong>Masking (-100)</strong>：在 PyTorch 里，如果 Label 是 <code>-100</code>，计算 Loss（误差）时就会忽略它。</li>
+<li><code>get_edit_labels</code>: 这是一个专门为编辑设计的标签函数。它会计算句子的长度，然后把<strong>最后几个词（Target/答案）</strong> 留着，把前面的所有词（Question/Prompt）都变成 <code>-100</code>。<ul>
+<li><em>例子</em>：如果句子是 "The sky is [blue]"。我们只想让模型学 "blue"，不想让它重复学 "The sky is"。</li>
+</ul>
+</li>
+<li><code>get_labels</code>: 这是给普通文本用的，只把 Padding（填充的 0）变成 -100。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个文件在干嘛？</h3>
+<p>想象你在教一个学生（模型）改错题：</p>
+<ol>
+<li><strong><code>__init__</code></strong> 是你的书包，装了<strong>错题本</strong>（Edit Samples）和<strong>语文课本</strong>（Base/Locality Samples）。</li>
+<li><strong><code>edit_generator</code></strong> 是你在出考卷。<ul>
+<li>你挑一道错题放在<strong>第一题</strong>（Edit Inner），让他重做。</li>
+<li>你把这道错题换个问法放在<strong>第二题</strong>（Edit Outer），看他是不是真懂了。</li>
+<li>你从语文课本里随便抄一段话放在<strong>第三题</strong>（Loc），看他改错题改得脑子乱没乱（能不能正常阅读普通文章）。</li>
+</ul>
+</li>
+<li><strong><code>get_edit_labels</code></strong> 是你的红笔，你只批改<strong>答案</strong>部分，题目抄错了你不管（Mask 掉）。</li>
+</ol>
+<p>这个 <code>wiki.py</code> 就是负责不停地生成这种“考卷”给 MEND 模型去训练的。</p>

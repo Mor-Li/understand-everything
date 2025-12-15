@@ -1,0 +1,98 @@
+<h1>steer/trainer/utils/data_utils.py</h1>
+<p>这份代码确实比较复杂，它是为一个叫做 <strong>ReFT (Representation Fine-Tuning)</strong> 或者类似的<strong>模型引导（Steering）</strong>技术准备数据的。</p>
+<p>简单来说，这段代码的任务不是“微调整个模型”，而是<strong>“找出在模型的什么位置（哪几个Token）插入干扰信号，并把数据整理好喂给GPU”</strong>。</p>
+<p>为了让你更容易理解，我把它拆解成一个 <strong>“模型引导训练的数据准备清单 (Task List)”</strong>。</p>
+<hr />
+<h3>核心任务清单：如何把原始文本变成“可引导”的训练数据？</h3>
+<h4>第一步：确定“手术位置” (定位)</h4>
+<p><strong>目标</strong>：我们需要决定在模型的哪几个 Token 上进行“干预”（修改它的内部表示）。
+<strong>对应代码</strong>：<code>parse_positions</code> 和 <code>get_intervention_locations</code></p>
+<ol>
+<li><strong>解析指令 (<code>parse_positions</code>)</strong>：<ul>
+<li>用户可能会输入像 <code>"f1+l1"</code> 这样的神秘代码。</li>
+<li>这个函数负责翻译：<code>f1</code> = 第一个(first) Token，<code>l1</code> = 最后一个(last) Token。</li>
+</ul>
+</li>
+<li><strong>计算具体坐标 (<code>get_intervention_locations</code>)</strong>：<ul>
+<li>因为每个句子的长度不一样，"最后一个 Token" 的索引在每个句子里都不同。</li>
+<li>这个函数根据句子的实际长度，算出具体的数字坐标（比如：第0个和第15个位置）。</li>
+<li><em>难点处理</em>：如果是一批数据（Batch），有的句子短有的长，它还需要处理对齐（Padding）的问题。</li>
+</ul>
+</li>
+</ol>
+<h4>第二步：准备“标准答案”数据 (SFT 数据处理)</h4>
+<p><strong>目标</strong>：准备用于<strong>监督微调</strong>的数据。即：给模型一个提示（Prompt）和一个概念（Concept），教它输出正确的回答。
+<strong>对应代码</strong>：<code>make_data_module</code></p>
+<ol>
+<li><strong>分词 (Tokenization)</strong>：<ul>
+<li>把 <code>input</code>（问题）和 <code>output</code>（回答）变成数字 ID。</li>
+<li>把 <code>concept</code>（你想注入的概念，比如“变得更有礼貌”）也变成数字 ID。</li>
+</ul>
+</li>
+<li><strong>设置标签 (Labels)</strong>：<ul>
+<li>我们需要模型预测“回答”，但不需要它预测“问题”。</li>
+<li>所以代码里把 <code>prompt</code> 部分的 Label 设为 <code>-100</code>（意思是：计算 Loss 时忽略这部分，只学后面的回答）。</li>
+</ul>
+</li>
+<li><strong>确定干预点</strong>：<ul>
+<li>调用第一步写的函数，把每一条数据的“手术位置”记录下来。</li>
+</ul>
+</li>
+</ol>
+<h4>第三步：把数据打包成批次 (SFT Collator)</h4>
+<p><strong>目标</strong>：GPU 喜欢一次吃一批数据（Batch），这一步负责把长短不一的数据对齐。
+<strong>对应代码</strong>：<code>InterventionDataCollator</code></p>
+<ol>
+<li><strong>填充 (Padding)</strong>：<ul>
+<li>这是最繁琐的一步。</li>
+<li><code>input_ids</code>（输入文本）要对齐：短的句子后面补 0。</li>
+<li><code>labels</code>（标准答案）要对齐。</li>
+<li><strong>关键点</strong>：<code>intervention_locations</code>（干预位置）也要对齐！<ul>
+<li>比如句子 A 在 <code>[0, 5]</code> 干预，句子 B 在 <code>[0, 10]</code> 干预。Collator 会把它们补齐成一样长，并生成 Mask（掩码），告诉模型哪些位置是填充的假数据，不要管。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>第四步：准备“比较”数据 (偏好学习/DPO 数据处理)</h4>
+<p><strong>目标</strong>：有时候我们不直接教模型“说什么”，而是教它“哪个更好”。这通常用于 DPO（直接偏好优化）。
+<strong>对应代码</strong>：<code>make_preference_data_module</code> 和 <code>preprocess_preference_data</code></p>
+<ol>
+<li><strong>构建对比组 (Pairs)</strong>：<ul>
+<li>这里有四种情况（Winning vs Losing）：<ul>
+<li><strong>orig_add</strong>: 原始指令下，引导后的回答（赢） vs 原始回答（输）。</li>
+<li><strong>orig_sub</strong>: 原始指令下，原始回答（赢） vs 引导后的回答（输）。</li>
+<li>以及 <code>steered_add</code> 和 <code>steered_sub</code>。</li>
+</ul>
+</li>
+<li><em>通俗解释</em>：就是告诉模型：“加了这个干扰后生成的这句话是好的，没加的那句是不好的”，或者反过来。</li>
+</ul>
+</li>
+<li><strong>预处理单条数据 (<code>preprocess_preference_data</code>)</strong>：<ul>
+<li>把“赢”的句子和“输”的句子都分别做 Tokenization。</li>
+<li>分别为它们计算干预位置。</li>
+</ul>
+</li>
+</ol>
+<h4>第五步：把比较数据打包成批次 (Preference Collator)</h4>
+<p><strong>目标</strong>：把成对的“赢/输”数据打包。
+<strong>对应代码</strong>：<code>PreferenceInterventionDataCollator</code></p>
+<ol>
+<li><strong>双倍的工作量</strong>：<ul>
+<li>它做的事情和第三步（SFT Collator）很像。</li>
+<li>区别在于：它要同时处理 <code>winning_input</code>（赢家输入）和 <code>losing_input</code>（输家输入）。</li>
+<li>它要保证赢家和输家的数据都被正确地填充（Padding）并对齐，以便同时喂给模型计算 Loss。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结：这文件到底是干啥的？</h3>
+<p>如果你是一个厨师，这个文件就是你的<strong>备菜员</strong>：</p>
+<ol>
+<li><strong><code>parse_positions</code></strong>: 听懂主厨说“切头去尾”（解析位置参数）。</li>
+<li><strong><code>make_data_module</code></strong>: 把原材料（文本数据）洗好、切好（Tokenization），并标记好哪里要下调料（计算干预位置）。</li>
+<li><strong><code>InterventionDataCollator</code></strong>: 把切好的菜装盘（Padding），保证每一盘的分量一致，方便下锅（Batching）。</li>
+<li><strong><code>Preference...</code></strong>: 专门负责准备“品尝测试”的菜（对比学习数据），左边一盘好吃的，右边一盘难吃的，让模型学会分辨。</li>
+</ol>
+<p><strong>你看不到模型训练的核心代码（反向传播、Loss计算），因为这里全是脏活累活——数据的预处理和对齐。</strong></p>

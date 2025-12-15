@@ -1,0 +1,140 @@
+<h1>easyeditor/models/unke/unke_main.py</h1>
+<p>这份代码实现了一个名为 <strong>UnKE (Unconstrained Knowledge Editing)</strong> 的算法逻辑。简单来说，它的目的是<strong>修改大语言模型（LLM）中的特定知识</strong>（比如把“法国的首都是哪里？”的答案从“巴黎”改成“伦敦”），同时尽量不破坏模型原有的其他能力。</p>
+<p>为了让你更容易理解，我们可以把这个过程想象成<strong>修理一个多级水管系统</strong>（神经网络），我们需要调整中间的几个阀门（层），让最终流出的水（输出）变成我们想要的颜色（目标答案）。</p>
+<p>下面是一个<strong>Task To-Do List</strong>，按照代码执行的顺序，一步步拆解它的逻辑：</p>
+<hr />
+<h3>📋 UnKE 算法执行清单 (Task To-Do List)</h3>
+<ol>
+<li><strong>准备阶段：锁定目标与备份</strong><ul>
+<li>找出我们要修改模型的哪些层（Layers）。</li>
+<li>备份这些层的原始参数（万一改坏了或者需要对比）。</li>
+</ul>
+</li>
+<li><strong>设定终极目标 (Compute Z)</strong><ul>
+<li>计算一下：为了输出新的目标答案（比如“伦敦”），模型最后一层的“水流状态”（向量表示）应该是长什么样的？记为 <code>zs</code>。</li>
+</ul>
+</li>
+<li><strong>逐层修正循环 (Iterative Editing)</strong><ul>
+<li>开始遍历每一个需要修改的层（从浅层到深层）。</li>
+</ul>
+</li>
+<li><strong>诊断当前状态</strong><ul>
+<li>在这个层，当前的“水流”输入是什么？输出是什么？</li>
+<li>当前模型最终输出的状态 <code>cur_zs</code> 和我们的终极目标 <code>zs</code> 差距有多大？</li>
+</ul>
+</li>
+<li><strong>分配修正任务 (Distribute Residual)</strong><ul>
+<li>计算总差距（Error）。</li>
+<li><strong>关键点</strong>：不要让当前这一层承担所有修正工作。把差距除以“剩余需要修改的层数”，让当前层只负责修正一部分。</li>
+<li>设定当前层的新目标输出 = <code>旧输出</code> + <code>这一小部分修正值</code>。</li>
+</ul>
+</li>
+<li><strong>准备“防遗忘”数据 (Preservation)</strong><ul>
+<li>输入一些无关的文本（<code>ex_data</code>），记录这一层在处理正常文本时的反应。我们需要保证修完后，它对这些无关文本的反应不变。</li>
+</ul>
+</li>
+<li><strong>微调参数 (Optimization)</strong><ul>
+<li>启动一个优化器（AdamW）。</li>
+<li><strong>训练目标（Loss）</strong>：调整当前层的参数，使得：<ol>
+<li>对问题输入：输出尽可能接近“新目标输出”。</li>
+<li>对无关输入：输出尽可能保持“原样”。</li>
+</ol>
+</li>
+</ul>
+</li>
+<li><strong>收尾与清理</strong><ul>
+<li>这一层修好了，清理显存，进入下一层，重复步骤 4-7。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🔍 代码逐段详解</h3>
+<p>现在我们对照上面的 List，看看代码具体是怎么写的：</p>
+<h4>1. 准备阶段：锁定与备份</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">apply_unke_to_model</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="c1"># ... 省略部分代码 ...</span>
+    <span class="c1"># 找到所有符合配置层号(hparams.layers)的参数名称</span>
+    <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">params</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">named_parameters</span><span class="p">():</span>
+        <span class="k">if</span> <span class="nb">int</span><span class="p">(</span><span class="n">splitted_name</span><span class="p">[</span><span class="mi">2</span><span class="p">])</span> <span class="ow">in</span> <span class="n">hparams</span><span class="o">.</span><span class="n">layers</span><span class="p">:</span>
+            <span class="n">preserve_params</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">name</span><span class="p">)</span>
+
+    <span class="c1"># 备份原始权重，以便后续恢复或对比</span>
+    <span class="n">weights</span> <span class="o">=</span> <span class="p">{</span><span class="n">param</span><span class="p">:</span> <span class="n">nethook</span><span class="o">.</span><span class="n">get_parameter</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">param</span><span class="p">)</span> <span class="k">for</span> <span class="n">param</span> <span class="ow">in</span> <span class="n">preserve_params</span><span class="p">}</span>
+    <span class="n">weights_copy</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">weights</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
+</code></pre></div>
+
+<h4>2. 设定终极目标 (Compute Z)</h4>
+<div class="codehilite"><pre><span></span><code>    <span class="n">z_layer</span> <span class="o">=</span> <span class="n">hparams</span><span class="o">.</span><span class="n">layers</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="c1"># 最后一层作为基准</span>
+    <span class="n">z_list</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">for</span> <span class="n">data</span> <span class="ow">in</span> <span class="n">batch_data</span><span class="p">:</span>
+        <span class="c1"># compute_z 是一个外部函数，用于计算&quot;为了得到新答案，最后一层应该输出的向量&quot;</span>
+        <span class="n">cur_z</span> <span class="o">=</span> <span class="n">compute_z</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">tok</span><span class="p">,</span> <span class="n">data</span><span class="p">,</span> <span class="n">z_layer</span><span class="p">,</span> <span class="n">hparams</span><span class="p">)</span>
+        <span class="n">z_list</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">cur_z</span><span class="p">)</span>
+    <span class="n">zs</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">z_list</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span> <span class="c1"># 这就是我们的终极目标向量</span>
+</code></pre></div>
+
+<h4>3. 逐层修正循环 &amp; 4. 诊断当前状态</h4>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># 开始循环每一层</span>
+    <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">layer</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">hparams</span><span class="o">.</span><span class="n">layers</span><span class="p">):</span>
+        <span class="c1"># ...</span>
+        <span class="c1"># 使用 nethook.Trace 像听诊器一样，截获当前层(layer)的输入(input)和输出(output)</span>
+        <span class="k">with</span> <span class="n">nethook</span><span class="o">.</span><span class="n">Trace</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="k">as</span> <span class="n">tr</span><span class="p">:</span>
+            <span class="n">_</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="o">**</span><span class="n">contexts_tok</span><span class="p">)</span>
+            <span class="n">layer_in_ks</span> <span class="o">=</span> <span class="n">tr</span><span class="o">.</span><span class="n">input</span>  <span class="c1"># 当前层的输入</span>
+            <span class="n">layer_out_ks</span> <span class="o">=</span> <span class="n">tr</span><span class="o">.</span><span class="n">output</span> <span class="c1"># 当前层的输出</span>
+
+        <span class="c1"># 计算当前模型最终输出(cur_zs)和终极目标(zs)的差距</span>
+        <span class="n">cur_zs</span><span class="p">,</span> <span class="n">idxs</span> <span class="o">=</span> <span class="n">compute_ks</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">tok</span><span class="p">,</span> <span class="n">batch_question</span><span class="p">,</span> <span class="n">hparams</span><span class="p">,</span> <span class="n">z_layer</span><span class="p">)</span>
+        <span class="n">targets</span> <span class="o">=</span> <span class="n">zs</span> <span class="o">-</span> <span class="n">cur_zs</span> <span class="c1"># 这是总共还需要弥补的差距</span>
+</code></pre></div>
+
+<h4>5. 分配修正任务 (核心逻辑)</h4>
+<p>UnKE 的核心思想是<strong>线性插值</strong>，它不强求一层改完，而是平摊给剩下的层。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># (len(hparams.layers) - i) 是剩余还没改的层数</span>
+    <span class="c1"># 如果还剩3层，就把差距除以3，当前层只负责修 1/3</span>
+    <span class="n">resid</span> <span class="o">=</span> <span class="n">targets</span> <span class="o">/</span> <span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">hparams</span><span class="o">.</span><span class="n">layers</span><span class="p">)</span> <span class="o">-</span> <span class="n">i</span><span class="p">)</span> 
+
+    <span class="c1"># 修改目标：当前层的输出应该加上这部分残差</span>
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">idxs</span><span class="p">)):</span>
+        <span class="n">layer_out_ks</span><span class="p">[</span><span class="n">i</span><span class="p">,</span><span class="n">idxs</span><span class="p">[</span><span class="n">i</span><span class="p">]]</span> <span class="o">+=</span> <span class="n">resid</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> 
+</code></pre></div>
+
+<h4>6. 准备“防遗忘”数据</h4>
+<p>为了防止模型改了这个问题后，把别的东西忘了（比如改了“法国首都”，结果连“苹果是水果”都忘了），需要引入 <code>ex_data</code>（无关数据）。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># 跑一遍无关数据(ex_data)，记录这一层原本是怎么处理它们的</span>
+    <span class="k">with</span> <span class="n">nethook</span><span class="o">.</span><span class="n">Trace</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="k">as</span> <span class="n">tr</span><span class="p">:</span>
+        <span class="n">_</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="o">**</span><span class="n">ex_tok</span><span class="p">)</span>
+        <span class="n">stat_in</span> <span class="o">=</span> <span class="n">tr</span><span class="o">.</span><span class="n">input</span>
+        <span class="n">stat_out</span> <span class="o">=</span> <span class="n">tr</span><span class="o">.</span><span class="n">output</span> <span class="c1"># 我们希望改完参数后，这里的输出保持不变</span>
+</code></pre></div>
+
+<h4>7. 微调参数 (Optimization)</h4>
+<p>这里就是局部的训练过程。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># 定义优化器，只优化当前这一层的参数</span>
+    <span class="n">optimizer</span> <span class="o">=</span> <span class="n">optim</span><span class="o">.</span><span class="n">AdamW</span><span class="p">(</span><span class="n">params</span><span class="p">,</span> <span class="n">lr</span><span class="o">=</span><span class="n">hparams</span><span class="o">.</span><span class="n">lr</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+    <span class="k">for</span> <span class="n">step</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">hparams</span><span class="o">.</span><span class="n">optim_num_step</span><span class="p">):</span>
+        <span class="n">optimizer</span><span class="o">.</span><span class="n">zero_grad</span><span class="p">()</span>
+
+        <span class="c1"># Loss 由两部分组成：</span>
+        <span class="c1"># 1. 记忆保持 Loss: criterion(当前层对无关数据的输出, 原始输出 stat_out)</span>
+        <span class="c1"># 2. 编辑目标 Loss: criterion(当前层对问题的输出, 修改后的目标 layer_out_ks)</span>
+        <span class="n">loss</span> <span class="o">=</span> <span class="n">criterion</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">stat_out</span><span class="p">)</span> <span class="o">+</span> <span class="n">criterion</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">layer_out_ks</span><span class="p">)</span>
+
+        <span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span> <span class="c1"># 反向传播</span>
+        <span class="n">optimizer</span><span class="o">.</span><span class="n">step</span><span class="p">()</span> <span class="c1"># 更新参数</span>
+</code></pre></div>
+
+<p><em>注：代码中关于 <code>get_causal_mask</code> 的部分是为了适配 Llama 和 Qwen 等不同模型的注意力掩码格式，属于工程细节，不影响核心逻辑。</em></p>
+<h4>8. 收尾与清理</h4>
+<div class="codehilite"><pre><span></span><code>        <span class="c1"># 清理显存，防止爆显存</span>
+        <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="p">[</span><span class="n">layer_in_ks</span><span class="p">,</span> <span class="n">layer_out_ks</span><span class="p">,</span> <span class="n">cur_zs</span><span class="p">,</span> <span class="n">targets</span><span class="p">,</span> <span class="n">stat_in</span><span class="p">,</span> <span class="n">stat_out</span><span class="p">]:</span>
+            <span class="n">x</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span>
+            <span class="k">del</span> <span class="n">x</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">empty_cache</span><span class="p">()</span>
+
+    <span class="k">return</span> <span class="n">weights_copy</span> <span class="c1"># 返回备份的权重</span>
+</code></pre></div>
+
+<h3>总结</h3>
+<p>这个脚本在做的事情就是：<strong>把一个大的修改目标，拆解成若干小份，分摊到模型的多个层中去逐层微调。</strong> 在微调每一层时，既要努力达成那一小份的修改目标，又要死死守住对其他无关数据的原始响应，以此实现“精准手术”般的知识编辑。</p>

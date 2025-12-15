@@ -1,0 +1,125 @@
+<h1>easyeditor/dataset/zsre.py</h1>
+<p>没问题，这份代码对于不熟悉 <strong>“模型编辑”（Model Editing）</strong> 或者 <strong>PyTorch 数据处理流程</strong> 的人来说确实很劝退。</p>
+<p>我们可以把这个文件想象成一个 <strong>“备菜员”</strong>。厨师（AI模型）要学习做新菜（新的知识），备菜员（这个脚本）需要把原始的食材（JSON数据）清洗、切好、打包，最后递给厨师。</p>
+<p>这份代码主要是在处理一个叫 <strong>zsRE</strong> 的数据集，这是一个用于问答（QA）的数据集，常用来测试模型能不能“学会并记住”一个新的事实。</p>
+<p>我把这个过程拆解成 <strong>4个阶段（Task List）</strong>，一步步带你看懂：</p>
+<hr />
+<h3>Task 1: 进货与准备工具 (<code>__init__</code> 部分)</h3>
+<p><strong>目标</strong>：读取原始文件，并准备好“翻译机”（Tokenizer）。</p>
+<ol>
+<li><strong>找到仓库位置</strong>：<ul>
+<li>代码：<code>data_dir = Path(data_dir)</code></li>
+<li>解释：确定存放数据的文件夹在哪里。</li>
+</ul>
+</li>
+<li><strong>准备翻译机 (Tokenizer)</strong>：<ul>
+<li>代码：<code>tokenizer = getattr(transformers, config.tokenizer_class)...</code></li>
+<li>解释：AI 看不懂中文或英文，只看得懂数字。Tokenizer 就是把“Who is the president?”变成 <code>[34, 12, 99...]</code> 这种数字列表的工具。</li>
+<li><em>注意</em>：代码里特意判断了是不是 GPT2，如果是，因为 GPT 是从左往右生成的，所以补齐（Padding）要放在左边。</li>
+</ul>
+</li>
+<li><strong>打开账本 (Load JSON)</strong>：<ul>
+<li>代码：<code>with open(zsre_loc, "r") as f: raw = json.load(f)</code></li>
+<li>解释：把原始的 <code>.json</code> 题库文件读进内存。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>Task 2: 清洗食材 (解析数据循环)</h3>
+<p><strong>目标</strong>：把原始的一大坨 JSON 数据，整理成我们训练需要的标准格式。</p>
+<p>代码在 <code>for i, record in enumerate(raw):</code> 这个循环里做了核心清洗工作。每一条数据（<code>record</code>）都被整理成了一个字典，包含以下关键要素：</p>
+<ol>
+<li><strong>提取“要修改的问题” (<code>prompt</code>)</strong>：<ul>
+<li>代码：<code>"prompt": record["src"]</code></li>
+<li>含义：比如“美国现在的总统是谁？”（原始知识可能是拜登）。</li>
+</ul>
+</li>
+<li><strong>提取“新的答案” (<code>target_new</code>)</strong>：<ul>
+<li>代码：<code>"target_new": record["alt"]</code></li>
+<li>含义：我们要强行让模型记住的新答案，比如“特朗普”（即使这是错的，或者过时的，模型编辑就是要测试修改能力）。</li>
+</ul>
+</li>
+<li><strong>提取“真值” (<code>ground_truth</code>)</strong>：<ul>
+<li>代码：<code>"ground_truth": record["answers"][0]</code></li>
+<li>含义：原本正确的答案。</li>
+</ul>
+</li>
+<li><strong>提取“换个问法” (<code>rephrase_prompt</code>)</strong>：<ul>
+<li>代码：<code>"rephrase_prompt": record["rephrase"]</code></li>
+<li>含义：比如“谁是美利坚的现任元首？”。</li>
+<li><em>目的</em>：测试模型是不是真学会了知识，还是只死记硬背了上面那句话。如果真学会了，换个问法它也应该答“特朗普”。</li>
+</ul>
+</li>
+<li><strong>提取“不相关的邻居” (<code>locality_prompt</code>)</strong>：<ul>
+<li>代码：<code>"locality_prompt": record["loc"]</code></li>
+<li>含义：一个完全无关的问题，比如“法国的首都是哪里？”。</li>
+<li><em>目的</em>：测试“副作用”。我们修改美国总统时，不能把“法国首都”这个知识点搞坏了。模型应该保持对这个问题的原样回答。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>Task 3: 打包发货 (PyTorch Dataset 基础)</h3>
+<p>这是 <code>Dataset</code> 类的标准动作，非常简单。</p>
+<ol>
+<li><strong>取货 (<code>__getitem__</code>)</strong>：<ul>
+<li>当你喊 <code>dataset[0]</code> 时，它把上面整理好的第 0 条字典给你。</li>
+</ul>
+</li>
+<li><strong>盘点库存 (<code>__len__</code>)</strong>：<ul>
+<li>告诉你一共有多少条数据。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>Task 4: 拼盘上菜 (<code>collate_fn</code> 和 <code>collate_gpt_fn</code>)</h3>
+<p><strong>这是最难懂的部分</strong>。因为模型训练是一批一批（Batch）进行的，比如一次吃 32 口。我们需要把 32 个长短不一的句子拼在一起，变成整齐的张量（Tensor）。</p>
+<p>这里有两个函数，分别对应两种不同的 AI 模型架构：</p>
+<h4>A. 给 T5/BART 这种模型用的 (<code>collate_fn</code>)</h4>
+<p>这种模型是 <strong>Encoder-Decoder</strong> 架构（像翻译软件，输入和输出是分开的）。</p>
+<ol>
+<li><strong>分拣</strong>：把这一批里的所有 <code>prompt</code> 放在一堆，<code>target</code> 放在一堆，<code>rephrase</code> 放在一堆。</li>
+<li><strong>数字化与补齐</strong>：调用 <code>self.tok(...)</code>。因为句子长短不一，短的后面要补 0 (Padding)，把它们变成一样长。</li>
+<li><strong>打包 <code>edit_inner</code></strong>：<ul>
+<li>这是用来<strong>训练（修改）</strong>的数据包。</li>
+<li>输入是 <code>src</code> (问题)，标签是 <code>trg</code> (新答案)。</li>
+</ul>
+</li>
+<li><strong>打包 <code>edit_rephrase</code></strong>：<ul>
+<li>这是用来<strong>测试泛化</strong>的数据包。</li>
+<li>输入是 <code>rephrase</code> (换个问法)，标签依然是 <code>trg</code> (新答案)。</li>
+</ul>
+</li>
+<li><strong>打包 <code>loc</code></strong>：<ul>
+<li>这是用来<strong>测试稳定性</strong>的数据包。</li>
+<li>输入是 <code>loc</code> (无关问题)，标签是 <code>loc_ans</code> (原本的正确答案)。</li>
+</ul>
+</li>
+</ol>
+<h4>B. 给 GPT/LLaMA 这种模型用的 (<code>collate_gpt_fn</code>)</h4>
+<p>这种模型是 <strong>Decoder-only</strong> 架构（像文字接龙，输入和输出是连在一起的）。</p>
+<ol>
+<li><strong>拼接字符串</strong>：<ul>
+<li>GPT 训练时，通常是把问题和答案拼起来。</li>
+<li>代码逻辑：<code>src_</code> + <code>' '</code> + <code>trg_</code>。</li>
+<li>比如变成：“美国总统是谁？ 特朗普”。</li>
+</ul>
+</li>
+<li><strong>SERAC 算法的特殊处理</strong>：<ul>
+<li>代码里有一大段 <code>if self.config.alg == 'SERAC':</code>。</li>
+<li>这是一个特殊的模型编辑算法，它要求数据格式比较特殊（把问题和答案切片处理），如果你不是用 SERAC 算法，可以跳过这段，逻辑会走到 <code>else</code> 分支，就是简单的拼接。</li>
+</ul>
+</li>
+<li><strong>生成 Labels (标签)</strong>：<ul>
+<li><code>get_edit_labels</code> 函数：用来把输入部分的 Loss 盖住（Mask）。</li>
+<li>因为在 GPT 里，我们只希望模型学会<strong>生成答案</strong>，而不计算它生成“问题”的误差。</li>
+</ul>
+</li>
+</ol>
+<h3>总结：这个文件到底在干嘛？</h3>
+<p>如果把这个 Task List 浓缩成一句话：</p>
+<p><strong>这个文件负责从 JSON 里读取“知识编辑”题目，把它们分成“修改目标”、“同义改写测试”、“无关知识测试”三组，然后转化成 PyTorch 能看懂的数字矩阵（Tensor），喂给模型去训练。</strong></p>
+<ul>
+<li><code>edit_inner</code>: 告诉模型“你要把这个改了”。</li>
+<li><code>edit_rephrase</code>: 考考模型“换个说法你还认得吗？”</li>
+<li><code>loc</code>: 考考模型“别把无关的事情搞乱了”。</li>
+</ul>

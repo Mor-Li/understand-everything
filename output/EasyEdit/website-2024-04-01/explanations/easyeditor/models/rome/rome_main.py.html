@@ -1,0 +1,125 @@
+<h1>easyeditor/models/rome/rome_main.py</h1>
+<p>这份代码实现了 <strong>ROME (Rank-One Model Editing)</strong> 算法的核心逻辑。简单来说，它的目的是像做微创手术一样，修改大模型（如GPT）里的某一条特定知识（例如把“埃菲尔铁塔在巴黎”修改为“埃菲尔铁塔在罗马”），而不破坏模型里的其他知识。</p>
+<p>这份代码读起来难懂，是因为它把“计算怎么改”和“实际动手改”分开了。</p>
+<p>我们可以把这个过程想象成<strong>给模型做一次“记忆移植手术”</strong>。下面是一个按步骤执行的 <strong>Task Todo List</strong>，对应代码中的执行逻辑：</p>
+<hr />
+<h3>📋 ROME 算法执行清单 (Task Todo List)</h3>
+<h4>Phase 1: 术前准备 (Setup)</h4>
+<ol>
+<li><strong>[ ] 接收修改请求</strong>: 获取用户想要修改的内容（比如：把“Steve Jobs”是“Apple”的创始人，改成是“Microsoft”的创始人）。</li>
+<li><strong>[ ] 复制模型 (可选)</strong>: 如果不想破坏原模型，就先克隆一个备份 (<code>deepcopy</code>)。</li>
+<li><strong>[ ] 准备提示词模版</strong>: 为了让修改更稳健（不仅仅死记硬背这一句话），生成一堆上下文模版（比如“因为 Steve Jobs...”，“我说 Steve Jobs...”），这对应代码里的 <code>get_context_templates</code>。</li>
+</ol>
+<h4>Phase 2: 制定手术方案 (对应 <code>execute_rome</code> 函数)</h4>
+<p><em>这一步只计算数据，不产生永久性修改。</em></p>
+<ol>
+<li><strong>[ ] 锁定目标层</strong>: 决定在神经网络的第几层动刀（由 <code>hparams.layers</code> 决定）。</li>
+<li><strong>[ ] 计算“手术位置”向量 (Compute $u$)</strong>:<ul>
+<li><strong>任务</strong>: 找到模型大脑中处理“Steve Jobs”这个主语的具体神经元位置。</li>
+<li><strong>代码</strong>: 调用 <code>compute_u</code>。</li>
+<li><strong>原理</strong>: 这是一个“键 (Key)”向量，代表“我们要改哪里”。</li>
+</ul>
+</li>
+<li><strong>[ ] 计算“新记忆”向量 (Compute $v$)</strong>:<ul>
+<li><strong>任务</strong>: 计算出一个新的数值向量，使得当模型读到“Steve Jobs”时，直接输出“Microsoft”。</li>
+<li><strong>代码</strong>: 调用 <code>compute_v</code>。</li>
+<li><strong>原理</strong>: 这是一个“值 (Value)”向量，代表“我们要改成什么内容”。</li>
+</ul>
+</li>
+<li><strong>[ ] 验证并记录方案</strong>:<ul>
+<li>暂时在内存里模拟修改一下，看看效果。</li>
+<li>把计算出的 $u$ 和 $v$ 打包成一个“增量包 (<code>deltas</code>)”。</li>
+<li><strong>重要</strong>: 计算完后，把模型<strong>恢复原状</strong>（<code>execute_rome</code> 里的 <code>weights[...]=weights_copy</code>），保证这一步纯粹只是为了算出方案。</li>
+</ul>
+</li>
+</ol>
+<h4>Phase 3: 执行手术 (对应 <code>apply_rome_to_model</code> 函数)</h4>
+<p><em>这一步是真正的写入操作。</em></p>
+<ol>
+<li><strong>[ ] 读取增量包</strong>: 拿到刚才算出来的 $u$ 和 $v$。</li>
+<li><strong>[ ] 格式对齐</strong>: 检查矩阵形状是否匹配（有的模型矩阵是转置的），对应 <code>upd_matrix_match_shape</code>。</li>
+<li><strong>[ ] 注入新权重</strong>:<ul>
+<li><strong>核心公式</strong>: <code>New_Weight = Old_Weight + (u * v)</code>。</li>
+<li><strong>代码</strong>: <code>w[...] += upd_matrix</code>。</li>
+<li>这相当于在原有的大脑连接上，叠加了一个修正补丁。</li>
+</ul>
+</li>
+<li><strong>[ ] 清理现场</strong>: 如果不需要保留原始权重备份，就释放内存。</li>
+<li><strong>[ ] 出院</strong>: 返回修改后的模型 (<code>model</code>)。</li>
+</ol>
+<hr />
+<h3>🔍 逐步代码对应讲解</h3>
+<p>现在我们带着上面的清单，重新看一段段代码：</p>
+<h4>1. 入口函数：<code>apply_rome_to_model</code></h4>
+<p>这是手术的主刀医生，负责统筹。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">apply_rome_to_model</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="c1"># ... 省略部分代码</span>
+
+    <span class="c1"># 1. 制定方案：调用 execute_rome 计算出 u 和 v</span>
+    <span class="n">deltas</span> <span class="o">=</span> <span class="n">execute_rome</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">tok</span><span class="p">,</span> <span class="n">request</span><span class="p">,</span> <span class="n">hparams</span><span class="p">)</span>
+
+    <span class="c1"># 2. 执行手术：真正修改模型的权重</span>
+    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+        <span class="k">for</span> <span class="n">w_name</span><span class="p">,</span> <span class="p">(</span><span class="n">delta_u</span><span class="p">,</span> <span class="n">delta_v</span><span class="p">)</span> <span class="ow">in</span> <span class="n">deltas</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="c1"># 核心数学操作：计算改变量矩阵 = u 乘 v</span>
+            <span class="n">upd_matrix</span> <span class="o">=</span> <span class="n">delta_u</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span> <span class="o">@</span> <span class="n">delta_v</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+
+            <span class="c1"># 获取模型原本的权重参数</span>
+            <span class="n">w</span> <span class="o">=</span> <span class="n">nethook</span><span class="o">.</span><span class="n">get_parameter</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">w_name</span><span class="p">)</span>
+
+            <span class="c1"># 形状对齐（防止矩阵长宽搞反）</span>
+            <span class="n">upd_matrix</span> <span class="o">=</span> <span class="n">upd_matrix_match_shape</span><span class="p">(</span><span class="n">upd_matrix</span><span class="p">,</span> <span class="n">w</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span>
+
+            <span class="c1"># !!! 这一步是真正的修改 !!! </span>
+            <span class="c1"># 把计算出的变化量加到原权重上</span>
+            <span class="n">w</span><span class="p">[</span><span class="o">...</span><span class="p">]</span> <span class="o">+=</span> <span class="n">upd_matrix</span>
+
+    <span class="k">return</span> <span class="n">model</span><span class="p">,</span> <span class="n">weights_copy</span>
+</code></pre></div>
+
+<h4>2. 核心大脑：<code>execute_rome</code></h4>
+<p>这是负责计算的麻醉师和分析师。它的特点是：<strong>计算完会把模型还原，只返回计算结果。</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">execute_rome</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="c1"># ... 预处理 prompt ...</span>
+
+    <span class="c1"># 备份当前层的原始权重，方便计算完后还原</span>
+    <span class="n">weights_copy</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">weights</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
+
+    <span class="c1"># 循环处理每一层（通常 ROME 只改一层，但代码支持多层）</span>
+    <span class="k">for</span> <span class="n">layer</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">hparams</span><span class="o">.</span><span class="n">layers</span><span class="p">):</span>
+        <span class="c1"># Todo Step 5: 算出 u (在哪里改)</span>
+        <span class="n">left_vector</span> <span class="o">=</span> <span class="n">compute_u</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> 
+
+        <span class="c1"># Todo Step 6: 算出 v (改成什么)</span>
+        <span class="n">right_vector</span> <span class="o">=</span> <span class="n">compute_v</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+        <span class="c1"># ... </span>
+        <span class="c1"># 记录下这两个向量，存入 deltas</span>
+        <span class="n">deltas</span><span class="p">[</span><span class="n">weight_name</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">left_vector</span><span class="p">,</span> <span class="n">right_vector</span><span class="p">)</span>
+
+    <span class="c1"># !!! 恢复现场 !!!</span>
+    <span class="c1"># 把刚才为了计算临时改动的权重恢复成原始状态</span>
+    <span class="c1"># 因为真正的修改要交给 apply_rome_to_model 去做</span>
+    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+        <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">weights</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="n">v</span><span class="p">[</span><span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="n">weights_copy</span><span class="p">[</span><span class="n">k</span><span class="p">]</span>
+
+    <span class="k">return</span> <span class="n">deltas</span> <span class="c1"># 返回计算好的 u 和 v</span>
+</code></pre></div>
+
+<h4>3. 辅助工具：<code>get_context_templates</code></h4>
+<p>这是为了防止模型“死记硬背”。</p>
+<ul>
+<li><strong>观点</strong>: 如果我们只教模型“Steve Jobs founded Microsoft”，它可能换个问法“Who created Microsoft?”就答不上来了。</li>
+<li><strong>做法</strong>: 代码里生成了很多前缀，比如 "I think...", "Because...", "The..."。</li>
+<li><strong>目的</strong>: 在计算 $v$ (新记忆) 时，让模型在各种语境下都能输出正确的新结果，增强泛化能力。</li>
+</ul>
+<h3>总结</h3>
+<p>这篇代码其实就在干一件事：
+<strong>$W_{new} = W_{old} + u \times v^T$</strong></p>
+<ul>
+<li><code>apply_rome_to_model</code> 负责执行这个加法。</li>
+<li><code>execute_rome</code> 负责算出 $u$ 和 $v$ 是多少。</li>
+<li><code>compute_u</code> 找主语（Subject）的位置。</li>
+<li><code>compute_v</code> 找新目标（Target）的信息。</li>
+</ul>

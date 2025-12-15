@@ -1,0 +1,114 @@
+<h1>easyeditor/models/alphaedit/compute_ks.py</h1>
+<p>这份代码确实一上来直接看会很晕，因为它涉及到了<strong>模型编辑（Model Editing）</strong>算法的核心逻辑，特别是像 ROME、MEMIT 或 AlphaEdit 这类算法。</p>
+<p>简单来说，这段代码的目的是：<strong>为了修改模型里的某个知识（比如“埃菲尔铁塔在巴黎”），我们需要先找到“埃菲尔铁塔”在这个模型特定层里的“长相”（特征向量），我们管这个特征向量叫做 $k$ (Key)。</strong></p>
+<p>为了让你彻底搞懂，我把这个过程拆解成一个 <strong>“任务清单 (Todo List)”</strong>，我们一步步来完成这个计算任务。</p>
+<hr />
+<h3>任务清单：如何计算知识的“钥匙” ($k$)</h3>
+<h4>✅ Task 1: 理解核心目标 ($k$ 是什么？)</h4>
+<p>在模型编辑算法中，我们把神经网络的一层看作是一个键值对存储（Key-Value Memory）。
+*   <strong>$k$ (Key)</strong>: 是输入的特征。比如当你输入“埃菲尔铁塔”时，模型在第 5 层产生的向量。
+*   <strong>$v$ (Value)</strong>: 是输出的结果。比如模型接下来想预测“在巴黎”。
+*   <strong>目标</strong>: 这里的代码就是为了<strong>算出一个最准、最通用的 $k$</strong>。</p>
+<h4>✅ Task 2: 准备“多样化”的诱饵 (Context Templates)</h4>
+<p>如果你只给模型输入一句话“埃菲尔铁塔在哪里？”，算出来的 $k$ 可能有偏差（过拟合）。
+为了让编辑更稳健，我们需要把“埃菲尔铁塔”放在各种不同的句子里，取平均值。
+*   <strong>动作</strong>: 代码里 <code>context_templates</code> 就是一堆句式模板（比如 <code>["{}是...", "{}位于...", "你知道{}吗"]</code>）。
+*   <strong>代码对应</strong>: 列表推导式那一大坨代码。它把你要编辑的 <code>prompt</code> 填入各种模板，生成一大堆句子。</p>
+<h4>✅ Task 3: 捕捉特征 (Forward Pass)</h4>
+<p>我们需要把这些句子喂给模型，然后在指定的层（<code>layer</code>）停下来，看看模型对“关键词”（Subject，比如“埃菲尔铁塔”）的反应是什么。
+*   <strong>动作</strong>: 调用 <code>get_module_input_output_at_words</code>。
+*   <strong>代码对应</strong>: <code>layer_ks = get_module_input_output_at_words(...)</code>。
+    *   它返回的 <code>layer_ks</code> 是一个巨大的张量（Tensor），里面存了所有模板句子中关键词的向量。</p>
+<h4>✅ Task 4: 分组与取平均 (Averaging)</h4>
+<p>这是代码最难懂的部分（那个双重循环）。
+因为我们生成的句子是分种类的（比如“前缀类模板”、“后缀类模板”）。为了防止某一类模板太多导致权重过大，代码做了一个<strong>分层平均</strong>。
+*   <strong>第一步</strong>: 先算出每一类模板产生的向量的平均值。
+*   <strong>第二步</strong>: 再把所有类别的平均值，再取一次平均。
+*   <strong>结果</strong>: 得到一个最能代表“埃菲尔铁塔”在这个模型中样子的向量。</p>
+<hr />
+<h3>代码逐行精讲</h3>
+<p>现在我们带着上面的理解，再看一遍代码，我把每一步都翻译成了中文逻辑：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">compute_ks</span><span class="p">(</span>
+    <span class="n">model</span><span class="p">:</span> <span class="n">AutoModelForCausalLM</span><span class="p">,</span>
+    <span class="n">tok</span><span class="p">:</span> <span class="n">AutoTokenizer</span><span class="p">,</span>
+    <span class="n">requests</span><span class="p">:</span> <span class="n">Dict</span><span class="p">,</span> <span class="c1"># 用户的编辑请求，包含 prompt(提示) 和 subject(关键词)</span>
+    <span class="n">hparams</span><span class="p">:</span> <span class="n">AlphaEditHyperParams</span><span class="p">,</span>
+    <span class="n">layer</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="c1"># 我们要在哪一层提取特征</span>
+    <span class="n">context_templates</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="c1"># 各种各样的句子模板</span>
+<span class="p">):</span>
+    <span class="c1"># ==========================================</span>
+    <span class="c1"># 步骤 1: 准备数据并提取原始特征</span>
+    <span class="c1"># ==========================================</span>
+    <span class="n">layer_ks</span> <span class="o">=</span> <span class="n">get_module_input_output_at_words</span><span class="p">(</span>
+        <span class="n">model</span><span class="p">,</span>
+        <span class="n">tok</span><span class="p">,</span>
+        <span class="n">layer</span><span class="p">,</span>
+        <span class="c1"># 这里做了很暴力的列表生成：</span>
+        <span class="c1"># 假设有 1 个请求，3 种模板类型，每种类型有 5 个模板。</span>
+        <span class="c1"># 这里会生成 1 * 3 * 5 = 15 个句子。</span>
+        <span class="n">context_templates</span><span class="o">=</span><span class="p">[</span>
+            <span class="n">context</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">request</span><span class="p">[</span><span class="s2">&quot;prompt&quot;</span><span class="p">])</span>
+            <span class="k">for</span> <span class="n">request</span> <span class="ow">in</span> <span class="n">requests</span>
+            <span class="k">for</span> <span class="n">context_type</span> <span class="ow">in</span> <span class="n">context_templates</span>
+            <span class="k">for</span> <span class="n">context</span> <span class="ow">in</span> <span class="n">context_type</span>
+        <span class="p">],</span>
+        <span class="c1"># 提取每个句子中 subject (关键词) 对应的向量</span>
+        <span class="n">words</span><span class="o">=</span><span class="p">[</span>
+            <span class="n">request</span><span class="p">[</span><span class="s2">&quot;subject&quot;</span><span class="p">]</span>
+            <span class="k">for</span> <span class="n">request</span> <span class="ow">in</span> <span class="n">requests</span>
+            <span class="k">for</span> <span class="n">context_type</span> <span class="ow">in</span> <span class="n">context_templates</span>
+            <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="n">context_type</span>
+        <span class="p">],</span>
+        <span class="n">module_template</span><span class="o">=</span><span class="n">hparams</span><span class="o">.</span><span class="n">rewrite_module_tmp</span><span class="p">,</span>
+        <span class="n">fact_token_strategy</span><span class="o">=</span><span class="n">hparams</span><span class="o">.</span><span class="n">fact_token</span><span class="p">,</span>
+    <span class="p">)[</span><span class="mi">0</span><span class="p">]</span> <span class="c1"># [0] 表示我们要的是 Input (Key)，不是 Output</span>
+
+    <span class="c1"># ==========================================</span>
+    <span class="c1"># 步骤 2: 计算分组的长度信息</span>
+    <span class="c1"># ==========================================</span>
+    <span class="c1"># context_templates 是个列表的列表（List[List[str]]）</span>
+    <span class="c1"># 比如: [[短模板1, 短模板2], [长模板1, 长模板2, 长模板3]]</span>
+    <span class="c1"># context_type_lens = [0, 2, 3]</span>
+    <span class="n">context_type_lens</span> <span class="o">=</span> <span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">+</span> <span class="p">[</span><span class="nb">len</span><span class="p">(</span><span class="n">context_type</span><span class="p">)</span> <span class="k">for</span> <span class="n">context_type</span> <span class="ow">in</span> <span class="n">context_templates</span><span class="p">]</span>
+
+    <span class="c1"># context_len = 5 (一个请求总共对应多少个模板句子)</span>
+    <span class="n">context_len</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">context_type_lens</span><span class="p">)</span>
+
+    <span class="c1"># cumsum 是累加，用于确定切片的索引位置</span>
+    <span class="c1"># context_type_csum = [0, 2, 5] -&gt; 第一组在0-2，第二组在2-5</span>
+    <span class="n">context_type_csum</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">cumsum</span><span class="p">(</span><span class="n">context_type_lens</span><span class="p">)</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span>
+
+    <span class="c1"># ==========================================</span>
+    <span class="c1"># 步骤 3: 复杂的平均逻辑</span>
+    <span class="c1"># ==========================================</span>
+    <span class="n">ans</span> <span class="o">=</span> <span class="p">[]</span>
+
+    <span class="c1"># 外层循环：遍历每一个 Request (编辑请求)</span>
+    <span class="c1"># range(0, 总向量数, 每个请求的模板数)</span>
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">layer_ks</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">context_len</span><span class="p">):</span>
+        <span class="n">tmp</span> <span class="o">=</span> <span class="p">[]</span>
+
+        <span class="c1"># 内层循环：遍历每一个模板类型 (Context Type)</span>
+        <span class="k">for</span> <span class="n">j</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">context_type_csum</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">):</span>
+            <span class="c1"># 确定当前这组模板在张量中的 起始 和 结束 位置</span>
+            <span class="n">start</span><span class="p">,</span> <span class="n">end</span> <span class="o">=</span> <span class="n">context_type_csum</span><span class="p">[</span><span class="n">j</span><span class="p">],</span> <span class="n">context_type_csum</span><span class="p">[</span><span class="n">j</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span>
+
+            <span class="c1"># 【关键点】：先把这一类模板的向量取平均</span>
+            <span class="c1"># i 是当前请求的偏移量，start/end 是模板类型的偏移量</span>
+            <span class="n">tmp</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">layer_ks</span><span class="p">[</span><span class="n">i</span> <span class="o">+</span> <span class="n">start</span> <span class="p">:</span> <span class="n">i</span> <span class="o">+</span> <span class="n">end</span><span class="p">]</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="mi">0</span><span class="p">))</span>
+
+        <span class="c1"># 【关键点】：再把所有类型的平均值，堆叠起来再取一次平均</span>
+        <span class="c1"># 这样得到的就是当前 Request 最终的 k 向量</span>
+        <span class="n">ans</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">tmp</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="mi">0</span><span class="p">))</span>
+
+    <span class="c1"># 最后把所有 Request 的结果堆叠返回</span>
+    <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">ans</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+</code></pre></div>
+
+<h3>总结文中的观点</h3>
+<p>这段代码其实只表达了一个核心技术观点：</p>
+<p><strong>“不要相信单一特定语境下的特征，要通过层级化的平均（Hierarchical Averaging）来获得更鲁棒（Robust）的知识表示。”</strong></p>
+<ol>
+<li>它认为一个事实（Fact）应该在多种上下文中都成立。</li>
+<li>它认为不同类型的上下文（比如疑问句模板 vs 陈述句模板）应该具有相等的权重，所以它先组内平均，再组间平均。</li>
+</ol>

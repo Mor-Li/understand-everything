@@ -1,0 +1,134 @@
+<h1>easyeditor/trainer/algs/local_nn.py</h1>
+<p>这份代码确实充满了很多“深度学习工程上的黑魔法”，特别是关于<strong>初始化（Initialization）</strong>和<strong>低秩矩阵（Low-Rank）</strong>的操作。</p>
+<p>如果不了解其背后的<strong>模型编辑（Model Editing）</strong>背景，确实很难看懂。这个文件通常用于像 <strong>SERAC</strong> 这样的算法，它的核心逻辑是：<strong>不直接修改大模型原本的参数，而是外挂一个小模型来修正大模型的输出。</strong></p>
+<p>为了让你彻底搞懂，我为你制定了一个 <strong>5步走的 Task List</strong>。我们把这个文件当做一个“外挂补丁工厂”来拆解。</p>
+<hr />
+<h3>📝 学习任务清单 (Todo List)</h3>
+<ol>
+<li><strong>Task 1: 理解核心目标——“无害原则” (Identity Mapping)</strong><ul>
+<li><em>目标</em>：明白为什么代码里到处都在把模型初始化为 $y=x$。</li>
+</ul>
+</li>
+<li><strong>Task 2: 拆解基础积木——<code>LRLinear</code> (低秩线性层)</strong><ul>
+<li><em>目标</em>：理解为什么把一个大矩阵拆成两个小矩阵乘积，以及 <code>mode</code> 是干嘛的。</li>
+</ul>
+</li>
+<li><strong>Task 3: 理解组装逻辑——<code>IDMLP</code> (恒等多层感知机)</strong><ul>
+<li><em>目标</em>：看懂它是如何利用残差连接（Residual Connection）实现“输出等于输入”的。</li>
+</ul>
+</li>
+<li><strong>Task 4: 理解高级封装——<code>MLP</code> 及其初始化魔法</strong><ul>
+<li><em>目标</em>：看懂 <code>init="id"</code> 时那些奇怪的矩阵操作（比如乘以 -1）是为了解决 ReLU 的非线性问题。</li>
+</ul>
+</li>
+<li><strong>Task 5: 验收测试——<code>__main__</code> 函数</strong><ul>
+<li><em>目标</em>：验证上述理论在代码运行中的表现。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>✅ Task 1: 理解核心目标——“无害原则”</h4>
+<p><strong>背景：</strong>
+你想给大模型打个补丁（比如修正一个错误知识）。在训练开始前，这个补丁必须是“透明”的。
+<strong>直觉：</strong>
+如果不透明，你挂上一个随机初始化的神经网络，大模型的输出立刻就会变成乱码。
+<strong>代码体现：</strong>
+这就是为什么你会在代码里反复看到 <code>init="id"</code>（Identity，恒等映射）。意思就是：<strong>初始状态下，无论输入 $x$ 是什么，经过这个网络，输出 $y$ 必须约等于 $x$。</strong> 只有开始训练后，才慢慢改变输出。</p>
+<hr />
+<h4>✅ Task 2: 拆解基础积木——<code>LRLinear</code></h4>
+<p>这个类是 <code>Linear</code>（线性层）的变体。</p>
+<p><strong>1. 什么是 Low-Rank (低秩)?</strong>
+*   <strong>普通线性层</strong>：$W$ 是一个大矩阵（比如 $1000 \times 1000$）。参数量大，训练慢。
+*   <strong>LRLinear</strong>：把 $W$ 拆成两个小矩阵 $U$ 和 $V$ 相乘（比如 $1000 \times 10$ 和 $10 \times 1000$）。
+*   <strong>代码位置</strong>：
+    <code>python
+    # 中间维度 rank 很小
+    self.u = nn.Parameter(torch.zeros(outf, mid_dim))
+    self.v = nn.Parameter(torch.randn(mid_dim, inf))
+    # 前向传播：先乘 v 再乘 u
+    pre_act = (self.u @ (self.v @ x.T)).T</code>
+*   <strong>目的</strong>：参数更少，更适合微调或作为轻量级插件。</p>
+<p><strong>2. 什么是 <code>mode</code>?</strong>
+*   这是一个“条件控制”机制（类似 FiLM 层）。
+*   <strong>直觉</strong>：假设这个网络要处理不同类型的任务（Mode 0: 修正人名, Mode 1: 修正地名）。传入 <code>mode</code> ID，网络会根据 ID 调整自己的缩放（scale）和偏移（shift）。
+*   <strong>代码位置</strong>：
+    <code>python
+    scale, shift = self.mode_scale(mode), self.mode_shift(mode)
+    pre_act = pre_act * scale + shift</code></p>
+<p><strong>3. 如何实现 Task 1 的“无害原则”？</strong>
+*   注意看 <code>forward</code> 的最后：
+    <code>python
+    if self.init == "id":
+        return acts + x  # 强制加上输入 x，形成残差连接</code>
+*   如果 <code>acts</code>（神经网络的计算结果）初始接近 0，那么返回值就是 $0 + x = x$。</p>
+<hr />
+<h4>✅ Task 3: 理解组装逻辑——<code>IDMLP</code></h4>
+<p><code>IDMLP</code> 是一个专门为了“恒等映射”设计的网络。</p>
+<ul>
+<li><strong>结构</strong>：它就是把好几个 <code>LRLinear</code> 串起来。</li>
+<li><strong>逻辑</strong>：
+    因为 <code>LRLinear</code> 在 <code>init="id"</code> 模式下，输出是 <code>acts + x</code>。
+    <code>IDMLP</code> 通过堆叠这些层，并配合特定的初始化（让 <code>u</code> 为 0），使得每一层的 <code>acts</code> 都很小。
+    最终效果：整个网络就是一个复杂的“什么都不做”的管道，直到你开始训练它去修改特定的 hidden state。</li>
+</ul>
+<hr />
+<h4>✅ Task 4: 理解高级封装——<code>MLP</code> 及其初始化魔法</h4>
+<p>这个类是最复杂的，因为它试图用标准的 <code>nn.Linear</code> 来实现恒等映射，这很难，因为我们有激活函数 <code>ReLU</code>。</p>
+<p><strong>难点：</strong>
+$ReLU(x)$ 会把负数变成 0。如果你初始化 $W$ 为单位矩阵 $I$，那么 $ReLU(Ix)$ 会丢失一半的信息（负数部分），导致 $y \neq x$。</p>
+<p><strong>代码里的魔法 (<code>init="id"</code> 部分)：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这是一个非常经典的技巧，用来让 ReLU 网络模拟线性恒等映射</span>
+<span class="c1"># 1. 扩充隐藏层维度</span>
+<span class="k">if</span> <span class="n">hidden_dim</span> <span class="o">&lt;</span> <span class="n">indim</span> <span class="o">*</span> <span class="mi">2</span><span class="p">:</span> <span class="n">hidden_dim</span> <span class="o">=</span> <span class="n">indim</span> <span class="o">*</span> <span class="mi">2</span>
+
+<span class="c1"># 2. 构造特殊的权重</span>
+<span class="c1"># 第一层权重：复制两份单位矩阵，其中一份乘以 -1</span>
+<span class="n">layers</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">data</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">eye</span><span class="p">(</span><span class="n">indim</span><span class="p">)</span><span class="o">.</span><span class="n">repeat</span><span class="p">(</span><span class="n">hidden_dim</span> <span class="o">//</span> <span class="n">indim</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+<span class="n">layers</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">data</span><span class="p">[</span><span class="n">hidden_dim</span> <span class="o">//</span> <span class="mi">2</span> <span class="p">:]</span> <span class="o">*=</span> <span class="o">-</span><span class="mi">1</span>
+
+<span class="c1"># 最后一层权重：对应地合并回去，并再次反转符号</span>
+<span class="n">layers</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">data</span><span class="p">[:,</span> <span class="n">hidden_dim</span> <span class="o">//</span> <span class="mi">2</span> <span class="p">:]</span> <span class="o">*=</span> <span class="o">-</span><span class="mi">1</span>
+</code></pre></div>
+
+<p><strong>原理解析（简单版）：</strong>
+想象输入是 $x=5$ 和 $x=-5$。
+1.  网络造了两条路：
+    *   路 A: $x$
+    *   路 B: $-x$
+2.  经过 ReLU：
+    *   如果输入是 5：路 A 也就是 5 (保留)，路 B 是 -5 (被ReLU变成0)。
+    *   如果输入是 -5：路 A 是 -5 (被ReLU变成0)，路 B 是 5 (保留)。
+3.  输出层：
+    *   把路 A 和 路 B 的结果拼回来（路 B 再乘个 -1 还原回去）。
+4.  <strong>结果</strong>：无论输入正负，都能完美还原。这就是为什么代码里要有 <code>*= -1</code> 和 <code>repeat</code> 的原因。</p>
+<p><strong><code>init="id_alpha"</code> 模式：</strong>
+这是另一种更简单的策略：</p>
+<div class="codehilite"><pre><span></span><code><span class="bp">self</span><span class="o">.</span><span class="n">alpha</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Parameter</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">outdim</span><span class="p">))</span>
+<span class="c1"># forward:</span>
+<span class="k">return</span> <span class="n">x</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">alpha</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">mlp</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+</code></pre></div>
+
+<p>直接把 MLP 的输出乘以一个系数 $\alpha$（初始化为 0）。
+初始状态：$x + 0 \times MLP(x) = x$。
+训练时：$\alpha$ 慢慢变大，MLP 的影响慢慢浮现。</p>
+<hr />
+<h4>✅ Task 5: 验证结果——<code>__main__</code> 函数</h4>
+<p>最后，作者写了一个测试脚本来证明他的魔法是生效的。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># m0: 普通 MLP -&gt; 输出肯定不等于输入</span>
+<span class="n">m0</span> <span class="o">=</span> <span class="n">MLP</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> 
+<span class="k">assert</span> <span class="ow">not</span> <span class="n">torch</span><span class="o">.</span><span class="n">allclose</span><span class="p">(</span><span class="n">y0</span><span class="p">,</span> <span class="n">x</span><span class="p">)</span>
+
+<span class="c1"># m1: 使用魔法初始化的 MLP -&gt; 输出必须等于输入</span>
+<span class="n">m1</span> <span class="o">=</span> <span class="n">MLP</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="s2">&quot;id&quot;</span><span class="p">)</span>
+<span class="k">assert</span> <span class="n">torch</span><span class="o">.</span><span class="n">allclose</span><span class="p">(</span><span class="n">y1</span><span class="p">,</span> <span class="n">x</span><span class="p">)</span>  <span class="c1"># 验证成功！</span>
+
+<span class="c1"># m2: 使用 alpha 门控的 MLP -&gt; 输出必须等于输入</span>
+<span class="n">m2</span> <span class="o">=</span> <span class="n">MLP</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="s2">&quot;id_alpha&quot;</span><span class="p">)</span>
+<span class="k">assert</span> <span class="n">torch</span><span class="o">.</span><span class="n">allclose</span><span class="p">(</span><span class="n">y2</span><span class="p">,</span> <span class="n">x</span><span class="p">)</span>  <span class="c1"># 验证成功！</span>
+</code></pre></div>
+
+<h3>总结</h3>
+<p>这段代码的核心思想是：
+<strong>构建一个神经网络（MLP），但通过巧妙的“低秩分解”、“残差连接”或“正负双路初始化”，强制让它在没训练之前，表现得像一个透明的玻璃（输出=输入）。</strong></p>
+<p>这样做是为了在编辑大模型时，提供一个<strong>平滑的起点</strong>。</p>

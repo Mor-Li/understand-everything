@@ -1,0 +1,121 @@
+<h1>examples/run_santinization_llama2.py</h1>
+<p>这份代码确实比较长，涉及到了大模型编辑（Model Editing）的很多具体流程。简单来说，这是一个<strong>自动化实验脚本</strong>，用来测试不同的“模型手术”方法（比如 ROME, MEMIT, LoRA 等）在 Llama-2 模型上的效果。</p>
+<p>它的核心目的是：<strong>我想让模型“忘记”或“修改”某些特定的知识（比如把“奶酪”改成其他东西），同时不破坏模型原有的其他能力。</strong></p>
+<p>为了让你清晰理解，我把它拆解成一个 <strong>Project Manager 的任务清单（Todo List）</strong>，然后一步步解释每个任务在代码里是怎么实现的。</p>
+<hr />
+<h3>📋 任务清单 (Task Todo List)</h3>
+<ol>
+<li><strong>【准备阶段】配置与初始化</strong><ul>
+<li>确定今天要用哪种“手术刀”（编辑方法，如 ROME, LoRA）。</li>
+<li>加载病人（模型）和病历本（数据集）。</li>
+</ul>
+</li>
+<li><strong>【基准测试】记录手术前的状态 (Caching)</strong><ul>
+<li>在动手术前，先问问模型一些无关问题，记下它的原始回答（作为参照物）。</li>
+</ul>
+</li>
+<li><strong>【手术阶段】执行模型编辑 (Editing)</strong><ul>
+<li>根据选择的方法，对模型权重进行修改或微调。</li>
+<li><em>如果是微调类（FT/LoRA）：</em> 需要混合“遗忘数据”和“保留数据”一起练。</li>
+<li><em>如果是定位编辑类（ROME/MEMIT）：</em> 直接定位神经元修改。</li>
+</ul>
+</li>
+<li><strong>【验收阶段】术后评估 (Evaluation)</strong><ul>
+<li><strong>成功率 (Success)：</strong> 让你改的知识改过来了吗？</li>
+<li><strong>局部性/副作用 (Locality)：</strong> 没让你改的知识（无关知识）是不是坏掉了？</li>
+<li><strong>流畅度 (Fluency)：</strong> 模型还能不能说人话？</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🧐 逐步深度解析</h3>
+<p>下面我按照上面的清单，结合代码片段给你讲讲它的逻辑。</p>
+<h4>1. 【准备阶段】配置与初始化</h4>
+<p><strong>代码位置：</strong> <code>__init__</code> 函数和 <code>args_parser</code>。</p>
+<ul>
+<li><strong>观点：</strong> 实验必须有控制变量。</li>
+<li><strong>做什么：</strong><ul>
+<li>脚本启动时接收参数 <code>args.editing_method</code>（比如 ROME）。</li>
+<li>根据方法加载对应的超参数（<code>hparams</code>）。</li>
+<li>加载训练集（用来教模型改什么）和测试集（用来考模型）。</li>
+<li><strong>关键点：</strong> 代码里把数据分成了 <code>train</code>（用于编辑）和 <code>test</code>（用于评估）。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 【基准测试】记录手术前的状态</h4>
+<p><strong>代码位置：</strong> <code>cache_locality_before_editing</code> 和 <code>cache_train_before_editing</code>。</p>
+<ul>
+<li><strong>观点：</strong> 所谓的“副作用”是指<strong>相对于原模型</strong>的变化。如果原模型本来就答不对这道题，那编辑后答不对就不算副作用。</li>
+<li><strong>做什么：</strong><ul>
+<li><strong>Locality Cache:</strong> 在还没修改模型参数之前，先把测试集里的 <code>locality</code>（邻域/无关知识）问题问一遍。</li>
+<li>比如问：“天空是什么颜色的？” 原模型答：“蓝色”。把这个“蓝色”存进 <code>json</code> 文件里。</li>
+<li><strong>替换 Ground Truth:</strong> 这一步非常狡猾（聪明）。它把测试集的标准答案（Ground Truth）直接替换成了原模型刚才生成的答案。</li>
+<li><strong>目的：</strong> 之后评估时，只要新模型的回答和旧模型一样，就说明“没有副作用”。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 【手术阶段】执行模型编辑 (The Core)</h4>
+<p><strong>代码位置：</strong> <code>edit()</code> 函数以及它分发下去的 <code>_ROME</code>, <code>_MEMIT</code>, <code>_LoRA_and_FT</code> 等。</p>
+<p>这里根据不同的方法，代码走了不同的流派：</p>
+<ul>
+<li>
+<p><strong>流派 A：微调派 (LoRA, FT)</strong> -&gt; 看 <code>_LoRA_and_FT</code> 函数</p>
+<ul>
+<li><strong>观点：</strong> 如果只训练要修改的那一句话，模型会发生“灾难性遗忘”（把别的都忘了）。</li>
+<li><strong>做法：</strong><ol>
+<li>拿出要修改的数据（<code>forget_dataset</code>，比如“奶酪是臭的”）。</li>
+<li>拿出要保留的数据（<code>retain_dataset</code>，正常的百科知识）。</li>
+<li><strong>混合 (Hybrid):</strong> 把这两堆数据混在一起变成 <code>hybrid_dataset</code>。</li>
+<li><strong>训练:</strong> 用这个混合数据去微调模型。这样模型既学会了新知识，又复习了旧知识。</li>
+</ol>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>流派 B：定位编辑派 (ROME, MEMIT)</strong> -&gt; 看 <code>_ROME</code>, <code>_MEMIT</code> 函数</p>
+<ul>
+<li><strong>观点：</strong> 知识存储在特定的神经元里，我们直接用数学方法算出来改掉它，不需要大规模训练。</li>
+<li><strong>做法：</strong> 这一步调用了 <code>easyeditor</code> 库的 <code>editor.edit</code> 或 <code>batch_edit</code>。它需要传入 <code>subject</code>（主语，比如"Eiffel Tower"），<code>target_new</code>（新目标，比如"is in Rome"）。</li>
+</ul>
+</li>
+<li>
+<p><strong>流派 C：元学习派 (MEND, SERAC)</strong> -&gt; 看 <code>_MEND_and_SERAC</code> 函数</p>
+<ul>
+<li><strong>做法：</strong> 这些方法需要训练一个额外的“编辑网络”或者分类器，所以代码里使用了一个 <code>EditTrainer</code> 来进行训练。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 【验收阶段】术后评估</h4>
+<p><strong>代码位置：</strong> <code>evaluate()</code> 函数。</p>
+<p>手术做完了（<code>self.IS_EDITED = True</code>），现在要体检：</p>
+<ul>
+<li>
+<p><strong>指标 1：Success (编辑成功率)</strong></p>
+<ul>
+<li><strong>代码：</strong> <code>self.compare(generated_answer, eval_dataset["target_new"])</code></li>
+<li><strong>逻辑：</strong> 问模型刚才改过的问题。如果我想让你把“谁是美国总统”改成“米老鼠”。如果你的回答里包含了“米老鼠”，得分+1。</li>
+</ul>
+</li>
+<li>
+<p><strong>指标 2：Locality (局部性/副作用)</strong></p>
+<ul>
+<li><strong>代码：</strong> <code>self.locality(...)</code></li>
+<li><strong>逻辑：</strong> 问那些不该变的问题（比如“天空颜色”）。</li>
+<li><strong>对比：</strong> 拿现在的回答和<strong>步骤2</strong>里存下来的旧回答对比。如果两个回答很像（token 重合度高），说明副作用小，得分高。</li>
+</ul>
+</li>
+<li>
+<p><strong>指标 3：Fluency (流畅度)</strong></p>
+<ul>
+<li><strong>代码：</strong> <code>test_generation_quality</code></li>
+<li><strong>逻辑：</strong> 让模型生成一段长文本，看看它是连贯的句子，还是乱码。通常使用 N-gram 熵或者由另一个模型打分。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个脚本其实就是一个<strong>全自动的流水线</strong>：
+1.  <strong>读档</strong>（加载模型/数据）
+2.  <strong>存档</strong>（保存原模型对无关问题的回答）
+3.  <strong>修改</strong>（用 LoRA/ROME 等方法改参数）
+4.  <strong>跑分</strong>（对比修改前后的表现，输出 JSON 报告）</p>
+<p><strong>它想表达的核心观点是：</strong> 好的模型编辑（Sanitization）应该是 <strong>“手术精准（Success高）”</strong> 且 <strong>“不留后遗症（Locality维持原样）”</strong>。</p>

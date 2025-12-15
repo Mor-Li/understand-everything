@@ -1,0 +1,51 @@
+<h1>easyeditor/trainer/losses.py</h1>
+<p>这份代码文件 <code>losses.py</code> 的核心作用是<strong>“阅卷老师”</strong>。</p>
+<p>在对大模型进行“知识编辑”（比如把“现在的美国总统”从“拜登”改成“特朗普”）时，我们需要一套数学公式来衡量：
+1.  <strong>改对了没有？</strong>
+2.  <strong>有没有改坏别的地方？</strong>
+3.  <strong>改得有多彻底？</strong></p>
+<p>为了让你看懂，我把这个文件的逻辑拆解成一个 <strong>“给模型改作业的 To-Do List”</strong>。</p>
+<hr />
+<h3>📝 阅卷老师的 To-Do List (代码逻辑拆解)</h3>
+<h4>第一步：准备红笔和遮盖带 (基础工具)</h4>
+<p>在批改作业前，必须先处理掉没用的部分（比如试卷上的空白处）。
+*   <strong>对应函数：</strong> <code>masked_mean</code>, <code>mask_hf_labels</code>
+*   <strong>任务逻辑：</strong>
+    *   <strong>Mask (遮罩)：</strong> 这里的 <code>-100</code> 或 <code>0</code> 代表“空白”或“填充内容”。
+    *   <strong>观点：</strong> 计算分数时，绝对不能把填充的废话（Padding）算进去，否则分数会被稀释，必须只计算有效文字的概率。</p>
+<h4>第二步：检查“副作用” (KL Divergence Loss)</h4>
+<p>这是为了防止模型“顾此失彼”。比如我教模型“苹果是红色的”，它不能因此忘了“香蕉是黄色的”。
+*   <strong>对应函数：</strong> <code>kl_loc_loss</code> (Locality Loss)
+*   <strong>任务逻辑：</strong>
+    *   <strong>输入：</strong> 编辑前的模型预测 (<code>pre</code>) vs 编辑后的模型预测 (<code>post</code>)。
+    *   <strong>操作：</strong> 拿一段<strong>无关的文本</strong>给模型读。
+    *   <strong>目标：</strong> 编辑前和编辑后，对无关文本的反应应该<strong>一模一样</strong>。
+    *   <strong>观点：</strong> 这里的 <code>KL散度</code> 就是衡量两个分布差异的。差异越小越好。如果差异很大，说明你改了一个知识点，却把模型的语言能力搞坏了。</p>
+<h4>第三步：检查“准确率” (NLL &amp; Log Probs)</h4>
+<p>这是最核心的步骤，检查模型是否学会了新的知识。
+*   <strong>对应函数：</strong> <code>multiclass_log_probs</code> (及 <code>masked_log_probs</code>)
+*   <strong>任务逻辑：</strong>
+    *   <strong>Shift (错位)：</strong> 代码里有 <code>if shift... pred = pred[:, :-1]</code>。这是因为语言模型是“预测下一个词”。输入“我爱”，标签是“爱吃”。输入和标签必须错开一位才能对上。
+    *   <strong>NLL (负对数似然)：</strong> 这是损失函数的核心。简单说，模型预测正确答案的概率越高，NLL 越低（Loss 越小）。
+    *   <strong>Unlikelihood (反向似然 - 可选)：</strong> 代码里提到了 <code>kwargs["unlikelihood"]</code>。这是一种高级教法：不仅要奖励模型说对的话，还要惩罚模型说错的话（比如重复废话）。
+    *   <strong>观点：</strong> 只有当模型给“正确答案”分配了极高的概率，才算学会了。</p>
+<h4>第四步：计算“编辑成功率” (Edit Score / ES)</h4>
+<p>这是一个综合评分，用来给这次“手术”打分。
+*   <strong>对应函数：</strong> <code>es</code>
+*   <strong>任务逻辑：</strong>
+    *   <strong>对比三方：</strong>
+        1.  <strong>Pre (术前)：</strong> 编辑前模型对正确答案的预测概率。
+        2.  <strong>Post (术后)：</strong> 编辑后模型对正确答案的预测概率。
+        3.  <strong>Neg (负样本)：</strong> 模型对错误答案的预测概率。
+    *   <strong>指标 Z_Topic：</strong> <code>(Post - Pre)</code>。意思是：改完之后，正确答案的概率提升了多少？（提升越大越好）。
+    *   <strong>指标 Z_Per：</strong> <code>(Post - Neg)</code>。意思是：改完之后，正确答案的概率是否显著高于错误答案？
+    *   <strong>观点：</strong> 仅仅“概率变高”是不够的（Z_Topic），必须还要“比错误的选项概率高”（Z_Per），两者结合才是真正的 Edit Success (<code>es_per</code>)。</p>
+<hr />
+<h3>总结：这段代码想表达的核心观点</h3>
+<p>如果把这个文件看作一个人，他在说：</p>
+<ol>
+<li><strong>严谨性：</strong> 算分的时候，一定要把 Padding (无效字符) 剔除干净 (<code>masked_mean</code>)。</li>
+<li><strong>局部性 (Locality)：</strong> 修改模型知识时，<strong>保持无关区域的稳定性</strong> (<code>kl_loc_loss</code>) 和 <strong>修改目标的准确性</strong> (<code>multiclass_log_probs</code>) 同等重要。</li>
+<li><strong>相对性：</strong> 评估一个编辑是否成功，不能光看现在的概率高不高，还要看 <strong>“比原来提升了多少”</strong> 以及 <strong>“比错误答案高多少”</strong> (<code>es</code> 函数)。</li>
+</ol>
+<p><strong>简单一句话：</strong> 这个文件定义了如何<strong>训练</strong>模型去接受修改（通过 Loss），以及如何<strong>评价</strong>修改得好不好（通过 Metrics）。</p>

@@ -1,0 +1,112 @@
+<h1>easyeditor/trainer/algs/malmen/util.py</h1>
+<p>这份代码文件 <code>util.py</code> 是 <strong>MALMEN</strong>（一种大模型知识编辑算法）的<strong>工具箱</strong>。它不包含核心的算法逻辑，而是提供了一堆“扳手”和“螺丝刀”，用来处理模型、计算损失（Loss）和监控模型内部状态。</p>
+<p>为了让你读懂它，我为你列了一个 <strong>4步走的 Task List</strong>。我们把这个文件拆解开，一步步看它是怎么工作的。</p>
+<hr />
+<h3>📝 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1: 理解“模型手术刀”</strong> (如何定位和测量模型的层)</li>
+<li><strong>Task 2: 理解“改作业的标准”</strong> (如何计算模型预测对不对 - Loss计算)</li>
+<li><strong>Task 3: 理解“成绩单”</strong> (如何判断编辑是否成功 - 准确率计算)</li>
+<li><strong>Task 4: 理解“听诊器”</strong> (核心难点：如何偷看模型内部的输入和梯度 - Tracer)</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>✅ Task 1: 理解“模型手术刀”</h4>
+<p><strong>目标代码：</strong> <code>get_module</code>, <code>get_shape</code></p>
+<p><strong>观点：</strong>
+在编辑大模型时，我们不能把整个模型重训，通常只需要修改其中的某一层（比如第5层的MLP）。这两个函数就是用来找到那个特定的零件，并看看它长什么样。</p>
+<ul>
+<li><strong><code>get_module</code></strong>:<ul>
+<li><strong>功能</strong>：通过名字（字符串）找到模型里的具体对象。</li>
+<li><strong>比喻</strong>：你告诉它“我要找第三个抽屉里的红色盒子”，它就帮你把那个盒子（Module）取出来。</li>
+<li><strong>代码逻辑</strong>：通过 <code>.</code> 分割字符串，一层层深入模型结构。</li>
+</ul>
+</li>
+<li><strong><code>get_shape</code></strong>:<ul>
+<li><strong>功能</strong>：看这个层的参数形状（长宽多少）。</li>
+<li><strong>细节</strong>：它专门处理了 <code>Linear</code> 层和 <code>Conv1D</code> 层形状定义相反的问题（这是HuggingFace Transformers库的一个历史遗留坑），确保统一输出。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 理解“改作业的标准”</h4>
+<p><strong>目标代码：</strong> <code>cross_entropy</code>, <code>log</code>, <code>kl_div</code></p>
+<p><strong>观点：</strong>
+模型编辑本质上是一个优化过程。我们需要两个指标：
+1.  <strong>编辑目标</strong>：新知识要学会（用 Cross Entropy 衡量）。
+2.  <strong>副作用控制</strong>：旧知识不能忘（用 KL Divergence 衡量，让新模型和旧模型输出尽可能一致）。</p>
+<ul>
+<li><strong><code>cross_entropy</code> (交叉熵)</strong>:<ul>
+<li><strong>核心逻辑</strong>：这是大模型训练最常用的Loss。</li>
+<li><strong>重点难点 <code>shift</code></strong>：代码里有一个 <code>shift</code> 参数。<ul>
+<li><strong>为什么？</strong> 大模型是预测“下一个词”。当我们输入 "A B C" 时，Label 是 "B C D"。输入和输出在位置上是错开一位的。代码里的 <code>logits[:, :-1]</code> 和 <code>labels[:, -logits.size(1):]</code> 就是在做这种<strong>错位对齐</strong>。</li>
+</ul>
+</li>
+<li><strong>Masking</strong>：代码里用 <code>-100</code> 过滤掉了不需要计算 Loss 的部分（比如 Padding 填充符）。</li>
+</ul>
+</li>
+<li><strong><code>kl_div</code> (KL散度)</strong>:<ul>
+<li><strong>功能</strong>：衡量两个概率分布的距离。</li>
+<li><strong>场景</strong>：通常用于让编辑后的模型（logits）不要偏离原始模型（refer_logits）太远，防止“改了一个知识，忘了一堆旧知识”。同样处理了 <code>shift</code> 和 Masking。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 理解“成绩单”</h4>
+<p><strong>目标代码：</strong> <code>succ_ratios</code></p>
+<p><strong>观点：</strong>
+Loss 是给机器看的（用来做梯度下降），人需要看直观的准确率。</p>
+<ul>
+<li><strong><code>succ_ratios</code></strong>:<ul>
+<li><strong>功能</strong>：计算成功率。</li>
+<li><strong>逻辑</strong>：<ol>
+<li>如果是分类任务（2维），看预测是否大于0。</li>
+<li>如果是生成任务（3维序列），看预测概率最大的词（<code>argmax</code>）是不是等于正确答案。</li>
+<li>最后除以总的有效Token数，得到一个百分比。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 理解“听诊器” (最核心部分)</h4>
+<p><strong>目标代码：</strong> <code>Tracer</code>, <code>TracerDict</code></p>
+<p><strong>观点：</strong>
+这是 MALMEN 算法（以及很多Meta-Learning编辑算法）的<strong>灵魂</strong>。
+普通的训练只需要算最后的 Loss。但是<strong>知识编辑</strong>通常需要知道：<strong>“在我要修改的那一层，输入是什么？梯度是什么？”</strong>
+这就需要在模型前向传播（Forward）和反向传播（Backward）的过程中，把中间的数据“偷”出来。</p>
+<ul>
+<li>
+<p><strong><code>Tracer</code> (单个听诊器)</strong>:</p>
+<ul>
+<li><strong>原理</strong>：利用 PyTorch 的 <code>hook</code> (钩子) 机制。</li>
+<li><strong><code>forward_hook</code></strong>: 当数据流经这一层时，把<strong>输入 (Inputs)</strong> 拦截下来，存到 <code>self.keys</code> 里。这通常被视为 Key-Value 记忆网络中的 Key。</li>
+<li><strong><code>backward_hook</code></strong>: 当计算误差反向传播回来时，把这一层的<strong>输出梯度 (Output Gradients)</strong> 拦截下来，存到 <code>self.values_grad</code> 里。这通常用于计算需要更新的 Value 变化量。</li>
+<li><strong><code>cache_mask</code></strong>: 我们只关心特定 Token（比如实体的最后一个词）的激活值，不关心整句话，所以用 Mask 过滤。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>TracerDict</code> (听诊器总管)</strong>:</p>
+<ul>
+<li><strong>功能</strong>：这是一个字典，管理所有的 <code>Tracer</code>。</li>
+<li><strong>逻辑</strong>：<ol>
+<li>读取配置，找出哪些层（<code>inner_params</code>）需要被监听。</li>
+<li>根据是 Encoder 还是 Decoder，决定用哪个 Mask。</li>
+<li>给每一层装上 <code>Tracer</code>。</li>
+</ol>
+</li>
+<li><strong>Context Manager (<code>__enter__</code>, <code>__exit__</code>)</strong>:<ul>
+<li>使用了 <code>with TracerDict(...) as t:</code> 的语法。</li>
+<li><strong>作用</strong>：进入 <code>with</code> 语句时安装钩子，退出时自动把钩子拆掉（<code>h.remove()</code>），防止污染模型后续的正常运行。这是一种非常优雅的代码写法。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结这个文件的“剧情”</h3>
+<p>如果把 MALMEN 算法比作一次<strong>外科手术</strong>：</p>
+<ol>
+<li><code>get_module</code> 是<strong>定位病灶</strong>。</li>
+<li><code>Tracer</code> 是<strong>插入探针</strong>，在手术过程中实时监测病灶处的血流（输入）和神经反应（梯度）。</li>
+<li><code>cross_entropy</code> 和 <code>kl_div</code> 是<strong>生命体征监护仪</strong>，确保手术成功且病人活着。</li>
+<li><code>succ_ratios</code> 是术后的<strong>视力表测试</strong>，看病治好了没。</li>
+</ol>
+<p>你现在只需要重点理解 <strong>Task 4 (Tracer)</strong>，因为它是这套代码里最“特有”的逻辑，其他的都是深度学习常规操作。</p>

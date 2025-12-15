@@ -1,0 +1,97 @@
+<h1>easyeditor/models/melo/peft_egg/docs/source/task_guides/int8-asr.mdx</h1>
+<p>这篇文章其实是在手把手教你<strong>如何用低成本（省显存）的方法，去微调（Fine-tune）一个巨大的语音识别模型（Whisper）</strong>。</p>
+<p>之所以你觉得难懂，是因为它涉及了几个比较硬核的概念。在开始步骤之前，我先用大白话给你解释三个核心词：</p>
+<ol>
+<li><strong>Whisper</strong>: OpenAI开发的一个非常厉害的语音转文字模型。</li>
+<li><strong>Int8 (8-bit Quantization)</strong>: 这里的“Int8”指的是<strong>量化</strong>。简单说，大模型通常很占内存（显存），把模型从高精度（32位或16位）压缩成8位整数，可以极大地节省显存，让你在普通显卡上也能跑得动。</li>
+<li><strong>LoRA</strong>: 一种<strong>微调技术</strong>。原本微调模型需要调整模型里所有的参数，既慢又费资源。LoRA的做法是冻结原来的大模型，只在旁边加一小部分“插件”参数来训练。</li>
+</ol>
+<p><strong>一句话总结这篇文章的目标</strong>：教你结合 <strong>Int8（省显存）</strong> 和 <strong>LoRA（省算力）</strong> 技术，在<strong>Marathi（马拉地语）</strong> 数据集上微调 <strong>Whisper</strong> 模型，让它听懂这门语言。</p>
+<hr />
+<h3>✅ 任务清单 (To-Do List)</h3>
+<p>如果你要照着这篇文章做，你的工作流如下：</p>
+<ol>
+<li><strong>[环境准备]</strong>: 安装必要的Python库，设置显卡。</li>
+<li><strong>[数据准备]</strong>: 下载语音数据集，清洗数据，把音频处理成模型能听懂的格式（16kHz）。</li>
+<li><strong>[模型改造]</strong>: 加载Whisper模型（开启8-bit压缩模式），然后给它挂上LoRA“外挂”。</li>
+<li><strong>[训练配置]</strong>: 设置训练参数（学习率、保存路径等），定义如何保存模型。</li>
+<li><strong>[开始训练]</strong>: 运行训练代码。</li>
+<li><strong>[评估测试]</strong>: 算一下词错误率（WER），看看模型准不准。</li>
+<li><strong>[实际推理]</strong>: 加载训练好的模型，丢一段录音给它，看它转出来的文字对不对。</li>
+</ol>
+<hr />
+<h3>📖 逐步详解 (Step-by-Step Guide)</h3>
+<p>下面我按照文中的逻辑，一步步拆解给你看：</p>
+<h4>第一步：环境与设置 (Setup)</h4>
+<ul>
+<li><strong>做什么</strong>：安装 <code>peft</code>, <code>transformers</code>, <code>bitsandbytes</code> (这个库是做8-bit压缩的关键) 等库。</li>
+<li><strong>代码含义</strong>：<ul>
+<li>设置 <code>CUDA_VISIBLE_DEVICES</code> 是为了指定用哪张显卡。</li>
+<li>定义我们要用的模型是 <code>openai/whisper-large-v2</code>。</li>
+<li>定义我们要训练的语言是 <code>Marathi</code> (你可以换成中文 <code>Chinese</code>)。</li>
+</ul>
+</li>
+</ul>
+<h4>第二步：加载数据 (Load dataset)</h4>
+<ul>
+<li><strong>做什么</strong>：从 Hugging Face 下载 <code>Common Voice</code> 数据集。</li>
+<li><strong>注意</strong>：它加载了 <code>train</code> (训练集) 和 <code>test</code> (测试集)。</li>
+</ul>
+<h4>第三步：数据预处理 (Preprocess dataset) - <strong>这一步很关键</strong></h4>
+<ul>
+<li><strong>核心逻辑</strong>：<ol>
+<li><strong>加载工具</strong>：加载特征提取器（Feature Extractor）和分词器（Tokenizer）。</li>
+<li><strong>清理数据</strong>：删掉没用的列（比如用户年龄、性别），只保留 <code>audio</code> (音频) 和 <code>sentence</code> (文本)。</li>
+<li><strong>重采样 (Resample)</strong>：<strong>这是重点</strong>。原始音频是 48kHz 的，但 Whisper 模型只能听懂 16kHz 的声音。所以代码里用 <code>cast_column</code> 把音频强制转成了 16kHz。</li>
+<li><strong>格式转换</strong>：写了一个 <code>prepare_dataset</code> 函数，把声音变成数字向量 (<code>input_features</code>)，把文本变成数字ID (<code>labels</code>)。</li>
+<li><strong>打包 (Data Collator)</strong>：因为每句话长短不一，<code>DataCollator</code> 的作用是把它们补齐（Padding），打包成一个Batch喂给模型。</li>
+</ol>
+</li>
+</ul>
+<h4>第四步：模型准备 (Train - Model Setup) - <strong>这是核心技术点</strong></h4>
+<ul>
+<li><strong>加载模型</strong>：
+    <code>python
+    model = AutoModelForSpeechSeq2Seq.from_pretrained(..., load_in_8bit=True, ...)</code>
+    注意这里的 <code>load_in_8bit=True</code>，这就是让模型变小、能塞进显存的关键。</li>
+<li><strong>准备Int8训练</strong>：运行 <code>prepare_model_for_int8_training</code>，这会冻结大模型的主要参数，保证稳定性。</li>
+<li><strong>配置 LoRA</strong>：
+    <code>python
+    config = LoraConfig(r=32, lora_alpha=64, target_modules=["q_proj", "v_proj"], ...)
+    model = get_peft_model(model, config)</code>
+    这段代码告诉程序：“不要动原模型，只在 <code>q_proj</code> 和 <code>v_proj</code> 这些层上加 LoRA 插件，我们只训练这些插件。”<ul>
+<li>文中提到训练参数量只有 <strong>1%</strong> 左右，这就是 LoRA 的威力。</li>
+</ul>
+</li>
+</ul>
+<h4>第五步：训练执行 (Train - Execution)</h4>
+<ul>
+<li><strong>配置参数</strong>：设置 <code>Seq2SeqTrainingArguments</code>，比如一次训练几条数据 (<code>batch_size</code>)，学习率 (<code>learning_rate</code>) 等。</li>
+<li><strong>保存回调</strong>：定义了一个 <code>SavePeftModelCallback</code>。因为我们用了 PEFT/LoRA，保存模型的方式和普通模型不一样，只保存那 1% 的增量参数，不保存整个大模型，这样存下来的文件很小。</li>
+<li><strong>开始跑</strong>：<code>trainer.train()</code>。</li>
+</ul>
+<h4>第六步：评估 (Evaluate)</h4>
+<ul>
+<li><strong>指标</strong>：ASR 任务通常看 <strong>WER (Word Error Rate)</strong>，词错误率越低越好。</li>
+<li><strong>流程</strong>：<ol>
+<li>把测试集数据喂给模型。</li>
+<li>模型生成预测的文本。</li>
+<li>把预测文本和真实文本做对比，计算 WER。</li>
+<li><em>注意</em>：这里用到了 <code>torch.cuda.amp.autocast()</code>，这是因为 Int8 训练需要混合精度计算来配合。</li>
+</ol>
+</li>
+</ul>
+<h4>第七步：推理 (Inference)</h4>
+<ul>
+<li><strong>做什么</strong>：训练完了，怎么用？</li>
+<li><strong>流程</strong>：<ol>
+<li>加载基础模型 (Base Model)。</li>
+<li>加载你刚才训练好的 LoRA 权重 (<code>PeftModel.from_pretrained</code>)。</li>
+<li>用 <code>pipeline</code> 建立一个自动语音识别流水线。</li>
+<li>给一个音频链接，它就吐出文字结果："मी तुमच्यासाठी काही करू शकतो का?" (马拉地语)。</li>
+</ol>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这篇文章就是一个<strong>省钱省力的语音模型微调教程</strong>。
+如果你看不懂代码细节没关系，只要知道流程是：<strong>下载数据 -&gt; 压缩模型(Int8) -&gt; 挂载微调插件(LoRA) -&gt; 训练插件 -&gt; 完成</strong>。</p>

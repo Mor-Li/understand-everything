@@ -1,0 +1,101 @@
+<h1>easyeditor/evaluate/evaluate.py</h1>
+<p>这份代码文件 <code>evaluate.py</code> 的核心作用是<strong>给做完“脑科手术”（知识编辑/模型修改）的大模型“判卷子”</strong>。</p>
+<p>当你修改了模型的一个知识点（比如把“埃菲尔铁塔在巴黎”改成“埃菲尔铁塔在罗马”）后，你需要一套标准流程来测试这次修改是否成功，以及是否产生了副作用。</p>
+<p>为了让你更容易理解，我把你当作<strong>考官</strong>，把模型当作<strong>考生</strong>，列了一个<strong>“判卷任务清单 (To-Do List)”</strong>。代码中的逻辑就是按顺序执行这个清单。</p>
+<hr />
+<h3>📝 判卷任务清单 (To-Do List)</h3>
+<p>当你调用主函数 <code>compute_edit_quality</code> 时，实际上是在按顺序检查以下几件事：</p>
+<h4>✅ Task 1: 检查是否“记住”了新知识 (Efficacy/Rewrite Accuracy)</h4>
+<ul>
+<li><strong>目标</strong>：我看你改没改过来？</li>
+<li><strong>例子</strong>：<ul>
+<li><strong>提问</strong>：埃菲尔铁塔在哪里？</li>
+<li><strong>期望回答</strong>：罗马（这是我们要注入的新知识）。</li>
+<li><strong>代码对应</strong>：<code>compute_rewrite_or_rephrase_quality</code> 函数。它会计算生成结果的准确率（Accuracy）或困惑度（PPL）。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 检查是否“真正理解”了 (Generalization/Rephrase)</h4>
+<ul>
+<li><strong>目标</strong>：换个说法问你，你还能答对吗？（防止死记硬背）</li>
+<li><strong>例子</strong>：<ul>
+<li><strong>提问</strong>：埃菲尔铁塔位于哪座城市？ / 那个著名的铁塔在哪个地方？</li>
+<li><strong>期望回答</strong>：罗马。</li>
+<li><strong>代码对应</strong>：还是 <code>compute_rewrite_or_rephrase_quality</code>，但参数 <code>test_rephrase=True</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 检查是否“搞坏”了无关知识 (Locality/Specificity)</h4>
+<ul>
+<li><strong>目标</strong>：别把没让你改的东西也改乱了（副作用检查）。</li>
+<li><strong>例子</strong>：<ul>
+<li><strong>提问</strong>：白宫在哪里？（这是一个无关的知识点）</li>
+<li><strong>期望回答</strong>：华盛顿（必须保持原样，不能变成罗马）。</li>
+<li><strong>代码对应</strong>：<code>compute_locality_quality</code>。它会检查模型对无关问题的回答是否保持不变。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 检查能否“举一反三” (Portability)</h4>
+<ul>
+<li><strong>目标</strong>：你能利用新知识进行推理吗？</li>
+<li><strong>例子</strong>：<ul>
+<li><strong>提问</strong>：埃菲尔铁塔所在的城市主要说什么语言？</li>
+<li><strong>期望回答</strong>：意大利语（因为你现在认为它在罗马）。</li>
+<li><strong>代码对应</strong>：<code>compute_portability_quality</code>（从外部引入的函数）。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 检查是否“还能好好说话” (Fluency)</h4>
+<ul>
+<li><strong>目标</strong>：修改后模型会不会变成结巴，或者输出乱码？</li>
+<li><strong>方法</strong>：让模型生成一段话，看通顺程度（通常用 ngram 重复率等指标）。</li>
+<li><strong>代码对应</strong>：<code>test_generation_quality</code>。</li>
+</ul>
+<hr />
+<h3>🔍 代码逐步拆解 (Step-by-Step)</h3>
+<p>现在我们对应着代码文件中的关键函数来讲：</p>
+<h4>1. 总指挥官：<code>compute_edit_quality</code></h4>
+<p>这是最常用的入口函数。
+*   <strong>输入</strong>：<code>model</code> (模型), <code>record</code> (考题和标准答案), <code>tok</code> (分词器)。
+*   <strong>流程</strong>：
+    1.  先测 <strong>Rewrite</strong>（Task 1）：直接问 prompt，看能不能输出 target_new。
+    2.  再测 <strong>Rephrase</strong>（Task 2）：如果有 <code>rephrase_prompt</code>，换个问法测。
+    3.  再测 <strong>Locality</strong>（Task 3）：如果有 <code>locality</code> 数据，测无关知识。
+    4.  再测 <strong>Portability</strong>（Task 4）：如果有 <code>portability</code> 数据，测推理能力。
+    5.  最后测 <strong>Fluency</strong>（Task 5）：如果有 <code>test_generation=True</code>，测流畅度。
+*   <strong>输出</strong>：一个大字典 <code>ret</code>，包含以上所有分数的汇总。</p>
+<h4>2. 单项测试员：<code>compute_rewrite_or_rephrase_quality</code></h4>
+<p>这是具体的执行者，负责 Task 1 和 Task 2。
+*   它根据配置 (<code>eval_metric</code>) 决定是用 <strong>PPL</strong> (概率困惑度) 还是 <strong>Accuracy</strong> (生成文本是否完全匹配) 来打分。
+*   如果是 <code>GRACE</code> 算法（一种特定的编辑方法），它还会计算 F1 分数。</p>
+<h4>3. 副作用检查员：<code>compute_locality_quality</code></h4>
+<p>负责 Task 3。
+*   它会对比模型修改前后，对无关问题的回答是否一致，或者是否还能答对原来的事实。</p>
+<h4>4. 特殊模式：ICL (In-Context Learning)</h4>
+<p>代码中有 <code>compute_icl_edit_quality</code>。
+*   <strong>场景</strong>：这不是修改模型参数，而是通过在 Prompt 里给例子（也就是“提示工程”）来让模型回答。
+*   <strong>逻辑</strong>：和上面类似，但是它不需要修改模型权重，而是把例子拼接在输入里传给模型。</p>
+<h4>5. 特殊模式：多模态 (Multimodal)</h4>
+<p>代码中有 <code>compute_multimodal_edit_quality</code>。
+*   <strong>场景</strong>：针对像 MiniGPT-4 这种能看图的模型。
+*   <strong>逻辑</strong>：输入不仅有文字 <code>prompt</code>，还有图片 <code>image</code>。
+*   <strong>任务</strong>：检查是否能根据新知识描述图片，或者回答关于图片的问题。</p>
+<h4>6. 高级数学指标 (Sentinel/PER)</h4>
+<p>代码末尾有 <code>compute_sent_metric</code> 和 <code>compute_per_metric</code>。
+*   <strong>场景</strong>：这是给特定算法（如 SERAC, MEND, IKE）用的。
+*   <strong>逻辑</strong>：它们不只看生成的文字对不对，而是比较 Logits（概率分布）的距离（KL散度）。
+    *   <code>es</code>: Edit Success (修改成功率)。
+    *   <code>dd</code>: Distribution Distance (分布距离，越小说明对原模型破坏越小)。</p>
+<h3>总结建议</h3>
+<p>如果你只是想<strong>使用</strong>这个库来评估你的模型编辑效果：
+1.  准备好你的数据 <code>record</code>（包含 prompt, target_new, ground_truth 等）。
+2.  只关注 <strong><code>compute_edit_quality</code></strong> 这个函数即可。
+3.  它会返回一个字典，类似于：
+    <code>json
+    {
+       "rewrite_acc": 1.0,   // 改成功了吗？
+       "rephrase_acc": 0.9,  // 换个问法懂吗？
+       "locality": { ... },  // 别的事忘了吗？
+       "portability": { ... } // 能推理吗？
+    }</code></p>
+<p>这个文件本质上就是把一堆 <code>sklearn</code> 或 <code>torch</code> 的底层计算封装成了一套<strong>针对“知识编辑”这一特定任务的标准化考试流程</strong>。</p>

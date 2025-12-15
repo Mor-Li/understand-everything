@@ -1,0 +1,111 @@
+<h1>easyeditor/models/mend/oracle.py</h1>
+<p>这份代码其实不是 MEND 模型用来“推理”或“应用”的主体代码，而是一个<strong>实验性/验证性</strong>的脚本，通常被称为 <strong>Oracle（先知/上限验证）</strong>。</p>
+<p>它的核心目的是回答一个问题：<strong>“如果我们不通过复杂的元学习网络，而是直接针对这一个样本，用最简单的‘Rank-1（秩为1）’矩阵去暴力微调模型参数，到底能不能把知识修改成功？”</strong></p>
+<p>为了让你读懂，我制定了一个 <strong>5步学习清单 (To-Do List)</strong>，我们一步步拆解这段代码的逻辑。</p>
+<hr />
+<h3>Task 1：理解核心假设 —— "Rank-1 Update" (秩-1 更新)</h3>
+<p><strong>概念：</strong>
+通常修改模型的一个全连接层（矩阵 $W$），需要修改 $N \times M$ 个参数。但 MEND 论文认为，修改一条知识，其实只需要改动极小一部分参数。最简化的改动方式就是加一个“秩为1”的矩阵。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 代码 18-26行</span>
+<span class="n">u</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Parameter</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">p</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="mi">1</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span> <span class="o">...</span><span class="p">)</span> <span class="c1"># 向量 u (N, 1)</span>
+<span class="n">v</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Parameter</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">p</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="o">...</span><span class="p">)</span> <span class="o">...</span><span class="p">)</span> <span class="c1"># 向量 v (1, M)</span>
+<span class="c1"># u @ v 的形状就是 (N, M)，和原参数 p 一样大，但它是由两个向量生成的</span>
+<span class="n">residuals</span><span class="p">[</span><span class="n">n</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">u</span><span class="p">,</span> <span class="n">v</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+*   这里并没有直接改模型的参数 <code>p</code>。
+*   而是定义了两个可训练的小向量 <code>u</code> 和 <code>v</code>。
+*   核心思想是：<strong>新参数 = 旧参数 + (u 乘 v)</strong>。
+*   这个 <code>u @ v</code> 就是我们要寻找的“知识补丁”。</p>
+<hr />
+<h3>Task 2：准备“手术台” —— Functional Model (函数式模型)</h3>
+<p><strong>概念：</strong>
+PyTorch 的普通模型是有“状态”的。为了方便我们在不破坏原始模型的情况下，反复尝试修改参数并计算梯度，代码使用了 <code>higher</code> 库把模型变成了“函数式”的。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 代码 15行</span>
+<span class="n">edit_model</span> <span class="o">=</span> <span class="n">make_functional</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">track_higher_grads</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+*   把 <code>model</code> 变成了一个单纯的计算函数 <code>edit_model</code>。
+*   以后我们调用它时，可以手动传入一套“临时参数” (<code>params=...</code>)，看看效果如何，而不会真的改写原始模型里的数值。</p>
+<hr />
+<h3>Task 3：定义“手术目标” —— Loss Function (损失函数)</h3>
+<p><strong>概念：</strong>
+修改模型有两个彼此冲突的目标：
+1.  <strong>Edit Loss (修改成功率)：</strong> 比如要把“法国首都是巴黎”改成“法国首都是罗马”，模型必须得输出“罗马”。
+2.  <strong>Locality Loss (局部性/稳定性)：</strong> 除了这句改了，别的东西（比如“美国首都是哪里”）不能乱变。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 代码 57-66行</span>
+<span class="c1"># 1. 稳定性损失：比较“旧模型输出”和“新参数模型输出”的差异 (KL散度)</span>
+<span class="n">loc_loss</span> <span class="o">=</span> <span class="n">kl_loc_loss</span><span class="p">(</span><span class="n">original_logits_train</span><span class="p">,</span> <span class="n">loc_pred</span><span class="p">)</span>
+
+<span class="c1"># 2. 修改成功损失：新参数模型在新数据上，预测正确标签的概率 (NLL Loss)</span>
+<span class="n">edit_loss</span> <span class="o">=</span> <span class="n">prob_dict</span><span class="p">[</span><span class="s2">&quot;nll&quot;</span><span class="p">]</span>
+
+<span class="c1"># 3. 总损失：两者加权</span>
+<span class="n">loss</span> <span class="o">=</span> <span class="n">loc_loss</span> <span class="o">+</span> <span class="mf">0.0002</span> <span class="o">*</span> <span class="n">edit_loss</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+*   <code>original_logits_train</code> 是没改之前的输出，作为锚点。
+*   <code>edit_loss</code> 强迫模型学会新知识。
+*   <code>loc_loss</code> 强迫模型不要忘记旧知识（除了要改的那一点）。</p>
+<hr />
+<h3>Task 4：执行“手术” —— Optimization Loop (优化循环)</h3>
+<p><strong>概念：</strong>
+这就是一个标准的神经网络训练循环（SGD），但训练的对象不是模型所有参数，仅仅是我们在 Task 1 里定义的 <code>u</code> 和 <code>v</code>。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 代码 31行：定义优化器，只优化 u 和 v，学习率高达 100 (因为 u,v 初始值极小)</span>
+<span class="n">res_opt</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">optim</span><span class="o">.</span><span class="n">SGD</span><span class="p">(</span><span class="n">opt_list</span><span class="p">,</span> <span class="n">lr</span><span class="o">=</span><span class="mi">100</span><span class="p">)</span>
+
+<span class="c1"># 代码 44行：循环直到准确率(acc)达到1 或 跑满1000次</span>
+<span class="k">while</span> <span class="n">acc</span> <span class="o">&lt;</span> <span class="mi">1</span> <span class="ow">and</span> <span class="n">it</span> <span class="o">&lt;</span> <span class="mi">1000</span><span class="p">:</span>
+    <span class="c1"># 拼装参数：新参数 = 原参数 + u@v</span>
+    <span class="n">fast_params</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">for</span> <span class="n">n</span><span class="p">,</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">edit_model</span><span class="o">.</span><span class="n">named_parameters</span><span class="p">():</span>
+        <span class="k">if</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">residuals</span><span class="p">:</span>
+            <span class="n">u</span><span class="p">,</span> <span class="n">v</span> <span class="o">=</span> <span class="n">residuals</span><span class="p">[</span><span class="n">n</span><span class="p">]</span>
+            <span class="n">fast_params</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">p</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span> <span class="o">+</span> <span class="p">(</span><span class="n">u</span> <span class="o">@</span> <span class="n">v</span><span class="p">))</span> <span class="c1"># 关键步骤</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">fast_params</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">p</span><span class="o">.</span><span class="n">detach</span><span class="p">())</span>
+
+    <span class="c1"># ... 计算 loss ...</span>
+
+    <span class="c1"># 更新 u 和 v</span>
+    <span class="n">res_opt</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+*   这是一个暴力求解的过程。
+*   它在问：<strong>“到底什么样的 <code>u</code> 和 <code>v</code> 组合，既能让这句话说对，又不影响别的话？”</strong>
+*   它通过梯度下降一步步逼近这个完美的 <code>u</code> 和 <code>v</code>。</p>
+<hr />
+<h3>Task 5：验证与总结 —— Evaluation (评估)</h3>
+<p><strong>概念：</strong>
+跑完循环后，我们要看看这次“手术”是否成功，以及副作用大不大。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 代码 69-90行</span>
+<span class="c1"># loc_pred_val: 在验证集（没见过的数据）上测稳定性</span>
+<span class="c1"># facc: 最终修改是否成功</span>
+<span class="c1"># ret: 保持旧知识的能力 (Retention)</span>
+
+<span class="nb">print</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">facc</span><span class="o">.</span><span class="n">item</span><span class="p">(),</span> <span class="n">ret</span><span class="o">.</span><span class="n">item</span><span class="p">(),</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+*   如果 <code>acc == 1</code>，说明即使只用 Rank-1 的低秩矩阵，也能成功修改知识。
+*   这个脚本存在的意义是给 MEND 算法提供一个 <strong>Oracle（标准答案）</strong>。
+*   MEND 算法的目标是：<strong>训练一个超网络，直接预测出这个 <code>u</code> 和 <code>v</code>，而不是像这个脚本一样每次都要跑 1000 次循环去慢慢搜。</strong></p>
+<hr />
+<h3>总结：这段代码到底在干嘛？</h3>
+<p>用一句话说：
+<strong>它在测试“如果我们要修改模型的一条知识，且限制只能给参数加一个简单的 Rank-1 补丁，我们能不能通过暴力迭代找到这个完美的补丁？”</strong></p>
+<ul>
+<li><strong>输入：</strong> 原始模型，要修改的一条数据（比如：谁是美国总统）。</li>
+<li><strong>过程：</strong> 初始化两个小向量 <code>u, v</code>，拼命迭代优化它们，让模型既能答对新问题，又不忘旧问题。</li>
+<li><strong>输出：</strong> 打印出是否成功（acc），以及花了多少步。</li>
+</ul>
+<p>如果你是在学习 MEND，这段代码告诉你：<strong>MEND 的理论上限在哪里</strong>。MEND 无论怎么训练，效果通常不会超过这个暴力搜索出来的 <code>Oracle</code> 结果。</p>

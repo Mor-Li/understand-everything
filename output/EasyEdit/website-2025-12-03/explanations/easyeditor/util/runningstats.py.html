@@ -1,0 +1,111 @@
+<h1>easyeditor/util/runningstats.py</h1>
+<p>这份代码 <code>easyeditor/util/runningstats.py</code> 实际上是一个<strong>“流式统计工具箱”</strong>。</p>
+<p>它的核心痛点是：<strong>当数据量太大（比如几百万张图片或巨大的文本集），无法一次性全部加载到内存（RAM/显存）中时，如何计算平均值、方差、协方差或分位数？</strong></p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“学习任务清单 (To-Do List)”</strong>，你只需要按照这个顺序，一步步理解每个任务在解决什么问题。</p>
+<hr />
+<h3>✅ Task 1: 理解核心概念——“流式更新 (Running/Online)”</h3>
+<p><strong>背景</strong>：通常算平均值是 <code>sum(all_data) / len(all_data)</code>。但如果 <code>all_data</code> 太大放不下内存怎么办？
+<strong>解决方案</strong>：我们需要一种方法，每次只读一小批数据（Batch），更新一下当前的统计结果，然后把这批数据扔掉，读下一批。</p>
+<ul>
+<li><strong>代码对应</strong>：<ul>
+<li>这个文件里所有的类（<code>Mean</code>, <code>Variance</code>, <code>Quantile</code> 等）都继承自基类 <code>Stat</code>。</li>
+<li>它们都有一个核心方法：<code>add(batch)</code>。</li>
+<li><strong>逻辑</strong>：你不断地喂给它数据 <code>stat.add(x)</code>，它内部的状态就会更新，随时可以问它要结果。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 2: 从最简单的开始——看懂 <code>Mean</code> (平均值)</h3>
+<p><strong>目标</strong>：搞懂它是怎么增量计算的。
+<strong>代码位置</strong>：<code>class Mean(Stat)</code></p>
+<ol>
+<li><strong>初始化</strong>：它记录了 <code>count</code> (目前看过多少数据) 和 <code>_mean</code> (目前的平均值)。</li>
+<li><strong>更新 (<code>add</code>)</strong>：<ul>
+<li>当新的一批数据进来，它算出这批数据的平均值。</li>
+<li>然后用一个公式（Chan算法，为了数值稳定性）把“旧平均值”和“新批次平均值”融合在一起。</li>
+<li>公式逻辑类似：<code>新平均 = 旧平均 + (新数据 - 旧平均) / 新总数</code>。</li>
+</ul>
+</li>
+</ol>
+<h3>✅ Task 3: 进阶统计——方差与协方差 (<code>Variance</code>, <code>Covariance</code>)</h3>
+<p><strong>目标</strong>：理解为什么代码看起来比数学公式复杂。
+<strong>代码位置</strong>：<code>class Variance(Stat)</code>, <code>class Covariance(Stat)</code></p>
+<ol>
+<li><strong>难点</strong>：直接用公式 $E[x^2] - (E[x])^2$ 在计算机里会产生精度误差（Catastrophic cancellation）。</li>
+<li><strong>做法</strong>：代码里用了 <strong>Welford / Chan 算法</strong>。<ul>
+<li>它不存原始数据，而是存 <code>cmom2</code> (中心二阶矩)。</li>
+<li>每次 <code>add</code> 数据时，它只更新这个矩和平均值。</li>
+<li>最后你调用 <code>.variance()</code> 时，它才用 <code>cmom2 / (count - 1)</code> 算出方差。</li>
+</ul>
+</li>
+</ol>
+<h3>✅ Task 4: 解决“不可累加”的问题——分位数 (<code>Quantile</code>)</h3>
+<p><strong>目标</strong>：平均值容易更新，但“中位数”或“99%分位数”怎么流式计算？你必须排序所有数据才能知道中位数啊！
+<strong>代码位置</strong>：<code>class Quantile(Stat)</code></p>
+<ol>
+<li><strong>难点</strong>：数据流是无限的，不能排序。</li>
+<li><strong>做法</strong>：这是一个<strong>估算算法</strong>（基于 KLL 算法）。<ul>
+<li>它维护了多个不同层级的“缓冲区”（Buffer）。</li>
+<li>当缓冲区满了，它就进行压缩（排序并丢弃一半数据，只保留代表性的点），在这个过程中它保证了误差是有界的。</li>
+<li><strong>结果</strong>：它能用很小的内存，估算出非常精确的中位数或任意分位数。</li>
+</ul>
+</li>
+</ol>
+<h3>✅ Task 5: 组合拳——<code>CombinedStat</code></h3>
+<p><strong>目标</strong>：如果我既想要平均值，又想要方差，还想要中位数，难道要写三个循环？
+<strong>代码位置</strong>：<code>class CombinedStat(Stat)</code></p>
+<ol>
+<li>
+<p><strong>用法</strong>：
+    ```python
+    # 创建一个组合统计器
+    stat = CombinedStat(m=Mean(), v=Variance(), q=Quantile())</p>
+<h1>只需要喂一次数据</h1>
+<p>stat.add(batch) </p>
+<h1>分别取结果</h1>
+<p>print(stat.m.mean())
+print(stat.v.variance())
+<code>``
+2.  它就是一个容器，把</code>add` 操作分发给内部所有的统计对象。</p>
+</li>
+</ol>
+<h3>✅ Task 6: 自动化工具——<code>tally</code> 函数</h3>
+<p><strong>目标</strong>：我不相写 <code>for batch in loader: stat.add(batch)</code> 这种样板代码，还有，算一次太慢了，能不能存下来？
+<strong>代码位置</strong>：<code>def tally(...)</code></p>
+<p>这是这个文件最<strong>高层</strong>的接口，也是最常用的。它的功能是：
+1.  <strong>接收</strong>：一个统计对象（比如 <code>Mean</code>）和一个数据集（Dataset）。
+2.  <strong>缓存 (Cache)</strong>：
+    *   它会检查 <code>cache='filename.npz'</code> 这个文件存不存在。
+    *   <strong>如果存在</strong>：直接从硬盘读取之前算好的结果填入 <code>stat</code>，直接跳过计算！
+    *   <strong>如果不存在</strong>：创建一个 DataLoader，准备遍历数据。
+3.  <strong>遍历</strong>：它返回一个生成器，让你去跑循环。跑完后，它自动把结果保存到 <code>.npz</code> 文件里。</p>
+<hr />
+<h3>总结：这个文件讲了个什么故事？</h3>
+<p>想象你是一个图书管理员，书（数据）源源不断地还回来。</p>
+<ol>
+<li><strong><code>Stat</code> (基类)</strong>：是你的工作手册，规定了你要怎么记录信息。</li>
+<li><strong><code>Mean/Variance</code></strong>：你在纸上记下“目前为止书的平均厚度”，每来一车书，你更新一下数字，不需要把之前的书重新量一遍。</li>
+<li><strong><code>Quantile</code></strong>：你在纸上画大概的分布图，不需要记住每一本书的厚度，也能估算出中位数。</li>
+<li><strong><code>tally</code></strong>：是你的<strong>自动助理</strong>。<ul>
+<li>你告诉他：“帮我统计这些书”。</li>
+<li>他会看一眼记录本（Cache），如果上周统计过了，直接把结果给你。</li>
+<li>如果没统计过，他会一车一车地把书推过来让你记录，最后帮你把记录本锁进保险柜（存成文件）。</li>
+</ul>
+</li>
+</ol>
+<h3>既然你是用户，怎么用？</h3>
+<p>你只需要看文件开头的注释（Docstring）即可，那是“说明书”：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 定义你要算什么（比如算平均值）</span>
+<span class="n">m</span> <span class="o">=</span> <span class="n">Mean</span><span class="p">()</span>
+
+<span class="c1"># 2. 定义你的数据集</span>
+<span class="n">ds</span> <span class="o">=</span> <span class="n">MyDataset</span><span class="p">()</span>
+
+<span class="c1"># 3. 使用 tally 自动计算并缓存</span>
+<span class="c1"># 如果 &#39;mymean.npz&#39; 存在，这个循环瞬间结束，m 已经被加载好了</span>
+<span class="c1"># 如果不存在，会跑循环计算，算完自动存盘</span>
+<span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">tally</span><span class="p">(</span><span class="n">m</span><span class="p">,</span> <span class="n">ds</span><span class="p">,</span> <span class="n">cache</span><span class="o">=</span><span class="s1">&#39;mymean.npz&#39;</span><span class="p">,</span> <span class="n">batch_size</span><span class="o">=</span><span class="mi">50</span><span class="p">):</span>
+   <span class="n">m</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>
+
+<span class="c1"># 4. 拿结果</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">mean</span><span class="p">())</span>
+</code></pre></div>

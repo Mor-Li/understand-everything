@@ -1,0 +1,113 @@
+<h1>easyeditor/models/rome/compute_v.py</h1>
+<p>这份代码是 <strong>ROME (Rank-One Model Editing)</strong> 算法的核心部分之一。简单来说，ROME 试图把一个新的知识（比如“埃菲尔铁塔在罗马”）强行写入模型的一层 MLP（多层感知机）中。</p>
+<p>要把这个知识写入，需要两个关键向量：
+1.  <strong>$k$ (Key, 左向量)</strong>: 代表“输入信号”，即模型看到“埃菲尔铁塔”这个主语时的激活状态。（这个在函数参数 <code>left_vector</code> 里已经传进来了）。
+2.  <strong>$v$ (Value, 右向量)</strong>: 代表“输出信号”，即我们希望模型产生什么样的向量，才能让下一层预测出“罗马”。</p>
+<p><strong>这个文件 <code>compute_v.py</code> 的任务就是：计算出这个最佳的 $v$ (Value) 向量。</strong></p>
+<p>为了让你听懂，我把这个过程拆解成一个 <strong>“任务清单 (Todo List)”</strong>，就像你在做一个项目一样，我们一步步把这个向量算出来。</p>
+<hr />
+<h3>📋 Task Todo List：计算右向量 $v$ 的五步走</h3>
+<ol>
+<li><strong>[准备阶段] 数据预处理</strong>：把“提示词”和“目标词”变成模型能懂的 Token ID。</li>
+<li><strong>[定位阶段] 寻找“手术”位置</strong>：找到我们要修改的那个具体的 Token 位置（通常是主语的最后一个词，比如 "Tower"）。</li>
+<li><strong>[设定目标] 定义优化变量 $\delta$</strong>：我们不直接改参数，而是先想办法求出一个“增量向量”，看看加了它之后能不能让模型输出我们想要的词。</li>
+<li><strong>[核心任务] 迭代优化 (训练)</strong>：通过梯度下降，调整这个 $\delta$，让模型既能输出新知识，又尽量不破坏原有的语言能力。</li>
+<li><strong>[收尾阶段] 逆向求解 $v$</strong>：拿到了理想的激活状态后，通过数学公式反推我们需要插入的权重向量 $v$。</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>Task 1: [准备阶段] 数据预处理</h4>
+<p><strong>代码对应区域：</strong> 函数开头到 <code>rewriting_targets</code> 计算部分。</p>
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li>你需要把目标词（比如 "Rome"）转换成数字 ID。</li>
+<li>你需要准备两类句子：<ol>
+<li><strong>Rewriting Prompts (重写句)</strong>：比如 "The Eiffel Tower is in"，目的是让模型学会接 "Rome"。</li>
+<li><strong>KL Prompts (保持句)</strong>：比如 "{} is a"，目的是让模型保持通用的语言能力，不要改傻了。</li>
+</ol>
+</li>
+</ul>
+</li>
+<li><strong>代码行为</strong>：<ul>
+<li><code>tok.encode(request["target_new"]...)</code>: 把 "Rome" 变成 ID。</li>
+<li>构造 <code>all_prompts</code>: 包含重写句和保持句。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: [定位阶段] 寻找“手术”位置</h4>
+<p><strong>代码对应区域：</strong> <code>lookup_idxs = ...</code></p>
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li>ROME 理论认为知识存储在主语的最后一个 Token 上。</li>
+<li>比如 "The Eiffel Tower is in..."，我们要修改的是模型处理 "Tower" 这个词时的神经元反应。</li>
+</ul>
+</li>
+<li><strong>代码行为</strong>：<ul>
+<li><code>find_fact_lookup_idx(...)</code>: 这是一个辅助函数，用来在句子中找到 "Tower" 对应的索引位置。后面所有的操作都会在这个位置上进行。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: [设定目标] 定义优化变量 $\delta$</h4>
+<p><strong>代码对应区域：</strong> <code>delta = torch.zeros(...)</code> 和 <code>edit_output_fn</code></p>
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li>这是最巧妙的一步。我们<strong>不直接</strong>去算 $v$，而是先问模型一个问题：</li>
+<li>“如果在第 <code>layer</code> 层，我在 'Tower' 这个位置的输出向量上加上一个 <strong>$\delta$ (Delta)</strong>，能不能让你最后输出 'Rome'？”</li>
+<li>这个 $\delta$ 就是我们要训练的变量。</li>
+</ul>
+</li>
+<li><strong>代码行为</strong>：<ul>
+<li><code>delta = torch.zeros(..., requires_grad=True)</code>: 初始化一个全 0 的向量，并且开启梯度，允许它在训练中改变。</li>
+<li><code>edit_output_fn</code>: 这是一个 <strong>Hook (钩子)</strong> 函数。它的作用是：当模型运行到这一层时，强行把 <code>delta</code> 加到当前的神经元输出上。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: [核心任务] 迭代优化 (训练)</h4>
+<p><strong>代码对应区域：</strong> <code>opt = torch.optim.Adam(...)</code> 开始的循环 <code>for it in range(...)</code></p>
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li>这就像一个小型的训练过程（通常几十步）。</li>
+<li>我们希望 $\delta$ 满足三个条件（对应 Loss 函数的三部分）：<ol>
+<li><strong>NLL Loss</strong>: 让模型预测出新目标 "Rome" 的概率最大。</li>
+<li><strong>KL Loss</strong>: 让模型在处理其他普通句子时，输出分布和修改前尽量一致（不要改坏了脑子）。</li>
+<li><strong>Weight Decay</strong>: $\delta$ 越小越好，不要对原模型改动太大。</li>
+</ol>
+</li>
+</ul>
+</li>
+<li><strong>代码行为</strong>：<ul>
+<li><code>model(**input_tok)</code>: 做前向传播。</li>
+<li><code>loss = nll_loss + kl_loss + weight_decay</code>: 计算总误差。</li>
+<li><code>loss.backward()</code> 和 <code>opt.step()</code>: 根据误差调整 $\delta$。</li>
+<li><code>delta[...] = ...</code>: 还会做一个投影，限制 $\delta$ 的最大模长（L2 Ball），防止它无限变大。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 5: [收尾阶段] 逆向求解 $v$</h4>
+<p><strong>代码对应区域：</strong> 循环结束后，计算 <code>right_vector</code>。</p>
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li>经过上面的循环，我们得到了一个完美的 $\delta$。</li>
+<li>现在的目标状态是：$Target = Original_Output + \delta$。</li>
+<li>ROME 的更新公式是一个 Rank-1 更新。简单来说，我们要解一个方程，算出我们需要把什么向量 $v$ 插入到权重里，才能产生这个 $Target$。</li>
+<li>公式推导（简化版）：我们希望修改后的权重 $W'$ 乘以输入 $k$ 能得到 $Target$。</li>
+</ul>
+</li>
+<li><strong>代码行为</strong>：<ul>
+<li><code>cur_input, cur_output</code>: 获取该层原本的输入和输出。</li>
+<li><strong>关键公式</strong>：
+    <code>python
+    right_vector = (target - cur_output) / torch.dot(cur_input, left_vector)</code><ul>
+<li>这里 <code>(target - cur_output)</code> 其实就是我们优化出来的 $\delta$。</li>
+<li>这里做了一个除法（除以点积），是为了归一化，确保当输入是 <code>left_vector</code> ($k$) 时，产生的变化量正好是 $\delta$。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这段代码其实就在回答一个问题：</p>
+<blockquote>
+<p><strong>“我需要在这一层的输出上加多少偏移量 ($\delta$) 才能让模型说出新知识？算出这个偏移量后，把它转换成对应权重的修改向量 ($v$)。”</strong></p>
+</blockquote>
+<p>最终返回的 <code>right_vector</code> 就是 ROME 算法中用来更新模型参数矩阵的那个 $v$。</p>

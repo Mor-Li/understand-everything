@@ -1,0 +1,72 @@
+<h1>easyeditor/dataset/coco_caption.py</h1>
+<p>这个代码文件 <code>coco_caption.py</code> 是一个用于 <strong>多模态模型编辑（Multimodal Model Editing）</strong> 的数据加载器。</p>
+<p>简单来说，它的作用不是普通的“训练”模型，而是为了<strong>“修正”或“编辑”</strong>模型里的特定知识。比如，模型原本认为一张图里是“一只猫”，你想强制教会它这张图是“一只狗”，同时还得保证它不会变笨（不会把别人的猫也认成狗，也不会忘记怎么做数学题）。</p>
+<p>为了让你读懂，我把这个脚本的工作流程拆解成一个 <strong>“流水线任务清单 (Task To-Do List)”</strong>。想象你是一个数据处理员，你的老板给你下达了以下指令：</p>
+<hr />
+<h3>任务清单：从原始数据到模型输入</h3>
+<h4>✅ 第一阶段：准备工具 (初始化 <code>__init__</code>)</h4>
+<p>在开始处理数据之前，你需要先把工具备好。
+1.  <strong>准备图像处理器 (<code>vis_processor</code>)</strong>：
+    *   你需要一个工具把图片调整成模型能看懂的大小（比如 364x364 像素）。这里用的是 BLIP 模型的处理器。
+2.  <strong>准备文本分词器 (<code>tokenizer</code>)</strong>：
+    *   你需要一个工具把人类语言（“Question:...”）切分成数字 ID，以便模型理解。
+3.  <strong>确定文件路径</strong>：
+    *   老板告诉你图片存在哪里 (<code>vis_root</code>)，用来测试泛化能力的图片在哪里 (<code>rephrase_root</code>)。</p>
+<h4>✅ 第二阶段：收集原材料 (处理 <code>__init__</code> 中的循环)</h4>
+<p>现在开始遍历数据列表（<code>self.annotation</code>），对于每一条要“编辑”的数据（比如把图 A 的描述从 X 改成 Y），你需要收集以下素材：</p>
+<ol>
+<li><strong>加载 3 张关键图片</strong>：<ul>
+<li><strong>原图 (<code>image</code>)</strong>：我们要编辑的那张图。</li>
+<li><strong>重述图 (<code>rephrase_image</code>)</strong>：可能是原图的变体（用于测试模型能不能举一反三）。</li>
+<li><strong>局部性测试图 (<code>locality_image</code>)</strong>：一张完全不相关的图（用于测试模型有没有“改坏了”，比如改了猫的知识，不能影响它识别汽车）。</li>
+</ul>
+</li>
+<li><strong>加载文本信息</strong>：<ul>
+<li><strong>Prompt (<code>src</code>)</strong>：提问，比如“图里是什么？”</li>
+<li><strong>Target (<code>alt</code>)</strong>：我们希望模型学会的新答案（目标答案）。</li>
+<li><strong>Locality Prompt (<code>loc</code>)</strong>：不相关的问题，比如“香蕉是什么颜色的？”（用来检查副作用）。</li>
+</ul>
+</li>
+<li><strong>打包成单条数据 (<code>item</code>)</strong>：<ul>
+<li>把上面加载好的图片（转成 Tensor）和文本塞到一个字典里，存入 <code>self._data</code> 列表。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ 第三阶段：打包发货 (核心难点 <code>collate_fn</code>)</h4>
+<p>这是代码里最长、最难懂的部分。
+当模型训练时，它一次不只看一条数据，而是一批（Batch）。你需要把多条 <code>item</code> 整理成模型能直接吃的格式。
+这里的关键是：<strong>为了实现精准的“模型编辑”，每一批数据被拆分成了 5 个不同的“子任务包”</strong>。</p>
+<p>请看这个详细的打包清单：</p>
+<p><strong>📦 子包 1：Edit Inner (核心编辑任务)</strong>
+*   <strong>目的</strong>：教会模型新知识。
+*   <strong>内容</strong>：原图 + 原问题 + <strong>新答案</strong>。
+*   <strong>逻辑</strong>：告诉模型，“看到这张图和这个问题，你必须回答这个新答案”。</p>
+<p><strong>📦 子包 2：Edit Outer (文本泛化任务)</strong>
+*   <strong>目的</strong>：测试模型是不是死记硬背。
+*   <strong>内容</strong>：原图 + <strong>换一种问法（Rephrase）</strong> + 新答案。
+*   <strong>逻辑</strong>：如果我换个方式问（比如把“这是啥”改成“请描述图片”），模型也得能答出新答案。</p>
+<p><strong>📦 子包 3：Edit Outer Image (图像泛化任务)</strong>
+*   <strong>目的</strong>：测试模型对图像变化的适应性。
+*   <strong>内容</strong>：<strong>重述图（Rephrase Image）</strong> + 原问题 + 新答案。
+*   <strong>逻辑</strong>：如果图片稍微变了一点点（或者加了噪点），模型依然要坚持新答案。</p>
+<p><strong>📦 子包 4：Loc (纯文本局部性任务)</strong>
+*   <strong>目的</strong>：防止模型变笨（灾难性遗忘）。
+*   <strong>内容</strong>：<strong>没有图片</strong> + 不相关的纯文本问题 + 原始正确答案。
+*   <strong>逻辑</strong>：我们修改图片知识时，不能让模型忘记纯文本的知识（比如“1+1=2”或“法国首都是巴黎”）。</p>
+<p><strong>📦 子包 5：Loc Image (多模态局部性任务)</strong>
+*   <strong>目的</strong>：防止模型把别的图片也认错。
+*   <strong>内容</strong>：<strong>不相关的图（Locality Image）</strong> + 对应的问题 + 原始正确答案。
+*   <strong>逻辑</strong>：我们教模型“图A是狗”，但模型不能因此把“图B（汽车）”也看成狗。</p>
+<hr />
+<h3>总结：代码在干什么？</h3>
+<p>这段代码不仅仅是加载图片和文字，它在<strong>构造一个复杂的训练场景</strong>。</p>
+<ol>
+<li><strong><code>__init__</code></strong>：负责把硬盘上的图片读进内存，变成像素矩阵。</li>
+<li><strong><code>collate_fn</code></strong>：负责把这些数据拼凑成 PyTorch 的 Tensor。它把每个 Batch 分成了 <strong>“我要学的（Edit）”</strong> 和 <strong>“我不能忘的（Locality）”</strong> 以及 <strong>“我要举一反三的（Generalization）”</strong> 这几部分。</li>
+</ol>
+<p><strong>为什么看不懂？</strong>
+因为大部分 Dataset 只需要返回 <code>(image, label)</code>。但这个 Dataset 是为了 <code>EasyEditor</code> 这种知识编辑库服务的，它需要同时计算：
+*   编辑损失（Edit Loss）：有没有学会新知识？
+*   泛化损失（Generalization Loss）：换个问法会不会？
+*   局部性损失（Locality Loss）：有没有改坏别的地方？</p>
+<p>所以它一次性返回了 5 组数据（<code>edit_inner</code>, <code>edit_outer</code>, <code>edit_outer_image</code>, <code>loc</code>, <code>loc_image</code>），每一组都包含了 <code>input_ids</code>（文本输入）、<code>labels</code>（目标输出）和 <code>image</code>（图像输入）。</p>

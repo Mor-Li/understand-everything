@@ -1,0 +1,142 @@
+<h1>easyeditor/models/ft/ft_main.py</h1>
+<p>这份代码实现的是一种<strong>基于微调（Fine-Tuning, FT）的模型编辑方法</strong>。</p>
+<p>简单来说，它的目的是：<strong>为了让大模型学会一个新的知识点（比如“美国现在的总统是XX”），我们不重新训练整个模型，而是只针对性地微调模型里的一小部分参数，算出这些参数需要怎么变，然后把变化量加进去。</strong></p>
+<p>为了让你听懂，我把这段代码的逻辑拆解成一个<strong>“施工队修路”的 To-Do List（任务清单）</strong>。</p>
+<p>我们将代码分为两个角色：
+1.  <strong>包工头 (<code>apply_ft_to_model</code>)</strong>：负责统筹，决定修哪，最后验收。
+2.  <strong>施工队 (<code>execute_ft</code>)</strong>：负责具体的计算和尝试，找出最佳的修改方案。</p>
+<hr />
+<h3>任务清单 (To-Do List)</h3>
+<h4>第一阶段：包工头进场 (<code>apply_ft_to_model</code> 函数)</h4>
+<ol>
+<li>
+<p><strong>[ ] 决定是否保留原貌</strong></p>
+<ul>
+<li>代码：<code>if copy: model = deepcopy(model)</code></li>
+<li>解释：如果怕把原来的模型弄坏，就先复制一份备用。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 派施工队去计算方案 (核心)</strong></p>
+<ul>
+<li>代码：<code>deltas = execute_ft(model, tok, requests, hparams)</code></li>
+<li>解释：这是最关键的一步。调用 <code>execute_ft</code> 函数。这个函数<strong>不会直接修改模型</strong>，而是返回一个“施工图纸”（<code>deltas</code>），告诉我们需要修改哪些参数，以及修改的数值是多少。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 依照图纸施工</strong></p>
+<ul>
+<li>代码：<code>w[...] += upd_matrix</code></li>
+<li>解释：拿到 <code>deltas</code>（参数的变化量）后，把这些变化量加到模型的权重里去。</li>
+<li><em>此时模型已经学会了新知识。</em></li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 完工交货</strong></p>
+<ul>
+<li>代码：<code>return model, weights_copy</code></li>
+<li>解释：返回修好的模型。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>第二阶段：施工队干活 (<code>execute_ft</code> 函数) - <em>这是最难懂的部分</em></h4>
+<p>这个函数的目标是：<strong>算出参数该怎么变 (<code>delta</code>)，才能既学会新知识，又不破坏旧知识。</strong></p>
+<ol>
+<li>
+<p><strong>[ ] 确定施工范围</strong></p>
+<ul>
+<li>代码：<code>weights = { ... if hparams.rewrite_module_tmp.format(layer) in n ... }</code></li>
+<li>解释：我们不能修改整个模型几十亿个参数，那样太慢且容易崩。这里根据配置（<code>hparams</code>），只挑出特定的几层（比如第5层的MLP层）作为修改目标。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 拍照留底 (备份)</strong></p>
+<ul>
+<li>代码：<code>weights_copy = { ... .detach().clone() ... }</code></li>
+<li>解释：在修改前，把这些特定层的原始参数备份下来。</li>
+<li><em>目的：</em> 后面为了计算变化量（新参数 - 老参数），以及防止改得太离谱。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 准备工具 (优化器)</strong></p>
+<ul>
+<li>代码：<code>opt = torch.optim.Adam(...)</code></li>
+<li>解释：设置优化器（Adam），只允许优化器调整我们选定的那几层参数，其他参数冻结不动。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 开始试错循环 (Training Loop)</strong></p>
+<ul>
+<li>代码：<code>for it in range(hparams.num_steps):</code></li>
+<li>
+<p>解释：开始一轮轮的微调训练。</p>
+</li>
+<li>
+<p><strong>4.1 整理数据</strong></p>
+<ul>
+<li>代码：<code>inputs = tok(txt...); target_ids = tok(tgt...)</code></li>
+<li>解释：把输入的提示词（Prompt）和目标答案（Target）变成机器能读懂的数字向量。</li>
+</ul>
+</li>
+<li>
+<p><strong>4.2 计算误差 (Loss) - 最复杂的逻辑分支</strong></p>
+<ul>
+<li>代码里有很多 <code>if/elif</code>，是因为不同模型（T5, ChatGLM, Llama等）计算误差的方式不一样。</li>
+<li><strong>核心逻辑</strong>：模型现在的输出 vs 我们想要的输出（<code>target_new</code>）。</li>
+<li>如果不一致，就会产生 Loss（误差值）。</li>
+</ul>
+</li>
+<li>
+<p><strong>4.3 反向传播与更新</strong></p>
+<ul>
+<li>代码：<code>loss.backward(); opt.step()</code></li>
+<li>解释：根据误差，稍微调整一下那几层的参数，让模型下次预测得更准一点。</li>
+</ul>
+</li>
+<li>
+<p><strong>4.4 施加安全限制 (关键点)</strong></p>
+<ul>
+<li>代码：<code>v[...] = torch.clamp(v, min=weights_copy[k] - eps, max=weights_copy[k] + eps)</code></li>
+<li>解释：<strong>这行非常重要！</strong> 虽然我们在微调，但我们强制要求新参数不能偏离老参数太远（<code>eps</code> 是一个很小的范围）。</li>
+<li><em>为什么？</em> 如果改动太大，模型虽然学会了新知识，但可能会把以前学过的东西全忘了（灾难性遗忘）。</li>
+</ul>
+</li>
+<li>
+<p><strong>4.5 提前下班</strong></p>
+<ul>
+<li>代码：<code>if loss_meter.avg &lt; 1e-2: break</code></li>
+<li>解释：如果误差已经很小了（学会了），就不用练满所有轮次，提前结束。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 生成施工图纸 (计算 Delta)</strong></p>
+<ul>
+<li>代码：<code>deltas = {k: (weights[k] - weights_copy[k]).detach() ...}</code></li>
+<li>解释：<code>变化量 = 现在的参数 - 最开始备份的参数</code>。这就是我们要的“补丁”。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 恢复现场</strong></p>
+<ul>
+<li>代码：<code>v[...] = weights_copy[k]</code></li>
+<li>解释：<code>execute_ft</code> 这个函数承诺“不直接修改传入的模型对象”。所以它计算完 <code>deltas</code> 后，会把模型里的参数<strong>恢复成最开始的样子</strong>。</li>
+</ul>
+</li>
+<li>
+<p><strong>[ ] 上交图纸</strong></p>
+<ul>
+<li>代码：<code>return deltas</code></li>
+<li>解释：把计算好的 <code>deltas</code> 交给包工头。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结一下文中的核心观点</h3>
+<ol>
+<li><strong>局部微调</strong>：不要动全模型，只动特定的几层参数。</li>
+<li><strong>约束优化 (Constrained Optimization)</strong>：微调时，参数的更新必须被限制在原始参数的一个很小的邻域内（通过 <code>torch.clamp</code> 实现）。这是为了保证模型编辑的<strong>可靠性</strong>（学会新知识）和<strong>局部性</strong>（不影响其他无关知识）。</li>
+<li><strong>Delta 更新</strong>：编辑的本质是计算一个权重增量矩阵（Delta），可以随时加到模型上。</li>
+</ol>

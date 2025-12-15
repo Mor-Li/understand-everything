@@ -1,0 +1,134 @@
+<h1>easyeditor/trainer/algs/SERAC.py</h1>
+<p>这份代码实现了一个叫做 <strong>SERAC</strong> (Semi-Parametric Editing with a Retrieval-Augmented Counterfactual Model) 的模型编辑算法。</p>
+<p>简单来说，它的核心思想是：<strong>当我们要修改大模型的一个知识点时，不要直接去动大模型的参数（因为容易把别的知识改坏），而是外挂一个小模型和一个“记事本”。</strong></p>
+<p>如果把大模型比作一个<strong>“老专家”</strong>：
+1.  <strong>平常情况</strong>：问题直接由老专家回答。
+2.  <strong>修改情况</strong>：如果用户问的问题是我们之前“修正”过的，就让旁边的<strong>“实习生”</strong>（小模型）照着<strong>“记事本”</strong>（缓存）来回答。</p>
+<p>下面我按照你的要求，列一个 Task Todo List，一步步带你拆解这个代码的逻辑。</p>
+<hr />
+<h3>Task List：SERAC 是如何工作的？</h3>
+<p>你可以把这段代码看作是在构建一个<strong>“智能分流系统”</strong>。</p>
+<h4>Task 1: 组建团队 (初始化 <code>__init__</code>)</h4>
+<ul>
+<li><strong>目标</strong>：准备好三个核心组件。</li>
+<li><strong>动作</strong>：<ol>
+<li>加载 <strong>Base Model (原模型)</strong>：那个需要被修正，但我们尽量不动它的大模型。</li>
+<li>加载 <strong>Classifier (分类器/保安)</strong>：负责判断“这个问题是不是我们之前修正过的？”</li>
+<li>加载 <strong>Replacement Model (替补模型/实习生)</strong>：如果分类器说是修正过的，就由这个小模型来生成新的答案。</li>
+<li>准备 <strong>Cache (记事本)</strong>：<code>self.cache_inputs</code> 和 <code>self.cache_labels</code>，用来存我们要修改的那些问答对。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 2: 接受修改指令 (<code>edit</code> 函数)</h4>
+<ul>
+<li><strong>目标</strong>：用户告诉模型“在这个问题上，你应该回答B，而不是A”。</li>
+<li><strong>动作</strong>：<ol>
+<li><strong>不要反向传播</strong>：你会发现这里没有 <code>loss.backward()</code> 这种训练代码。</li>
+<li><strong>存入记事本</strong>：代码里 <code>cache_inputs = self.cache_inputs + inputs</code>。它只是把新的输入和目标输出存到了列表里。</li>
+<li><strong>返回新系统</strong>：它创建了一个新的 <code>SERAC</code> 对象，把更新后的记事本传给它。</li>
+<li><strong>观点</strong>：SERAC 的“编辑”其实是“记忆”。它不改参数，只改内存。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 3: 处理新问题 (<code>forward</code> 函数 - 核心逻辑)</h4>
+<ul>
+<li><strong>目标</strong>：当一个新问题（<code>inputs</code>）进来时，决定谁来回答。</li>
+<li><strong>动作</strong>：<ol>
+<li><strong>老专家先回答</strong>：<code>base_logits = super().forward(...)</code>。先让原模型算一个结果出来，放在一边。</li>
+<li><strong>保安查记事本</strong>：调用 <code>run_classifier</code>。<ul>
+<li>计算当前问题和记事本里存的问题的<strong>相似度</strong> (<code>cls_sims</code>)。</li>
+<li>如果相似度很高（比如 &gt; 0.5），说明这个问题命中了好球区。</li>
+</ul>
+</li>
+<li><strong>实习生准备回答</strong>：<ul>
+<li>构建提示词：<code>rep_texts = [ctx + inp ...]</code>。把记事本里的正确答案作为上下文（Context），拼接上当前的问题。</li>
+<li>实习生生成：<code>replacement(...)</code> 算出替补模型的答案 (<code>rep_cls_logits</code>)。</li>
+</ul>
+</li>
+<li><strong>混合答案 (Mixing)</strong>：<ul>
+<li><strong>软混合 (Soft)</strong>：根据相似度分数加权。<code>最终结果 = (1 - 分数) * 老专家结果 + (分数) * 实习生结果</code>。</li>
+<li><strong>硬混合 (Hard)</strong>：如果分数 &gt; 0.5，直接完全用实习生的结果；否则完全用老专家的结果。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>逐步代码对应讲解</h3>
+<p>现在如果你回头看代码，就能看懂了：</p>
+<h4>1. 初始化部分 (<code>__init__</code>)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">SERAC</span><span class="p">(</span><span class="n">EditableModel</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+        <span class="c1"># ...</span>
+        <span class="c1"># 1. 这里的 self.classifier 就是“保安”</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">classifier</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">transformers</span><span class="p">,</span> <span class="n">config</span><span class="o">.</span><span class="n">cls_class</span><span class="p">)</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+        <span class="c1"># 2. 这里的 self.replacement 就是“实习生”</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">replacement</span> <span class="o">=</span> <span class="n">BertClassifier</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 或者其他小模型</span>
+
+        <span class="c1"># 3. 这里的 cache 就是“记事本”</span>
+        <span class="k">if</span> <span class="n">cache_inputs</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">cache_inputs</span> <span class="o">=</span> <span class="p">[]</span> 
+</code></pre></div>
+
+<h4>2. 编辑部分 (<code>edit</code>)</h4>
+<p>这是最“反直觉”的地方，因为它没有训练过程。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">def</span><span class="w"> </span><span class="nf">edit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">batch</span><span class="p">,</span> <span class="n">condition</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">detach_history</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+        <span class="c1"># ... 解码输入 ...</span>
+
+        <span class="c1"># 核心动作：仅仅是把数据追加到列表里</span>
+        <span class="n">cache_inputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">cache_inputs</span> <span class="o">+</span> <span class="n">inputs</span>
+        <span class="n">cache_labels</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">cache_labels</span> <span class="o">+</span> <span class="n">labels</span>
+
+        <span class="c1"># 返回一个带着新记事本的新对象</span>
+        <span class="n">new_model</span> <span class="o">=</span> <span class="n">SERAC</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">cache_inputs</span><span class="p">,</span> <span class="n">cache_labels</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">new_model</span><span class="p">,</span> <span class="p">{}</span>
+</code></pre></div>
+
+<h4>3. 判别部分 (<code>run_classifier</code>)</h4>
+<p>保安在工作，计算距离。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">def</span><span class="w"> </span><span class="nf">embedding_logsim_matrix</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">cls_ctxs</span><span class="p">,</span> <span class="n">test_input_text</span><span class="p">):</span>
+        <span class="c1"># ...</span>
+        <span class="c1"># 计算当前输入(main_embeds)和缓存输入(ctx_embeds)的距离</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">cos</span><span class="p">:</span>
+            <span class="c1"># 余弦相似度</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="c1"># 欧式距离</span>
+            <span class="n">dists</span> <span class="o">=</span> <span class="p">(</span><span class="n">ctx_embeds</span><span class="p">[</span><span class="kc">None</span><span class="p">]</span> <span class="o">-</span> <span class="n">main_embeds</span><span class="p">[:,</span> <span class="kc">None</span><span class="p">])</span><span class="o">.</span><span class="n">norm</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+
+        <span class="c1"># 转换成概率分数</span>
+        <span class="n">cls_logsims</span> <span class="o">=</span> <span class="o">-</span><span class="n">dists</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">scale</span>
+        <span class="k">return</span> <span class="n">cls_logsims</span>
+</code></pre></div>
+
+<h4>4. 推理部分 (<code>forward</code>)</h4>
+<p>这是整个流程的大脑。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+        <span class="c1"># 1. 老专家（原模型）先跑一遍</span>
+        <span class="n">base_logits</span> <span class="o">=</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">forward</span><span class="p">(</span><span class="o">*</span><span class="n">inputs</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span><span class="o">.</span><span class="n">float</span><span class="p">()</span>
+
+        <span class="c1"># 2. 保安计算相似度 (cls_sims)</span>
+        <span class="n">cls_sims</span><span class="p">,</span> <span class="n">cls_idxs</span><span class="p">,</span> <span class="n">cls_logits</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">run_classifier</span><span class="p">(</span><span class="o">*</span><span class="n">inputs</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+
+        <span class="c1"># 3. 实习生（Replacement）跑一遍</span>
+        <span class="c1"># 它是基于记事本里的内容(rep_cls_inputs)来推理的</span>
+        <span class="n">rep_cls_logits</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">replacement</span><span class="p">(</span><span class="o">**</span><span class="n">rep_cls_inputs</span><span class="p">)</span>
+
+        <span class="c1"># 4. 混合结果</span>
+        <span class="k">if</span> <span class="n">soft</span><span class="p">:</span>
+            <span class="c1"># 这里的公式就是：Result = (1-w) * Base + w * Replacement</span>
+            <span class="c1"># 意思就是：越像我们要修的问题，就越听实习生的；不像，就听老专家的。</span>
+            <span class="n">mixture_logits</span> <span class="o">=</span> <span class="p">((</span><span class="mi">1</span> <span class="o">-</span> <span class="n">rep_weight</span><span class="p">)</span> <span class="o">*</span> <span class="n">base_probs</span> <span class="o">+</span> <span class="n">rep_weight</span> <span class="o">*</span> <span class="n">rep_cls_logits</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">+</span> <span class="n">eps</span><span class="p">)</span><span class="o">.</span><span class="n">log</span><span class="p">()</span>
+
+        <span class="k">return</span> <span class="n">mixture_logits</span>
+</code></pre></div>
+
+<h3>总结文中的核心观点</h3>
+<p>这个文件的代码其实在表达一种<strong>“非破坏性”</strong>的模型编辑哲学：</p>
+<ol>
+<li><strong>隔离性 (Isolation)</strong>：不要为了修一个Bug，就把整个系统重新编译一遍（不要微调大模型参数）。这能最大程度防止“灾难性遗忘”（改了一个，忘了十个）。</li>
+<li><strong>显式记忆 (Explicit Memory)</strong>：把所有的“补丁”（Edits）显式地存在一个外部缓存里，而不是试图把它们压缩进神经网络的权重里。</li>
+<li><strong>路由机制 (Routing)</strong>：模型编辑本质上是一个路由问题。关键在于准确判断“当前这个问题，是不是属于那个补丁管辖的范围”。</li>
+<li><strong>小模型辅助 (Small Model Auxiliary)</strong>：大模型负责通用知识，专门的小模型负责处理那些特定的、被修改过的极端情况。</li>
+</ol>
+<p>至于 <code>SERAC_MULTI</code> 类，逻辑完全一样，只是为了处理 <strong>MiniGPT-4</strong> 或 <strong>BLIP-2</strong> 这种多模态模型（能看图说话的模型），所以代码里多了很多处理图片（<code>image_embeds</code>）和映射层（<code>language_projection</code>）的逻辑。</p>

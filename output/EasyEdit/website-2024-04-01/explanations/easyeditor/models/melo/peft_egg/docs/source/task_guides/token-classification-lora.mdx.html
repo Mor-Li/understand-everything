@@ -1,0 +1,99 @@
+<h1>easyeditor/models/melo/peft_egg/docs/source/task_guides/token-classification-lora.mdx</h1>
+<p>这篇文章其实是一篇 <strong>技术教程</strong>。它的核心目的是教你如何使用一种叫做 <strong>LoRA</strong> 的省钱、省显存的技术，去微调一个大型语言模型（RoBERTa），让这个模型学会从一段生物医学文本中<strong>挑出专有名词</strong>（比如识别出哪些词是DNA，哪些是蛋白质）。</p>
+<p>这种任务在AI领域叫做 <strong>Token Classification（词元分类）</strong> 或者 <strong>NER（命名实体识别）</strong>。</p>
+<p>为了让你看懂，我把你原本要做的事情拆解成了一个 <strong>“任务清单 (To-Do List)”</strong>，然后一步步解释每个步骤在干什么。</p>
+<hr />
+<h3>📋 你的任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>准备环境</strong>：安装必要的工具包。</li>
+<li><strong>理解数据</strong>：下载生物医学数据集，弄清楚输入是什么，输出要什么。</li>
+<li><strong>数据加工 (预处理)</strong>：这是最难的一步。把人类的单词转换成机器懂的“Token”，并对齐标签。</li>
+<li><strong>配置模型 (核心步骤)</strong>：加载基础大模型，并给它穿上“LoRA”这件马甲（设置只训练极少量的参数）。</li>
+<li><strong>开始训练</strong>：设置训练参数，让模型开始学习。</li>
+<li><strong>模型推理</strong>：训练好了，拿一句新的一句话测试一下效果。</li>
+</ol>
+<hr />
+<h3>🧐 逐步详细讲解</h3>
+<h4>第一步：准备环境 (Setup)</h4>
+<p>文中开头让你 <code>pip install</code> 一堆东西。
+*   <strong>核心逻辑</strong>：你需要用到 <code>transformers</code> (HuggingFace的基础库) 和 <code>peft</code> (专门用来做LoRA微调的库)。
+*   <strong>你需要知道的</strong>：LoRA (Low-Rank Adaptation) 是一种“偷懒”的训练方法。它不改变大模型原本几亿个参数，而是像“打补丁”一样，只训练旁边一小撮参数。这样你用普通的显卡也能跑得动。</p>
+<h4>第二步：理解数据 (Load dataset and metric)</h4>
+<ul>
+<li><strong>代码操作</strong>：加载 <code>tner/bionlp2004</code> 数据集。</li>
+<li><strong>数据长什么样？</strong><ul>
+<li><strong>输入 (Tokens)</strong>: <code>["Since", "HUVECs", "released", ...]</code> (一句话被切开的单词)</li>
+<li><strong>标签 (Tags)</strong>: <code>[0, 7, 0, ...]</code> (每个单词对应的类别ID)</li>
+</ul>
+</li>
+<li><strong>标签含义</strong>：<ul>
+<li><code>O</code> (0): 普通单词，不是实体。</li>
+<li><code>B-DNA</code>: DNA实体的开头。</li>
+<li><code>I-DNA</code>: DNA实体的中间部分。</li>
+<li>以此类推，还有蛋白质(protein)、RNA等。</li>
+</ul>
+</li>
+<li><strong>评估指标</strong>：加载 <code>seqeval</code>，这是专门用来给这种提取任务打分的工具（算准确率、召回率等）。</li>
+</ul>
+<h4>第三步：数据加工 (Preprocess dataset) —— <strong>最容易晕的地方</strong></h4>
+<ul>
+<li><strong>问题所在</strong>：
+    模型读不懂单词（Word），它读的是“词元”（Token）。
+    比如单词 <code>"HUVECs"</code>，可能会被模型切成两个 Token：<code>"HU"</code> 和 <code>"VECs"</code>。<ul>
+<li>原来的标签是给 <code>"HUVECs"</code> 的（比如标签是7）。</li>
+<li>现在切开了，<code>"HU"</code> 和 <code>"VECs"</code> 都要对应标签。</li>
+</ul>
+</li>
+<li><strong>解决方案</strong> (<code>tokenize_and_align_labels</code> 函数)：<ol>
+<li>把单词切碎成 Token。</li>
+<li>利用 <code>word_ids</code> 追踪每个 Token 属于哪个原单词。</li>
+<li><strong>对齐标签</strong>：把原单词的标签赋给切分后的第一个 Token。如果一个单词被切成好几段，后面的段通常标为 <code>-100</code>（意思是训练时忽略它，或者也给它标签，看具体策略）。</li>
+<li>这一步做完，数据才能喂给模型。</li>
+</ol>
+</li>
+</ul>
+<h4>第四步：配置模型 (Train - PEFT/LoRA Setup) —— <strong>本文重点</strong></h4>
+<ul>
+<li><strong>加载底模</strong>：先加载一个普通的 <code>roberta-large</code> 模型。</li>
+<li><strong>设置 LoRA</strong> (<code>LoraConfig</code>)：<ul>
+<li><code>task_type</code>: 告诉它我们做的是 Token Classification（分类任务）。</li>
+<li><code>r=16</code>: LoRA 的秩。简单说，这个数越小，训练参数越少，速度越快，但可能变笨；数越大越接近全量微调。</li>
+</ul>
+</li>
+<li><strong>应用 LoRA</strong> (<code>get_peft_model</code>)：<ul>
+<li>代码里有一行打印结果：<code>trainable params: 1,855,499 ... trainable%: 0.52%</code>。</li>
+<li><strong>意思是</strong>：原本模型有3.5亿个参数，现在你只需要训练180万个参数（才0.5%！）。这就是LoRA神奇的地方，极大地降低了硬件门槛。</li>
+</ul>
+</li>
+</ul>
+<h4>第五步：开始训练 (Training)</h4>
+<ul>
+<li><strong>设置参数</strong> (<code>TrainingArguments</code>)：设定学习率、跑几轮(epoch)、要把模型存在哪。</li>
+<li><strong>训练器</strong> (<code>Trainer</code>)：把模型、数据、参数都丢进去，执行 <code>trainer.train()</code>。</li>
+<li><strong>过程</strong>：这时候模型就在不断看数据，调整那 0.5% 的参数，学习如何区分哪个词是DNA，哪个是蛋白质。</li>
+</ul>
+<h4>第六步：模型推理 (Inference)</h4>
+<ul>
+<li><strong>场景</strong>：训练完了，怎么用？</li>
+<li><strong>操作</strong>：<ol>
+<li>加载原本的 <code>roberta-large</code>。</li>
+<li>加载你训练好的 LoRA 权重（那个小补丁）。</li>
+<li>把它们“合体” (<code>PeftModel.from_pretrained</code>)。</li>
+</ol>
+</li>
+<li><strong>测试</strong>：<ul>
+<li>输入一句话：<code>"The activation of IL-2 gene..."</code></li>
+<li>模型输出：它会给每个词打标。</li>
+<li>结果展示：<code>("IL", "B-DNA")</code>, <code>("NF", "B-protein")</code>。模型成功识别出了 IL-2 是DNA相关，NF 是蛋白质相关。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结一下文中的核心观点</h3>
+<p>这篇文章不是在讲大道理，而是一个<strong>实操手册</strong>。它想告诉你：</p>
+<ol>
+<li>做生物医学文本挖掘（NER任务）很难，需要大模型。</li>
+<li>大模型很难训练（太贵、太慢）。</li>
+<li><strong>用 LoRA 技术</strong>，你可以冻住大模型，只训练一点点参数，就能在你的特定数据集（BioNLP）上达到很好的效果。</li>
+<li>它提供了完整的代码，让你从头到尾跑通这个流程。</li>
+</ol>

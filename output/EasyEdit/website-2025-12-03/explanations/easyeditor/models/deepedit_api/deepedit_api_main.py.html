@@ -1,0 +1,107 @@
+<h1>easyeditor/models/deepedit_api/deepedit_api_main.py</h1>
+<p>这份代码其实实现了一个<strong>基于检索和推理链（Chain of Thought）的知识编辑系统</strong>。</p>
+<p>简单来说，它的目的不是去“修改”模型内部的参数（权重），而是通过一个<strong>外部的“外挂大脑”</strong>（存储新知识），配合一个<strong>强大的LLM（这里用的是智谱GLM-4）</strong>，让模型在回答问题时，能够实时地检索并利用这些新知识，从而表现得像是被“编辑”过了一样。</p>
+<p>为了让你更容易理解，我把这个代码的逻辑拆解成一个 <strong>“任务清单 (Todo List)”</strong>，我们一步步来看它是怎么工作的。</p>
+<hr />
+<h3>核心任务清单 (DeepEdit Workflow)</h3>
+<h4>阶段一：准备工作 (备料)</h4>
+<ol>
+<li><strong>[ ] 读取配置与API Key</strong>：拿到智谱AI的钥匙，准备好调用大模型。</li>
+<li><strong>[ ] 加载“指令书” (Prompts)</strong>：读取一堆 <code>.txt</code> 文件。这些是用来告诉大模型该怎么做的“咒语”，比如：<ul>
+<li>怎么做多跳推理 (<code>multihop-cot-prompts</code>)</li>
+<li>怎么判断两个句子是否冲突 (<code>conflict-prompt</code>)</li>
+<li>怎么提取实体 (<code>entity-prompt</code>)</li>
+</ul>
+</li>
+<li><strong>[ ] 招聘“图书管理员” (Contriever)</strong>：加载一个叫 <code>Contriever</code> 的模型和它的分词器。<ul>
+<li><em>作用</em>：它不负责回答问题，只负责把句子变成向量（数学表示），用来计算句子之间的相似度，方便快速查找。</li>
+</ul>
+</li>
+</ol>
+<h4>阶段二：构建新知识库 (建立外挂显存)</h4>
+<ol>
+<li><strong>[ ] 整理新知识 (Facts)</strong>：从数据集 (<code>datasets</code>) 里提取所有需要“写入”的新知识。<ul>
+<li>比如：原本模型认为“美国总统是拜登”，现在我们要注入一条新知识“美国总统是特朗普”。</li>
+</ul>
+</li>
+<li><strong>[ ] 知识向量化</strong>：让“图书管理员”把这些新知识全部转化成向量，存起来。这样当问题来的时候，我们能快速找到相关的新知识。</li>
+</ol>
+<h4>阶段三：开始做题 (推理循环)</h4>
+<p><em>(这是代码中最核心的 <code>for d in tqdm(dataset)</code> 循环部分)</em></p>
+<ol>
+<li><strong>[ ] 拿到一个问题</strong>：比如：“《卧虎藏龙》的导演现在的妻子是谁？”</li>
+<li><strong>[ ] 初始化推理状态</strong>：建立一个“任务栈” (<code>state_ls</code>)。<ul>
+<li>这就好比探险，我们把起始点（问题）放进背包里，准备一步步往下走。</li>
+</ul>
+</li>
+<li><strong>[ ] 进入推理死循环 (<code>while</code> loop)</strong>：只要任务栈里还有没走完的路，就一直循环：<ul>
+<li><strong>A. 思考下一步 (<code>oneStep</code> 函数)</strong>：<ul>
+<li>问 GLM-4：“根据当前的情况，下一步该想什么？”</li>
+<li>如果是最后一步（得出答案），直接返回答案。</li>
+<li>如果不是，生成一个中间推理步骤（Thought）。</li>
+</ul>
+</li>
+<li><strong>B. 检查与修正 (DeepEdit的核心)</strong>：<ul>
+<li><strong>检索</strong>：用刚才生成的“中间想法”去“新知识库”里搜一下，看有没有相关的修正补丁。</li>
+<li><strong>冲突检测</strong>：用 GLM-4 判断：“我刚才生成的想法，和搜到的新知识冲突吗？”</li>
+<li><strong>替换</strong>：如果冲突（或者发现了新实体），就用<strong>新知识</strong>强行替换掉模型原本生成的想法。</li>
+<li><em>例子</em>：模型原本想说“导演是李安”，但新知识库里有“导演是张三”。系统检测到冲突，强行把推理链条掰弯，变成“导演是张三”。</li>
+</ul>
+</li>
+<li><strong>C. 更新状态</strong>：把修正后的新想法作为下一步的起点，压入任务栈。</li>
+</ul>
+</li>
+</ol>
+<h4>阶段四：交卷与评分</h4>
+<ol>
+<li><strong>[ ] 验证答案</strong>：当循环结束拿到最终答案后，和标准答案 (<code>new_answer</code>) 对比。</li>
+<li><strong>[ ] 记录成绩</strong>：如果对了，计数器 <code>cor</code> 加一，并打印当前的准确率。</li>
+</ol>
+<hr />
+<h3>关键函数通俗解释</h3>
+<p>为了让你看代码不晕，这里有几个关键函数的“人话”翻译：</p>
+<ol>
+<li>
+<p><strong><code>apply_deepedit_api_to_model</code></strong>:</p>
+<ul>
+<li>这是总指挥。它负责把上面所有的流程串起来。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>call_glm</code></strong>:</p>
+<ul>
+<li><strong>打电话给外援</strong>。把提示词发给智谱AI的API，获取生成的文本。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>get_sent_embeddings</code> &amp; <code>retrieve_facts</code></strong>:</p>
+<ul>
+<li><strong>搜素引擎</strong>。把句子变成向量，然后在一堆新知识里找出和当前句子最像的那几条。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>searchFact</code></strong>:</p>
+<ul>
+<li><strong>精准定位</strong>。它不仅仅是搜相似，还会让大模型先生成一个“搜索关键词”（比如把句子里的实体去掉），然后再去搜，为了搜得更准。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>judgeConflict</code></strong>:</p>
+<ul>
+<li><strong>裁判员</strong>。给它两个句子（一个是模型自己想的，一个是新知识库里的），问它：“这两个矛盾吗？”如果矛盾，说明模型还在用旧知识，得改。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>oneStep</code> (最重要)</strong>:</p>
+<ul>
+<li><strong>走一步棋</strong>。它负责生成推理链的下一个环节。最骚的操作都在这里：它生成了想法后，会立刻去库里查有没有冲突，如果有，它会<strong>分叉</strong>出新的推理路径（把修正后的想法加进去）。</li>
+</ul>
+</li>
+</ol>
+<h3>总结：这到底在讲啥？</h3>
+<p>这段代码实现的是一种<strong>“即插即用”的知识编辑</strong>方法。</p>
+<ul>
+<li><strong>传统方法</strong>：我要教模型新知识，我就要把模型拉回去重新训练（Fine-tuning）或者修改它的神经元（ROME/MEMIT）。这很慢，而且容易把模型搞坏。</li>
+<li><strong>DeepEdit (这个代码)</strong>：我不改模型参数。我把新知识写在一个小本本上。当模型回答问题时，每想一步，我就让它查一下小本本。如果它的想法和小本本冲突，我就按小本本上的改，强行引导它推理出符合新知识的答案。</li>
+</ul>
+<p><strong>核心观点</strong>：通过<strong>检索（Retrieval）</strong>和<strong>冲突检测（Conflict Detection）</strong>来干预大模型的<strong>思维链（Chain of Thought）</strong>，从而实现知识编辑的效果。</p>

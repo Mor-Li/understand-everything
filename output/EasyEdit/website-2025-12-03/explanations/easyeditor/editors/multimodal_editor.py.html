@@ -1,0 +1,97 @@
+<h1>easyeditor/editors/multimodal_editor.py</h1>
+<p>这份代码文件 <code>multimodal_editor.py</code> 的核心作用相当于一个<strong>“多模态模型手术室的总管”</strong>。</p>
+<p>它的主要任务是：<strong>加载各种多模态大模型（如 LLaVA, Qwen-VL, BLIP），接收用户的修改指令（比如“把这张图里的狗认成猫”），调用具体的算法进行修改，最后检查修改是否成功以及是否改坏了别的地方。</strong></p>
+<p>为了让你更容易理解，我将整个文件的逻辑拆解为一个<strong>“模型编辑任务清单 (Todo List)”</strong>，我们一步步来看它是怎么工作的：</p>
+<hr />
+<h3>📋 任务清单：多模态模型编辑流程</h3>
+<h4>1. 【准备阶段】招聘与培训 (初始化 <code>__init__</code>)</h4>
+<p><strong>任务目标</strong>：根据配置文件，把指定的模型招募进来，并准备好处理图片和文字的工具。</p>
+<ul>
+<li><strong>Todo 1.1：读取配置</strong><ul>
+<li>查看 <code>hparams</code>（超参数），确定今天要编辑哪个模型（是 <code>blip2</code>，<code>minigpt4</code>，<code>llava</code> 还是 <code>qwen2-vl</code>？）。</li>
+</ul>
+</li>
+<li><strong>Todo 1.2：加载模型 (Load Model)</strong><ul>
+<li>代码中有大量的 <code>if-elif</code> 语句。</li>
+<li>如果是 <code>blip2</code>，就通过 <code>Blip2OPT</code> 加载。</li>
+<li>如果是 <code>llava-onevision</code>，就用 HuggingFace 的 <code>LlavaOnevisionForConditionalGeneration</code> 加载。</li>
+<li><strong>观点</strong>：这个类像一个万能适配器，把不同架构的模型统一加载进来，放到 GPU 上。</li>
+</ul>
+</li>
+<li><strong>Todo 1.3：准备“翻译器” (Tokenizer &amp; Processor)</strong><ul>
+<li>加载 <code>tok</code> (文本分词器) 和 <code>vis_tok</code> (图像处理器)。</li>
+<li><strong>观点</strong>：因为多模态模型既看图也看字，所以需要两套预处理工具。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 【整理阶段】填写手术单 (数据预处理 <code>_prepare_requests</code>)</h4>
+<p><strong>任务目标</strong>：用户给的输入可能是乱七八糟的字符串或路径，需要整理成算法能看懂的标准格式。</p>
+<ul>
+<li><strong>Todo 2.1：对齐数据</strong><ul>
+<li>检查用户给的 <code>prompts</code>（提示词）、<code>targets</code>（目标输出）、<code>image</code>（图片）数量是否一致。</li>
+</ul>
+</li>
+<li><strong>Todo 2.2：处理图片</strong><ul>
+<li>调用 <code>self.vis_tok</code> 把图片路径变成模型能看懂的 Tensor（张量）数据。</li>
+</ul>
+</li>
+<li><strong>Todo 2.3：打包请求</strong><ul>
+<li>将每一组数据（提示词+目标+图片）打包成一个字典 <code>request</code>。</li>
+<li><strong>观点</strong>：这里还会处理 <strong>Locality（局部性/非相关数据）</strong>。比如，我教模型“把埃菲尔铁塔说成在柏林”，我得同时准备一张“自由女神像”的图，确保模型不会把自由女神像也说错。这叫“防止改坏”。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 【执行阶段】进行手术 (核心方法 <code>edit</code>)</h4>
+<p><strong>任务目标</strong>：这是整个代码的主入口，负责调度算法修改模型权重。</p>
+<ul>
+<li><strong>Todo 3.1：选择模式</strong><ul>
+<li>如果是 <code>sequential_edit</code> (顺序编辑)，就一个接一个改。</li>
+<li>如果是 <code>batch_edit</code> (批量编辑)，就一次性改一组。</li>
+</ul>
+</li>
+<li><strong>Todo 3.2：调用算法 (Apply Algorithm)</strong><ul>
+<li>代码：<code>self.apply_algo(...)</code>。</li>
+<li><strong>观点</strong>：<code>MultimodalEditor</code> 本身不懂怎么改权重，它只是个经理。它会调用 <code>hparams.alg_name</code> 指定的具体算法（比如 ROME, MEMIT, IKE 等）去干活。</li>
+<li>这一步会返回 <code>edited_model</code>（改好的模型）和 <code>weights_copy</code>（原始权重的备份，方便后悔）。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 【体检阶段】术后观察 (评估 <code>compute_..._results</code>)</h4>
+<p><strong>任务目标</strong>：手术做完了，得看看效果怎么样，有没有副作用。</p>
+<ul>
+<li><strong>Todo 4.1：检查编辑成功率 (Reliability)</strong><ul>
+<li>用原来的提示词和图片问模型，看它是不是输出了我们想要的 <code>target</code>。</li>
+<li>代码：<code>metrics['post']</code> (编辑后) vs <code>metrics['pre']</code> (编辑前)。</li>
+</ul>
+</li>
+<li><strong>Todo 4.2：检查泛化性 (Generalization)</strong><ul>
+<li>用 <code>rephrase_prompt</code>（换个说法的提示词）问模型，看它能不能举一反三。</li>
+</ul>
+</li>
+<li><strong>Todo 4.3：检查副作用 (Locality)</strong><ul>
+<li><strong>这是重点</strong>：代码中有一大段关于 <code>locality_output</code> 的计算。</li>
+<li><strong>观点</strong>：它比较编辑前后的 Logits（输出概率）。如果我在改“埃菲尔铁塔”时，模型对“苹果是红色的”这句话的判断变了，说明手术有副作用（Locality Accuracy 下降）。代码会计算这个准确率。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 【汇报阶段】写病历 (日志与返回)</h4>
+<p><strong>任务目标</strong>：记录整个过程花了多少时间，结果如何。</p>
+<ul>
+<li><strong>Todo 5.1：记录日志</strong><ul>
+<li>使用 <code>LOG.info</code> 打印每次编辑的耗时、评估指标。</li>
+</ul>
+</li>
+<li><strong>Todo 5.2：返回结果</strong><ul>
+<li>函数最后返回 <code>all_metrics</code>（所有指标字典）、<code>edited_model</code>（新模型）、<code>weights_copy</code>（旧权重）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码在讲什么？</h3>
+<p>这段代码并不是在<strong>发明</strong>一种新的编辑算法，而是在<strong>构建一个工程框架</strong>。它的核心观点是：</p>
+<ol>
+<li><strong>统一接口</strong>：无论底层是 LLaVA 还是 Qwen，无论用的是什么编辑算法，用户只需要调用 <code>editor.edit()</code> 这一行代码。</li>
+<li><strong>多模态不仅是加张图</strong>：代码特意强调了 <code>vis_tok</code>（视觉处理）和 <code>multimodal_locality</code>（多模态的副作用检查），说明多模态编辑比纯文本编辑多了一个维度的复杂性。</li>
+<li><strong>严谨的评估</strong>：它不仅关注“改没改过来”，非常看重“有没有改坏无关的知识”（Locality），这是模型编辑领域评估算法好坏的关键标准。</li>
+</ol>
+<p>你可以把它看作是一个<strong>“模型编辑流水线车间”</strong>。</p>

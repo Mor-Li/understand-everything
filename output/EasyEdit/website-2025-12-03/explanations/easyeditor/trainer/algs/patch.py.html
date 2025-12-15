@@ -1,0 +1,153 @@
+<h1>easyeditor/trainer/algs/patch.py</h1>
+<p>这份代码确实非常晦涩，因为它涉及到了 Python 的<strong>元编程（Meta-programming）</strong>和 PyTorch 的底层机制。</p>
+<p>简单来说，这个文件的核心目的是：<strong>把一个普通的 PyTorch 模型（Stateful，有状态的）变成一个“函数式”的模型（Stateless，无状态的）。</strong></p>
+<p>为了让你看懂，我们先别看代码，先看<strong>逻辑</strong>。</p>
+<h3>核心背景：为什么要这么做？</h3>
+<p>在普通的 PyTorch 中，模型权重（Parameters）是存放在 <code>model</code> 里面的。
+*   <strong>普通模式</strong>：<code>output = model(input)</code>。模型自己知道权重是多少。</p>
+<p>但是，在<strong>模型编辑（Model Editing）</strong>或<strong>元学习（Meta-Learning）</strong>中，我们需要计算“权重的梯度”的“梯度”（二阶导数），或者我们需要快速地把一套新权重“塞”进模型里试运行，而不改变原本的模型。
+*   <strong>本代码的目标模式</strong>：<code>output = model(input, params=new_weights)</code>。
+    *   把模型变成一个纯粹的计算器（空壳）。
+    *   把权重变成外部输入的参数。</p>
+<hr />
+<h3>任务清单 (Task To-Do List)</h3>
+<p>为了实现上述目标，这段代码实际上在执行以下步骤。你可以把这看作是代码作者的“开发任务列表”：</p>
+<ol>
+<li>
+<p><strong>准备工作 (Helpers)</strong>：</p>
+<ul>
+<li>创建一个“占位符”类，用来替换掉原本模型里的真实权重（让模型以为自己有权重，其实是空的）。</li>
+<li>创建一个上下文管理器，允许我们在修改模型内部属性时暂时绕过一些安全检查。</li>
+</ul>
+</li>
+<li>
+<p><strong>定义“猴子补丁”基类 (<code>_MonkeyPatchBase</code>)</strong>：</p>
+<ul>
+<li>定义一个通用的父类，所有被改造后的模型都要继承它。</li>
+<li>在这个类里管理“快速权重”（Fast Params），也就是我们想动态传入的那套参数。</li>
+</ul>
+</li>
+<li>
+<p><strong>核心改造逻辑 (<code>_make_functional</code>) - 最难的一步</strong>：</p>
+<ul>
+<li><strong>递归遍历</strong>：遍历原始模型的所有子层（比如 Linear, Conv2d）。</li>
+<li><strong>动态造类</strong>：在运行时动态创建一个新类，继承自原有的层和 <code>_MonkeyPatchBase</code>。</li>
+<li><strong>拦截赋值</strong>：重写 <code>__setattr__</code>。当有人试图修改参数时，拦截下来，改到外部的参数列表里，而不是改模型内部。</li>
+<li><strong>替换 Forward</strong>：重写 <code>forward</code> 函数。在计算前，把外部传入的权重“挂载”到模型上；计算完后，再卸载。</li>
+</ul>
+</li>
+<li>
+<p><strong>封装接口 (<code>make_functional</code> &amp; <code>monkeypatch</code>)</strong>：</p>
+<ul>
+<li>提供给用户的最终入口。</li>
+<li>把原始模型里的参数提取出来，变成一个 Tensor 列表。</li>
+<li>返回一个“空壳”模型（fmodule）和“参数列表”（params）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>逐步代码解析 (Step-by-Step)</h3>
+<p>现在我们对应上面的 List，一段一段看代码讲的是啥。</p>
+<h4>第一步：准备工作与基类</h4>
+<p>代码开头定义了一个 <code>_MonkeyPatchBase</code> 类。</p>
+<ul>
+<li><strong>它的作用</strong>：这是一个“空壳模型”的模板。</li>
+<li><strong>关键点</strong>：<ul>
+<li><code>_fast_params</code>: 用来存外部传进来的权重。</li>
+<li><code>forward()</code>: 这里的 <code>forward</code> 抛出错误，因为具体的 <code>forward</code> 会在后面动态生成。</li>
+<li><code>_expand_params</code>: 因为参数被拍平成了一个长列表，这个函数负责根据索引找到当前层对应的参数是哪几个。</li>
+</ul>
+</li>
+</ul>
+<h4>第二步：核心引擎 <code>_make_functional</code></h4>
+<p>这是全文件最复杂的函数（大约第 196 行）。它的逻辑是递归地把模型拆解并重组。</p>
+<ol>
+<li>
+<p><strong>定义新类 <code>MonkeyPatched</code></strong>：</p>
+<ul>
+<li>代码里写着 <code>class MonkeyPatched(_ModuleType, _MonkeyPatchBase):</code>。</li>
+<li>这叫<strong>动态继承</strong>。它创造了一个新类，既保留了原模型（比如 <code>nn.Linear</code>）的功能，又拥有了我们自定义的“补丁”功能。</li>
+</ul>
+</li>
+<li>
+<p><strong>处理参数 (<code>__init__</code>)</strong>：</p>
+<ul>
+<li>它把原本的 <code>self.weight</code> 和 <code>self.bias</code> 删掉（或者隐藏），换成了 <code>_ParameterPlaceholder</code>（占位符）。</li>
+<li>这样模型虽然没有真权重，但结构还在。</li>
+</ul>
+</li>
+<li>
+<p><strong>拦截修改 (<code>__setattr__</code>)</strong>：</p>
+<ul>
+<li>这是黑魔法所在。当你对这个新模型做 <code>model.weight = x</code> 时，它不会把 <code>x</code> 存进模型，而是去更新外部的 <code>fast_params</code> 列表。</li>
+</ul>
+</li>
+<li>
+<p><strong>魔改 <code>forward</code> (<code>patched_forward</code>)</strong>：</p>
+<ul>
+<li>代码定义了一个 <code>patched_forward</code> 函数，并把它赋值给新类的 <code>forward</code>。</li>
+<li><strong>逻辑流</strong>：<ol>
+<li>用户调用 <code>model(x, params=my_weights)</code>。</li>
+<li><code>patched_forward</code> 启动。</li>
+<li><strong>挂载</strong>：它利用 <code>contextmanager</code>，临时把 <code>my_weights</code> 里的 Tensor 赋值给模型的 <code>self.weight</code>。现在模型短暂地拥有了实体权重。</li>
+<li><strong>计算</strong>：调用原本 PyTorch 的 <code>true_forward</code> 进行计算。</li>
+<li><strong>恢复</strong>：函数结束，之前的临时赋值失效（或者在下一次调用时被覆盖）。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ol>
+<h4>第三步：递归处理</h4>
+<p><code>_make_functional</code> 函数里有这样一段：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">child</span> <span class="ow">in</span> <span class="n">module</span><span class="o">.</span><span class="n">_modules</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+    <span class="c1"># ...</span>
+    <span class="n">child_params_offset</span><span class="p">,</span> <span class="n">fchild</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">_make_functional</span><span class="p">(</span><span class="n">child</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+    <span class="c1"># ...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：模型通常是层层嵌套的（Model -&gt; BERT -&gt; Encoder -&gt; Layer ...）。这个函数会一直钻到底，把每一层都变成“MonkeyPatched”版本，然后重新组装起来。</li>
+</ul>
+<h4>第四步：用户接口 <code>monkeypatch</code></h4>
+<p>这是文件末尾的函数，也是你在外部会调用的函数。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">monkeypatch</span><span class="p">(</span><span class="n">module</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+    <span class="c1"># ...</span>
+    <span class="n">fmodule</span> <span class="o">=</span> <span class="n">make_functional</span><span class="p">(</span><span class="n">module</span><span class="p">,</span> <span class="n">encapsulator</span><span class="o">=</span><span class="n">encapsulator</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">fmodule</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：<ol>
+<li>它接收你原本的 <code>module</code>（比如一个 ResNet）。</li>
+<li>它调用 <code>make_functional</code> 把模型变成“无状态版” <code>fmodule</code>。</li>
+<li>它把原模型的权重复制一份，作为初始的 <code>params</code>。</li>
+<li>最后你得到一个 <code>fmodule</code>。</li>
+</ol>
+</li>
+</ul>
+<h3>总结：怎么使用这个东西？</h3>
+<p>理解了原理，你就知道怎么用它了。它的用法通常是这样的：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 原始模型</span>
+<span class="n">model</span> <span class="o">=</span> <span class="n">MyNet</span><span class="p">()</span> 
+
+<span class="c1"># 2. 变成“补丁”模型</span>
+<span class="c1"># fmodel 是代码逻辑（空壳），params 是数据（权重）</span>
+<span class="n">fmodel</span> <span class="o">=</span> <span class="n">monkeypatch</span><span class="p">(</span><span class="n">model</span><span class="p">)</span> 
+<span class="n">params</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">fmodel</span><span class="o">.</span><span class="n">parameters</span><span class="p">())</span>
+
+<span class="c1"># 3. 正常前向传播</span>
+<span class="n">output</span> <span class="o">=</span> <span class="n">fmodel</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">params</span><span class="o">=</span><span class="n">params</span><span class="p">)</span>
+
+<span class="c1"># 4. 计算梯度</span>
+<span class="n">loss</span> <span class="o">=</span> <span class="n">loss_fn</span><span class="p">(</span><span class="n">output</span><span class="p">,</span> <span class="n">target</span><span class="p">)</span>
+<span class="n">grads</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">grad</span><span class="p">(</span><span class="n">loss</span><span class="p">,</span> <span class="n">params</span><span class="p">)</span>
+
+<span class="c1"># 5. 更新参数（注意：我们更新的是 params 这个列表，而不是 model 内部）</span>
+<span class="n">new_params</span> <span class="o">=</span> <span class="p">[</span><span class="n">p</span> <span class="o">-</span> <span class="n">lr</span> <span class="o">*</span> <span class="n">g</span> <span class="k">for</span> <span class="n">p</span><span class="p">,</span> <span class="n">g</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">params</span><span class="p">,</span> <span class="n">grads</span><span class="p">)]</span>
+
+<span class="c1"># 6. 使用新参数再次前向传播（这就实现了不改模型本身，却用了新参数）</span>
+<span class="n">output_new</span> <span class="o">=</span> <span class="n">fmodel</span><span class="p">(</span><span class="nb">input</span><span class="p">,</span> <span class="n">params</span><span class="o">=</span><span class="n">new_params</span><span class="p">)</span>
+</code></pre></div>
+
+<h3>一句话总结</h3>
+<p>这个文件是一个<strong>“模型手术刀”</strong>，它把 PyTorch 模型的<strong>“灵魂”（逻辑/结构）</strong>和<strong>“肉体”（权重参数）</strong>强行分离，让你可以在保留逻辑的情况下，随意替换肉体（权重），主要用于需要对权重本身进行复杂求导或快速替换的场景（如 EasyEditor 这种知识编辑库）。</p>

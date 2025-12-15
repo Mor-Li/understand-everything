@@ -1,0 +1,78 @@
+<h1>steer/models/Multimodalmodel_wrapper.py</h1>
+<p>这份代码写得非常“极客”，它的核心目的是<strong>对大模型进行“手术”和“干预”</strong>。</p>
+<p>简单来说，这不是用来正常跑模型的代码，而是用来<strong>一边跑模型，一边修改模型内部数据（Steering/干预）</strong>的代码。比如，你想让模型“更诚实”或“更愤怒”，你就可以通过这个代码，在模型思考的过程中强行注入一个代表“诚实”或“愤怒”的向量。</p>
+<p>为了让你看懂，我把它拆解成一个<strong>“如何构建一个模型干预系统”的 Todo List</strong>，我们一步步来看：</p>
+<h3>任务清单：构建模型干预系统</h3>
+<h4>Step 1: 制作“窃听器”和“注射器” (Attn/MLP Wrapper)</h4>
+<p><strong>目标</strong>：我们需要深入到模型的最小单元（注意力层 Attention 和 前馈层 MLP），既能看到它们输出了什么，也能往里面“加料”。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>AttnWrapper</code> 和 <code>MLPWrapper</code> 类。</li>
+<li><strong>原理解析</strong>：<ul>
+<li>这两个类是 PyTorch 模块的包装器。</li>
+<li><code>forward</code> 函数：原本模型是怎么算的，这里照样算，但是多了一步——把计算结果存进 <code>self.activations</code>（这就是<strong>窃听</strong>）。</li>
+<li><code>add</code> 函数：允许你存入一个 <code>add_..._activations</code> 向量。虽然这部分代码里没直接展示相加的逻辑，但它是为了后续在更上层进行干预做准备的（这就是<strong>注射器</strong>的接口）。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 2: 接管模型的每一层 (BlockOutputWrapper)</h4>
+<p><strong>目标</strong>：大模型有很多层（Layer/Block）。我们需要一个“层管理员”，把 Step 1 里的零件组装起来，并负责真正的“干预”操作。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>BlockOutputWrapper</code> 类。</li>
+<li><strong>原理解析</strong>：<ul>
+<li><strong>识别身份</strong>：它会检查 <code>model_name_or_path</code>（是 Llama, GPT 还是 Qwen?），因为不同模型的内部变量名不一样（比如有的叫 <code>attn</code>，有的叫 <code>self_attn</code>）。</li>
+<li><strong>干预核心</strong>：看 <code>forward</code> 方法里的这段代码：
+    <code>python
+    if self.add_activations_dict:
+        # ...
+        augmented_output = add_vector_from_position(...)</code>
+    这就是核心逻辑！如果字典里有预设的干预向量，它就在这里把向量<strong>加</strong>到模型的输出上，强行改变模型的思考路径。</li>
+<li><strong>解码内部想法 (Unembedding)</strong>：它有一个功能是将隐藏层向量（一堆数字）转回人类能懂的 Token（文字）。这通常用于调试，看看模型在这一层到底在想什么。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 3: 组装整台手术台 (BaseModelWrapper)</h4>
+<p><strong>目标</strong>：我们需要一个总指挥，负责加载模型、分发“层管理员”，并提供对外的操作接口。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>BaseModelWrapper</code> 类。</li>
+<li><strong>原理解析</strong>：<ul>
+<li><strong>加载</strong>：初始化 <code>AutoTokenizer</code> 和 <code>AutoModelForCausalLM</code>。</li>
+<li><strong>改装 (<code>_adapt_model_layers</code>)</strong>：这是最关键的一步。它遍历模型原有的每一层，把它们替换成我们在 Step 2 写的 <code>BlockOutputWrapper</code>。<ul>
+<li><em>效果</em>：现在的模型已经不是原装模型了，是一台被我们需要监控和修改的“改装车”。</li>
+</ul>
+</li>
+<li><strong>修改最后一层 (<code>replace_final_layer</code>)</strong>：这是另一种干预流派（LM Steer）。不改中间层，直接改模型最后输出词表的映射方式（Projected Adaptor），强行扭转输出概率。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 4: 设计控制台功能 (BaseModelWrapper 的方法)</h4>
+<p><strong>目标</strong>：改装完模型后，我们需要按钮来控制它。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>BaseModelWrapper</code> 中的各种 <code>set_...</code> 和 <code>get_...</code> 方法。</li>
+<li><strong>功能列表</strong>：<ul>
+<li><code>set_add_activations</code>：<strong>核心功能</strong>。告诉某一层的 Wrapper：“嘿，把你存的那个干预向量加上去。”</li>
+<li><code>reset</code> / <code>reset_all</code>：清除所有的干预，让模型恢复出厂设置。</li>
+<li><code>get_last_activations</code>：拿回模型运行时的中间数据。</li>
+<li><code>ori_generate</code>：<strong>“对照组”生成</strong>。这个函数很有意思，它会先把所有干预向量暂时存起来，清空模型，跑一遍原始生成，然后再把干预向量装回去。这是为了对比“干预前”和“干预后”的区别。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 5: 适配多模态/图片 (LlavaOVWrapper)</h4>
+<p><strong>目标</strong>：如果输入的不仅仅是字，还有图片（比如 Llava 模型），我们需要专门处理数据格式。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>LlavaOVWrapper</code> 类。</li>
+<li><strong>原理解析</strong>：<ul>
+<li>继承自 <code>BaseModelWrapper</code>，拥有上述所有能力。</li>
+<li><strong>新增 <code>process_input</code></strong>：处理图片。它会读取图片路径，调整大小（Resize），并把文字和图片拼成符合 Llava 模型要求的 Prompt 格式（Chat Template）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这代码到底是干嘛的？</h3>
+<p>这就好比你是一个<strong>脑科医生</strong>：</p>
+<ol>
+<li><strong>Wrapper (Step 1 &amp; 2)</strong> 是你插入大脑皮层的<strong>电极</strong>。</li>
+<li><strong>BaseModelWrapper (Step 3)</strong> 是你的<strong>手术台</strong>，把病人（模型）放上来，插满电极。</li>
+<li><strong>set_add_activations (Step 4)</strong> 是你的<strong>电流开关</strong>，你可以通过电极刺激大脑的特定区域（加上一个向量），看病人会不会突然从“悲伤”变成“快乐”。</li>
+<li><strong>LlavaWrapper (Step 5)</strong> 只是说明这个手术台不仅能给写文章的人（纯文本模型）做手术，也能给看图说话的人（多模态模型）做手术。</li>
+</ol>
+<p><strong>一句话概括</strong>：这是一个用于<strong>研究和操控</strong> Transformer 模型内部激活状态的工具库，主要用于<strong>Activation Steering（激活干预）</strong>技术。</p>

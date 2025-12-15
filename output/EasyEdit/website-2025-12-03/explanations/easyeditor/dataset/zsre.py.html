@@ -1,0 +1,95 @@
+<h1>easyeditor/dataset/zsre.py</h1>
+<p>这份代码确实包含了很多深度学习数据处理的细节，初看容易晕。</p>
+<p>简单来说，这个文件的作用是<strong>为“模型知识编辑”（Model Editing）任务准备数据</strong>。</p>
+<p>想象你要教一个已经训练好的大模型（比如 Llama 或 GPT）一条<strong>新知识</strong>（例如：“现在的英国首相是苏纳克”，而不是以前训练数据里的某个人）。你需要把原始数据转换成模型能听懂的格式（Tensor/张量）。</p>
+<p>我把这段代码做的事情拆解成一个 <strong>Task Todo List</strong>，一步步带你过一遍：</p>
+<h3>📝 Task Todo List (代码执行流程)</h3>
+<ol>
+<li><strong>[准备工具] 初始化分词器 (Tokenizer)</strong><ul>
+<li>确定我们要编辑哪个模型（GPT? Llama? Qwen?），并设置好它的“语言规则”。</li>
+</ul>
+</li>
+<li><strong>[采购原料] 读取原始数据</strong><ul>
+<li>从硬盘加载 <code>zsre</code> 数据集（这是一个专门用来测试“零样本关系抽取”或知识编辑的数据集）。</li>
+</ul>
+</li>
+<li><strong>[清洗切菜] 格式化单条数据</strong><ul>
+<li>把原始数据里的“问题”、“旧答案”、“新答案”提取出来，整理成字典。</li>
+</ul>
+</li>
+<li><strong>[打包上菜] 组装成 Batch (Collate Functions)</strong><ul>
+<li>这是最难的一步。把多条文本数据转换成数字（Token IDs），并打包成模型训练需要的张量（Tensor）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>逐步详解</h3>
+<h4>Task 1: [准备工具] 初始化 (<code>__init__</code> 部分)</h4>
+<p>这部分代码在 <code>class ZsreDataset</code> 的开头。</p>
+<ul>
+<li><strong>目的</strong>：模型不认识字，只认识数字。我们需要加载 <code>Tokenizer</code>（分词器）。</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li>检查配置里的 <code>tokenizer_name</code>。</li>
+<li><strong>关键点</strong>：代码里有一大堆 <code>if 'gpt' in ... elif 'llama' in ...</code>。这是为了处理不同模型的怪癖。<ul>
+<li>比如 Llama 和 GPT 通常需要把 <code>padding_side</code> 设为 <code>left</code>（左侧填充），因为生成式模型是从左往右预测的，填充在右边会干扰生成。</li>
+<li>Qwen（千问）或 Mistral 也有特殊的 Token 设置。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2 &amp; 3: [采购与清洗] 读取与整理数据 (<code>__init__</code> 后半部分)</h4>
+<ul>
+<li><strong>目的</strong>：把复杂的 JSON 文件变成清晰的 Python 列表。</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li><code>json.load(f)</code> 读取文件。</li>
+<li><strong>核心字段解析</strong>（这是理解这个任务的关键）：<ul>
+<li><code>prompt</code> (原句): 比如 "Who is the founder of Microsoft?"</li>
+<li><code>target_new</code> (新目标): 我们希望模型学会的新知识，比如 "Elon Musk" (假设我们要强行修改这一事实)。</li>
+<li><code>ground_truth</code> (旧真相): 原始答案 "Bill Gates"。</li>
+<li><code>rephrase_prompt</code> (重述): 同一个意思换个问法，比如 "Name the person who started Microsoft." （用来测试模型是不是真的学会了知识，还是死记硬背了句子）。</li>
+<li><code>locality_prompt</code> (邻域/无关问题): 比如 "Who is the president of USA?" （用来测试模型修改完上面的知识后，会不会把无关的知识搞坏了）。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: [打包上菜] 组装 Batch (<code>collate_fn</code> 和 <code>collate_gpt_fn</code>)</h4>
+<p>这部分代码定义了两个函数，这是数据处理最核心、最复杂的地方。PyTorch 的 DataLoader 会调用它们把一堆样本拼成一个 Batch。</p>
+<p>为什么有两个函数？
+*   <code>collate_fn</code>: 通常用于 Encoder-Decoder 模型（如 T5, BART）或某些特定的编辑算法（如 MEND）。
+*   <code>collate_gpt_fn</code>: 专门用于 GPT 类（Decoder-only）模型。</p>
+<p>我们重点看 <strong><code>collate_gpt_fn</code></strong>（因为现在大模型多是 GPT 架构）：</p>
+<ol>
+<li><strong>拼接文本</strong>：<ul>
+<li>GPT 是生成式模型，它通过上文预测下文。</li>
+<li>代码里 <code>src_ + ' ' + trg_</code> 的意思就是把 <strong>“问题”</strong> 和 <strong>“新答案”</strong> 拼起来。</li>
+<li>例如变成：<code>"Who is the founder of Microsoft? Elon Musk"</code>。</li>
+</ul>
+</li>
+<li><strong>分词 (Tokenization)</strong>：<ul>
+<li><code>self.tok(...)</code> 把这些拼好的句子变成数字列表（Input IDs）和掩码（Attention Mask）。</li>
+<li>如果有句子比较短，会用 Pad Token 补齐。</li>
+</ul>
+</li>
+<li><strong>构建标签 (Labels)</strong>：<ul>
+<li><code>get_edit_labels</code>: 这是一个很重要的辅助函数。</li>
+<li>在训练时，我们只希望模型计算“新答案”部分的 Loss（损失），而不关心“问题”部分的 Loss。</li>
+<li>所以它会把“问题”部分的 Label 设为 <code>-100</code>（PyTorch 中计算 Loss 时通常忽略 -100）。</li>
+</ul>
+</li>
+<li><strong>打包输出</strong>：
+    最后返回一个大字典，包含三个关键部分：<ul>
+<li><code>edit_inner</code>: 用来训练模型“学会新知识”的数据（问题+新答案）。</li>
+<li><code>edit_rephrase</code>: 用来评估模型“泛化能力”的数据（换个问法+新答案）。</li>
+<li><code>loc</code>: 用来评估“副作用”的数据（无关问题+原答案，希望模型保持不变）。</li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p>这个文件就是个<strong>数据搬运工</strong>。</p>
+<p>它告诉你：
+1.  <strong>我要改什么？</strong> (<code>edit_inner</code>: 问题 -&gt; 新答案)
+2.  <strong>怎么测我改没改成功？</strong> (<code>edit_rephrase</code>: 换个问法 -&gt; 新答案)
+3.  <strong>怎么测我有没有改坏别的东西？</strong> (<code>loc</code>: 无关问题 -&gt; 保持原样)</p>
+<p>它把这些文本变成了 PyTorch 能够直接喂进 GPU 进行梯度下降的 Tensor 格式。</p>

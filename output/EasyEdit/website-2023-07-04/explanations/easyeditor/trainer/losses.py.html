@@ -1,0 +1,85 @@
+<h1>easyeditor/trainer/losses.py</h1>
+<p>没问题，这段代码确实涉及很多 PyTorch 的底层张量操作，如果对大模型（LLM）的训练细节不熟悉，看起来会像天书一样。</p>
+<p>这个文件 <code>losses.py</code> 属于 <strong>EasyEditor</strong>（一个大模型知识编辑库），它的核心作用只有两个：
+1.  <strong>算账（Loss）</strong>：计算模型改得怎么样了？（是不是改对了？是不是把别的地方改坏了？）
+2.  <strong>评估（Metrics）</strong>：计算准确率和概率。</p>
+<p>我们可以把理解这段代码的过程拆解成一个 <strong>5步走的 To-Do List</strong>。我们一步一步来划掉这些任务。</p>
+<hr />
+<h3>✅ Task 1: 理解背景 —— 我们在做什么？</h3>
+<p><strong>目标</strong>：理解为什么会有这些函数。</p>
+<p>在“模型编辑”中，我们通常有两个相互矛盾的目标：
+1.  <strong>编辑成功</strong>：把“法国首都是哪里？”的答案从“巴黎”改成“马赛”（即使是错的，为了测试编辑能力）。这需要计算 <strong>预测准确率</strong>（对应代码里的 <code>log_probs</code> 相关函数）。
+2.  <strong>保持原样（Locality）</strong>：除了这个问题，别的问题（比如“美国首都是哪里”）不能变。这需要计算 <strong>编辑前后的差异</strong>（对应代码里的 <code>kl_loc_loss</code>）。</p>
+<hr />
+<h3>✅ Task 2: 攻克核心难点 —— <code>kl_loc_loss</code></h3>
+<p><strong>目标</strong>：理解这个函数是如何防止模型“变傻”的。</p>
+<ul>
+<li><strong>函数名</strong>：<code>kl_loc_loss</code> (KL Divergence Locality Loss)。</li>
+<li><strong>输入</strong>：<ul>
+<li><code>pre</code>: 编辑<strong>前</strong>的模型输出（原始记忆）。</li>
+<li><code>post</code>: 编辑<strong>后</strong>的模型输出（新记忆）。</li>
+<li><code>mask</code>: 面具，用来盖住不需要计算的部分（比如填充的空字符）。</li>
+</ul>
+</li>
+</ul>
+<p><strong>逻辑拆解</strong>：
+1.  <strong>核心思想</strong>：它计算 <code>pre</code> 和 <code>post</code> 两个概率分布之间的 <strong>KL散度（KL Divergence）</strong>。简单说，就是衡量<strong>两个分布有多不同</strong>。我们希望这个值越小越好（意味着除了编辑的目标外，其他知识没变）。
+2.  <strong>代码流程</strong>：
+    *   <code>if not sequence</code>: 如果不是序列（通常指简单的分类任务），用 <code>sigmoid</code> 处理。
+    *   <code>else</code>: <strong>这是重点</strong>（LLM通常走这里）。
+        *   它把模型输出的 logits 转换成概率 (<code>softmax</code>) 和 对数概率 (<code>log_softmax</code>)。
+        *   公式 <code>pre * (log_pre - log_post)</code> 就是 KL 散度的数学公式。
+        *   最后乘上 <code>mask</code>，只计算有效文本部分的差异，忽略填充部分。</p>
+<p><strong>一句话总结</strong>：这个函数在监督模型：“<strong>喂，除了我让你改的那句话，其他地方你不许变！</strong>”</p>
+<hr />
+<h3>✅ Task 3: 理解总管家 —— <code>masked_log_probs</code></h3>
+<p><strong>目标</strong>：理解代码的入口。</p>
+<ul>
+<li><strong>函数名</strong>：<code>masked_log_probs</code>。</li>
+<li><strong>作用</strong>：这是一个<strong>分流器（Dispatcher）</strong>。</li>
+</ul>
+<p><strong>逻辑拆解</strong>：
+1.  它检查模型的输出 <code>pred</code> 的形状。
+2.  <strong>情况 A</strong>：如果输出维度是 1 (<code>pred.shape[-1] == 1</code>)，说明这是个<strong>二分类问题</strong>（比如判断 是/否）。它会把任务派发给 <code>binary_log_probs</code>。
+3.  <strong>情况 B</strong>：如果输出维度大于 1（比如 LLM 输出词表中几万个词的概率），说明是<strong>多分类问题</strong>。它会把任务派发给 <code>multiclass_log_probs</code>。</p>
+<p><strong>一句话总结</strong>：它负责看人下菜碟，决定用哪种方式算分。</p>
+<hr />
+<h3>✅ Task 4: 搞定最常用的计算 —— <code>multiclass_log_probs</code></h3>
+<p><strong>目标</strong>：理解大模型是如何计算准确率的。（这是最长的一个函数，也是 LLM 最常用的）。</p>
+<ul>
+<li><strong>输入</strong>：<code>pred</code> (预测值), <code>targ</code> (正确答案/标签)。</li>
+</ul>
+<p><strong>逻辑拆解</strong>：
+1.  <strong>处理 Mask</strong>：
+    *   代码里有 <code>mask = targ != -100</code>。在 PyTorch 中，<code>-100</code> 通常代表“忽略这个位置”。比如一句话太短，后面补了零，这些零的标签就是 -100。
+    *   这个步骤是为了把这些无效位置剔除，不计入成绩。
+2.  <strong>计算 Log Prob (对数概率)</strong>：
+    *   <code>pred.log_softmax(-1)</code>：把模型输出的分数变成概率。
+    *   <code>.gather(...)</code>：这是一个查表操作。它去模型预测的一堆概率里，把<strong>正确答案对应的那个概率</strong>给拎出来。
+3.  <strong>计算 Accuracy (准确率)</strong>：
+    *   <code>pred.argmax(-1)</code>：看模型预测概率最大的那个词是谁。
+    *   <code>correct = pred_ids == targ</code>：看预测的词和正确答案是不是同一个。
+    *   如果是 T5 模型（<code>if 't5' in config...</code>），有特殊处理（T5 可能会在结尾加特殊标记，要忽略）。
+4.  <strong>计算 NLL (Negative Log Likelihood)</strong>：
+    *   <code>nll</code> 是最常用的损失指标。它等于 <code>-log_prob</code>。概率越高，NLL 越低（Loss 越小）。</p>
+<p><strong>一句话总结</strong>：这个函数在算两件事——<strong>你猜对了吗？</strong>（Accuracy）以及 <strong>你对正确答案有多大把握？</strong>（Prob/NLL）。</p>
+<hr />
+<h3>✅ Task 5: 扫尾边缘情况 —— <code>binary_log_probs</code></h3>
+<p><strong>目标</strong>：理解简单的二分类计算。</p>
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li>非常简单。因为只有“是”或“否”。</li>
+<li>使用 <code>logsigmoid</code> 把数值压缩到 0~1 之间。</li>
+<li>如果概率 &gt; 0.5，就认为是“是”，否则是“否”，以此计算准确率。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📝 最终总结回顾</h3>
+<p>把这个文件看作一个<strong>“阅卷老师”</strong>：</p>
+<ol>
+<li><strong><code>kl_loc_loss</code></strong>：这是<strong>纪律委员</strong>。它检查模型有没有“乱动”不该动的地方（Locality）。</li>
+<li><strong><code>masked_log_probs</code></strong>：这是<strong>教务处主任</strong>。它看你是考语文（多分类）还是考数学（二分类），把你分配给不同的阅卷老师。</li>
+<li><strong><code>multiclass_log_probs</code></strong>：这是<strong>语文阅卷老师</strong>。专门负责给大模型打分，看它下一个词预测得准不准，并忽略掉卷子上的空白处（Mask）。</li>
+</ol>
+<p>现在，你再回头看代码，是不是觉得逻辑清晰了一些？重点关注 <code>kl_loc_loss</code>（为了稳定性）和 <code>multiclass_log_probs</code>（为了准确性）即可。</p>

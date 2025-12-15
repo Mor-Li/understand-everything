@@ -1,0 +1,92 @@
+<h1>easyeditor/models/alphaedit/AlphaEdit_main.py</h1>
+<p>这份代码实现了一个叫做 <strong>AlphaEdit</strong> 的算法。它的核心目的是：<strong>在不重新训练整个大模型的情况下，通过数学方法“手术刀”式地修改模型的一小部分参数，让模型记住新的知识（或者修正错误的知识），同时尽量不破坏模型原有的能力。</strong></p>
+<p>为了让你听懂，我把这段代码的执行逻辑拆解成一个 <strong>“给模型做脑部微创手术”的 To-Do List（任务清单）</strong>。</p>
+<hr />
+<h3>📋 AlphaEdit 任务清单 (Task To-Do List)</h3>
+<h4>Phase 1: 术前准备 (准备工作)</h4>
+<p><strong>代码位置:</strong> <code>apply_AlphaEdit_to_model</code> 函数开头</p>
+<ol>
+<li><strong>[ ] 复制/加载模型</strong><ul>
+<li>如果需要，先深拷贝（<code>deepcopy</code>）一份模型，防止把原版搞坏了。</li>
+</ul>
+</li>
+<li><strong>[ ] 准备“保护区地图” (计算矩阵 P)</strong><ul>
+<li><strong>核心观点</strong>: 这是 AlphaEdit 的核心。代码检查是否存在 <code>null_space_project.pt</code>。</li>
+<li><strong>逻辑</strong>: 如果没有，代码会调用 <code>get_project</code>。它通过分析模型在处理普通文本时的统计数据（Covariance），找出哪些参数方向是“重要的”（动了会变傻），哪些是“无关紧要的”（Null Space，零空间）。</li>
+<li><strong>目的</strong>: 生成矩阵 <strong>P</strong>（投影矩阵）。这就好比在手术前先画好线：“这里不能动，那里可以动”。</li>
+</ul>
+</li>
+</ol>
+<h4>Phase 2: 确定手术目标 (计算目标向量)</h4>
+<p><strong>代码位置:</strong> <code>execute_AlphaEdit</code> -&gt; <code>compute_z</code></p>
+<ol>
+<li><strong>[ ] 解析用户的修改请求</strong><ul>
+<li>比如用户想把“埃菲尔铁塔在巴黎”改成“埃菲尔铁塔在罗马”（用于测试模型编辑能力）。</li>
+<li>代码会把 prompt 里的主体（Subject）替换成占位符 <code>{}</code>。</li>
+</ul>
+</li>
+<li><strong>[ ] 计算“理想的脑电波” (Target $z$)</strong><ul>
+<li><strong>逻辑</strong>: 代码调用 <code>compute_z</code>。</li>
+<li><strong>目的</strong>: 想要模型输出“罗马”，模型最后一层的神经元激活状态（Hidden State）应该长什么样？</li>
+<li><strong>动作</strong>: 代码会跑一遍模型，看看要想输出新词，最后一层的向量 $v^*$ 应该是多少。</li>
+</ul>
+</li>
+</ol>
+<h4>Phase 3: 执行手术 (计算权重修改量)</h4>
+<p><strong>代码位置:</strong> <code>execute_AlphaEdit</code> -&gt; <code>for i, layer in enumerate(hparams.layers):</code> 循环</p>
+<ol>
+<li><strong>[ ] 逐层扫描当前状态 (Compute $k$)</strong><ul>
+<li><strong>逻辑</strong>: 调用 <code>compute_ks</code>。</li>
+<li><strong>目的</strong>: 在我们要修改的那几层（Layer），当输入“埃菲尔铁塔”时，模型当前的输入信号（Key）是什么？记为 $k$。</li>
+</ul>
+</li>
+<li><strong>[ ] 计算“误差差距” (Residual)</strong><ul>
+<li><strong>逻辑</strong>: 比较“现在的输出”和“理想的输出（第4步算的 $z$）”之间的差距。</li>
+<li><strong>目的</strong>: 知道我们还差多少才能让模型说出“罗马”。</li>
+</ul>
+</li>
+<li><strong>[ ] 求解数学方程 (核心算法)</strong><ul>
+<li><strong>代码核心</strong>: <code>torch.linalg.solve(...)</code> 这一长串。</li>
+<li><strong>逻辑</strong>: 这是一个受约束的最小二乘法问题。<ul>
+<li>我们要找到一个权重变化量 $\Delta W$。</li>
+<li><strong>约束1</strong>: 这个变化必须能填补第6步算的“差距”，让模型学会新知识。</li>
+<li><strong>约束2 (关键)</strong>: 这个变化必须经过 <strong>P</strong> 矩阵的过滤（投影到 Null Space）。</li>
+</ul>
+</li>
+<li><strong>人话解释</strong>: 也就是在“不影响模型原有能力（由 P 保证）”的前提下，“最大化地记住新知识”。</li>
+</ul>
+</li>
+<li><strong>[ ] 记录修改量 (Deltas)</strong><ul>
+<li>算出这一层的权重该怎么改（<code>upd_matrix</code>），先存起来，或者暂时应用到模型上以便计算下一层。</li>
+</ul>
+</li>
+</ol>
+<h4>Phase 4: 术后缝合与更新 (应用与缓存)</h4>
+<p><strong>代码位置:</strong> <code>execute_AlphaEdit</code> 结尾 &amp; <code>apply_AlphaEdit_to_model</code> 结尾</p>
+<ol>
+<li><strong>[ ] 更新历史缓存 (Update Cache C)</strong><ul>
+<li><strong>代码</strong>: <code>cache_c[i,:,:] += ...</code></li>
+<li><strong>逻辑</strong>: AlphaEdit 支持连续编辑多个知识。为了保证后面的编辑知道前面的编辑发生过，需要更新一个全局的协方差缓存 <code>cache_c</code>。</li>
+</ul>
+</li>
+<li><strong>[ ] 正式修改模型权重</strong><ul>
+<li><strong>代码</strong>: <code>weights[w_name][...] += upd_matrix</code></li>
+<li><strong>动作</strong>: 把算出来的 $\Delta W$ 加到模型的原始权重上。</li>
+</ul>
+</li>
+<li><strong>[ ] 清理现场</strong><ul>
+<li>删除临时变量，释放 GPU 显存 (<code>torch.cuda.empty_cache</code>)，防止爆显存。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结一下文中的核心观点</h3>
+<p>如果不看代码细节，这个文件其实就在讲一件事：</p>
+<p><strong>AlphaEdit 认为，要在不破坏大模型原有能力的前提下注入新知识，必须在“零空间（Null Space）”里做文章。</strong></p>
+<ol>
+<li><strong>保护机制 (P矩阵)</strong>：它先计算出哪些参数方向对模型原本的语言能力至关重要，然后强制修改量避开这些方向（投影到正交的子空间）。</li>
+<li><strong>增量学习 (Cache C)</strong>：它维护了一个缓存，使得你可以连续改好几个知识点，每改一个，模型都在“心里”记一笔，下一次修改会考虑到之前的变动。</li>
+<li><strong>闭式解 (Closed-form Solution)</strong>：它不是通过梯度下降（像训练模型那样慢悠悠地学），而是直接解一个线性代数方程，一步到位算出权重该加多少。</li>
+</ol>
+<p><strong>简单比喻：</strong>
+如果模型是一座满是家具的房子，普通的微调（Fine-tuning）可能会为了放进一张新沙发而乱扔旧家具。<strong>AlphaEdit</strong> 则是先用激光扫描找出房子里的空地（Null Space），然后精确地把新沙发塞进空地里，既放进了新东西，又完全没碰到旧东西。</p>

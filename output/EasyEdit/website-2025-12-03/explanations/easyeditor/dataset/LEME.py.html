@@ -1,0 +1,73 @@
+<h1>easyeditor/dataset/LEME.py</h1>
+<p>这份代码确实包含了很多细节，涉及到深度学习中<strong>数据预处理</strong>的核心逻辑。</p>
+<p>简单来说，这个脚本是一个<strong>“数据服务员”</strong>。它的工作是从硬盘里读取原始数据（比如 JSON 文件），然后清洗、切菜、摆盘，最后把处理好的“食材”（数据 Tensor）端给“大厨”（模型）去训练或评估。</p>
+<p>这个特定的“服务员”是为了<strong>LEME (Long-form Evaluation of Model Editing)</strong> 任务服务的。也就是评估当我们修改大模型里的某条知识（比如“法国的首都是哪里？”从“巴黎”改成“伦敦”）时，模型在长文本生成下的表现如何。</p>
+<p>为了让你看懂，我列一个 <strong>Task Todo List</strong>，模拟这个代码在运行时的思考过程：</p>
+<h3>📋 代码逻辑 Todo List</h3>
+<ol>
+<li><strong>准备工具 (Initialization)</strong>: 准备好切菜刀（Tokenizer），设定好切多长（max_length）。</li>
+<li><strong>读取菜单 (Load Data)</strong>: 打开 JSON 文件，把原始数据读进内存。</li>
+<li><strong>清洗食材 (Process Data)</strong>:<ul>
+<li>把原始数据转化成统一的格式（字典）。</li>
+<li>提取出：<strong>问题</strong>（Prompt）、<strong>新知识</strong>（Target New）、<strong>旧知识</strong>（Ground Truth）。</li>
+<li>提取出：<strong>重述句</strong>（Rephrase，换个问法）、<strong>无关句</strong>（Locality，测试有没有改坏别的地方）。</li>
+<li><em>LEME 特有</em>：提取长文本评估需要的关联实体。</li>
+</ul>
+</li>
+<li><strong>打包上菜 (Collate Functions)</strong>:<ul>
+<li>当模型需要一批数据（Batch）时，把上面处理好的文本转化成机器能懂的数字（Tensor）。</li>
+<li>如果是 GPT 类模型，要把问题和答案拼起来。</li>
+<li>如果是 T5 类模型，要把问题和答案分开。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>逐步讲解（中文大白话版）</h3>
+<h4>第一步：准备工具 (<code>__init__</code> 函数)</h4>
+<p>这是类的初始化部分。</p>
+<ul>
+<li><strong>设定长度</strong>: <code>self.max_length = 40</code>。如果不指定，默认每句话最长处理 40 个词。</li>
+<li><strong>加载分词器 (Tokenizer)</strong>: 代码里有一大段 <code>if...elif...</code>。<ul>
+<li>这是因为不同的模型（GPT2, Llama, Qwen, Mistral）对“句尾符”和“填充符”的处理方式不一样。</li>
+<li>比如 Llama 和 Mistral 通常需要 <code>padding_side = 'left'</code>（从左边填充空格），这对于生成任务很重要。</li>
+</ul>
+</li>
+<li><strong>读取文件</strong>: <code>json.load(f)</code> 把硬盘上的数据读进来。</li>
+<li><strong>循环处理</strong>: 针对每一条数据，根据它是 <code>zsre</code> 数据集还是 <code>counterfact</code> 数据集，调用不同的清洗函数（<code>_process_zsre_data</code> 或 <code>_process_counterfact_data</code>）。</li>
+</ul>
+<h4>第二步：清洗食材 (<code>_process_...</code> 函数)</h4>
+<p>这是最繁琐但最重要的部分。原始数据可能长得很乱，这里要把它们整理成统一的字典格式。</p>
+<p>以 <code>_process_zsre_data</code> 为例，它整理出以下关键字段：
+*   <code>prompt</code>: <strong>提示词</strong>。比如 "Who is the president of US?"
+*   <code>target_new</code>: <strong>编辑目标</strong>。我们要教给模型的新知识，比如 "Joe Biden"。
+*   <code>ground_truth</code>: <strong>原始真相</strong>。模型原本知道的，比如 "Donald Trump"。
+*   <code>rephrase</code>: <strong>重述</strong>。比如 "The name of US president is?"（用来测试模型是不是真的学会了知识，还是只是死记硬背了那句话）。
+*   <code>locality</code>: <strong>局部性/邻域</strong>。比如 "What is the capital of France?"（用来测试模型修改美国总统时，会不会把法国首都搞乱。这里不应该变）。
+*   <code>longform_...</code>: <strong>长文本相关</strong>。这是这个脚本特有的，提取一些关联实体，用来评估长文本生成的一致性。</p>
+<h4>第三步：打包上菜 (<code>collate_fn</code> 和 <code>collate_gpt_fn</code>)</h4>
+<p>这是 PyTorch <code>DataLoader</code> 用到的函数。它的作用是把<strong>多条</strong>清洗好的数据（list of dicts）合并成<strong>一个</strong>大的批次（Batch Tensor）。</p>
+<p>这里有两个函数，区别在于<strong>模型架构</strong>不同：</p>
+<p><strong>1. <code>collate_fn</code> (适用于 Encoder-Decoder 模型，如 T5, BART)</strong>
+*   这种模型把“输入”和“输出”分开处理。
+*   代码逻辑：
+    *   把 <code>prompt</code> 变成 <code>input_ids</code>。
+    *   把 <code>target_new</code> 变成 <code>labels</code>。
+    *   分别对 <code>src</code> (源文本), <code>trg</code> (目标文本), <code>rephrase</code> (重述文本) 进行 Tokenize（转成数字）。</p>
+<p><strong>2. <code>collate_gpt_fn</code> (适用于 Decoder-only 模型，如 GPT, Llama, Qwen)</strong>
+*   这种模型是“接龙”生成的，它不分输入输出，只有一段连续的文本。
+*   <strong>关键代码</strong>:
+    <code>python
+    src = [src_ + ' ' + trg_ for src_, trg_ in zip(src, trg)]</code>
+    *   它把 <strong>问题 (src)</strong> 和 <strong>答案 (trg)</strong> 拼接到了一起。
+    *   比如：输入变成 <code>"Who is the president? Joe Biden"</code>。
+*   <strong>Label 的处理</strong>:
+    *   虽然输入是拼在一起的，但训练时我们只想让模型预测“答案”部分，不想让它预测“问题”部分。
+    *   <code>get_edit_labels</code> 和后续逻辑通常会把“问题”部分的 Label 设为 <code>-100</code>（PyTorch 中代表忽略，不计算 Loss），只计算“答案”部分的 Loss。</p>
+<h3>总结文中的核心观点</h3>
+<p>这个文件实际上没有表达“观点”，它是一个<strong>工程实现</strong>。但它隐含了<strong>模型编辑（Model Editing）</strong>评估的几个核心标准：</p>
+<ol>
+<li><strong>Efficacy (有效性)</strong>: 代码里准备了 <code>target_new</code>，看模型能不能学会新知识。</li>
+<li><strong>Generalization (泛化性)</strong>: 代码里准备了 <code>rephrase</code>，看换个问法模型懂不懂。</li>
+<li><strong>Locality (局部性/安全性)</strong>: 代码里准备了 <code>locality</code>，看模型会不会改坏无关的知识。</li>
+<li><strong>Long-form Consistency (长文本一致性)</strong>: 这是这个文件（LEME）的特色，它专门提取了 <code>longform_coupled_entities</code>，说明作者认为仅仅评估简短问答是不够的，还需要评估模型在生成长文章时，能不能保持新知识的一致性。</li>
+</ol>

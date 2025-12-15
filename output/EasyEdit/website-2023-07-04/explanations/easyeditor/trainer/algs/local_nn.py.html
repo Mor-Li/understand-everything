@@ -1,0 +1,92 @@
+<h1>easyeditor/trainer/algs/local_nn.py</h1>
+<p>这份代码确实包含了很多深度学习底层的技巧，如果不熟悉<strong>低秩分解（Low-Rank）</strong>或者<strong>模型编辑（Model Editing）</strong>的初始化技巧，读起来会很晕。</p>
+<p>这份代码的核心目的是：<strong>构建几种特殊的神经网络（MLP），这些网络在刚初始化时，输出几乎等于输入（即 $f(x) \approx x$）。</strong></p>
+<p>为什么要这样做？在“模型编辑”场景下，我们通常训练一个小网络去修改大模型。最开始我们希望这个小网络“什么都不做”，保持大模型原样，然后随着训练慢慢产生改动。如果一上来就是随机噪声，大模型就“崩”了。</p>
+<p>下面我列一个 <strong>Learning Task List</strong>，带你一步步拆解这三个核心类：<code>LRLinear</code>、<code>IDMLP</code> 和 <code>MLP</code>。</p>
+<hr />
+<h3>📝 任务清单：一步步读懂 <code>local_nn.py</code></h3>
+<h4>✅ Task 1: 理解基础积木 <code>LRLinear</code> (低秩线性层)</h4>
+<p><strong>位置：</strong> 代码第 44 行左右 <code>class LRLinear(nn.Module)</code>
+<strong>目标：</strong> 搞懂它为什么不直接用 <code>nn.Linear</code>。</p>
+<ol>
+<li><strong>省参数 (Low Rank):</strong><ul>
+<li>普通的 <code>nn.Linear</code> 有一个大矩阵 $W$ (形状是 <code>out</code> $\times$ <code>in</code>)。</li>
+<li>这里它把 $W$ 拆成了两个小矩阵 <code>self.u</code> 和 <code>self.v</code>。</li>
+<li>运算逻辑是：$Output = U \times (V \times x)$。</li>
+<li><strong>目的：</strong> 减少参数量，这就是 LoRA（Low-Rank Adaptation）的核心思想。</li>
+</ul>
+</li>
+<li><strong>模式调节 (Modes):</strong><ul>
+<li>看 <code>self.mode_scale</code> 和 <code>self.mode_shift</code>。</li>
+<li><strong>比喻：</strong> 想象这层网络有几个“档位”。如果你传入 <code>mode=1</code>，它会对输出进行特定的缩放（scale）和平移（shift）。这允许同一个网络处理不同类型的任务。</li>
+</ul>
+</li>
+<li><strong>核心魔法 (Identity Init):</strong><ul>
+<li>看 <code>forward</code> 函数最后的 <code>if self.init == "id": return acts + x</code>。</li>
+<li><strong>解释：</strong> 如果初始化模式是 <code>id</code>，它会在计算结果上<strong>强制加上输入 x</strong>。这就是所谓的“残差连接”（Residual Connection）。如果计算出来的 <code>acts</code> 接近 0，那么输出就等于输入。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 2: 理解组装体 <code>IDMLP</code> (身份初始化 MLP)</h4>
+<p><strong>位置：</strong> 代码第 9 行左右 <code>class IDMLP(nn.Module)</code>
+<strong>目标：</strong> 它是怎么利用 <code>LRLinear</code> 的。</p>
+<ol>
+<li><strong>结构：</strong><ul>
+<li>它就是一个列表，里面装了好几个 <code>LRLinear</code> 层。</li>
+</ul>
+</li>
+<li><strong>逻辑：</strong><ul>
+<li>它的名字叫 <code>IDMLP</code> (Identity MLP)。</li>
+<li>因为它用的全是上面说的 <code>LRLinear</code>，并且默认带有残差连接。</li>
+<li><strong>结论：</strong> 这个网络生下来就是一个“恒等映射器”。你给它 1，它吐出 1。训练它，就是为了让它学会“在 1 的基础上加一点点修改”。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 3: 理解标准体 <code>MLP</code> 的特殊初始化</h4>
+<p><strong>位置：</strong> 代码第 101 行左右 <code>class MLP(nn.Module)</code>
+<strong>目标：</strong> 这是一个标准的 MLP，但为了实现“输出等于输入”，它用了非常硬核的数学技巧。</p>
+<ol>
+<li><strong>普通模式：</strong><ul>
+<li>如果 <code>init="xavier"</code>，它就是一个普普通通的 <code>Linear -&gt; ReLU -&gt; Linear</code> 网络。</li>
+</ul>
+</li>
+<li><strong>ID 模式 (Hard-coded Identity):</strong><ul>
+<li>看代码第 163-174 行（<code>if init == "id": ...</code>）。</li>
+<li><strong>这是最难懂的地方。</strong> 它的做法是：手动把权重矩阵设为单位矩阵（Identity Matrix），并且利用 ReLU 的性质。</li>
+<li><strong>原理：</strong> 它构造了两部分权重，一部分是正的，一部分是负的。<ul>
+<li>正的部分通过 ReLU：$x \to x$</li>
+<li>负的部分通过 ReLU：$-x \to 0$ (被截断)</li>
+<li>最后再通过第二层把它们拼回来。</li>
+</ul>
+</li>
+<li><strong>目的：</strong> 不使用残差连接（<code>+x</code>），纯粹靠调整权重矩阵的值，强行让一个非线性网络变成恒等映射。</li>
+</ul>
+</li>
+<li><strong>ID_Alpha 模式:</strong><ul>
+<li>看 <code>forward</code> 函数里的 <code>if self.init == "id_alpha": return x + self.alpha * self.mlp(x)</code>。</li>
+<li><strong>解释：</strong> 这个最简单粗暴。它设了一个参数 <code>alpha</code> 初始化为 0。</li>
+<li>公式：$Output = x + 0 \times Network(x)$。</li>
+<li>一开始输出绝对等于输入。随着训练，<code>alpha</code> 变大，网络的影响力才慢慢显现。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 4: 看懂测试代码 (验证观点)</h4>
+<p><strong>位置：</strong> 代码第 196 行 <code>if __name__ == "__main__":</code>
+<strong>目标：</strong> 验证上面说的理论。</p>
+<ol>
+<li><strong>m0 (普通初始化):</strong> <code>y0</code> 和 <code>x</code> 差距很大（<code>assert not torch.allclose</code>）。</li>
+<li><strong>m1 (ID模式):</strong> 使用了那段复杂的矩阵初始化技巧。结果 <code>y1</code> 和 <code>x</code> 几乎一样。</li>
+<li><strong>m2 (Alpha模式):</strong> 使用了 <code>alpha=0</code> 的技巧。结果 <code>y2</code> 和 <code>x</code> 几乎一样。</li>
+<li><strong>m3 (正交初始化):</strong> 另一种普通初始化，差距也很大。</li>
+</ol>
+<hr />
+<h3>总结：这段代码讲了啥？</h3>
+<p>这段代码是一个<strong>工具箱</strong>，用来创建几种特定用途的神经网络。</p>
+<p><strong>核心思想是：</strong>
+我想要一个网络，<strong>初始状态下它就像透明的一样（输入=输出）</strong>。</p>
+<p><strong>实现方法有三种：</strong>
+1.  <strong><code>IDMLP</code> / <code>LRLinear</code> 方法：</strong> 用低秩分解省参数，并直接在代码里写 <code>return result + x</code>（残差）。
+2.  <strong><code>MLP(init="id")</code> 方法：</strong> 精心设计权重矩阵的数值，让数学公式刚好抵消成 $x$。
+3.  <strong><code>MLP(init="id_alpha")</code> 方法：</strong> 在网络外面乘个 0，再加 $x$。</p>
+<p><strong>应用场景：</strong>
+通常用于 <strong>Knowledge Editing（大模型知识编辑）</strong>。比如你想把 LLM 里的 "法国首都是巴黎" 改成 "罗马"。你需要训练一个小网络去干预原模型，但训练开始前，你希望这个小网络不要干扰其他知识，所以要求它初始化为“透明”状态。</p>

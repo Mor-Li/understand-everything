@@ -1,0 +1,133 @@
+<h1>examples/run_zsre_llama2.py</h1>
+<p>这份代码其实是一个<strong>“给大模型做知识矫正手术”</strong>的流程控制脚本。</p>
+<p>它的核心目的是：<strong>使用不同的算法（如 ROME, MEMIT, LoRA 等），强行修改大模型（比如 Llama2）里的某条特定知识，并评估修改得好不好。</strong></p>
+<p>举个例子：模型原本认为“法国总统是奥朗德”，我们要把它改成“马克龙”，同时还要保证模型没变傻（不会把“美国总统”也改错）。</p>
+<p>按照你的要求，我把这个脚本的工作流程拆解成一个 <strong>Task To-Do List</strong>，一步步带你看懂它在干什么。</p>
+<hr />
+<h3>Task List: 大模型知识编辑流程</h3>
+<ol>
+<li><strong>Task 1: 确定手术方案 (配置参数)</strong><ul>
+<li>决定用什么刀法（算法）？</li>
+<li>去哪里找配置文件？</li>
+</ul>
+</li>
+<li><strong>Task 2: 准备“病历本” (加载数据)</strong><ul>
+<li>读取我们要修改的知识数据（ZsRE 数据集）。</li>
+</ul>
+</li>
+<li><strong>Task 3: 整理“考卷” (数据预处理)</strong><ul>
+<li>准备好“编辑目标”（要改成什么）。</li>
+<li>准备好“连带测试题”（测试有没有改成功，以及有没有改坏）。</li>
+</ul>
+</li>
+<li><strong>Task 4: 特殊器械准备 (仅针对 IKE 算法)</strong><ul>
+<li>如果是 IKE 这种特殊方法，需要额外的准备工作。</li>
+</ul>
+</li>
+<li><strong>Task 5: 进行手术 (执行编辑)</strong><ul>
+<li>初始化编辑器。</li>
+<li>把数据喂进去，开始修改模型权重。</li>
+</ul>
+</li>
+<li><strong>Task 6: 术后体检 (保存结果)</strong><ul>
+<li>把评估指标（成功率、副作用等）存下来。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>详细步骤解读</h3>
+<h4>Task 1: 确定手术方案 (配置参数)</h4>
+<p>代码最开始的一大段 <code>if-elif-else</code> 逻辑，就是在做选择题。</p>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>python
+    parser.add_argument('--editing_method', required=True, type=str)
+    # ...
+    if args.editing_method == 'FT':
+        editing_hparams = FTHyperParams
+    elif args.editing_method == 'ROME':
+        editing_hparams = ROMEHyperParams
+    # ...</code></li>
+<li><strong>解读：</strong><ul>
+<li>你在运行脚本时会传入 <code>editing_method</code>（比如 <code>ROME</code>）。</li>
+<li>脚本根据这个名字，去加载对应的<strong>超参数类</strong>（<code>HyperParams</code>）。</li>
+<li><strong>观点：</strong> 不同的编辑算法（FT=微调, ROME=定位并修改神经元, LoRA=外挂参数）需要不同的配置，这里是在对号入座。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 准备“病历本” (加载数据)</h4>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>python
+    test_data = json.load(open(os.path.join(args.data_dir, 'zsre_mend_eval_portability_gpt4.json'), ...))
+    if args.ds_size is not None:
+        test_data = random.sample(test_data, args.ds_size)</code></li>
+<li><strong>解读：</strong><ul>
+<li>加载 <code>zsre_...json</code> 文件。ZsRE 是一个经典的问答数据集（Zero-Shot Relation Extraction）。</li>
+<li>如果数据太多不想全跑，可以用 <code>ds_size</code> 随机抽取一部分来测试。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 整理“考卷” (数据预处理)</h4>
+<p>这是最繁琐但也最重要的一步。为了验证“手术”成不成功，需要准备三类数据：</p>
+<ol>
+<li><strong>编辑提示词 (Prompts):</strong> 告诉模型你要改啥。</li>
+<li><strong>局部性测试 (Locality):</strong> 检查副作用。</li>
+<li>
+<p><strong>迁移性测试 (Portability):</strong> 检查模型能不能举一反三。</p>
+</li>
+<li>
+<p><strong>代码片段：</strong>
+    ```python
+    prompts = [test_data_['src'] for test_data_ in test_data]     # 原始问题，如 "Who is the president of France?"
+    target_new = [edit_data_['alt'] for edit_data_ in test_data]  # 新答案，如 "Macron"</p>
+<h1>局部性 (Locality): 比如问 "Who is the president of USA?"，这个答案不应该变。</h1>
+<p>locality_inputs = { 'neighborhood':{ ... } }</p>
+<h1>迁移性 (Portability): 比如问 "Macron works in which building?"，模型应该能根据新知识推理出答案。</h1>
+<p>portability_inputs = { 'one_hop':{ ... } }
+```
+*   <strong>观点：</strong> 知识编辑不仅仅是让模型“背下”新答案，更重要的是<strong>不能破坏原有的其他知识</strong>（Locality），并且新知识要能<strong>被模型理解和运用</strong>（Portability）。</p>
+</li>
+</ol>
+<h4>Task 4: 特殊器械准备 (仅针对 IKE 算法)</h4>
+<p>IKE (In-Context Knowledge Editing) 是一种基于上下文（Prompt Engineering）的方法，不修改模型权重，而是像 RAG（检索增强生成）一样工作，所以它需要单独的准备。</p>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>python
+    if args.editing_method == 'IKE':
+        # 加载训练数据，用 SentenceTransformer 编码成向量
+        encode_ike_facts(sentence_model, train_ds, hparams)</code></li>
+<li><strong>解读：</strong> 如果你选的方法是 IKE，它需要先读入大量样本，把它们变成向量存起来，作为“示范案例”给模型看。其他方法（如 ROME）不需要这一步。</li>
+</ul>
+<h4>Task 5: 进行手术 (执行编辑)</h4>
+<p>这是全篇的核心，调用 <code>EasyEditor</code> 库的功能。</p>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>python
+    editor = BaseEditor.from_hparams(hparams) # 创建主刀医生
+    metrics, edited_model, _ = editor.edit(   # 开始手术
+        prompts=prompts,
+        target_new=target_new,
+        locality_inputs=locality_inputs,
+        portability_inputs=portability_inputs,
+        ...
+    )</code></li>
+<li><strong>解读：</strong><ul>
+<li><code>editor.edit()</code> 这一行代码内部完成了非常复杂的工作：加载 Llama2 模型 -&gt; 找到存储知识的神经元 -&gt; 修改参数 -&gt; 运行测试题 -&gt; 返回分数。</li>
+<li><code>metrics</code>：手术评分表（成功了吗？原来的知识忘了吗？）。</li>
+<li><code>edited_model</code>：修改后的新模型对象。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 6: 术后体检 (保存结果)</h4>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>python
+    json.dump(metrics, open(...), indent=4)</code></li>
+<li><strong>解读：</strong> 把 Task 5 得到的评分表存成 JSON 文件，方便你后续画图或写论文分析。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这篇代码的<strong>核心观点</strong>是：
+<strong>不要手动去改模型代码，而是把“我想改什么（Prompt）”和“我想改成什么（Target）”整理好，交给一个统一的编辑器（BaseEditor）去自动化处理，并自动跑分。</strong></p>
+<p>它就像一个<strong>批处理脚本</strong>，帮你把数据喂给复杂的数学算法，最后告诉你结果好不好。</p>

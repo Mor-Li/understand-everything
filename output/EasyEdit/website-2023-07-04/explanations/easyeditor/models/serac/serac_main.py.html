@@ -1,0 +1,131 @@
+<h1>easyeditor/models/serac/serac_main.py</h1>
+<p>这份代码确实看起来有点乱，因为它混合了<strong>实际运行的代码</strong>和<strong>一大段被注释掉（废弃）的代码</strong>。而且它涉及到了模型编辑（Model Editing）中比较独特的 SERAC 算法。</p>
+<p>别担心，我们把它想象成一个<strong>“给大模型做微创手术”</strong>的过程。SERAC 的特点是：它<strong>不直接修改</strong>大模型原本的脑细胞（权重），而是给它挂一个“外挂缓存”和“分类器”。当遇到特定的问题时，分类器会拦截，并让“外挂”来回答。</p>
+<p>为了让你看懂，我列了一个 <strong>Task Todo List</strong>，然后一步步拆解代码。</p>
+<hr />
+<h3>📋 Task Todo List (核心流程)</h3>
+<ol>
+<li><strong>准备阶段 (Init)</strong>: 加载 SERAC 算法需要的辅助模型（分类器、小模型等）。</li>
+<li><strong>接单阶段 (Input)</strong>: 接收用户的修改请求（比如：“把‘美国总统’改成‘特朗普’”）。</li>
+<li><strong>切菜阶段 (Pre-processing)</strong>: 把用户的请求文本切分成机器能懂的 Token（数字向量），并处理成特定的格式。</li>
+<li><strong>手术阶段 (Editing)</strong>: 调用 SERAC 核心算法，把新的知识存入“外挂缓存”中。</li>
+<li><strong>收尾阶段 (Return)</strong>: 返回一个这就携带了“外挂”的新模型对象。</li>
+</ol>
+<hr />
+<h3>🧐 逐步代码详解</h3>
+<h4>1. 准备阶段：<code>init_model</code></h4>
+<p>这部分是用来初始化的。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">init_model</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model</span><span class="p">,</span> <span class="n">tok</span><span class="p">,</span> <span class="n">params</span><span class="p">:</span> <span class="n">SERACHparams</span><span class="p">):</span>
+    <span class="c1"># ... 省略部分代码 ...</span>
+
+    <span class="c1"># 1. 设置分词器的填充规则（往左边补0，因为是生成式模型）</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">set_padding</span><span class="p">():</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">pad_token_id</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">eos_token_id</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">padding_side</span> <span class="o">=</span> <span class="s1">&#39;left&#39;</span>
+    <span class="n">set_padding</span><span class="p">()</span>
+
+    <span class="c1"># 2. 加载 SERAC 核心算法类</span>
+    <span class="c1"># SERAC 就像一个管理者，它管理着原始模型和一个小的“修正模型”</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">alg</span> <span class="o">=</span> <span class="n">SERAC</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">,</span> <span class="n">params</span><span class="p">,</span> <span class="k">lambda</span><span class="p">:</span> <span class="n">deepcopy</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">))</span>
+
+    <span class="c1"># 3. 加载预训练好的 SERAC 权重（这是一个额外的文件，不是大模型本身的权重）</span>
+    <span class="n">d</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">params</span><span class="o">.</span><span class="n">archive</span><span class="p">,</span> <span class="n">map_location</span><span class="o">=</span><span class="s1">&#39;cpu&#39;</span><span class="p">)</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">alg</span><span class="o">.</span><span class="n">load_state_dict</span><span class="p">(</span><span class="n">d</span><span class="p">[</span><span class="s2">&quot;model&quot;</span><span class="p">],</span> <span class="kc">False</span><span class="p">)</span>
+
+    <span class="c1"># 4. 把东西搬到 GPU 上去</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">alg</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="sa">f</span><span class="s1">&#39;cuda:</span><span class="si">{</span><span class="n">params</span><span class="o">.</span><span class="n">device</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">))</span>
+    <span class="c1"># ...</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">is_init</span> <span class="o">=</span> <span class="kc">True</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：这就好比你要给病人动手术，你得先穿好手术服，把手术刀（SERAC算法）和止血钳（权重文件）拿出来消毒，准备好。</p>
+<h4>2. 接单与切菜阶段：<code>apply_to_model</code> (前半部分)</h4>
+<p>这是最让你头晕的地方，主要是数据处理。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">apply_to_model</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model</span><span class="p">,</span> <span class="n">tok</span><span class="p">,</span> <span class="n">requests</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+    <span class="c1"># 如果没初始化，先初始化</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_init</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">init_model</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">tok</span><span class="p">,</span> <span class="n">hparams</span><span class="p">)</span>
+
+    <span class="c1"># ... 这里有几十行被注释掉的代码，直接无视！那是旧的 MEND 算法残留 ...</span>
+
+    <span class="c1"># === 下面是真正的数据处理逻辑 ===</span>
+
+    <span class="c1"># 1. 拿到目标文本 (target_new)，比如 &quot;President&quot;</span>
+    <span class="n">targets</span> <span class="o">=</span> <span class="p">[</span> <span class="o">...</span> <span class="p">]</span> 
+
+    <span class="c1"># 2. 把目标文本变成数字 (Token IDs)</span>
+    <span class="n">target_tok</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">(</span><span class="n">targets</span><span class="p">,</span> <span class="o">...</span> <span class="p">)[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">]</span>
+
+    <span class="c1"># 3. 【最难懂的一步】构建训练句子</span>
+    <span class="c1"># 这里的逻辑是：把 Prompt 和 Target 的每一个字逐步拼接。</span>
+    <span class="c1"># 比如 Prompt是 &quot;Who is he?&quot;, Target是 &quot;He is Bob&quot;</span>
+    <span class="c1"># 它可能会构建出：</span>
+    <span class="c1"># &quot;Who is he? He&quot;</span>
+    <span class="c1"># &quot;Who is he? He is&quot;</span>
+    <span class="c1"># &quot;Who is he? He is Bob&quot;</span>
+    <span class="n">sentences</span> <span class="o">=</span> <span class="p">[</span>
+        <span class="p">[</span><span class="n">request</span><span class="p">[</span><span class="s1">&#39;prompt&#39;</span><span class="p">]</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="n">target_tok</span><span class="p">[</span><span class="n">i</span><span class="p">][:</span><span class="n">j</span><span class="p">])</span> <span class="k">for</span> <span class="n">j</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">target_tok</span><span class="p">[</span><span class="n">i</span><span class="p">]))]</span>
+        <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">request</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">requests</span><span class="p">)</span>
+    <span class="p">]</span>
+    <span class="c1"># 把它展平成一个大列表</span>
+    <span class="n">sentences</span> <span class="o">=</span> <span class="p">[</span><span class="n">sentence</span> <span class="k">for</span> <span class="n">sentences_</span> <span class="ow">in</span> <span class="n">sentences</span> <span class="k">for</span> <span class="n">sentence</span> <span class="ow">in</span> <span class="n">sentences_</span><span class="p">]</span>
+
+    <span class="c1"># 4. 构建对应的标签 (Labels)</span>
+    <span class="c1"># 对应上面的句子，告诉模型下一个字该预测啥</span>
+    <span class="n">targets</span> <span class="o">=</span> <span class="p">[</span> <span class="o">...</span> <span class="p">]</span> 
+
+    <span class="c1"># 5. 最终把这些文本全部转成 Tensor (张量/矩阵) 放到 GPU 上</span>
+    <span class="n">label_tok</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">(</span><span class="n">targets</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="n">sent_tok</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">(</span><span class="n">sentences</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：
+SERAC 是一种基于“缓存”的方法。它需要把新的知识（Prompt + Target）存起来。
+这段复杂的循环是在做<strong>数据增强</strong>或者<strong>格式对齐</strong>。它把“问题+答案”拆解开，确保 SERAC 那个小的“修正模型”能够学会：只要看到这个 Prompt，就要逐字逐句地生成新的 Target。</p>
+<h4>3. 手术阶段：<code>self.alg.edit</code> (核心)</h4>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># 准备好输入数据字典</span>
+    <span class="n">edit_inner</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span>
+        <span class="n">input_ids</span><span class="o">=</span><span class="n">sent_tok</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">],</span>
+        <span class="n">attention_mask</span><span class="o">=</span><span class="n">sent_tok</span><span class="p">[</span><span class="s2">&quot;attention_mask&quot;</span><span class="p">],</span>
+        <span class="n">labels</span><span class="o">=</span><span class="n">label_tok</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">],</span>
+    <span class="p">)</span>
+    <span class="c1"># 准备条件数据（这里和上面一样，可能是接口遗留问题）</span>
+    <span class="n">cond</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">sent_tok</span><span class="p">[</span><span class="n">k</span><span class="p">]</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">,</span> <span class="s2">&quot;attention_mask&quot;</span><span class="p">]}</span>
+
+    <span class="c1"># === 关键一击 ===</span>
+    <span class="c1"># 调用 SERAC 算法的 edit 方法</span>
+    <span class="c1"># 注意：这里并没有像传统训练那样返回梯度去改参数</span>
+    <span class="c1"># 而是返回了一个 new_model</span>
+    <span class="n">new_model</span><span class="p">,</span> <span class="n">model_info</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">alg</span><span class="o">.</span><span class="n">edit</span><span class="p">(</span><span class="n">edit_inner</span><span class="p">,</span> <span class="n">cond</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：
+这里是核心。对于 SERAC 来说，<code>edit</code> 函数做的通常不是修改大模型的神经元，而是<strong>往内存列表里添加一条记录</strong>。
+比如它会在内部的小本本上写下：</p>
+<blockquote>
+<p><em>如果遇到类似 "Who is the CEO?" 的问题，不要问大模型了，直接启用 001 号修正方案，输出 "Tim Cook"。</em></p>
+</blockquote>
+<h4>4. 忽略干扰项</h4>
+<p>代码后面紧接着又是一大段被注释掉的（<code># factors = ...</code>），那是另一种算法（MEND）用来算梯度的，<strong>完全不用看</strong>。</p>
+<h4>5. 收尾阶段：<code>return</code></h4>
+<div class="codehilite"><pre><span></span><code>    <span class="k">if</span> <span class="n">keep_original_weight</span><span class="p">:</span>
+        <span class="c1"># 如果需要保持原样，就把刚才加进去的缓存删掉（这里只保留了最后一个，逻辑有点怪，可能是为了测试）</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">alg</span><span class="o">.</span><span class="n">cache_labels</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">alg</span><span class="o">.</span><span class="n">cache_labels</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">:]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">alg</span><span class="o">.</span><span class="n">cache_inputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">alg</span><span class="o">.</span><span class="n">cache_inputs</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">:]</span>
+
+    <span class="k">return</span> <span class="n">new_model</span><span class="p">,</span> <span class="p">{}</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：手术完成，把这就包含“新知识外挂”的模型交还给用户。</p>
+<hr />
+<h3>总结：这段代码到底在干啥？</h3>
+<p>简单说，这个文件就是 <strong>SERAC 算法的“操作台”</strong>。</p>
+<ol>
+<li>它<strong>不修改</strong>原始大模型的权重文件。</li>
+<li>它把用户的修改请求（Prompt + Target）处理成一堆 Tensor。</li>
+<li>它把这些 Tensor 喂给 <code>SERAC</code> 类。</li>
+<li><code>SERAC</code> 类会在内部更新它的<strong>分类器</strong>和<strong>缓存</strong>（Cache）。</li>
+<li>以后模型推理时，SERAC 会先看分类器，如果匹配中缓存，就用缓存里的模式生成答案；如果不匹配，就由原模型生成。</li>
+</ol>
+<p><strong>为什么你看不懂？</strong>
+因为代码里包含了大量被注释掉的“僵尸代码”（可能是作者从 MEND 算法那里复制粘贴过来修改的），而且变量命名（如 <code>sentences</code> 里的列表推导式）写得非常晦涩。你只需要关注 <code>init_model</code> 和 <code>alg.edit</code> 这两个关键点即可。</p>

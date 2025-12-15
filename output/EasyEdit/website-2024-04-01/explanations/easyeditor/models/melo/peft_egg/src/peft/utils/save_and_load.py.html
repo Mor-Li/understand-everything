@@ -1,0 +1,110 @@
+<h1>easyeditor/models/melo/peft_egg/src/peft/utils/save_and_load.py</h1>
+<p>这段代码确实比较晦涩，因为它属于 <strong>PEFT (Parameter-Efficient Fine-Tuning)</strong> 库的底层工具代码。它的核心作用是：<strong>“只保存和加载大模型中被修改过的那一小部分参数，而不是整个巨大的模型。”</strong></p>
+<p>为了让你看懂，我们把阅读这段代码当做一个项目任务（Project），我为你列一个 <strong>Todo List</strong>，我们一步步解锁它的逻辑。</p>
+<hr />
+<h3>任务清单：理解 PEFT 的“存”与“取”</h3>
+<h4>✅ Task 0: 理解背景 (Context)</h4>
+<p><strong>为什么会有这个文件？</strong>
+*   <strong>现状</strong>：大模型（比如 LLaMA）参数量巨大（几十 GB）。微调时，如果我们用 LoRA 或 Prompt Tuning 技术，其实只修改了模型里 <strong>1% 甚至更少</strong> 的参数。
+*   <strong>痛点</strong>：如果直接用 PyTorch 的 <code>model.save()</code>，它会把那 99% 没变的参数也存一遍，浪费硬盘空间，读写也慢。
+*   <strong>目标</strong>：这个文件的目标就是做一个“过滤器”。
+    *   <strong>存的时候</strong>：只把那 1% 的参数挑出来存盘。
+    *   <strong>读的时候</strong>：把这 1% 的参数塞回到大模型里对应的位置。</p>
+<hr />
+<h4>✅ Task 1: 拆解“保存”逻辑 (<code>get_peft_model_state_dict</code>)</h4>
+<p>这个函数的任务是：<strong>从完整模型中“提纯”出我们需要保存的参数字典。</strong></p>
+<ul>
+<li>
+<p><strong>Step 1.1: 拿到全量参数</strong></p>
+<ul>
+<li>代码：<code>state_dict = model.state_dict()</code></li>
+<li>解释：先把模型里所有的参数（几百亿个）都拿出来放在桌子上。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 1.2: 判断微调类型 (What type?)</strong></p>
+<ul>
+<li>代码：<code>if config.peft_type in (PeftType.LORA, ...)</code></li>
+<li>解释：看你是用什么方法微调的？是 <strong>LoRA</strong>？还是 <strong>Prompt Tuning</strong>？不同的方法，要保存的参数名字不一样。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 1.3: 如果是 LoRA，怎么挑？ (The LoRA Filter)</strong></p>
+<ul>
+<li><strong>核心逻辑</strong>：LoRA 会在模型里插入一些叫 <code>lora_A</code> 和 <code>lora_B</code> 的层。</li>
+<li>代码：<code>to_return = {k: state_dict[k] for k in state_dict if "lora_" in k}</code></li>
+<li>解释：遍历所有参数名，只要名字里带 <code>"lora_"</code> 的，就留下来。</li>
+<li><strong>关于 Bias (偏置)</strong>：代码里有一大段关于 <code>bias</code> 的判断 (<code>"none"</code>, <code>"all"</code>, <code>"lora_only"</code>)。这是在问：除了 LoRA 层，原本模型里的 Bias 参数你训练了吗？如果训练了，也要顺便存下来。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 1.4: 如果是 Prompt Learning，怎么挑？</strong></p>
+<ul>
+<li>代码：<code>elif isinstance(config, PromptLearningConfig): ...</code></li>
+<li>解释：这种模式不改模型结构，只在输入层加了一些“虚拟 Token”。所以只需要把这些 <code>prompt_embeddings</code> 存下来就行。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 1.5: 处理“特权分子” (<code>modules_to_save</code>)</strong></p>
+<ul>
+<li>代码：<code>if model.modules_to_save is not None:</code></li>
+<li>解释：有时候用户会指定：“除了 LoRA，我还要把最后的分类层（Classifier）也重新训练一下”。这部分参数在 <code>modules_to_save</code> 列表里，代码会专门把它们也找出来存好。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 1.6: 清洗名字 (Renaming)</strong></p>
+<ul>
+<li>代码：<code>to_return = {k.replace(f".{adapter_name}", ""): v ...}</code></li>
+<li>解释：保存到硬盘时，要把参数名里的特定标签（比如 <code>"default"</code>）去掉。这样做的好处是，以后加载时，我可以把它加载给名为 <code>"adapter_v1"</code> 的模块，也可以加载给 <code>"adapter_v2"</code>，通用性更强。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ Task 2: 拆解“加载”逻辑 (<code>set_peft_model_state_dict</code>)</h4>
+<p>这个函数的任务是：<strong>把硬盘上那个小小的参数文件，正确地“安装”回大模型里。</strong></p>
+<ul>
+<li>
+<p><strong>Step 2.1: 准备“特权分子”的路径</strong></p>
+<ul>
+<li>代码：<code>if model.modules_to_save is not None:</code> 部分</li>
+<li>解释：如果硬盘里的参数包含那些额外训练的层（如分类头），需要把它们的名字还原成模型内部能识别的长名字（加上 <code>modules_to_save</code> 这种前缀）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 2.2: 还原 LoRA 的名字 (Re-branding)</strong></p>
+<ul>
+<li>代码：<code>if config.peft_type in (PeftType.LORA, ...): ... k = f"{k}.{adapter_name}"</code></li>
+<li>解释：硬盘里的名字是通用的（比如 <code>layer.weight</code>），但模型内部为了区分不同的 LoRA 适配器，名字通常叫 <code>layer.weight.default</code> 或 <code>layer.weight.adapter_1</code>。</li>
+<li><strong>动作</strong>：这里把硬盘里的短名字，加上后缀 <code>.{adapter_name}</code>，变成模型能识别的内部名字。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 2.3: 最终加载 (Loading)</strong></p>
+<ul>
+<li>代码：<code>model.load_state_dict(peft_model_state_dict, strict=False)</code></li>
+<li>解释：<strong>最关键的一步</strong>。调用 PyTorch 的加载函数。</li>
+<li>注意 <code>strict=False</code>：这是必须的！因为你的字典里只有 1% 的参数，而模型有 100% 的坑位。如果 <code>strict=True</code>，PyTorch 会报错说“缺了好多参数啊！”。设为 False，PyTorch 就会只更新那 1% 的部分，剩下的保持原样。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 2.4: 处理 Prompt Embedding</strong></p>
+<ul>
+<li>代码：<code>model.prompt_encoder[adapter_name].embedding.load_state_dict(...)</code></li>
+<li>解释：如果是 Prompt Learning，参数加载方式比较特殊，需要手动塞进 <code>prompt_encoder</code> 模块里。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结 (Takeaway)</h3>
+<p>这篇代码其实就在做两件事，就像<strong>“搬家”</strong>：</p>
+<ol>
+<li><strong>打包（Get）</strong>：搬家时，不要把房子（大模型）搬走，只把你自己买的家具（LoRA 参数、Prompt 参数）挑出来，打包进箱子。<ul>
+<li><em>难点在于：要准确地从几万件物品中识别出哪些是你买的家具。</em></li>
+</ul>
+</li>
+<li><strong>拆包（Set）</strong>：到了新房子（加载模型），把箱子里的家具拿出来，摆放到指定的位置。<ul>
+<li><em>难点在于：要把家具贴上新房间的标签（重命名），并允许房子里本身就有其他东西（strict=False）。</em></li>
+</ul>
+</li>
+</ol>
+<p>现在再回头看代码，关注 <code>lora_</code> 关键字的筛选和 <code>replace</code> 名字的替换，应该就清晰多了。</p>

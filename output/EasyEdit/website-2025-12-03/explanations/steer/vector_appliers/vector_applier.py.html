@@ -1,0 +1,86 @@
+<h1>steer/vector_appliers/vector_applier.py</h1>
+<p>这份代码其实是一个<strong>“模型干预/控制（Steering）的执行总管”</strong>。</p>
+<p>简单来说，它的作用是：<strong>加载一个大模型 -&gt; 给模型“打针”（注入干预向量）让它变乖或改变风格 -&gt; 拿一堆问题去考考这个被“打针”后的模型 -&gt; 把回答记录下来。</strong></p>
+<p>为了让你听懂，我把这个脚本看作一个<strong>“考试管理员”</strong>，下面是它的一张 <strong>To-Do List（任务清单）</strong>，我们一步步来看它是怎么工作的：</p>
+<hr />
+<h3>📋 任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>准备工作 (<code>__init__</code>)</strong>: 看说明书，确认要用什么配置。</li>
+<li><strong>请出考生 (<code>_load_model</code>)</strong>: 把大模型（LLM）加载到显卡里。</li>
+<li><strong>进行“脑部手术” (<code>apply_steering</code>)</strong>: 关键步骤！把“干预向量”应用到模型里，改变模型的行为。</li>
+<li><strong>分发试卷 (<code>generate</code>)</strong>: 拿到测试数据集，把问题整理好。</li>
+<li><strong>监考答题 (Loop in <code>generate</code>)</strong>: 让模型回答问题（支持普通模式和 vLLM 加速模式）。<ul>
+<li><em>可选任务</em>：同时也让“没做手术”的原始模型回答一遍，用来做对比。</li>
+</ul>
+</li>
+<li><strong>收卷存档 (<code>save_results</code>)</strong>: 把模型生成的回答保存成 JSON 文件。</li>
+</ol>
+<hr />
+<h3>🔍 逐步详细讲解</h3>
+<p>下面我对应代码中的关键部分，给你翻译一下它具体在干啥：</p>
+<h4>1. 准备阶段：我是谁？我要干啥？</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>__init__</code></li>
+<li><strong>讲解</strong>:
+    这个类初始化时，会读取配置文件（<code>top_cfg</code>）。它主要是在确认：我们要用哪种干预算法（比如是 <code>prompt</code> 提示词工程，还是 <code>vector</code> 向量干预）？参数是多少？</li>
+</ul>
+<h4>2. 加载与“手术”：改造模型</h4>
+<ul>
+<li><strong>代码位置</strong>:<ul>
+<li><code>_load_model</code> / <code>_multimodal_load_model</code> (加载纯文本或多模态模型)</li>
+<li><code>apply_steering</code> (核心功能)</li>
+<li><code>apply_vectors</code></li>
+</ul>
+</li>
+<li><strong>讲解</strong>:
+    这是这个脚本最核心的地方。<ul>
+<li>它先调用 <code>load_model</code> 把模型搬进内存。</li>
+<li>然后调用 <code>apply_steering</code>。这就好比给模型喝了“药水”。</li>
+<li>代码里有一个循环 <code>for alg_name in hparams_dict.keys()</code>，它会根据你设定的算法，去调用具体的 <code>METHODS_CLASS_DICT</code>（比如 PCA 向量、对比向量等）来修改模型的内部参数。</li>
+<li><strong>结果</strong>：执行完这一步，<code>self.model</code> 就不再是原来的模型了，而是一个<strong>被控制方向（Steered）</strong>的模型。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 整理试卷：把输入变成模型能懂的格式</h4>
+<ul>
+<li><strong>代码位置</strong>:<ul>
+<li><code>_process_input_text</code></li>
+<li><code>_process_multimodal_input</code></li>
+</ul>
+</li>
+<li><strong>讲解</strong>:
+    模型听不懂纯粹的“你好”，它需要特定的格式（比如 Chat Template）。<ul>
+<li>这两个函数负责把数据集里的原始问题（如 "How to make a bomb?"）包装成模型需要的 Prompt 格式（如 <code>&lt;System&gt;...&lt;User&gt;How to make a bomb?&lt;Assistant&gt;</code>）。</li>
+<li>如果是多模态（Multimodal），它还会处理图片输入。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 考试进行中：生成回答</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>generate</code> (纯文本) 和 <code>multimodal_generate</code> (多模态)</li>
+<li><strong>讲解</strong>:
+    这是代码最长的一块。它在做这几件事：<ol>
+<li><strong>遍历数据集</strong>: <code>for item in dataset</code>，一个个拿问题。</li>
+<li><strong>判断加速模式</strong>: 代码里有一大块 <code>if self.model.VLLM_model is not None:</code>。意思是如果配置了 <strong>vLLM</strong>（一种超快的推理库），就用 vLLM 批量生成；否则就用普通的 PyTorch <code>generate</code> 慢速生成。</li>
+<li><strong>生成回答</strong>: 让那个“被干预过”的模型吐出文字。</li>
+<li><strong>对比组（可选）</strong>: 代码里有 <code>if self.config.get('generate_orig_output', False):</code>。如果你开启了这个开关，它还会让<strong>原始模型</strong>也回答一遍，方便你对比“打针前”和“打针后”的区别。</li>
+</ol>
+</li>
+</ul>
+<h4>5. 阅卷存档：保存结果</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>save_results</code> 和 <code>_format_result</code></li>
+<li><strong>讲解</strong>:
+    考试结束了。<ul>
+<li>它把 <strong>Input</strong>（问题）、<strong>Pred</strong>（干预后的回答）、<strong>Orig_pred</strong>（原始回答）打包成一个字典。</li>
+<li>最后用 <code>json.dump</code> 写入到硬盘上的 <code>generation_output_dir</code> 文件夹里。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个脚本就是一个<strong>自动化的实验台</strong>。
+你只需要给它：
+1. 一个模型。
+2. 一个干预向量（Steering Vector）。
+3. 一个测试题库。</p>
+<p>它就会自动帮你把向量装进模型，跑完测试题，然后告诉你结果怎么样。你不需要手动去一行行敲推理代码。</p>

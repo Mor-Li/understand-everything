@@ -1,0 +1,122 @@
+<h1>examples/run_AKEW_both.py</h1>
+<p>这份代码其实是一个<strong>大模型“知识编辑”（Knowledge Editing）</strong>的实验脚本。</p>
+<p>简单来说，它的目的是：<strong>不动用大规模重新训练，直接修改大模型内部的参数，让模型“学会”新的知识，或者“改正”错误的知识。</strong></p>
+<p>比如：模型原本认为“现在的美国总统是特朗普”，你想把它改成“拜登”，但又不想把整个模型重训一遍，就用这个脚本里的算法（如 ROME, MEMIT, UnKE 等）来做“微创手术”。</p>
+<p>下面我为你列一个 <strong>Task To-Do List</strong>，把这个脚本要做的事情拆解开，然后一步步给你讲。</p>
+<hr />
+<h3>📋 脚本执行任务清单 (Task To-Do List)</h3>
+<ol>
+<li><strong>准备阶段</strong>：加载必要的工具包，设定随机种子（保证结果可复现）。</li>
+<li><strong>接收指令</strong>：读取命令行参数，决定要用什么“手术刀”（编辑算法）和“病人”（模型及数据）。</li>
+<li><strong>分流处理</strong>：判断是做“结构化编辑”还是“非结构化编辑”？<ul>
+<li><em>分支 A：结构化编辑 (Structured)</em> - 传统的知识三元组编辑。</li>
+<li><em>分支 B：非结构化编辑 (Unstructured)</em> - 基于自由文本的编辑（代码重点）。</li>
+</ul>
+</li>
+<li><strong>执行编辑（手术中）</strong>：<ul>
+<li>加载模型（LLM）。</li>
+<li>加载数据（要修改的问题和答案）。</li>
+<li><strong>核心步骤</strong>：计算参数更新量，修改模型权重。</li>
+</ul>
+</li>
+<li><strong>术后检查（验证）</strong>：<ul>
+<li>用改过后的模型再次回答问题，看改没改成功（编辑成功率）。</li>
+<li>换个说法问同一个问题，看能不能答对（泛化性）。</li>
+<li>问一些无关的问题，看有没有把模型改傻了（局部性/Locality）。</li>
+</ul>
+</li>
+<li><strong>保存与评分</strong>：把所有问答结果存成文件，并计算最终得分。</li>
+</ol>
+<hr />
+<h3>🧐 逐步详细解读</h3>
+<h4>第一步：准备与接收指令 (<code>main</code> 函数部分)</h4>
+<p>代码的最下面 <code>if __name__ == "__main__":</code> 是入口。</p>
+<ul>
+<li><strong>观点</strong>：这是一个通用的实验框架，不绑定特定的模型或算法。</li>
+<li><strong>代码行为</strong>：它通过 <code>argparse</code> 接收参数，比如：<ul>
+<li><code>--editing_method</code>: 用什么算法？（比如 <code>ROME</code> 还是 <code>UnKE</code>）。</li>
+<li><code>--data_type</code>: 用什么数据？（比如 <code>counterfact</code> 反事实数据）。</li>
+<li><code>--use_unstructured_data</code>: <strong>关键开关</strong>。如果开了这个，就跑新的非结构化流程；没开就跑旧的结构化流程。</li>
+</ul>
+</li>
+</ul>
+<h4>第二步：分支 A - 结构化编辑 (<code>run_structured_editing</code>)</h4>
+<p>这是比较传统的知识编辑方式。</p>
+<ul>
+<li><strong>观点</strong>：数据是像数据库一样的 <code>(主语, 关系, 宾语)</code> 格式。</li>
+<li><strong>代码行为</strong>：<ul>
+<li>它直接调用了 <code>EasyEditor</code> 库里的 <code>BaseEditor</code>。</li>
+<li>它把数据整理成 <code>prompts</code>（提示词）、<code>target_new</code>（新目标）、<code>ground_truth</code>（旧事实）。</li>
+<li><code>editor.edit(...)</code> 一行代码就封装了所有的编辑过程。</li>
+<li>这部分代码比较简单，因为主要逻辑被封装在库里了。</li>
+</ul>
+</li>
+</ul>
+<h4>第三步：分支 B - 非结构化编辑 (<code>run_unstructured_editing</code>)</h4>
+<p><strong>这是该文件的核心，也是最复杂的部分。</strong> 它是为了处理像 <code>UnKE</code> 这种基于自然语言文本（而不是三元组）的新型编辑算法。</p>
+<ol>
+<li>
+<p><strong>加载模型与数据</strong>：</p>
+<ul>
+<li><code>model = AutoModelForCausalLM...</code>：把大模型加载到显卡里。</li>
+<li><code>ds = AKEWUnifiedDataset...</code>：加载 AKEW 这个数据集。</li>
+<li>它还加载了一些 <code>alpaca_data.json</code>（通用对话数据），用来在编辑时作为“正则化”数据，防止模型改了新知识却忘了怎么正常说话。</li>
+</ul>
+</li>
+<li>
+<p><strong>批次循环 (The Loop)</strong>：</p>
+<ul>
+<li>代码进入 <code>for batch_index in tqdm(range(num_batches)):</code> 循环。它是一批一批（Batch）来修改模型的。</li>
+</ul>
+</li>
+<li>
+<p><strong>应用编辑算法 (The Surgery)</strong>：</p>
+<ul>
+<li><code>apply_algo(model, ...)</code>：这是核心。它根据你选的算法（如 UnKE, LoRA_uns），计算出模型权重的变化量。</li>
+<li><strong>如果是 LoRA</strong>：它会挂载额外的参数层。</li>
+<li><strong>如果是 FT (Fine-tuning)</strong>：它会计算权重的 <code>delta</code> (差值)。</li>
+<li><strong>关键点</strong>：<code>weights_copy</code> 保存了修改前的权重（或者修改量的备份），用于后续恢复。</li>
+</ul>
+</li>
+<li>
+<p><strong>生成与验证 (The Check)</strong>：</p>
+<ul>
+<li>模型刚改完，马上进行测试。</li>
+<li><code>model.generate(...)</code>：让模型回答几个问题：<ul>
+<li><code>data['question']</code>: 原问题（比如“埃菲尔铁塔在哪里？”）。</li>
+<li><code>data['para_question']</code>: 换个说法的同义问题（Rephrase，比如“那个巴黎的高塔叫啥？”）。</li>
+<li><code>data['sub_question']</code>: 多跳推理问题（用于测试 <code>mquake</code> 数据集，看模型能不能举一反三）。</li>
+</ul>
+</li>
+<li>代码把模型生成的答案解码出来，存入 <code>data['original_prediction']</code> 等字段中。</li>
+</ul>
+</li>
+<li>
+<p><strong>恢复模型 (Reset)</strong>：</p>
+<ul>
+<li><code>if not args.sequential_edit:</code>：如果不做连续编辑（即每次只测试这一个编辑效果，测完还原），代码会执行：<ul>
+<li><code>nethook.get_parameter(model, k)[...] = v</code>：把模型权重<strong>恢复</strong>成编辑前的样子。这是为了保证下一个样本的测试环境是干净的。</li>
+</ul>
+</li>
+<li><strong>注意</strong>：如果开启了 <code>sequential_edit</code>，模型就会一直改下去，越来越偏离初始状态，用来测试模型的容量和稳定性。</li>
+</ul>
+</li>
+</ol>
+<h4>第四步：评估结果 (<code>eval_akew_...</code>)</h4>
+<p>不管跑哪条分支，最后都会生成一个 JSON 文件。</p>
+<ul>
+<li><code>eval_akew_structured</code> 或 <code>eval_akew_unstructured</code> 函数会被调用。</li>
+<li>它们读取刚才生成的 JSON，计算以下指标：<ul>
+<li><strong>Edit Success</strong>: 编辑成功了吗？（目标答案出现了吗？）</li>
+<li><strong>Rephrase Success</strong>: 换个问法还能答对吗？</li>
+<li><strong>Locality</strong>: 并没有把无关的知识改坏？</li>
+<li><strong>Portability</strong>: 知识能不能迁移应用？</li>
+</ul>
+</li>
+</ul>
+<h3>总结文中的核心观点</h3>
+<p>这个脚本实际上是在说：
+1.  <strong>知识编辑分两种</strong>：老的结构化（三元组）和新的非结构化（自由文本）。这个脚本想把两者统一起来测试。
+2.  <strong>UnKE 等新算法需要特殊处理</strong>：它们不仅需要目标知识，还需要一些通用的对话数据（Alpaca data）来保持模型的语言能力，所以代码里专门有一段加载 <code>alpaca_data.json</code> 的逻辑。
+3.  <strong>验证很关键</strong>：不仅要看模型是不是“背下来”了新答案，还要看它是不是“理解”了（通过 Paraphrase 和 Multi-hop question 来测试）。</p>
+<p>你看懂了吗？其实就是：<strong>加载模型 -&gt; 算怎么改参数 -&gt; 改参数 -&gt; 考试（测生成效果） -&gt; 恢复参数 -&gt; 下一个循环。</strong></p>

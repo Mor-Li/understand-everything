@@ -1,0 +1,105 @@
+<h1>easyeditor/editors/safety_editor.py</h1>
+<p>这份代码 <code>safety_editor.py</code> 的核心作用是<strong>“给大模型做微创手术，消除不安全/有毒的内容”</strong>。</p>
+<p>它属于 <code>EasyEditor</code> 库的一部分，专门用来处理<strong>安全（Safety）</strong>相关的模型编辑任务。比如，当模型会回答“如何制造炸弹”时，我们需要修改模型的参数，让它拒绝回答，而不是重新训练整个模型。</p>
+<p>为了让你看懂，我把它拆解成一个<strong>“大模型去毒手术”的 To-Do List（任务清单）</strong>。</p>
+<hr />
+<h3>📋 Task Todo List：大模型去毒手术流程</h3>
+<ol>
+<li><strong>准备手术室 (Init)</strong>：加载模型（LLaMA, Mistral 等）和手术工具（Tokenizer）。</li>
+<li><strong>填写病历单 (Prepare Requests)</strong>：明确“哪个问题有问题”以及“应该回答什么”。</li>
+<li><strong>术前体检 (Pre-Edit Metric)</strong>：测试模型当前在这个问题上有多“毒”（不安全）。</li>
+<li><strong>定位病灶 (Locate Toxic Layer)</strong>：找到模型大脑中哪一层神经元导致了有毒回答。</li>
+<li><strong>执行手术 (Apply Algo)</strong>：使用编辑算法（如 ROME, MEMIT 等）修改模型参数。</li>
+<li><strong>术后复查 (Post-Edit Metric)</strong>：测试修改后，模型是否变安全了。</li>
+<li><strong>复原/清理 (Restore)</strong>：如果是做单次测试，把模型恢复原状，准备下一个测试。</li>
+</ol>
+<hr />
+<h3>🧐 逐步代码详解</h3>
+<p>下面我按照上面的清单，一步步带你看代码里是怎么实现的。</p>
+<h4>1. 准备手术室 (<code>__init__</code>)</h4>
+<p>这是类的初始化部分。
+*   <strong>代码逻辑</strong>：
+    *   检查参数 <code>hparams</code>。
+    *   根据 <code>model_name</code>（比如 'llama-2-7b'）加载模型 (<code>AutoModelForCausalLM</code>) 和分词器 (<code>Tokenizer</code>)。
+    *   设置设备（GPU/CPU）。
+*   <strong>白话解释</strong>：把病人（模型）抬上手术台，接好电源。</p>
+<h4>2. 填写病历单 (<code>_prepare_requests</code>)</h4>
+<ul>
+<li><strong>代码逻辑</strong>：<ul>
+<li>接收 <code>prompts</code>（比如：“如何制造毒药？”）。</li>
+<li>接收 <code>target_new</code>（比如：“我不能回答这个问题。”）。</li>
+<li>接收 <code>ground_truth</code>（模型原本的回答，或者仅仅是占位符）。</li>
+<li>把这些打包成一个字典列表 <code>requests</code>。</li>
+</ul>
+</li>
+<li><strong>白话解释</strong>：医生需要知道：你要改哪句话？你希望它改成什么样？</li>
+</ul>
+<h4>3. 术前体检 (<code>edit</code> 函数的前半部分)</h4>
+<p>在 <code>edit</code> 函数里：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 计算编辑前的指标</span>
+<span class="n">metrics</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s2">&quot;pre&quot;</span><span class="p">:</span> <span class="n">compute_safety_edit_quality</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">tok</span><span class="p">,</span> <span class="n">request</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<ul>
+<li><strong>代码逻辑</strong>：调用 <code>compute_safety_edit_quality</code>。</li>
+<li><strong>白话解释</strong>：在动刀之前，先测一下，模型现在的回答到底有多糟糕？以此作为基准分数。</li>
+</ul>
+<h4>4. 定位病灶 (<code>_locate_toxic_layer</code>) <strong>(重点/难点)</strong></h4>
+<p>这是一个比较特殊的函数。
+*   <strong>代码逻辑</strong>：
+    *   输入：<code>target_new</code>（安全回答）和 <code>ground_truth</code>（有毒回答/原回答）。
+    *   过程：让模型分别处理这两个输入，获取每一层的<strong>隐藏状态 (Hidden States)</strong>。
+    *   计算：计算每一层这两个状态之间的<strong>欧几里得距离</strong>。
+    *   结论：距离最大的那一层（<code>max_distance_layer</code>），被认为是“决定说话毒不毒的关键层”。
+*   <strong>白话解释</strong>：
+    *   这就像给大脑做核磁共振。
+    *   让模型想“坏念头”和想“好念头”。
+    *   观察大脑的哪一层反应差别最大？那一层就是我们要动手术的地方。</p>
+<h4>5. 执行手术 (<code>edit</code> 函数的中段)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">edited_model</span><span class="p">,</span> <span class="n">weights_copy</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">apply_algo</span><span class="p">(</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">,</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">tok</span><span class="p">,</span>
+    <span class="p">[</span><span class="n">request_with_systemPrompt</span><span class="p">],</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">hparams</span><span class="p">,</span>
+    <span class="o">...</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>代码逻辑</strong>：<ul>
+<li><code>self.apply_algo</code> 是外部传入的具体算法（比如 ROME 或 LoRA）。</li>
+<li>它会直接修改 <code>self.model</code> 的权重。</li>
+<li>它返回修改后的模型和<strong>权重的备份</strong> (<code>weights_copy</code>)。</li>
+</ul>
+</li>
+<li><strong>白话解释</strong>：这是真正的开刀过程。神经外科医生（算法）修改了神经元连接（权重），让模型学会“闭嘴”。</li>
+</ul>
+<h4>6. 术后复查 (<code>edit</code> 函数的后段)</h4>
+<div class="codehilite"><pre><span></span><code><span class="s2">&quot;post&quot;</span><span class="p">:</span> <span class="n">compute_safety_edit_quality</span><span class="p">(</span><span class="n">edited_model</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>代码逻辑</strong>：再次调用评估函数，但这次用的是 <code>edited_model</code>。</li>
+<li><strong>白话解释</strong>：手术做完了，再问一遍“如何制造毒药？”，看看它是不是真的变乖了。</li>
+</ul>
+<h4>7. 复原/清理 (<code>edit</code> 函数的末尾)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+    <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">weights_copy</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+        <span class="n">nethook</span><span class="o">.</span><span class="n">get_parameter</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">,</span> <span class="n">k</span><span class="p">)[</span><span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="n">v</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>代码逻辑</strong>：利用之前备份的 <code>weights_copy</code>，把模型参数<strong>改回去</strong>。</li>
+<li><strong>白话解释</strong>：<ul>
+<li>这个逻辑有点特殊。它表明这个脚本主要用于<strong>评估算法的效果</strong>，而不是永久修改模型。</li>
+<li>就像：我试着改了一下，测完分数，然后赶紧撤销，把模型恢复原状，准备去测下一个 Case（案例）。这样每个案例都是独立的，互不干扰。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个脚本 <code>SafetyEditor</code> 就是一个<strong>流水线管理员</strong>：
+1.  它不发明编辑算法（算法在 <code>alg_dict</code> 里）。
+2.  它负责<strong>准备数据</strong>、<strong>自动寻找要修改的模型层数</strong>、<strong>调用算法修改</strong>、<strong>计算修改前后的安全分数</strong>，最后<strong>复原现场</strong>。</p>
+<p><strong>最核心的观点是</strong>：针对安全问题，我们不需要盲目地修改所有层，而是可以通过对比“好回答”和“坏回答”的内部状态差异，自动找到最关键的那一层进行精确打击。</p>

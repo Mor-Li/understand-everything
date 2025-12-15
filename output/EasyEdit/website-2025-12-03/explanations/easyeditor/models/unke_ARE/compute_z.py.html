@@ -1,0 +1,110 @@
+<h1>easyeditor/models/unke_ARE/compute_z.py</h1>
+<p>这份代码的核心目的是为了<strong>在一个大模型（LLM）的特定层，找到一个“完美的神经元激活值（Target Vector）”</strong>。</p>
+<p>简单来说，它的逻辑是：“如果我想让模型输出这句话（Answer），那么在第X层的某个位置，它的神经元数值应该是多少？”</p>
+<p>为了让你看懂，我把这个复杂的代码拆解成一个 <strong>Task List（任务清单）</strong>，然后一步步给你讲。</p>
+<hr />
+<h3>📋 Task List (代码执行流程)</h3>
+<ol>
+<li><strong>准备阶段</strong>：获取模型的输出层参数（为了后面手动算Loss用）。</li>
+<li><strong>数据处理</strong>：把“问题”和“答案”变成Token ID。</li>
+<li><strong>滑动窗口（Sliding Window）</strong>：因为答案可能很长，不能一次性优化，需要把答案切成一小段一小段（Chunk）来处理。</li>
+<li><strong>循环优化（核心）</strong>：针对每一段答案：<ul>
+<li><strong>Task 4.1</strong>: 拼凑当前的输入（问题 + 之前生成的答案片段）。</li>
+<li><strong>Task 4.2</strong>: 初始化一个可训练的变量 <code>delta</code>（这是一个微小的修正向量）。</li>
+<li><strong>Task 4.3</strong>: 定义一个“钩子（Hook）”函数，它的作用是在模型运行时，强行把 <code>delta</code> 加到隐藏层状态上。</li>
+<li><strong>Task 4.4</strong>: 跑多次“前向传播”和“反向传播”（梯度下降），调整 <code>delta</code> 的数值。</li>
+<li><strong>目标</strong>: 让模型生成当前这段答案的概率最大化（Loss最小）。</li>
+</ul>
+</li>
+<li><strong>保存结果</strong>：把优化好的 <code>delta</code> 和原始状态相加，得到最终的 $Z$ 向量，存起来。</li>
+<li><strong>输出</strong>：返回所有计算好的 $Z$ 向量和对应的位置。</li>
+</ol>
+<hr />
+<h3>🧐 逐步详细讲解</h3>
+<h4>1. 准备阶段 (Setup)</h4>
+<p>代码开头几行：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">lm_w</span><span class="p">,</span> <span class="n">ln_f</span> <span class="o">=</span> <span class="p">(</span> <span class="o">...</span> <span class="p">)</span> <span class="c1"># 获取LM Head（最后的分类层）和LayerNorm</span>
+</code></pre></div>
+
+<p><strong>观点</strong>：这里是为了后面能手动计算 Loss。因为我们要在中间层做手脚，所以需要拿到最后几层的参数来评估“现在的输出对不对”。</p>
+<h4>2. 数据处理 (Tokenization)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">target_ids</span> <span class="o">=</span> <span class="n">tok</span><span class="p">(</span><span class="n">data</span><span class="p">[</span><span class="s2">&quot;answer&quot;</span><span class="p">]</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 把答案变成数字 [23, 99, 102...]</span>
+<span class="n">input_tok</span> <span class="o">=</span> <span class="n">tok</span><span class="p">([</span><span class="n">data</span><span class="p">[</span><span class="s2">&quot;question&quot;</span><span class="p">]]</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 把问题变成数字</span>
+</code></pre></div>
+
+<p><strong>观点</strong>：标准的NLP操作，把文本转成模型能读懂的ID。</p>
+<h4>3. 滑动窗口 (The While Loop)</h4>
+<p>这是代码里最大的那个 <code>while start &lt; len(target_ids):</code> 循环。
+<strong>观点</strong>：
+*   假设答案是“美国的首都是华盛顿特区”。
+*   如果直接优化整句话，难度太大。
+*   这个算法选择切片：先优化让模型输出“华盛顿”，再优化“特区”。
+*   <code>hparams.window_size</code> 就是切片的大小。</p>
+<h4>4. 循环优化 (Optimization Loop) - 最难懂的部分</h4>
+<p>这里面有一个内部循环 <code>for it in range(hparams.v_num_grad_steps):</code>，这是在做<strong>梯度下降</strong>。</p>
+<p><strong>Task 4.2: 初始化 Delta</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">delta</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：<code>delta</code> 就是我们要找的“修正值”。一开始它是0。我们希望找到一个完美的 <code>delta</code>，加到原来的神经元上后，模型就能变聪明。</li>
+</ul>
+<p><strong>Task 4.3: Hook 函数 (<code>edit_output_fn</code>)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">edit_output_fn</span><span class="p">(</span><span class="n">cur_out</span><span class="p">,</span> <span class="n">cur_layer</span><span class="p">):</span>
+    <span class="c1"># ...</span>
+    <span class="c1"># 这一步是把之前优化过的delta也都加上，保证上下文连贯</span>
+    <span class="k">for</span> <span class="n">idxs_pre</span><span class="p">,</span> <span class="n">delta_pre</span> <span class="ow">in</span> <span class="n">all_delta</span><span class="p">:</span>
+        <span class="n">cur_out</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="n">idx</span><span class="p">,</span> <span class="n">i</span><span class="p">,</span> <span class="p">:]</span> <span class="o">+=</span> <span class="n">delta_pre</span> 
+
+    <span class="c1"># 这一步是把当前正在优化的 delta 加进去！</span>
+    <span class="n">cur_out</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="n">i</span><span class="p">,</span> <span class="n">idx</span><span class="p">,</span> <span class="p">:]</span> <span class="o">+=</span> <span class="n">delta</span> 
+    <span class="k">return</span> <span class="n">cur_out</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：这是PyTorch的高级玩法。</li>
+<li>想象模型是一个水管系统，水（数据）从前往后流。</li>
+<li>这个函数是一个“阀门”，安装在第 <code>layer</code> 层。</li>
+<li>当水流过这里时，它会偷偷把我们计算的 <code>delta</code> 注入进去，改变水的成分（改变隐藏层表示）。</li>
+</ul>
+<p><strong>Task 4.4: 计算 Loss 并反向传播</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 算模型输出的概率分布</span>
+<span class="n">log_probs</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">log_softmax</span><span class="p">(</span><span class="n">ln_f</span><span class="p">(</span><span class="n">full_repr</span><span class="p">)</span> <span class="o">@</span> <span class="n">lm_w</span> <span class="o">...</span> <span class="p">)</span>
+
+<span class="c1"># 算 NLL Loss (负对数似然)：就是看模型预测正确答案的概率大不大</span>
+<span class="n">nll_loss</span> <span class="o">=</span> <span class="o">...</span> 
+
+<span class="c1"># 算 Weight Decay：防止 delta 太大，破坏了模型的原始知识</span>
+<span class="n">weight_decay</span> <span class="o">=</span> <span class="o">...</span>
+
+<span class="n">loss</span> <span class="o">=</span> <span class="n">nll_loss</span> <span class="o">+</span> <span class="n">weight_decay</span>
+<span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span> <span class="c1"># 反向传播，算出梯度</span>
+<span class="n">opt</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>      <span class="c1"># 更新 delta</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：<ul>
+<li><strong>NLL Loss</strong>: 比如目标是输出“华盛顿”。如果模型输出了“纽约”，Loss就很大；如果输出了“华盛顿”，Loss就很小。</li>
+<li><strong>优化过程</strong>: 电脑会问：“我该怎么调 <code>delta</code> 里的数字，才能让 Loss 变小？”</li>
+<li>跑了几十轮（<code>v_num_grad_steps</code>）之后，<code>delta</code> 就被训练好了。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 保存结果</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">target</span> <span class="o">=</span> <span class="n">target_init</span> <span class="o">+</span> <span class="n">delta</span>  <span class="c1"># 原始状态 + 修正值 = 理想状态 (Z)</span>
+<span class="n">all_delta</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">lookup_idxs</span> <span class="p">,</span><span class="n">delta</span><span class="o">.</span><span class="n">clone</span><span class="p">()))</span> <span class="c1"># 存起来，下一轮窗口还要用</span>
+<span class="n">all_target</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">target</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：我们找到了这个“理想状态” $Z$。</li>
+<li><code>target_init</code> 是模型原本“脑子里的想法”。</li>
+<li><code>delta</code> 是我们需要做的“脑部手术修正”。</li>
+<li><code>target</code> 就是手术后的理想脑回路。</li>
+</ul>
+<h3>总结：这段代码在干嘛？</h3>
+<p>这段代码在回答一个问题：</p>
+<blockquote>
+<p><strong>“为了让这个模型能流利地背出这段新的答案，我在第 X 层的这个位置，应该把它的神经元数值改成多少？”</strong></p>
+</blockquote>
+<p>它通过<strong>滑动窗口</strong>把长答案切开，然后用<strong>梯度下降</strong>的方法，逆向推导出每一个片段对应的<strong>最佳神经元激活值（Z向量）</strong>。这些 $Z$ 向量后续会被用来更新模型的权重矩阵（在其他文件中进行，比如 ROME 或 MEMIT 算法的第二步）。</p>

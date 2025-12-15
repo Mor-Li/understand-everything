@@ -1,0 +1,124 @@
+<h1>easyeditor/models/dinm/dinm_main.py</h1>
+<p>这份代码实现了一个<strong>大模型知识编辑（Knowledge Editing）</strong>算法，名字叫 <strong>DINM</strong>。</p>
+<p>简单来说，它的目的是：<strong>强行修改模型对某个特定问题的回答（比如把“埃菲尔铁塔在哪？”的答案从“巴黎”改成“罗马”），同时尽最大努力保证模型在其他无关问题上的表现不发生变化（不“变傻”）。</strong></p>
+<p>为了让你看懂，我把整个流程拆解成一个 <strong>“手术任务清单” (Task Todo List)</strong>，我们一步步来看它是怎么给模型做“脑部手术”的。</p>
+<hr />
+<h3>DINM 算法执行清单 (Task Todo List)</h3>
+<ol>
+<li><strong>准备阶段 (Preparation)</strong>: 复制模型，准备好要修改的数据（Prompt 和 新的目标答案）。</li>
+<li><strong>锁定手术区域 (Locate Weights)</strong>: 确定要修改模型里的哪几层参数（Weights），冻结其他参数。</li>
+<li><strong>建立基准线 (Establish Baseline)</strong>: 记录模型在“通用知识”上的原始表现，作为“不许变傻”的标准。</li>
+<li><strong>开始微调循环 (Optimization Loop)</strong>:<ul>
+<li><strong>任务 A (Edit Loss)</strong>: 计算“修改目标”的误差（让模型学会新知识）。</li>
+<li><strong>任务 B (Locality Loss)</strong>: 计算“通用知识”的偏差（让模型别忘旧知识）。</li>
+<li><strong>任务 C (Weight Constraint)</strong>: 限制参数修改的幅度（防止参数改动过大导致模型崩坏）。</li>
+</ul>
+</li>
+<li><strong>计算增量 (Compute Deltas)</strong>: 算出参数到底改了多少。</li>
+<li><strong>应用修改 (Apply Changes)</strong>: 把算出来的增量正式加到模型上。</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>1. 准备阶段 (Preparation)</h4>
+<p><strong>对应代码：</strong> <code>apply_dinm_to_model</code> 函数开头</p>
+<p>这部分是入口。
+*   它首先决定是否要深拷贝（Deepcopy）一个模型副本，防止把原始模型搞坏。
+*   然后调用核心函数 <code>execute_dinm</code> 来计算参数的修改量。</p>
+<h4>2. 锁定手术区域 (Locate Weights)</h4>
+<p><strong>对应代码：</strong> <code>execute_dinm</code> 函数的前半部分</p>
+<div class="codehilite"><pre><span></span><code><span class="n">weights</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="n">n</span><span class="p">:</span> <span class="n">p</span>
+    <span class="k">for</span> <span class="n">n</span><span class="p">,</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">named_parameters</span><span class="p">()</span>
+    <span class="k">for</span> <span class="n">layer</span> <span class="ow">in</span> <span class="n">hparams</span><span class="o">.</span><span class="n">layers</span>   <span class="c1"># 配置文件里指定了只改哪几层</span>
+    <span class="k">if</span> <span class="n">hparams</span><span class="o">.</span><span class="n">rewrite_module_tmp</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">layer</span><span class="p">)</span> <span class="ow">in</span> <span class="n">n</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：大模型参数几十亿，我们不能全改，那样太慢且容易崩。</li>
+<li><strong>操作</strong>：代码只把配置文件（<code>hparams</code>）里指定的层（比如第20层的MLP部分）挑出来，放入 <code>weights</code> 字典。</li>
+<li><strong>优化器设置</strong>：只对这些挑出来的参数设置 <code>requires_grad=True</code>，其他参数全部冻结。</li>
+</ul>
+<h4>3. 建立基准线 (Establish Baseline) —— 关键步骤</h4>
+<p><strong>对应代码：</strong> <code>######## general knowledge constraint#####################</code> 下方</p>
+<div class="codehilite"><pre><span></span><code><span class="n">instruction_base_Logits</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="o">**</span><span class="n">instructandAns</span><span class="p">)</span><span class="o">.</span><span class="n">logits</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：为了防止“灾难性遗忘”（改了一个知识，忘了其他所有知识），我们需要让模型在修改过程中，时刻记得它原来的样子。</li>
+<li><strong>操作</strong>：<ol>
+<li>拿出一些通用的文本（<code>general knowledge constraint</code>），比如“天空是蓝色的”。</li>
+<li>在<strong>修改前</strong>，先让模型跑一遍这些文本，把输出结果（<code>Logits</code>）存下来，叫 <code>instruction_base_Logits</code>。</li>
+<li>这就像是给病人拍个“术前CT”，手术中要时刻对比，保证其他器官没移位。</li>
+</ol>
+</li>
+</ul>
+<h4>4. 开始微调循环 (Optimization Loop)</h4>
+<p><strong>对应代码：</strong> <code>for it in range(hparams.num_steps):</code> 循环内部</p>
+<p>这是核心的“手术”过程，通过多次迭代来更新参数。</p>
+<ul>
+<li>
+<p><strong>任务 A：学会新知识 (Edit Loss)</strong>
+    <code>python
+    loss_dict = masked_log_probs(hparams, output, out_labels, shift=True)
+    l_edit = loss_dict["nll"]</code></p>
+<ul>
+<li><strong>解释</strong>：把“提示词”和“新答案”喂给模型，计算<strong>负对数似然损失 (NLL)</strong>。</li>
+<li><strong>目的</strong>：让模型生成“新答案”的概率变大。</li>
+</ul>
+</li>
+<li>
+<p><strong>任务 B：保持旧能力 (Locality Loss)</strong>
+    <code>python
+    post_logits = model(**instructandAns).logits # 当前模型的输出
+    l_loc_instruction = kl_loc_loss(instruction_base_Logits.detach(), post_logits, ...)</code></p>
+<ul>
+<li><strong>解释</strong>：让<strong>当前模型</strong>再跑一遍刚才的通用文本，得到 <code>post_logits</code>。然后用 <strong>KL散度 (KL Divergence)</strong> 对比它和“术前CT”（<code>instruction_base_Logits</code>）的区别。</li>
+<li><strong>目的</strong>：如果区别太大，Loss就会变大。这强迫模型在学习新知识的同时，通用知识的输出分布尽量不要变。</li>
+</ul>
+</li>
+<li>
+<p><strong>总 Loss</strong>：
+    <code>python
+    loss = hparams.kl_factor * l_edit + l_loc_instruction</code></p>
+<ul>
+<li>这就是一个权衡（Trade-off）。<code>kl_factor</code> 是权重，决定了我们是更看重“学会新知识”还是更看重“保留旧知识”。</li>
+</ul>
+</li>
+<li>
+<p><strong>任务 C：参数约束 (Norm Constraint)</strong>
+    <code>python
+    v[...] = torch.clamp(v, min=weights_copy[k] - eps, max=weights_copy[k] + eps)</code></p>
+<ul>
+<li><strong>解释</strong>：在反向传播更新参数后，代码做了一个粗暴的 <code>clamp</code>（截断）。</li>
+<li><strong>目的</strong>：它强制要求新参数的值，不能偏离原始参数（<code>weights_copy</code>）太远（上下浮动不超过 <code>eps</code>）。这也是为了防止模型崩坏，保证修改是微小的。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 计算增量 (Compute Deltas)</h4>
+<p><strong>对应代码：</strong> <code>execute_dinm</code> 的结尾</p>
+<div class="codehilite"><pre><span></span><code><span class="n">deltas</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="p">(</span><span class="n">weights</span><span class="p">[</span><span class="n">k</span><span class="p">]</span> <span class="o">-</span> <span class="n">weights_copy</span><span class="p">[</span><span class="n">k</span><span class="p">])</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">weights</span><span class="p">}</span>
+</code></pre></div>
+
+<ul>
+<li><strong>操作</strong>：循环结束后，用 <code>训练后的参数 - 原始参数</code>，得到一个差值矩阵（Delta）。</li>
+<li><strong>恢复现场</strong>：代码里有一步 <code>v[...] = weights_copy[k]</code>，把模型参数还原回去了。这是因为 <code>execute_dinm</code> 只负责<strong>计算</strong>改动量，不负责永久修改模型对象（为了函数功能的纯粹性）。</li>
+</ul>
+<h4>6. 应用修改 (Apply Changes)</h4>
+<p><strong>对应代码：</strong> 回到 <code>apply_dinm_to_model</code> 函数</p>
+<div class="codehilite"><pre><span></span><code><span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+    <span class="k">for</span> <span class="n">w_name</span><span class="p">,</span> <span class="n">upd_matrix</span> <span class="ow">in</span> <span class="n">deltas</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+        <span class="n">w</span> <span class="o">=</span> <span class="n">nethook</span><span class="o">.</span><span class="n">get_parameter</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">w_name</span><span class="p">)</span>
+        <span class="n">w</span><span class="p">[</span><span class="o">...</span><span class="p">]</span> <span class="o">+=</span> <span class="n">upd_matrix</span>
+</code></pre></div>
+
+<ul>
+<li><strong>操作</strong>：拿到 <code>execute_dinm</code> 返回的 <code>deltas</code>，真正地把这些数值加到模型原本的权重上。</li>
+<li><strong>结果</strong>：现在，你得到的就是一个植入了新记忆，但尽量保留了原有能力的模型了。</li>
+</ul>
+<h3>总结</h3>
+<p>这份代码在讲：
+<strong>“我要通过梯度下降（Gradient Descent）强行修改模型的某几层参数。为了不把模型改坏，我用了三道保险：”</strong>
+1.  <strong>KL Loss</strong>：强迫通用知识的输出分布不变。
+2.  <strong>Norm Constraint</strong>：强迫参数数值的变化范围很小。
+3.  <strong>Locality</strong>：只改特定层，不改全模型。</p>

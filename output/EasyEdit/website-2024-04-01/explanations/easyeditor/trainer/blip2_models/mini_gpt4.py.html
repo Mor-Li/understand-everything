@@ -1,0 +1,109 @@
+<h1>easyeditor/trainer/blip2_models/mini_gpt4.py</h1>
+<p>这份代码定义了一个名为 <strong>MiniGPT-4</strong> 的多模态大模型架构。简单来说，它的核心思想是<strong>把一个“会看图的模型”和一个“会说话的模型”强行拼在一起，中间加个“翻译官”</strong>。</p>
+<p>为了让你更容易理解，我把它想象成一个<strong>项目经理的任务清单 (To-Do List)</strong>，我们来看看这个代码是如何一步步完成“让AI看图说话”这个任务的。</p>
+<hr />
+<h3>📋 MiniGPT-4 运作任务清单 (Task To-Do List)</h3>
+<h4>✅ Task 1: 组建团队 (初始化模型 <code>__init__</code>)</h4>
+<p><strong>目标</strong>：把三个核心的大佬（预训练模型）请过来，并决定谁干活，谁休息。</p>
+<ol>
+<li><strong>招聘视觉专家 (Visual Encoder / ViT)</strong>：<ul>
+<li>代码：<code>self.visual_encoder = ...</code></li>
+<li>作用：负责看图，把图片变成计算机能懂的特征向量。</li>
+<li><strong>动作</strong>：请来之后直接<strong>冻结 (Freeze)</strong>。意思是：你已经是专家了，不需要再学习（不更新参数），只管产出特征就行。</li>
+</ul>
+</li>
+<li><strong>招聘翻译官 (Q-Former)</strong>：<ul>
+<li>代码：<code>self.Qformer = ...</code></li>
+<li>作用：它是连接视觉和语言的桥梁。它从视觉专家那里拿信息，转化成语言模型喜欢的格式。</li>
+<li><strong>动作</strong>：请来之后也<strong>冻结 (Freeze)</strong>。它也是训练好的，不需要动。</li>
+</ul>
+</li>
+<li><strong>招聘语言大师 (LLaMA)</strong>：<ul>
+<li>代码：<code>self.llama_model = ...</code></li>
+<li>作用：负责说话、推理。这是整个系统的大脑。</li>
+<li><strong>动作</strong>：加载进来（如果是低资源模式 <code>low_resource</code>，还会用 8-bit 加载以省显存）。</li>
+</ul>
+</li>
+<li><strong>建立连接通道 (Linear Projection)</strong>：<ul>
+<li>代码：<code>self.llama_proj = nn.Linear(...)</code></li>
+<li><strong>关键点</strong>：这是全代码里<strong>最核心的可训练部分</strong>！</li>
+<li>作用：因为翻译官输出的向量尺寸和语言大师输入的尺寸不一样，这里加一个线性层，把尺寸对齐。<strong>我们在训练时，主要就是教这一层怎么把“图片特征”完美地塞给“语言模型”。</strong></li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 2: 处理视觉信号 (编码图片 <code>encode_img</code>)</h4>
+<p><strong>目标</strong>：当一张图片进来时，怎么把它变成大模型能吃的“数字”。</p>
+<ol>
+<li><strong>看图</strong>：把图片扔给视觉专家 (<code>visual_encoder</code>)，得到原始视觉特征。</li>
+<li><strong>翻译</strong>：把原始特征扔给翻译官 (<code>Q-Former</code>)，提取出最核心的视觉信息。</li>
+<li><strong>对齐</strong>：把翻译好的信息，通过那个“连接通道” (<code>llama_proj</code>)，变成和大模型文本向量一样维度的东西。<ul>
+<li><em>结果</em>：现在，图片不再是像素了，而是一串串代表“图片内容”的向量，大模型会把它当成一种特殊的“单词”。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 3: 包装提示词 (Prompt Wrapping <code>prompt_wrap</code>)</h4>
+<p><strong>目标</strong>：告诉大模型，图片放在句子的哪里。</p>
+<ol>
+<li><strong>设定模板</strong>：通常我们会用这样的格式：<code>###Human: &lt;Img&gt;&lt;ImageHere&gt;&lt;/Img&gt; 请描述这张图。</code></li>
+<li><strong>嵌入图片</strong>：代码会把 Task 2 中生成的“图片向量”，塞到 <code>&lt;ImageHere&gt;</code> 的位置。</li>
+<li><strong>拼接</strong>：<ul>
+<li>前面是：“###Human: <Img>” 的文本向量</li>
+<li>中间是：图片向量</li>
+<li>后面是：“</Img> 请描述...” 的文本向量</li>
+<li>最后把它们拼成一条长长的序列。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 4: 训练过程 (前向传播 <code>forward</code>)</h4>
+<p><strong>目标</strong>：教模型怎么根据图片回答问题。</p>
+<ol>
+<li><strong>准备输入</strong>：<ul>
+<li>如果有图片，执行 Task 2 和 Task 3，把图片和问题拼在一起。</li>
+<li>如果没有图片，直接处理纯文本。</li>
+</ul>
+</li>
+<li><strong>准备答案 (Targets)</strong>：<ul>
+<li>代码里有一段逻辑处理 <code>targets</code>。</li>
+<li><strong>关键点</strong>：我们不希望模型去预测“问题”是什么，只希望它预测“答案”是什么。所以代码把“提示词/问题”部分的标签设为 <code>-100</code>（意思是计算 Loss 时忽略这部分），只计算模型生成的回答对不对。</li>
+</ul>
+</li>
+<li><strong>喂给大脑</strong>：<ul>
+<li>把拼接好的 <code>inputs_embeds</code> (图片+文本) 扔给 LLaMA 模型。</li>
+</ul>
+</li>
+<li><strong>计算误差</strong>：<ul>
+<li>LLaMA 输出预测结果，跟真实答案对比，算出 <code>loss</code>（损失值）。</li>
+<li>这个 <code>loss</code> 会用来更新那个“连接通道”的参数。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 5: 实际应用/推理 (预测回答 <code>predict_answers</code>)</h4>
+<p><strong>目标</strong>：模型训练好了，现在让它看图说话。</p>
+<ol>
+<li><strong>流程复用</strong>：<ul>
+<li>拿到图片 -&gt; <code>encode_img</code> (变成向量)。</li>
+<li>拿到问题 -&gt; <code>prompt_wrap</code> (把图片向量插到问题中间)。</li>
+</ul>
+</li>
+<li><strong>生成文字</strong>：<ul>
+<li>调用 <code>self.llama_model.generate(...)</code>。</li>
+<li>这就像是用 ChatGPT 一样，给它上下文（包含图片信息），让它开始写续写，直到写完一句话。</li>
+</ul>
+</li>
+<li><strong>解码</strong>：<ul>
+<li>把模型输出的数字 ID 转换回人类能读的文字（String）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结一下文中的核心观点</h3>
+<p>这份代码其实就在干一件事：<strong>借力打力</strong>。</p>
+<ul>
+<li><strong>不从头训练</strong>：它认为现有的视觉模型（ViT/Q-Former）和语言模型（LLaMA）已经很强了，没必要重头练。</li>
+<li><strong>只练接口</strong>：它把这几个大模型冻结住，只训练中间那个小小的 <code>Linear</code> 层（以及部分 Q-Former 的参数，视配置而定）。这就像是给一个懂中文的人（LLM）和一个懂外语的人（Vision）中间配了一个翻译器，我们只负责培训这个翻译器。</li>
+<li><strong>多模态对齐</strong>：通过这种方式，强行让 LLaMA 理解了“图片向量”也是一种语言输入，从而实现了看图说话。</li>
+</ul>

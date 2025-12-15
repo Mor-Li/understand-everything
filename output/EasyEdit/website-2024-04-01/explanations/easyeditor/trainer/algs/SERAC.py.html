@@ -1,0 +1,132 @@
+<h1>easyeditor/trainer/algs/SERAC.py</h1>
+<p>这份代码确实比较复杂，因为它实现了一种名为 <strong>SERAC (Semi-Parametric Editing with a Retrieval-Augmented Counterfactual Model)</strong> 的模型编辑算法。</p>
+<p>简单来说，它的核心思想是：<strong>不要直接修改大模型原本的参数（因为容易把模型改坏），而是外挂一个“补丁系统”。</strong></p>
+<p>为了让你听懂，我们用一个<strong>“公司客服”</strong>的例子来比喻。
+*   <strong>原模型 (Base Model)</strong>：是一个只读过旧员工手册的老客服，他懂很多通用知识，但不知道最新的公司规定。
+*   <strong>SERAC系统</strong>：是在老客服旁边加了一个<strong>前台接待（分类器）</strong>和一个<strong>专门处理新规定的小客服（补丁模型）</strong>。</p>
+<p>下面我列一个 <strong>Learning To-Do List</strong>，分 5 步带你读懂这个代码。</p>
+<hr />
+<h3>Task 1: 理解核心角色 (The Three Components)</h3>
+<p><strong>目标</strong>：看懂 <code>__init__</code> 函数里到底初始化了哪三个关键人物。</p>
+<p>在 <code>class SERAC</code> 的 <code>__init__</code> 方法中，你会看到这三个主要组件：</p>
+<ol>
+<li><strong><code>self.model</code> (原模型/老客服)</strong>:<ul>
+<li>这是我们要编辑的目标大模型（比如 GPT-2, Llama）。</li>
+<li>在 SERAC 算法里，<strong>这个模型通常是冻结的 (Frozen)</strong>，我们不动它的权重。</li>
+</ul>
+</li>
+<li><strong><code>self.classifier</code> (分类器/前台接待)</strong>:<ul>
+<li>代码里通常是 <code>BertClassifier</code> 或类似的。</li>
+<li><strong>作用</strong>：当用户发来一句话，它负责判断：“这句话是关于我们修改过的那条新规定吗？”如果是，它会打高分；如果不是，打低分。</li>
+</ul>
+</li>
+<li><strong><code>self.replacement</code> (补丁模型/小客服)</strong>:<ul>
+<li>这是一个小的生成模型（比如一个小型的 GPT 或 T5）。</li>
+<li><strong>作用</strong>：如果分类器说“这是新规定”，那么这个小模型就会负责生成<strong>修改后</strong>的正确答案。</li>
+</ul>
+</li>
+</ol>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># __init__ 中</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">model</span> <span class="o">=</span> <span class="n">model</span>  <span class="c1"># 大模型</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">classifier</span> <span class="o">=</span> <span class="o">...</span> <span class="c1"># 分类器 (BERT等)</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">replacement</span> <span class="o">=</span> <span class="o">...</span> <span class="c1"># 补丁模型 (小模型)</span>
+</code></pre></div>
+
+<hr />
+<h3>Task 2: 理解“编辑”是如何发生的 (The Memory Bank)</h3>
+<p><strong>目标</strong>：看懂 <code>edit</code> 函数。SERAC 的编辑非常特别，它不改参数，而是<strong>存数据</strong>。</p>
+<p>SERAC 是“基于检索”的方法。当你要求它“把‘法国首都是巴黎’改成‘法国首都是伦敦’”时，它实际上是把这条数据存到了一个<strong>缓存列表 (Cache)</strong> 里。</p>
+<p><strong>代码逻辑</strong>：
+1.  接收要编辑的输入 (<code>inputs</code>) 和目标输出 (<code>labels</code>)。
+    *   <em>比如 Input: "法国首都是哪？", Label: "伦敦"</em>
+2.  把它追加到 <code>self.cache_inputs</code> 和 <code>self.cache_labels</code> 列表里。
+3.  返回一个新的模型对象。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">edit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">batch</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+    <span class="c1"># ... 解码输入 ...</span>
+    <span class="c1"># 把它加到列表里 (这就是所谓的“编辑”)</span>
+    <span class="n">cache_inputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">cache_inputs</span> <span class="o">+</span> <span class="n">inputs</span>
+    <span class="n">cache_labels</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">cache_labels</span> <span class="o">+</span> <span class="n">labels</span>
+
+    <span class="c1"># 返回一个带着新缓存的新对象</span>
+    <span class="n">new_model</span> <span class="o">=</span> <span class="n">SERAC</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> 
+    <span class="k">return</span> <span class="n">new_model</span><span class="p">,</span> <span class="p">{}</span>
+</code></pre></div>
+
+<hr />
+<h3>Task 3: 理解前台如何通过“检索”做决定 (The Classifier)</h3>
+<p><strong>目标</strong>：看懂 <code>run_classifier</code> 和 <code>embedding_logsim_matrix</code>。</p>
+<p>当新问题来的时候（比如“法国的首都在哪里？”），<strong>分类器</strong>需要决定是用<strong>老客服</strong>还是<strong>小客服</strong>。</p>
+<p><strong>逻辑流程</strong>：
+1.  把当前用户的输入（Query）变成向量。
+2.  把我们缓存里存的所有“编辑过的例子”（Cache Inputs）也变成向量。
+3.  计算 Query 和 Cache 之间的<strong>相似度 (Similarity)</strong>。
+4.  如果相似度很高（比如 &gt; 0.5），说明用户问的是我们改过的知识点。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">run_classifier</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+    <span class="c1"># 1. 计算当前输入和缓存输入的相似度矩阵</span>
+    <span class="n">log_sim_matrix</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">embedding_logsim_matrix</span><span class="p">(</span><span class="n">cache_inputs</span><span class="p">,</span> <span class="n">test_inputs</span><span class="p">)</span>
+
+    <span class="c1"># 2. 拿到最高的相似度分数 (cls_sims)</span>
+    <span class="n">sims</span> <span class="o">=</span> <span class="n">log_sim_matrix</span><span class="o">.</span><span class="n">exp</span><span class="p">()</span>
+    <span class="n">cls_sims</span><span class="p">,</span> <span class="n">cls_idxs</span> <span class="o">=</span> <span class="n">sims</span><span class="o">.</span><span class="n">max</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">cls_sims</span><span class="p">,</span> <span class="n">cls_idxs</span><span class="p">,</span> <span class="o">...</span>
+</code></pre></div>
+
+<hr />
+<h3>Task 4: 核心逻辑——混合输出 (The Forward Pass)</h3>
+<p><strong>目标</strong>：看懂 <code>forward</code> 函数。这是整个代码的心脏。</p>
+<p>当数据流向模型时，它执行以下步骤（这就是所谓的“软混合 Soft Mixing”）：</p>
+<ol>
+<li><strong>老客服说话</strong>：让 <code>self.model</code> 跑一遍，得到 <code>base_logits</code>（原始答案，比如“巴黎”）。</li>
+<li><strong>前台打分</strong>：运行 <code>run_classifier</code>，得到权重 <code>rep_weight</code>（是一个 0 到 1 之间的数）。<ul>
+<li>如果非常相关，权重接近 1。</li>
+<li>如果不相关，权重接近 0。</li>
+</ul>
+</li>
+<li><strong>小客服说话</strong>：让 <code>self.replacement</code> 跑一遍，得到 <code>rep_cls_logits</code>（补丁答案，比如“伦敦”）。</li>
+<li><strong>混合结果</strong>：<ul>
+<li><code>最终结果 = (1 - 权重) * 老客服答案 + (权重) * 小客服答案</code></li>
+</ul>
+</li>
+</ol>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+    <span class="c1"># 1. 原模型跑一遍</span>
+    <span class="n">base_logits</span> <span class="o">=</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">forward</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># 2. 计算相似度权重</span>
+    <span class="n">cls_sims</span><span class="p">,</span> <span class="n">cls_idxs</span><span class="p">,</span> <span class="n">cls_logits</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">run_classifier</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># 3. 补丁模型跑一遍 (针对匹配到的那个缓存例子)</span>
+    <span class="n">rep_cls_logits</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">replacement</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># 4. 混合 (Soft Mixing)</span>
+    <span class="k">if</span> <span class="n">soft</span><span class="p">:</span>
+        <span class="n">rep_weight</span> <span class="o">=</span> <span class="n">cls_sims</span> <span class="c1"># 这就是那个门控权重</span>
+        <span class="c1"># 公式：(1-w)*base + w*rep</span>
+        <span class="n">mixture_logits</span> <span class="o">=</span> <span class="p">((</span><span class="mi">1</span> <span class="o">-</span> <span class="n">rep_weight</span><span class="p">)</span> <span class="o">*</span> <span class="n">base_probs</span> <span class="o">+</span> <span class="n">rep_weight</span> <span class="o">*</span> <span class="n">rep_cls_logits</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">+</span> <span class="n">eps</span><span class="p">)</span><span class="o">.</span><span class="n">log</span><span class="p">()</span>
+
+    <span class="k">return</span> <span class="n">mixture_logits</span>
+</code></pre></div>
+
+<hr />
+<h3>Task 5: 多模态扩展 (SERAC_MULTI)</h3>
+<p><strong>目标</strong>：简单浏览 <code>class SERAC_MULTI</code>。</p>
+<p>这个类是 <code>SERAC</code> 的双胞胎兄弟，专门处理<strong>图文多模态模型</strong>（如 MiniGPT-4, BLIP-2）。</p>
+<ul>
+<li><strong>区别</strong>：逻辑完全一样（分类 -&gt; 路由 -&gt; 混合）。</li>
+<li><strong>难点</strong>：多模态模型输入不仅有文字，还有图片 (<code>pixel_values</code> 或 <code>image_embeds</code>)。</li>
+<li><strong>代码细节</strong>：你会看到很多处理图像编码器 (<code>visual_encoder</code>, <code>Qformer</code>) 和投影层 (<code>language_projection</code>) 的代码。这是为了让补丁模型（小客服）也能看懂图片。</li>
+</ul>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>看完这个 List，你应该能明白 <code>SERAC.py</code> 在干嘛了：</p>
+<ol>
+<li>它<strong>不改</strong>原模型。</li>
+<li>它用一个<strong>列表</strong>记住了所有的修改。</li>
+<li>它用一个 <strong>BERT 分类器</strong>判断当前问题是不是在列表里。</li>
+<li>如果是，就让一个<strong>小模型</strong>生成新答案，并覆盖掉原模型的答案。</li>
+</ol>
+<p>这就是为什么它叫 <strong>SERAC</strong>：<strong>Retrieval-Augmented</strong> (用检索去查缓存列表) <strong>Counterfactual Model</strong> (用反事实的小模型生成新结果)。</p>

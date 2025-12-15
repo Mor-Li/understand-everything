@@ -1,0 +1,120 @@
+<h1>easyeditor/trainer/algs/MEND.py</h1>
+<p>这份代码实现的是 <strong>MEND (Model Editor Networks with Gradient Decomposition)</strong> 算法。</p>
+<p>简单来说，MEND 的核心思想是：<strong>直接用梯度下降（Backpropagation）去修改大模型的一个知识点（比如把“法国首都是巴黎”改成“法国首都是里昂”）效果不好，容易导致“灾难性遗忘”或者改不过来。</strong></p>
+<p>所以，MEND 训练了一个<strong>小型的辅助神经网络（Hypernetwork）</strong>。当你想修改大模型时，这个小网络会观察你的梯度，然后告诉你：“嘿，别直接用这个梯度，用我处理过的这个‘变形梯度’去更新权重，效果更好，副作用更小。”</p>
+<p>为了让你读懂代码，我把它拆解成一个 <strong>5步走的 Task List</strong>，一步步带你对应代码里的逻辑：</p>
+<hr />
+<h3>Task 1: 理解基础组件 —— 梯度的本质</h3>
+<p>在看大类之前，先看辅助类 <code>GradientTransform</code>。</p>
+<ul>
+<li><strong>背景知识</strong>：在神经网络全连接层中，权重的梯度 $\nabla W$ 通常可以分解为 <strong>输入激活值 ($x$ 或 $u$)</strong> 和 <strong>输出误差信号 ($\delta$ 或 $v$)</strong> 的乘积。<ul>
+<li>即：$Gradient \approx u \cdot v^T$</li>
+</ul>
+</li>
+<li><strong>代码对应</strong>：<code>class GradientTransform(nn.Module)</code></li>
+<li><strong>功能</strong>：这个类就是一个简单的 MLP（多层感知机）。<ul>
+<li><strong>输入</strong>：它接收原始的梯度分量 $u$ (代码里的 <code>x_dim</code>) 和 $v$ (代码里的 <code>delta_dim</code>)。</li>
+<li><strong>处理</strong>：<ul>
+<li><code>self.mlp</code> (或 <code>mlp1</code>, <code>mlp2</code>)：这是主要的小网络。</li>
+<li><code>update_counter</code> 和 <code>forward</code> 里的 normalization：它会对输入的梯度进行归一化处理，防止梯度爆炸或过小。</li>
+</ul>
+</li>
+<li><strong>输出</strong>：它输出变换后的 $\tilde{u}$ 和 $\tilde{v}$。</li>
+</ul>
+</li>
+<li><strong>观点</strong>：MEND 认为原始梯度不仅包含了修改知识的信息，还包含了破坏其他知识的噪声。这个 <code>GradientTransform</code> 的作用就是<strong>提纯</strong>和<strong>修正</strong>这些梯度分量。</li>
+</ul>
+<h3>Task 2: 准备阶段 —— 挂载“监控探头”</h3>
+<p>接下来看主类 <code>MEND</code> 的初始化 <code>__init__</code>。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>class MEND(EditableModel)</code> -&gt; <code>__init__</code></li>
+<li><strong>核心逻辑</strong>：<ol>
+<li><code>hook_model(self.model, self.config.inner_params)</code>: 这一行非常关键（虽然实现在外部文件）。它的作用是在大模型的特定层（比如第9、10层的 MLP 层）安装<strong>钩子 (Hooks)</strong>。<ul>
+<li>这些钩子会在前向/后向传播时，悄悄把那一层的 <strong>输入激活 ($u$)</strong> 和 <strong>回传误差 ($v$)</strong> 存下来，分别存为 <code>p.__x__</code> 和 <code>p.__delta__</code>。</li>
+</ul>
+</li>
+<li><code>self.mend = nn.ModuleDict(...)</code>: 这里为每一个需要编辑的层，都初始化了一个 Task 1 中提到的 <code>GradientTransform</code> 网络。</li>
+</ol>
+</li>
+<li><strong>观点</strong>：要精准动手术，必须先在关键部位（<code>inner_params</code>）安装传感器，并为每个部位配备专门的“手术刀”（<code>GradientTransform</code>）。</li>
+</ul>
+<h3>Task 3: 核心流程 —— 执行编辑</h3>
+<p>这是最复杂也是最重要的部分，看 <code>edit</code> 函数。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>def edit(self, batch, ...)</code></li>
+<li>
+<p><strong>步骤拆解</strong>：</p>
+<ol>
+<li>
+<p><strong>计算原始 Loss</strong>：
+    <code>python
+    # 代码约 260-280行
+    loss = self.edit_loss_fn(self.config, outputs, batch["labels"])["nll"]</code>
+    这里计算通过输入（如“法国首都是？”）和目标（如“里昂”）产生的 Loss。</p>
+</li>
+<li>
+<p><strong>获取原始梯度信息</strong>：
+    <code>python
+    loss.backward()</code>
+    反向传播。<strong>注意</strong>：这里并没有直接 <code>optimizer.step()</code> 更新参数。这一步只是为了触发我们在 Task 2 安装的钩子，从而捕获 <code>p.__x__</code> 和 <code>p.__delta__</code>。</p>
+</li>
+<li>
+<p><strong>MEND 介入（梯度变换）</strong>：
+    <code>python
+    # 代码约 296-309行
+    transformed_factors = {
+        n: self.mend[...](p.__x__, p.__delta__, ...)
+        ...
+    }</code>
+    把捕获到的原始激活值和误差，喂给 <code>GradientTransform</code> 网络。它返回修饰后的因子。</p>
+</li>
+<li>
+<p><strong>合成“伪梯度”</strong>：
+    <code>python
+    # 代码约 317行
+    mean_grads = {
+        n: torch.einsum(f"bi,bj-&gt;{targ}", x, delta)
+        ...
+    }</code>
+    利用修饰后的因子，通过矩阵乘法（<code>einsum</code>）合成出最终的权重更新矩阵。</p>
+</li>
+<li>
+<p><strong>更新模型参数</strong>：
+    <code>python
+    # 代码约 341行
+    updates = {n: lr * g for lr, (n, g) in zip(self.edit_lrs, mean_grads.items())}</code>
+    计算出 <code>Delta W</code>。</p>
+</li>
+</ol>
+</li>
+</ul>
+<h3>Task 4: 应用更新 —— MonkeyPatch (偷天换日)</h3>
+<p>你可能会困惑代码里为什么有 <code>monkeypatch</code> 和 <code>higher</code>。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>monkeypatch</code> 函数 和 <code>edit</code> 函数末尾。</li>
+<li><strong>问题</strong>：如果在训练 MEND 的过程中，我们直接修改了原模型 <code>self.model</code> 的参数，那原模型就被破坏了，下次训练还得重新加载，效率极低。</li>
+<li><strong>解决方案</strong>：
+    <code>python
+    # 代码约 345行
+    edited_model = monkeypatch(edited_model, in_place=True)
+    ...
+    edited_model.update_params(new_params)</code>
+    <code>monkeypatch</code>（通常基于 <code>higher</code> 库）创建了一个<strong>无状态的、函数式的模型副本</strong>。<ul>
+<li>当我们调用 <code>edited_model.update_params</code> 时，它<strong>不会</strong>修改原始模型的物理内存里的权重，而是生成一套临时的“新参数”。</li>
+<li>后续的验证（Validation）都在这个 <code>edited_model</code> 上跑。</li>
+</ul>
+</li>
+<li><strong>观点</strong>：为了高效地进行“元学习”（Meta-learning），我们需要一种机制来模拟“如果我这样修改参数，结果会怎样”，而不必真的永久破坏原模型。</li>
+</ul>
+<h3>Task 5: 总结流程 (Todo List 回顾)</h3>
+<p>如果你要调试或修改这个代码，按照这个思路走：</p>
+<ol>
+<li><strong>数据流进来了</strong>：在 <code>edit</code> 函数里，先看 Loss 怎么算的。</li>
+<li><strong>钩子触发了</strong>：<code>loss.backward()</code> 后，检查 <code>self.model</code> 的参数里是不是真的多了 <code>__x__</code> 和 <code>__delta__</code> 属性。</li>
+<li><strong>小网络干活了</strong>：数据进了 <code>self.mend</code> (GradientTransform)，检查一下输入维度和输出维度是否对得上。</li>
+<li><strong>参数更新了</strong>：看 <code>mean_grads</code> 生成的矩阵形状是否和原参数形状一致。</li>
+<li><strong>模型变身了</strong>：确认 <code>edited_model</code> 是一个新的对象，且在它上面跑测试能得到修改后的结果（如输出“里昂”）。</li>
+</ol>
+<h3>总结文中的核心观点</h3>
+<p><strong>MEND 认为：</strong>
+知识编辑可以看作是一个<strong>函数变换</strong>。输入是“原始的错误梯度”，输出是“修正后的参数更新量”。只要训练好这个变换函数（即代码里的 <code>GradientTransform</code>），我们就可以用极低的计算成本（只过一遍 MLP，不需要迭代优化），快速、精准地修改大语言模型，同时不破坏它原有的能力。</p>

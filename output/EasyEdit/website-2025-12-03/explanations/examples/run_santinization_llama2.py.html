@@ -1,0 +1,150 @@
+<h1>examples/run_santinization_llama2.py</h1>
+<p>这份代码确实比较长，涉及了<strong>大模型编辑（Model Editing）</strong>的一个具体实验流程。简单来说，这个脚本的目的是：<strong>拿一个Llama-2模型，用不同的方法（如ROME, LoRA, FT等）修改它内部的特定知识（比如把“巴黎在法国”改成“巴黎在德国”），然后评估修改得好不好。</strong></p>
+<p>这里的“Sanitization”（净化）通常指移除或修改模型中有害/特定的知识。</p>
+<p>为了让你看懂，我把它拆解成三个部分：
+1. <strong>宏观任务清单 (Task Todo List)</strong>：这段代码到底想干嘛？
+2. <strong>核心概念对应</strong>：代码里的奇怪变量（K_F, K_R, Locality）是什么意思？
+3. <strong>逐步代码精读</strong>：顺着代码执行顺序讲逻辑。</p>
+<hr />
+<h3>第一部分：宏观任务清单 (Task Todo List)</h3>
+<p>想象你是一个实验员，这段代码就是你的<strong>实验操作手册</strong>。你的任务流程如下：</p>
+<ol>
+<li>
+<p><strong>[准备阶段] 初始化环境</strong>：</p>
+<ul>
+<li>读取命令行参数（用什么方法编辑？改哪个知识点？）。</li>
+<li>加载数据集（训练集和测试集）。</li>
+<li>加载原版 Llama-2 模型和分词器（Tokenizer）。</li>
+</ul>
+</li>
+<li>
+<p><strong>[快照阶段] 记录编辑前的表现 (Caching)</strong>：</p>
+<ul>
+<li>在动手修改模型之前，先问模型一些<strong>不该被修改的问题</strong>（Locality data），记录下它现在的回答。</li>
+<li><em>目的</em>：为了稍后对比。如果你改了“巴黎”，结果模型连“1+1等于几”都不会了，那就是失败。</li>
+</ul>
+</li>
+<li>
+<p><strong>[编辑阶段] 执行模型手术 (Editing)</strong>：</p>
+<ul>
+<li>根据选择的方法（ROME, MEMIT, LoRA, FT, MEND 等），对模型参数进行修改。</li>
+<li><em>FT/LoRA 特殊处理</em>：如果是微调方法，需要把“要遗忘的知识”和“要保留的知识”混合在一起训练，防止模型变傻（Catastrophic Forgetting）。</li>
+</ul>
+</li>
+<li>
+<p><strong>[评估阶段] 检查手术结果 (Evaluation)</strong>：</p>
+<ul>
+<li><strong>Success（成功率）</strong>：问模型刚才修改的问题，看它有没有按我们的新要求回答。</li>
+<li><strong>Locality（局部性/副作用）</strong>：问模型那些不该变的问题，看它的回答是不是和[快照阶段]记录的一样。</li>
+<li><strong>Fluency（流畅度）</strong>：看模型说话还通顺吗，是不是变成了乱码。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>第二部分：核心概念字典</h3>
+<p>在看代码前，先理解这几个缩写，不然会晕：</p>
+<ul>
+<li><strong><code>K_F</code> (Knowledge to Forget/Fix)</strong>: <strong>要修改的知识</strong>。比如原知识是“天空是蓝的”，我们要把它改成“天空是绿的”。</li>
+<li><strong><code>K_R</code> (Knowledge to Retain)</strong>: <strong>要保留的知识</strong>。比如“草是绿的”。我们在修改天空颜色时，不希望模型忘记草的颜色。</li>
+<li><strong><code>Locality</code> (局部性)</strong>: 指模型编辑的<strong>副作用范围</strong>。好的编辑应该只改目标知识，不影响无关知识（即拥有良好的 Locality）。</li>
+<li><strong><code>Ground Truth</code></strong>: 标准答案。</li>
+<li><strong><code>Target New</code></strong>: 我们希望模型说出的<strong>新答案</strong>（编辑后的目标）。</li>
+</ul>
+<hr />
+<h3>第三部分：逐步代码精读 (Step-by-Step)</h3>
+<p>我们按照代码执行的生命周期来看。入口在最底下的 <code>if __name__ == "__main__":</code>，它实例化了 <code>Experimenter</code> 类并调用了 <code>exp.run()</code>。</p>
+<h4>1. 初始化 (<code>__init__</code>)</h4>
+<p>这是实验的准备工作。</p>
+<ul>
+<li><strong>加载配置</strong>：<code>METHOD2HPARAMS</code> 字典决定了你用 ROME 还是 LoRA 等方法的参数。</li>
+<li><strong>加载数据</strong>：<ul>
+<li><code>self._prepare_dataset_before_edit</code>：这个函数把原始数据整理成容易处理的字典格式。它区分了 <code>K_F</code>（要改的）和 <code>K_R</code>（要留的）。</li>
+</ul>
+</li>
+<li><strong>加载模型</strong>：<code>BaseEditor.from_hparams</code> 会加载 Llama-2 模型。</li>
+<li><strong>关键步骤 (<code>cache_...</code>)</strong>：<ul>
+<li>调用 <code>self.cache_locality_before_editing(replace=True)</code>。</li>
+<li><strong>逻辑</strong>：在没改模型前，先跑一遍测试集里的无关问题（Locality prompts），把模型生成的答案存下来当作“标准答案”。以后我们要求模型改完后，对这些问题的回答尽量保持不变。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 执行流程 (<code>run</code> 方法)</h4>
+<p>这是主控室，逻辑非常简单：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">run</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="c1"># (Step 1 被注释掉了，原本是用来测试原模型的)</span>
+
+    <span class="c1"># Step 2. 编辑模型</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">edit</span><span class="p">()</span> 
+
+    <span class="c1"># (Step 3 被注释掉了)</span>
+
+    <span class="c1"># Step 4. 评估结果</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">evaluate</span><span class="p">()</span>
+</code></pre></div>
+
+<h4>3. 核心动作：编辑 (<code>edit</code> 方法)</h4>
+<p>这里是一个分发器（Dispatcher）。根据你传入的 <code>editing_method</code>，它会去调用不同的函数：</p>
+<ul>
+<li>
+<p><strong>如果是 <code>ROME</code> 或 <code>MEMIT</code></strong>：</p>
+<ul>
+<li>调用 <code>self._ROME()</code> 或 <code>self._MEMIT()</code>。</li>
+<li>这些是<strong>定位编辑</strong>方法。它们计算出特定的权重更新量，直接修改模型某一层的参数。</li>
+<li>代码逻辑：拿到 prompt 和 subject，传给 <code>self.editor.edit()</code>，底层库 EasyEditor 会处理复杂的数学计算。</li>
+</ul>
+</li>
+<li>
+<p><strong>如果是 <code>LoRA</code> 或 <code>FT</code> (Fine-Tuning)</strong>：</p>
+<ul>
+<li>调用 <code>self._LoRA_and_FT()</code>。</li>
+<li><strong>难点逻辑</strong>：微调不能只训练新知识，否则模型会忘掉旧知识。</li>
+<li><strong>混合数据 (<code>Hybrid Dataset</code>)</strong>：代码里写了一个循环，把 <code>forget_dataset</code> (要改的) 和 <code>retain_dataset</code> (要留的) <strong>拼在一起</strong>。</li>
+<li><code>hybrid_dataset["target_new"]</code>：对于要改的，目标是新答案；对于要留的，目标是原答案。</li>
+<li>然后调用 <code>self.editor.normal_edit</code> 进行常规的梯度下降训练。</li>
+</ul>
+</li>
+<li>
+<p><strong>如果是 <code>MEND</code> 或 <code>SERAC</code></strong>：</p>
+<ul>
+<li>调用 <code>self._MEND_and_SERAC()</code>。</li>
+<li>这些是<strong>元学习(Meta-learning)</strong>方法。它们需要训练一个额外的网络（HyperNetwork）。</li>
+<li>代码实例化了一个 <code>EditTrainer</code> 来进行训练。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 算分阶段 (<code>evaluate</code> 方法)</h4>
+<p>手术做完了，现在要打分。</p>
+<ul>
+<li>
+<p><strong>Success (编辑成功率)</strong>：</p>
+<ul>
+<li>拿 <code>eval_dataset["prompt"]</code> 喂给模型。</li>
+<li><code>self.compare()</code>：检查模型生成的文本里是不是包含了我们要的 <code>target_new</code> 关键词。</li>
+</ul>
+</li>
+<li>
+<p><strong>Locality (副作用检查)</strong>：</p>
+<ul>
+<li>拿 <code>self.test_dataset["locality"]</code> 喂给模型。</li>
+<li><code>self.locality()</code>：比较现在的回答和我们最开始 <code>cache</code> 下来的原版回答像不像。越像越好（得分越高）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Fluency (流畅度)</strong>：</p>
+<ul>
+<li>调用 <code>test_generation_quality</code>。通常是看生成文本的困惑度（Perplexity）或者重复率，确保模型没有坏掉变成复读机。</li>
+</ul>
+</li>
+</ul>
+<h3>总结文中的核心观点 (Key Takeaways)</h3>
+<p>这段代码其实在表达以下几个观点/实践逻辑：</p>
+<ol>
+<li><strong>编辑不仅仅是修改</strong>：做模型编辑实验，不仅要看改没改成功（Success），更重要的是看有没有把别的知识搞坏（Locality）。所以代码里花了很大篇幅在做 <code>Cache</code>（缓存原行为）。</li>
+<li><strong>方法差异化处理</strong>：<ul>
+<li>ROME/MEMIT 是“外科手术”，直接改参数，不需要混合数据。</li>
+<li>FT/LoRA 是“吃药调理”（微调），必须混合“保留数据集”（K_R），否则副作用极大。</li>
+</ul>
+</li>
+<li><strong>数据隔离</strong>：训练集（用于指导编辑）和测试集（用于验证效果）必须分开，且测试集包含多种类型（成功率测试、无关性测试）。</li>
+</ol>
+<p>希望这个列表和拆解能帮你读懂这个文件！建议先看 <code>run()</code> 函数，再看 <code>evaluate()</code>，最后看具体的 <code>_ROME</code> 或 <code>_LoRA_and_FT</code> 实现。</p>

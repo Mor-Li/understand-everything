@@ -1,0 +1,135 @@
+<h1>easyeditor/models/dinm/dinm_main.py</h1>
+<p>这段代码实现的是一种<strong>大模型编辑（Model Editing）</strong>算法，名字叫 <strong>DINM</strong>。</p>
+<p>简单来说，它的目的是：<strong>在不重新训练整个模型的情况下，通过微调一小部分参数，强制让模型“记住”一条新知识（或修改一条旧知识），同时尽量不破坏模型原有的通用能力。</strong></p>
+<p>我们可以把这段代码想象成给大模型做一次“微创手术”。为了让你看懂，我把这个过程拆解成一个 <strong>Task List（任务清单）</strong>，然后一步步对照代码讲解。</p>
+<hr />
+<h3>📋 DINM 算法执行任务清单 (Todo List)</h3>
+<ol>
+<li><strong>准备手术台</strong>：把模型搬到 GPU 上，准备好要修改的数据（Prompt 和 新的回答）。</li>
+<li><strong>锁定手术部位</strong>：决定要修改模型的哪几层参数（不是全改，只改特定层）。</li>
+<li><strong>记录术前体征（防遗忘机制）</strong>：在修改前，先测一下模型对“通用常识”的反应，记下来。防止改了新知识，旧常识忘了。</li>
+<li><strong>开始微调（循环迭代）</strong>：<ul>
+<li><strong>任务 A (注入新知)</strong>：强迫模型学会新知识，计算误差（Loss_Edit）。</li>
+<li><strong>任务 B (保持常识)</strong>：检查模型现在的常识回答和“术前体征”差多远，计算误差（Loss_Locality）。</li>
+<li><strong>任务 C (更新参数)</strong>：综合 A 和 B 的误差，修改参数。</li>
+<li><strong>任务 D (动作限制)</strong>：修改幅度不能太大（Clamp），防止把模型改崩了。</li>
+</ul>
+</li>
+<li><strong>缝合伤口</strong>：计算出参数到底变了多少（Delta），把这些变化量应用到模型上。</li>
+</ol>
+<hr />
+<h3>🔍 逐步代码对照讲解</h3>
+<h4>1. 准备手术台 (Setup)</h4>
+<p><strong>代码位置</strong>：<code>apply_dinm_to_model</code> 和 <code>execute_dinm</code> 的开头。</p>
+<ul>
+<li><strong>观点</strong>：模型编辑不需要动全身。</li>
+<li><strong>代码解读</strong>：<ul>
+<li><code>apply_dinm_to_model</code> 是主入口，它负责复制模型（可选）并调用核心逻辑。</li>
+<li><code>execute_dinm</code> 是核心。</li>
+<li><code>requests</code> 里装着你要改的内容，比如 <code>{"prompt": "法国的首都是", "target_new": "伦敦"}</code>（假设我们要强行指鹿为马）。</li>
+<li>代码会对 <code>target_new</code> 前面加个空格（为了分词正确）。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 锁定手术部位 (Identify Weights)</h4>
+<p><strong>代码位置</strong>：<code>execute_dinm</code> 中间部分。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">weights</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="n">n</span><span class="p">:</span> <span class="n">p</span>
+    <span class="k">for</span> <span class="n">n</span><span class="p">,</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">named_parameters</span><span class="p">()</span>
+    <span class="k">for</span> <span class="n">layer</span> <span class="ow">in</span> <span class="n">hparams</span><span class="o">.</span><span class="n">layers</span>   <span class="c1"># hparams里指定了具体改第几层</span>
+    <span class="k">if</span> <span class="n">hparams</span><span class="o">.</span><span class="n">rewrite_module_tmp</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">layer</span><span class="p">)</span> <span class="ow">in</span> <span class="n">n</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：只修改特定层的特定模块（比如 MLP 层或 Attention 层），效率高且副作用小。</li>
+<li><strong>操作</strong>：代码遍历模型所有参数，只把符合配置 (<code>hparams.layers</code>) 的参数挑出来放到 <code>weights</code> 字典里。</li>
+<li><strong>备份</strong>：<code>weights_copy</code> 把这些参数的原始值存了一份，方便后面计算差值或回滚。</li>
+</ul>
+<h4>3. 记录术前体征 (General Knowledge Constraint)</h4>
+<p><strong>代码位置</strong>：<code>######## general knowledge constraint#####################</code> 下方。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">instruction_base_Logits</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="o">**</span><span class="n">instructandAns</span><span class="p">)</span><span class="o">.</span><span class="n">logits</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点（核心难点）</strong>：模型编辑最怕“灾难性遗忘”。比如你教它“埃菲尔铁塔在柏林”，结果它把“天空是蓝色的”给忘了。</li>
+<li><strong>操作</strong>：<ul>
+<li>代码构造了一批“通用知识”的数据 (<code>general knowledge constraint</code>)。</li>
+<li>在修改参数<strong>之前</strong>，先让模型跑一遍这些通用数据，拿到 <code>instruction_base_Logits</code>（原本的输出概率）。</li>
+<li>这就像给病人拍个“术前CT”，作为基准线。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 开始微调循环 (The Loop)</h4>
+<p><strong>代码位置</strong>：<code>for it in range(hparams.num_steps):</code></p>
+<p>这是一个循环，默认跑几十次（<code>num_steps</code>）。</p>
+<ul>
+<li>
+<p><strong>任务 A：注入新知 (Edit Loss)</strong>
+    <code>python
+    output = model(**inputs).logits
+    loss_dict = masked_log_probs(hparams, output, out_labels, shift=True)
+    l_edit = loss_dict["nll"]</code></p>
+<ul>
+<li><strong>解释</strong>：把“Prompt + 新Target”喂给模型，看它现在的输出和我们想要的 Target 差多少。这个差值就是 <code>l_edit</code>（负对数似然损失）。我们希望这个 Loss 越小越好。</li>
+</ul>
+</li>
+<li>
+<p><strong>任务 B：保持常识 (Locality Loss)</strong>
+    <code>python
+    post_logits = model(**instructandAns).logits # 现在模型对常识的反应
+    l_loc_instruction = kl_loc_loss(instruction_base_Logits.detach(), post_logits, ...)</code></p>
+<ul>
+<li><strong>解释</strong>：让现在的模型再跑一遍刚才的“通用常识”。计算现在的输出 (<code>post_logits</code>) 和“术前CT” (<code>instruction_base_Logits</code>) 之间的距离（KL散度）。</li>
+<li><strong>目的</strong>：我们希望这个距离越小越好，意味着模型没有忘记常识。</li>
+</ul>
+</li>
+<li>
+<p><strong>任务 C：更新参数 (Optimization)</strong>
+    <code>python
+    loss = hparams.kl_factor * l_edit + l_loc_instruction
+    loss.backward()
+    opt.step()</code></p>
+<ul>
+<li><strong>解释</strong>：总 Loss = 编辑任务的 Loss + 保持常识的 Loss。通过反向传播（Backprop）更新那几个被锁定的参数。</li>
+</ul>
+</li>
+<li>
+<p><strong>任务 D：动作限制 (Norm Constraint)</strong>
+    <code>python
+    v[...] = torch.clamp(v, min=weights_copy[k] - eps, max=weights_copy[k] + eps)</code></p>
+<ul>
+<li><strong>解释</strong>：这一步很重要。<code>eps</code> 是一个很小的数。代码强制限制参数的修改范围，不能偏离原始参数 (<code>weights_copy</code>) 太多。如果改得太猛，会被强行剪裁（Clamp）回来。这是为了保证模型的稳定性。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 缝合伤口 (Extract Deltas &amp; Apply)</h4>
+<p><strong>代码位置</strong>：循环结束后。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">deltas</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="p">(</span><span class="n">weights</span><span class="p">[</span><span class="n">k</span><span class="p">]</span> <span class="o">-</span> <span class="n">weights_copy</span><span class="p">[</span><span class="n">k</span><span class="p">])</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">weights</span><span class="p">}</span>
+<span class="c1"># ... 恢复原始模型 ...</span>
+<span class="k">return</span> <span class="n">deltas</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：DINM 这种算法通常不直接返回一个巨大的新模型，而是返回“补丁包”。</li>
+<li><strong>操作</strong>：<ol>
+<li>计算 <code>Delta</code> = <code>训练后的参数</code> - <code>原始参数</code>。</li>
+<li>把 <code>execute_dinm</code> 里的模型参数还原回去（为了保持函数纯净性，或者节省显存）。</li>
+<li>回到 <code>apply_dinm_to_model</code> 函数，把这个 <code>Delta</code> 真正地加到最终的模型上：<code>w[...] += upd_matrix</code>。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>💡 总结：这篇文章（代码）讲了啥？</h3>
+<p>这篇代码实现了一个<strong>受约束的微调过程</strong>。</p>
+<ul>
+<li><strong>输入</strong>：一个大模型 + 一条想让它学会的新知识。</li>
+<li><strong>过程</strong>：<ol>
+<li>找到负责存储知识的参数层。</li>
+<li>一边训练它学会新知识（Loss Edit）。</li>
+<li>一边按着它不让它乱变，必须保持对旧知识的记忆（Loss Locality + Norm Constraint）。</li>
+</ol>
+</li>
+<li><strong>输出</strong>：一组参数的<strong>变化量（Delta）</strong>，把这个加到原模型上，模型就“变身”成功了。</li>
+</ul>
+<p>你看懂这个逻辑流了吗？核心就是：<strong>既要学会新东西，又不能把脑子改坏了。</strong></p>

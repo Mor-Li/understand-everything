@@ -1,0 +1,132 @@
+<h1>easyeditor/evaluate/eval_utils_zsre.py</h1>
+<p>这份代码主要是在做<strong>模型编辑（Model Editing）后的“体检”</strong>。</p>
+<p>简单来说，当我们试图修改大模型里的某个知识（比如把“埃菲尔铁塔在巴黎”改成“埃菲尔铁塔在罗马”）之后，我们需要用这份代码来评估修改得好不好。</p>
+<p>为了让你更容易理解，我把这个过程想象成<strong>“老师给刚补完课的学生出考卷”</strong>。</p>
+<p>下面是一个逻辑上的 <strong>Task To-Do List</strong>，我会按照这个列表一步步带你读代码。</p>
+<hr />
+<h3>📋 评估任务 To-Do List</h3>
+<ol>
+<li><strong>准备考题（提取数据）</strong>：从记录里拿出我们要考的题目、标准答案。</li>
+<li><strong>区分考试科目（分类提示词）</strong>：准备三种不同类型的题目来全方位测试：<ul>
+<li><em>科目一：死记硬背题</em>（你记住我教你的那句话了吗？）</li>
+<li><em>科目二：举一反三题</em>（换个说法问你，你还能答对吗？）</li>
+<li><em>科目三：不该忘的旧知识</em>（你有没有因为学新知识把隔壁无关的知识搞乱了？）</li>
+</ul>
+</li>
+<li><strong>学生答题（模型预测）</strong>：让模型去跑这些题目。<ul>
+<li><em>注意</em>：不同类型的学生（T5 vs GPT）答题方式不一样，要分情况处理。</li>
+</ul>
+</li>
+<li><strong>批改试卷（计算准确率）</strong>：对比模型的回答和标准答案。</li>
+<li><strong>发成绩单（打包返回）</strong>：把各项分数整理成字典返回。</li>
+</ol>
+<hr />
+<h3>逐步讲解（对应代码逻辑）</h3>
+<h4>第一步：准备考题 (Prepare Data)</h4>
+<p>代码位置：<code>compute_rewrite_quality_zsre</code> 函数的开头。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 提取核心信息</span>
+<span class="n">subject</span><span class="p">,</span> <span class="n">target_new</span><span class="p">,</span> <span class="n">target_true</span> <span class="o">=</span> <span class="p">(</span>
+    <span class="n">record</span><span class="p">[</span><span class="s2">&quot;requested_rewrite&quot;</span><span class="p">][</span><span class="n">x</span><span class="p">]</span> <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;subject&quot;</span><span class="p">,</span> <span class="s2">&quot;target_new&quot;</span><span class="p">,</span> <span class="s2">&quot;target_true&quot;</span><span class="p">]</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：这里是在解包数据。<ul>
+<li><code>subject</code>: 主语（比如“埃菲尔铁塔”）。</li>
+<li><code>target_new</code>: 我们想让模型记住的新知识（比如“罗马”）。</li>
+<li><code>target_true</code>: 原本正确的事实（比如“巴黎”）。</li>
+</ul>
+</li>
+</ul>
+<h4>第二步：区分考试科目 (Define Prompts)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">rewrite_prompts</span> <span class="o">=</span> <span class="p">[</span><span class="n">record</span><span class="p">[</span><span class="s2">&quot;requested_rewrite&quot;</span><span class="p">][</span><span class="s2">&quot;prompt&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">subject</span><span class="p">)]</span>
+<span class="n">paraphrase_prompts</span> <span class="o">=</span> <span class="n">record</span><span class="p">[</span><span class="s2">&quot;paraphrase_prompts&quot;</span><span class="p">]</span>
+<span class="n">neighborhood_prompts</span> <span class="o">=</span> <span class="n">record</span><span class="p">[</span><span class="s2">&quot;neighborhood_prompts&quot;</span><span class="p">]</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：这里准备了三类考题：<ol>
+<li><strong>Rewrite Prompts (重写提示词)</strong>：就是编辑时用的原话。测试<strong>有效性</strong>（Efficacy）。</li>
+<li><strong>Paraphrase Prompts (同义改写提示词)</strong>：意思一样但说法不同的句子。测试<strong>泛化性</strong>（Generalization）。比如编辑时用“埃菲尔铁塔位于哪里？”，这里问“埃菲尔铁塔的所在地是？”。</li>
+<li><strong>Neighborhood Prompts (邻域提示词)</strong>：跟这事儿无关，但长得很像的知识。测试<strong>特异性/局部性</strong>（Specificity/Locality）。比如问“自由女神像在哪里？”。我们希望模型<strong>不要</strong>把这个也改成“罗马”。</li>
+</ol>
+</li>
+</ul>
+<h4>第三步：学生答题 (Model Prediction)</h4>
+<p>这里代码分成了两由路：<code>if 't5' in model_name</code> 和 <code>elif 'gpt' in model_name</code>。这是因为 T5 和 GPT 的架构不同，推理方式不同。</p>
+<p><strong>情况 A：如果是 T5 模型 (Seq2Seq 架构)</strong>
+T5 像做翻译题，输入问题，直接输出答案。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="s1">&#39;t5&#39;</span> <span class="ow">in</span> <span class="n">model_name</span><span class="o">.</span><span class="n">lower</span><span class="p">():</span>
+    <span class="c1"># 批量测试 rewrite 和 paraphrase</span>
+    <span class="n">stuff_probs</span> <span class="o">=</span> <span class="n">test_seq2seq_batch_prediction_acc</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">target_new</span><span class="p">[</span><span class="s2">&quot;str&quot;</span><span class="p">])</span>
+    <span class="c1"># 单独测试 neighborhood</span>
+    <span class="n">neighborhood_correct</span> <span class="o">=</span> <span class="n">test_seq2seq_batch_prediction_acc</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">neighborhood</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li>它直接调用 <code>test_seq2seq_batch_prediction_acc</code>，把问题喂给模型，看模型生成的答案是不是 <code>target_new</code>。</li>
+</ul>
+<p><strong>情况 B：如果是 GPT 模型 (Causal LM 架构)</strong>
+GPT 是像连词成句一样，一个字一个字往后猜。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">elif</span> <span class="s1">&#39;gpt&#39;</span> <span class="ow">in</span> <span class="n">model_name</span><span class="o">.</span><span class="n">lower</span><span class="p">():</span>
+    <span class="c1"># ... 省略了复杂的切词代码 ...</span>
+    <span class="c1"># 核心逻辑是：</span>
+    <span class="c1"># 比如目标是 &quot;Rome&quot; (假设分词为 Ro, me)</span>
+    <span class="c1"># 第一次输入: &quot;Where is Eiffel? &quot; -&gt; 预测 &quot;Ro&quot;</span>
+    <span class="c1"># 第二次输入: &quot;Where is Eiffel? Ro&quot; -&gt; 预测 &quot;me&quot;</span>
+    <span class="n">stuff_probs</span> <span class="o">=</span> <span class="n">test_batch_prediction_acc</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">tok</span><span class="p">,</span> <span class="n">inp_prompts</span><span class="p">,</span> <span class="n">inp_targets</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li>这段代码看起来很复杂（<code>inp_prompts</code> 生成列表推导式那里），是因为它在手动构造<strong>“Teacher Forcing”</strong>。它在测试模型能不能在给定前缀的情况下，准确预测出目标单词的每一个 Token。</li>
+</ul>
+<h4>第四步：批改试卷 (Grading)</h4>
+<p>这一步其实融合在上面的 <code>test_..._acc</code> 函数里了。我们看底部的辅助函数：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">test_batch_prediction_acc</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">tok</span><span class="p">,</span> <span class="n">prompts</span><span class="p">,</span> <span class="n">target</span><span class="p">):</span>
+    <span class="c1"># ...</span>
+    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+        <span class="n">logits</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="o">**</span><span class="n">prompt_tok</span><span class="p">)</span><span class="o">.</span><span class="n">logits</span>
+        <span class="c1"># ... 复杂的gather操作 ...</span>
+        <span class="n">ans</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">argmax</span><span class="p">(</span><span class="n">gathered</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span> <span class="c1"># 模型认为概率最大的词</span>
+        <span class="c1"># ...</span>
+        <span class="k">return</span> <span class="p">(</span><span class="n">ans</span> <span class="o">==</span> <span class="n">correct_id</span><span class="p">)</span><span class="o">...</span> <span class="c1"># 对比模型选的和正确答案是否一致</span>
+</code></pre></div>
+
+<ul>
+<li><strong>核心逻辑</strong>：<ol>
+<li>让模型算概率 (<code>logits</code>)。</li>
+<li>找概率最大的那个词 (<code>argmax</code>)。</li>
+<li>看它是不是标准答案 (<code>ans == correct_id</code>)。</li>
+<li>如果是，得1分（True），不是得0分（False）。</li>
+</ol>
+</li>
+</ul>
+<h4>第五步：发成绩单 (Return Results)</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 把刚才混在一起测的结果拆分开</span>
+<span class="n">ret_probs</span> <span class="o">=</span> <span class="p">[</span><span class="n">probs</span><span class="p">[</span><span class="n">cutoffs</span><span class="p">[</span><span class="n">i</span> <span class="o">-</span> <span class="mi">1</span><span class="p">]</span> <span class="p">:</span> <span class="n">cutoffs</span><span class="p">[</span><span class="n">i</span><span class="p">]]</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">cutoffs</span><span class="p">))]</span>
+
+<span class="n">ret</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s2">&quot;rewrite_prompts_correct&quot;</span><span class="p">:</span> <span class="o">...</span><span class="p">,</span>      <span class="c1"># 科目一成绩</span>
+    <span class="s2">&quot;paraphrase_prompts_correct&quot;</span><span class="p">:</span> <span class="o">...</span><span class="p">,</span>   <span class="c1"># 科目二成绩</span>
+    <span class="s2">&quot;neighborhood_prompts_correct&quot;</span><span class="p">:</span> <span class="o">...</span>  <span class="c1"># 科目三成绩</span>
+<span class="p">}</span>
+<span class="k">return</span> <span class="n">ret</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：最后函数返回一个字典 <code>ret</code>。使用者拿到这个字典，就能知道：<ul>
+<li>编辑成功了吗？(rewrite_correct)</li>
+<li>换个问法还懂吗？(paraphrase_correct)</li>
+<li>有没有把别的东西搞坏？(neighborhood_correct)</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件的核心作用就是<strong>“阅卷老师”</strong>。</p>
+<ol>
+<li>它不管怎么编辑模型（那是别人的事）。</li>
+<li>它只负责拿编辑好的模型，去跑一遍 ZsRE 数据集里的相关问题。</li>
+<li>它针对 T5 和 GPT 两种主流架构写了不同的“监考逻辑”。</li>
+<li>最后告诉你：编辑得准不准（Rewrite）、稳不稳（Paraphrase）、有没有副作用（Neighborhood）。</li>
+</ol>

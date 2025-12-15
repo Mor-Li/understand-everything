@@ -1,0 +1,124 @@
+<h1>easyeditor/editors/editor.py</h1>
+<p>这份代码确实比较长，涉及了很多模型加载、数据处理和流程控制的逻辑。</p>
+<p>简单来说，这个 <code>editor.py</code> 定义了一个 <strong>“总管家”</strong> 类（<code>BaseEditor</code>）。它的作用不是实现具体的修改算法（比如怎么修改神经元），而是负责<strong>统筹整个模型修改的流程</strong>：加载模型 -&gt; 准备数据 -&gt; 评估修改前效果 -&gt; 调用算法修改 -&gt; 评估修改后效果 -&gt; 恢复现场。</p>
+<p>为了让你更容易理解，我把这个文件要做的事情拆解成一个 <strong>Task Todo List（任务清单）</strong>，然后一步步带你过一遍。</p>
+<hr />
+<h3>📝 模型编辑任务清单 (Task Todo List)</h3>
+<p>想象你是一个“模型医生”，你要给大模型做“脑科手术”（修改知识）。这个代码就是你的手术操作手册。</p>
+<ol>
+<li><strong>[准备阶段] 初始化环境与病人</strong> (<code>__init__</code>)<ul>
+<li>加载配置文件（HyperParams）。</li>
+<li>根据配置把对应的模型（Llama, GPT, T5等）和分词器（Tokenizer）加载到显卡上。</li>
+</ul>
+</li>
+<li><strong>[诊断阶段] 整理病历</strong> (<code>_prepare_requests</code>)<ul>
+<li>把用户输入的简单文本（提示词、目标）转换成算法能读懂的标准格式（Request）。</li>
+</ul>
+</li>
+<li><strong>[术前检查] 评估当前状态</strong> (<code>edit</code> 方法的前半部分)<ul>
+<li>在动刀之前，先测一下模型现在的回答是什么（Pre-edit metrics）。</li>
+</ul>
+</li>
+<li><strong>[手术阶段] 执行修改算法</strong> (<code>apply_algo</code>)<ul>
+<li>调用具体的算法（如 ROME, MEMIT, LoRA 等）来更新模型的权重。</li>
+</ul>
+</li>
+<li><strong>[术后检查] 评估修改效果</strong> (<code>edit</code> 方法的后半部分)<ul>
+<li>测一下模型改过来了吗？（Success Rate）</li>
+<li><strong>副作用检查（Locality）</strong>：改了这个问题，有没有把别的不相关的问题改坏？</li>
+<li><strong>泛化检查（Portability）</strong>：换个问法，模型还能答对吗？</li>
+</ul>
+</li>
+<li><strong>[收尾阶段] 恢复与记录</strong><ul>
+<li>如果是临时修改，要把模型权重还原。</li>
+<li>把手术日志（Logs）和结果（Metrics）保存下来。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🔍 逐步代码解读</h3>
+<p>下面我按照上面的清单，给你讲讲代码里具体是怎么实现的。</p>
+<h4>1. [准备阶段] 初始化 (<code>__init__</code>)</h4>
+<p>代码大约在第 53 行 <code>class BaseEditor:</code> 开始。</p>
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li>你传入参数 <code>hparams</code>，里面包含了模型名字（比如 <code>llama-2-7b</code>）和算法名字（比如 <code>ROME</code>）。</li>
+<li>代码里有一大堆 <code>if 't5' in ... elif 'llama' in ...</code>。这就像一个<strong>工厂</strong>，根据你给的名字，自动去 HuggingFace 下载并加载对应的 PyTorch 模型和 Tokenizer。</li>
+<li>它还会处理设备问题（比如放到 GPU 上）。</li>
+</ul>
+</li>
+</ul>
+<h4>2. [诊断阶段] 整理数据 (<code>_prepare_requests</code>)</h4>
+<p>这个函数在代码很后面（约 448 行），但在 <code>edit</code> 函数一开始就会被调用。</p>
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li>用户输入通常很简单：<code>prompts="谁是美国总统？"</code>, <code>target_new="特朗普"</code>。</li>
+<li>这个函数把它包装成一个字典列表（requests）：
+    <code>python
+    [{
+        'prompt': "谁是美国总统？",
+        'target_new': "特朗普",
+        'ground_truth': "拜登", # 原来的答案
+        'locality': {...},      # 用于测试副作用的数据
+        'portability': {...}    # 用于测试泛化的数据
+    }]</code></li>
+<li>这样后续的算法就不需要关心你的输入格式了，统一读这个字典就行。</li>
+</ul>
+</li>
+</ul>
+<h4>3. &amp; 5. [核心流程] 编辑与检查 (<code>edit</code>)</h4>
+<p>这是最核心的函数（约 132 行）。它是一个循环流程：</p>
+<ul>
+<li>
+<p><strong>术前测 (Pre-edit)</strong>：
+    <code>python
+    # 代码约 224 行
+    metrics = {
+        "pre": compute_edit_quality(self.model, ...)
+    }</code>
+    这里调用 <code>compute_edit_quality</code> 看看没改之前模型对这个问题的困惑度（Perplexity）和生成的文本。</p>
+</li>
+<li>
+<p><strong>执行手术 (Apply Algo)</strong>：
+    <code>python
+    # 代码约 269 行
+    edited_model, weights_copy = self.apply_algo(
+        self.model,
+        self.tok,
+        [request], # 传入刚才整理好的请求
+        ...
+    )</code>
+    <code>self.apply_algo</code> 是在初始化时根据配置选定的（比如 ROME 或 MEMIT）。这一步跑完，<code>edited_model</code> 就是修改后的模型了。</p>
+</li>
+<li>
+<p><strong>术后测 (Post-edit)</strong>：
+    <code>python
+    # 代码约 282 行
+    "post": compute_edit_quality(edited_model, ...)</code>
+    再次调用评估函数，看看现在模型是不是能输出“特朗普”了。</p>
+</li>
+<li>
+<p><strong>副作用检查 (Locality)</strong>：
+    代码 302 行左右。比如你把“美国总统”改成了“特朗普”，系统会测试模型是否还记得“香蕉是黄色的”。如果“香蕉”变成了“特朗普”，说明手术失败，破坏了无关知识。</p>
+</li>
+</ul>
+<h4>4. [批量处理] <code>batch_edit</code> 与 <code>edit_dataset</code></h4>
+<ul>
+<li><strong><code>edit</code></strong>：通常用于一次改一个，或者逐个改。</li>
+<li><strong><code>batch_edit</code></strong> (351 行)：有些算法（如 MEMIT）支持一次性并行修改成百上千条知识。这个函数会把数据切成小块（Chunks），一批一批地喂给算法，效率更高。</li>
+<li><strong><code>edit_dataset</code></strong> (404 行)：方便你直接把一个 PyTorch 的 <code>Dataset</code> 对象丢进去，它会自动循环处理。</li>
+</ul>
+<h4>6. [收尾] 恢复权重</h4>
+<p>在 <code>edit</code> 函数的末尾（约 290 行）：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">():</span>
+    <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">weights_copy</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+        <span class="n">nethook</span><span class="o">.</span><span class="n">get_parameter</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">,</span> <span class="n">k</span><span class="p">)[</span><span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="n">v</span><span class="o">...</span>
+</code></pre></div>
+
+<p>如果你设置了 <code>keep_original_weight=False</code>，或者算法需要恢复（比如 IKE 这种基于上下文的编辑，或者 LoRA unload），它会把模型参数还原，保证下一次编辑是从干净的模型开始，或者是为了对比实验。</p>
+<h3>总结</h3>
+<p><strong>这个文件的核心观点是：</strong></p>
+<blockquote>
+<p>模型编辑（Model Editing）不应该是一团乱麻的代码。我们需要一个<strong>统一的接口（BaseEditor）</strong>，无论你用的是 Llama 还是 GPT，无论你用的是 ROME 算法还是 LoRA，流程都应该是：<strong>加载 -&gt; 评估前 -&gt; 修改 -&gt; 评估后</strong>。</p>
+</blockquote>
+<p>你看不懂可能是因为被里面大量的 <code>if-else</code> 模型加载代码和日志记录代码干扰了。只要抓住 <strong><code>edit</code> 函数里的 <code>pre-eval</code> -&gt; <code>apply_algo</code> -&gt; <code>post-eval</code></strong> 这条主线，逻辑就很清晰了。</p>

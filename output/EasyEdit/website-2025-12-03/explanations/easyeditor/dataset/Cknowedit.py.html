@@ -1,0 +1,68 @@
+<h1>easyeditor/dataset/Cknowedit.py</h1>
+<p>这份代码是一个<strong>PyTorch Dataset（数据集）类</strong>的定义，名字叫 <code>CKnowEditDataset</code>。</p>
+<p>简单来说，它的作用就像是一个<strong>“配菜员”</strong>。它的工作是从硬盘里读取原始的文本数据（比如 JSON 文件），清洗干净，切好（提取关键信息），然后打包成模型（比如 GPT、Llama）能吃进去的格式（Tensor 张量）。</p>
+<p>这个特定的数据集是专门为了<strong>“知识编辑”（Knowledge Editing）</strong>任务准备的。也就是教大模型修改它脑子里的某条特定知识（比如把“美国总统是拜登”修改为“美国总统是特朗普”），同时不破坏其他知识。</p>
+<p>为了让你看懂，我把它拆解成一个<strong>“任务清单 (Todo List)”</strong>，我们一步步来看它是怎么工作的：</p>
+<hr />
+<h3>📋 任务清单：CKnowEditDataset 的工作流程</h3>
+<h4>✅ Task 1: 准备工具 (初始化 <code>__init__</code>)</h4>
+<p><strong>目标</strong>：设置好分词器（Tokenizer），把文件路径准备好。</p>
+<ol>
+<li><strong>加载配置</strong>：代码首先检查有没有传入 <code>config</code>，如果有，就设置最大长度（<code>max_length</code>）。</li>
+<li><strong>设置分词器 (Tokenizer)</strong>：<ul>
+<li>这是把文字变成数字的工具。</li>
+<li>代码里有一堆 <code>if/elif</code>，专门用来适配不同的模型（GPT2, Llama, Qwen）。</li>
+<li><em>关键点</em>：它特别处理了 <code>pad_token</code>（填充符），因为不同模型对“空白”的处理不一样，比如 Qwen 用 <code>&lt;|endoftext|&gt;</code> 当作填充。</li>
+</ul>
+</li>
+<li><strong>读取文件</strong>：打开 <code>data_dir</code> 指定的 JSON 文件，把里面的原始数据加载到内存里 (<code>raw = json.load(f)</code>)。</li>
+</ol>
+<h4>✅ Task 2: 清洗食材 (处理原始数据)</h4>
+<p><strong>目标</strong>：从原始的句子中，提取出我们要编辑的“主体”（Subject）。</p>
+<p>在 <code>__init__</code> 的后半部分，有一个很长的 <code>for</code> 循环和 <code>if/elif</code> 判断。这是为了处理中文特定的提示词。</p>
+<ul>
+<li><strong>原始数据可能是</strong>：“请解释如下成语：守株待兔”</li>
+<li><strong>模型需要知道</strong>：我们要编辑的对象是“守株待兔”。</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li>如果句子包含 "请填写下列古诗文的后一句：" -&gt; 把这句话删掉，剩下的就是古诗名。</li>
+<li>如果句子包含 "请解释如下成语：" -&gt; 把这句话删掉，剩下的就是成语。</li>
+<li>...以此类推。</li>
+</ul>
+</li>
+<li><strong>存储</strong>：最后把清洗好的数据（提示词 <code>prompt</code>，新答案 <code>target_new</code>，主体 <code>subject</code> 等）存进 <code>self._data</code> 列表里。</li>
+</ul>
+<h4>✅ Task 3: 随叫随到 (<code>__getitem__</code>)</h4>
+<p><strong>目标</strong>：当训练循环需要第 N 条数据时，把它递出去。</p>
+<ul>
+<li>这一步很简单，就是从列表里取出一个字典返回去。</li>
+</ul>
+<h4>✅ Task 4: 打包上菜 (Batch 处理 <code>collate_fn</code> 和 <code>collate_gpt_fn</code>)</h4>
+<p><strong>目标</strong>：把多条数据（比如 8 条）捆绑在一起，转换成 PyTorch 的 Tensor（张量），喂给 GPU。</p>
+<p>这里有两个函数，对应两种不同的模型架构：</p>
+<p><strong>情景 A：<code>collate_fn</code> (通常用于 Encoder-Decoder 模型，如 T5)</strong>
+1.  <strong>分离输入输出</strong>：把 <code>prompt</code> 当作输入 (<code>src</code>)，把 <code>target_new</code> 当作输出 (<code>trg</code>)。
+2.  <strong>分词 (Tokenize)</strong>：把文字转成数字 ID，并填充（Padding）到相同长度。
+3.  <strong>处理 Locality (局部性)</strong>：
+    *   <em>背景</em>：知识编辑不仅要让模型学会新知识，还要测试它有没有变傻（比如改了“美国总统”，问它“法国首都在哪”还要能答对）。
+    *   代码提取 <code>locality</code> 字段里的问题和答案，同样进行分词。
+4.  <strong>打包</strong>：把所有处理好的 Tensor 放进一个大字典返回。</p>
+<p><strong>情景 B：<code>collate_gpt_fn</code> (用于 GPT, Llama 等 Decoder-only 模型)</strong>
+*   <em>区别</em>：GPT 类模型是“接龙”生成的。
+1.  <strong>拼接</strong>：它把问题和答案拼起来了！
+    *   代码：<code>src_ + ' ' + trg_</code> （例如：“美国的许嵩是谁？” + “歌手”）
+    *   这样模型训练时，是看到上文预测下文。
+2.  <strong>生成标签 (Labels)</strong>：
+    *   它创建了 <code>edit_labels</code>。通常我们会把“问题部分”的 label 设为 -100（不计算 Loss），只计算“答案部分”的 Loss。
+3.  <strong>打包</strong>：同样把编辑任务的数据 (<code>edit_inner</code>) 和 保持能力测试的数据 (<code>loc</code>) 打包返回。</p>
+<hr />
+<h3>总结：这段代码的核心观点</h3>
+<ol>
+<li><strong>这是个中文数据集处理器</strong>：专门针对中文的指令（如“请解释成语”）做了硬编码的规则清洗，为了提取出 Subject（实体）。</li>
+<li><strong>支持多种主流模型</strong>：特意适配了 Llama, Qwen, GPT2 的分词器特性。</li>
+<li><strong>包含“编辑”与“保持”两部分数据</strong>：<ul>
+<li><code>edit_inner</code>: 用来教模型新知识的数据。</li>
+<li><code>loc</code> (Locality): 用来检查模型有没有改坏了的数据（比如改了A，B应该保持不变）。</li>
+</ul>
+</li>
+<li><strong>区分了模型结构</strong>：提供了两个整理函数，分别对应“问答分离”的模型和“文本接龙”的模型。</li>
+</ol>

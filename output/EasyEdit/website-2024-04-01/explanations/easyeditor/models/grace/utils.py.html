@@ -1,0 +1,100 @@
+<h1>easyeditor/models/grace/utils.py</h1>
+<p>这份代码文件 <code>utils.py</code> 其实不是核心算法，而是一个<strong>工具箱</strong>。</p>
+<p>你可以把它想象成一个外科医生的<strong>器械盘</strong>。医生（核心算法 GRACE）要给病人（大模型）做手术（编辑知识），需要用到各种小工具：有的用来定位部位，有的用来处理数据，有的用来存档。</p>
+<p>为了让你看懂，我把这些工具的功能拆解成一个 <strong>“给模型做手术” 的任务清单 (To-Do List)</strong>。我们可以按照手术的流程，一步步来看这些函数是干嘛的。</p>
+<hr />
+<h3>任务清单：如何给模型“做手术” (GRACE Utils 详解)</h3>
+<h4>第 1 步：术前准备 (环境与身份)</h4>
+<p>在开始编辑模型之前，我们需要准备好存盘路径和本次操作的 ID。</p>
+<ul>
+<li><strong>Task:</strong> 创建一个文件夹用来存手术后的模型（Checkpoint）。<ul>
+<li><strong>对应函数:</strong> <code>ckpt_dir()</code></li>
+<li><strong>解释:</strong> 如果文件夹不存在就新建一个。</li>
+</ul>
+</li>
+<li><strong>Task:</strong> 给这次操作生成一个唯一的身份证号 (UUID)。<ul>
+<li><strong>对应函数:</strong> <code>uuid(digits=4)</code></li>
+<li><strong>解释:</strong> 生成一个随机数字，防止多次实验搞混了。</li>
+</ul>
+</li>
+</ul>
+<h4>第 2 步：定位病灶 (找到模型中具体的层)</h4>
+<p>模型像是一个千层饼（或者嵌套的俄罗斯套娃），我们需要精准找到我们要修改的那一层参数。</p>
+<ul>
+<li><strong>Task:</strong> 处理参数的名字格式。<ul>
+<li><strong>对应函数:</strong> <code>brackets_to_periods(name)</code></li>
+<li><strong>解释:</strong> 有时候参数名叫 <code>layer[0]</code>，PyTorch 喜欢 <code>layer.0</code>，这个函数负责把方括号换成点，方便查找。</li>
+</ul>
+</li>
+<li><strong>Task:</strong> 根据名字找到参数的“父亲”（上一级模块）。<ul>
+<li><strong>对应函数:</strong> <code>parent_module(model, pname)</code></li>
+<li><strong>解释:</strong> <strong>这是个重点工具</strong>。<ul>
+<li>比如你想找 <code>model.layers.10.attention.weight</code>。</li>
+<li>这个函数会一层层剥开：先找 <code>model</code>，再找 <code>layers</code>，再找第 <code>10</code> 层，最后定位到 <code>attention</code> 这一层模块，把你带到“手术台”前。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>第 3 步：准备器械 (获取与处理参数)</h4>
+<p>找到了位置，现在要把具体的参数（权重）拿出来。</p>
+<ul>
+<li><strong>Task:</strong> 把参数拿出来，顺便带上名字。<ul>
+<li><strong>对应函数:</strong> <code>get_inner_params(named_parameters, inner_names)</code></li>
+<li><strong>解释:</strong> 返回 <code>(名字, 参数值)</code> 的列表。</li>
+</ul>
+</li>
+<li><strong>Task:</strong> 只拿参数值，不带名字。<ul>
+<li><strong>对应函数:</strong> <code>param_subset(...)</code></li>
+<li><strong>解释:</strong> 纯粹的数据列表。</li>
+</ul>
+</li>
+<li><strong>Task:</strong> 搞清楚参数的形状 (Shape)。<ul>
+<li><strong>对应函数:</strong> <code>get_shape(p, model)</code></li>
+<li><strong>解释:</strong> 这是一个<strong>兼容性补丁</strong>。<ul>
+<li>通常线性层是 <code>[out, in]</code>。</li>
+<li>但 OpenAI 的 GPT-2 用的是一维卷积 (Conv1D) 代替线性层，形状是反的。这个函数确保无论什么模型，我们拿到的形状标准是一致的。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>第 4 步：准备营养液 (数据预处理 - 最重要！)</h4>
+<p>模型看不懂文字，只能看懂数字（Token IDs）。这一步是把人类的修改指令转化成模型能吃的格式。</p>
+<ul>
+<li><strong>Task:</strong> 把文本变成 Tensor，并标记好哪里需要学习。<ul>
+<li><strong>对应函数:</strong> <code>tokenize(batch, tokenizer, device, test=False)</code></li>
+<li><strong>解释:</strong> <strong>这是全文件最复杂的函数，逻辑如下：</strong><ol>
+<li><strong>拼接:</strong> 把提示词 (Prompt) 和 新的目标回答 (Target) 拼在一起。</li>
+<li><strong>数字化:</strong> 用 <code>tokenizer</code> 变成数字 ID。</li>
+<li><strong>制作标签 (Labels) - 关键点:</strong><ul>
+<li>我们在训练（编辑）模型时，<strong>不希望模型重新学习 Prompt（提问）部分，只希望它学习 Target（回答）部分</strong>。</li>
+<li>PyTorch 计算损失 (Loss) 时，如果标签是 <code>-100</code>，就会自动忽略，不计算梯度。</li>
+<li>所以代码里做了个 <code>mask</code> 操作：把 Prompt 部分的标签全部设为 <code>-100</code>。</li>
+<li><strong>结论:</strong> 告诉模型：“前面这半句不用管，只许把后面这半句背下来！”</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<h4>第 5 步：术后观察 (获取输出)</h4>
+<p>手术做完了（或者正在做），我们需要看模型的反应。</p>
+<ul>
+<li><strong>Task:</strong> 拿到模型的原始输出分数 (Logits)。<ul>
+<li><strong>对应函数:</strong> <code>get_logits(x)</code></li>
+<li><strong>解释:</strong> 现在的 HuggingFace 模型输出通常是一个复杂的对象（包含 loss, hidden_states 等）。这个函数只把我们需要用来预测下一个词的 <code>logits</code> 提取出来。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>你之所以看不懂，是因为这些函数是<strong>碎片化</strong>的。现在串起来看：</p>
+<ol>
+<li><strong><code>tokenize</code></strong> 负责把“问题+答案”变成“带掩码的训练数据”。</li>
+<li><strong><code>parent_module</code></strong> 负责在巨大的神经网络里导航，找到要修改的那一层。</li>
+<li><strong><code>get_shape</code></strong> 和 <strong><code>get_logits</code></strong> 负责处理不同模型架构之间的细微差别（脏活累活）。</li>
+<li><strong><code>ckpt_dir</code></strong> 负责存文件。</li>
+</ol>
+<p>这个文件本身不包含“如何修改参数”的数学原理（那是 GRACE 算法的核心逻辑），它只是为核心算法打杂的后勤部。</p>

@@ -1,0 +1,98 @@
+<h1>easyeditor/models/r_rome/layer_stats.py</h1>
+<p>这份代码的核心目的是：<strong>在对模型进行“手术”（编辑/修改知识）之前，先对模型的某一层进行“体检”，计算并保存它的统计特征（主要是协方差矩阵）。</strong></p>
+<p>在 ROME/MEMIT 等模型编辑算法中，我们需要知道模型在处理普通文本时，某一层的神经元激活值通常长什么样（即“基准线”）。这个脚本就是用来计算这个基准线的。</p>
+<p>为了让你更容易理解，我把这个脚本做的事情拆解成一个 <strong>Task To-Do List（任务清单）</strong>，我们一步步来看：</p>
+<hr />
+<h3>📋 任务清单：模型层级统计数据收集 (Layer Statistics Collection)</h3>
+<ol>
+<li><strong>[准备阶段] 配置参数与环境</strong><ul>
+<li>确定要检查哪个模型（如 GPT-2 XL）。</li>
+<li>确定要检查哪一层（如第 17 层）。</li>
+<li>确定要用什么数据做体检（如 Wikipedia）。</li>
+</ul>
+</li>
+<li><strong>[检查缓存] 看看是不是已经算过了</strong><ul>
+<li>如果硬盘里已经有算好的统计文件（<code>.npz</code>），直接跳过后续步骤。</li>
+</ul>
+</li>
+<li><strong>[数据加载] 准备体检样本</strong><ul>
+<li>下载或加载 Wikipedia/Wikitext 数据集。</li>
+<li>把文本切分成模型能读懂的 Token。</li>
+</ul>
+</li>
+<li><strong>[核心循环] 开始批量扫描 (Batch Processing)</strong><ul>
+<li><strong>4.1</strong> 把数据喂给模型。</li>
+<li><strong>4.2</strong> <strong>[关键]</strong> 在指定的层“安装窃听器”（Hook）。</li>
+<li><strong>4.3</strong> 拦截并记录该层的输入/输出数据。</li>
+<li><strong>4.4</strong> 处理数据格式（去掉 Padding，展平）。</li>
+</ul>
+</li>
+<li><strong>[统计计算] 更新统计量</strong><ul>
+<li>使用流式计算方法，更新当前的“二阶矩”（Covariance/Second Moment）和“均值”。</li>
+</ul>
+</li>
+<li><strong>[存档] 保存结果</strong><ul>
+<li>将最终计算出的统计矩阵保存到硬盘。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<p>下面我结合代码，详细解释上面清单里的每一步：</p>
+<h4>1. [准备阶段] 配置参数与环境</h4>
+<p><strong>代码位置：</strong> <code>main()</code> 函数开头部分。
+<strong>解释：</strong>
+这就好比医生准备手术器材。脚本通过 <code>argparse</code> 接收命令行参数：
+*   <code>--model_name</code>: 病人是谁？(e.g., <code>gpt2-xl</code>)
+*   <code>--layers</code>: 要检查哪个部位？(e.g., <code>17</code> 表示第17层 Transformer block)
+*   <code>--dataset</code>: 用什么做测试？(e.g., <code>wikipedia</code>)
+*   <code>--to_collect</code>: 收集什么指标？默认是 <code>mom2</code> (Second Moment，即二阶矩，用于计算协方差)。</p>
+<h4>2. [检查缓存] 看看是不是已经算过了</h4>
+<p><strong>代码位置：</strong> <code>layer_stats</code> 函数中的 <code>filename</code> 定义和 <code>if not filename.exists()</code> 判断。
+<strong>解释：</strong>
+计算整个 Wikipedia 的统计数据非常慢（可能要几十分钟到几小时）。
+代码会根据模型名、层数、精度生成一个文件名（例如 <code>.../gpt2-xl/wikipedia_stats/layer17...npz</code>）。
+*   如果文件存在：任务直接结束，直接返回结果（或者在 <code>tally</code> 函数内部直接加载）。
+*   如果文件不存在：说明没算过，开始干活。</p>
+<h4>3. [数据加载] 准备体检样本</h4>
+<p><strong>代码位置：</strong> <code>get_ds()</code> 内部函数。
+<strong>解释：</strong>
+*   <code>load_dataset(...)</code>: 从 HuggingFace 下载维基百科数据。
+*   <code>TokenizedDataset</code>: 把人类文字转换成数字 ID。
+*   这里还做了一些处理 <code>maxlen</code> 的逻辑，确保输入的长度符合模型限制（比如 GPT-2 是 1024，Mistral 是 4096）。</p>
+<h4>4. [核心循环] 开始批量扫描</h4>
+<p><strong>代码位置：</strong> <code>layer_stats</code> 函数底部的 <code>loader = tally(...)</code> 以及随后的 <code>for batch_group in progress(loader...):</code> 循环。
+<strong>解释：</strong>
+这是最难懂也是最核心的部分。它并没有一次性把所有数据读进内存（内存会爆），而是用了一个叫 <code>tally</code> 的工具（来自 <code>util.runningstats</code>）来分批处理。</p>
+<ul>
+<li><strong>4.1 喂数据</strong>: <code>model(**batch)</code> 让模型阅读这一批文本。</li>
+<li>
+<p><strong>4.2 安装窃听器</strong>:
+    <code>python
+    with Trace(model, layer_name, retain_input=True, ...) as tr:
+        model(**batch)</code>
+    这段代码使用了 <code>Trace</code> 上下文管理器。它的作用是：当模型运行到 <code>layer_name</code> 指定的那一层时，<strong>暂停一下，把流经这里的数据（Tensor）复制一份存到 <code>tr.input</code> 里</strong>，然后继续运行。</p>
+<ul>
+<li><em>注意：</em> 代码里的注释写着 <code>Note, the statistics are collected over the inputs...</code>，这说明它收集的是进入该层的<strong>输入信号</strong>。</li>
+</ul>
+</li>
+<li>
+<p><strong>4.3 &amp; 4.4 处理数据</strong>:
+    <code>python
+    feats = flatten_masked_batch(tr.input, batch["attention_mask"])</code>
+    模型处理文本时会有 padding（补零），这些 0 是没有意义的。这一步把有效的 Token 对应的激活值提取出来，展平成一个长列表。</p>
+</li>
+</ul>
+<h4>5. [统计计算] 更新统计量</h4>
+<p><strong>代码位置：</strong> <code>stat.add(feats)</code>
+<strong>解释：</strong>
+*   <code>stat</code> 是一个 <code>CombinedStat</code> 对象，里面包含 <code>SecondMoment</code>（二阶矩）。
+*   每次循环拿到一批新的激活值 <code>feats</code>，就调用 <code>stat.add(feats)</code>。
+*   <strong>为什么这样做？</strong> 就像算平均分一样，你不需要把全校学生的分数都存下来再算。你可以每拿到一个班的分数，就更新一下目前的“总分”和“总人数”。这里计算的是更复杂的“协方差矩阵”，但也采用了这种<strong>流式更新（Running Update）</strong>的方法，省内存。</p>
+<h4>6. [存档] 保存结果</h4>
+<p><strong>代码位置：</strong> 虽然这部分代码被封装在 <code>tally</code> 函数内部（在 <code>.../util/runningstats.py</code> 里），但逻辑是：当循环结束，<code>stat</code> 对象里就存好了最终的统计数据，然后会被保存成 <code>.npz</code> 文件。</p>
+<h3>总结：这到底是在干啥？</h3>
+<p>用一句话说：
+<strong>这个脚本在跑遍整个维基百科，记录下模型第 X 层通常会接收到什么样的输入信号，并计算出这些信号的数学分布（协方差），存下来备用。</strong></p>
+<p><strong>为什么 ROME 需要这个？</strong>
+ROME 算法想要修改模型的一条知识（比如把“埃菲尔铁塔在巴黎”改成“在罗马”）。为了做到这一点，它需要求解一个线性方程。这个方程里有一个关键项是 $C^{-1}$（协方差矩阵的逆）。这个脚本算出来的就是 $C$。如果不算这个，ROME 就不知道该用多大的力度去修改参数，也不知道修改方向会不会破坏模型原有的其他知识。</p>

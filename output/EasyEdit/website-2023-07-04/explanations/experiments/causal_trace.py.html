@@ -1,0 +1,137 @@
+<h1>experiments/causal_trace.py</h1>
+<p>这份代码确实比较硬核，它是出自著名的论文 <strong>ROME (Rank-One Model Editing)</strong> 项目中的核心实验代码，叫做 <strong>“因果追踪” (Causal Tracing)</strong>。</p>
+<p>简单来说，这个脚本的目的是：<strong>像神经外科医生一样，通过“电击”（加噪声）和“修复”（恢复状态）大脑皮层（神经网络层），来精准定位大模型把知识（比如“埃菲尔铁塔在巴黎”）存在了哪一层、哪一个Token上。</strong></p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“侦探任务清单” (Task List)</strong>，然后逐步讲解每一步在做什么。</p>
+<hr />
+<h3>侦探任务清单 (To-Do List)</h3>
+<p>我们要搞清楚模型到底是怎么“想”出答案的。</p>
+<ol>
+<li><strong>[准备工作] 装备侦探工具</strong><ul>
+<li>加载模型（GPT-2, GPT-J 等）和分词器。</li>
+<li>准备“审讯”问题列表（比如：“Steve Jobs founded <em>[Apple]</em>”）。</li>
+</ul>
+</li>
+<li><strong>[制造混乱] 设定干扰方案 (Noise)</strong><ul>
+<li>计算如何给模型的输入（Subject，比如 "Steve Jobs"）加上噪声，让模型“失忆”或者变糊涂，答不出正确答案。</li>
+</ul>
+</li>
+<li><strong>[核心实验] 开始手术 (The Trace)</strong><ul>
+<li><strong>第一刀 (Clean Run):</strong> 让模型正常跑一遍，记录下所有神经元原本正确的反应。</li>
+<li><strong>第二刀 (Corrupt Run):</strong> 给输入加噪声，确认模型答错了。</li>
+<li><strong>第三刀 (Patching/Restoring):</strong> 这是一个循环过程：<ul>
+<li>在模型“糊涂”的状态下，<strong>强行把某一层、某一个Token的数值，恢复成“清醒”时的数值</strong>。</li>
+<li>观察：模型是不是突然“想起来”正确答案了？</li>
+<li>如果是，说明这个位置对这个知识点至关重要。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>[生成报告] 绘制热力图</strong><ul>
+<li>把所有测试结果画成一张图：X轴是层数，Y轴是Token位置。颜色越深，说明这里藏着知识。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>逐步讲解 (Step-by-Step)</h3>
+<p>下面我结合代码中的关键函数，把上面的清单展开讲。</p>
+<h4>第一步：准备工作 (Main Setup)</h4>
+<p>代码位置：<code>main()</code> 函数的前半部分。</p>
+<ul>
+<li><strong>做什么</strong>：读取命令行参数，决定用哪个模型（<code>args.model_name</code>），读取事实数据（<code>knowns</code>，比如“埃菲尔铁塔在巴黎”）。</li>
+<li><strong>代码对应</strong>：
+    <code>python
+    mt = ModelAndTokenizer(args.model_name, ...) # 加载模型
+    knowns = KnownsDataset(DATA_DIR)             # 加载一堆事实数据</code></li>
+</ul>
+<h4>第二步：设定干扰 (Noise Calculation)</h4>
+<p>代码位置：<code>main()</code> 中处理 <code>noise_level</code> 的部分。</p>
+<ul>
+<li><strong>做什么</strong>：为了做实验，我们必须能把模型搞“坏”。这里计算了Embedding层的标准差或协方差。</li>
+<li><strong>为什么</strong>：我们要给输入向量（比如 "Steve Jobs" 的向量）加上高斯噪声。噪声太小模型不受影响，噪声太大模型就坏了。代码里的 <code>collect_embedding_std</code> 就是去算一个合适的噪声强度。</li>
+</ul>
+<h4>第三步：核心实验循环 (The Loop)</h4>
+<p>代码位置：<code>main()</code> 中的 <code>for knowledge in tqdm(knowns):</code></p>
+<ul>
+<li><strong>做什么</strong>：遍历每一个知识点（例如 "Space Needle is in downtown [Seattle]"）。</li>
+<li><strong>关键调用</strong>：<code>calculate_hidden_flow(...)</code>。这是整个文件的灵魂函数。</li>
+</ul>
+<h4>第四步：手术过程 (Causal Tracing Logic)</h4>
+<p>这是最难懂的部分，主要在 <code>calculate_hidden_flow</code> 和 <code>trace_with_patch</code> 这两个函数里。</p>
+<p><strong>逻辑流：</strong></p>
+<ol>
+<li>
+<p><strong>确定目标</strong>：</p>
+<ul>
+<li>Prompt: "The Space Needle is in downtown"</li>
+<li>Subject: "The Space Needle" (我们要破坏这部分的理解)</li>
+<li>Expect: "Seattle"</li>
+</ul>
+</li>
+<li>
+<p><strong>运行 <code>trace_with_patch</code> (带补丁的追踪)</strong>：
+    这个函数是实验的执行者。它做了三件事：</p>
+<ul>
+<li><strong>Corrupt (破坏)</strong>：把输入中的 Subject ("The Space Needle") 对应的向量加上噪声。此时模型可能会预测成 "London" 或其他乱码。</li>
+<li><strong>Patch (打补丁/修复)</strong>：<ul>
+<li>代码里有一个参数 <code>states_to_patch</code>。</li>
+<li>它告诉模型：“虽然你现在输入是乱的，但是当运行到 <strong>第L层</strong> 的 <strong>第T个Token</strong> 时，请强制把神经元的数值替换回 <strong>正常（Clean）状态</strong> 下的数值。”</li>
+</ul>
+</li>
+<li><strong>Observe (观察)</strong>：<ul>
+<li>替换完这一个点后，看模型输出 "Seattle" 的概率恢复了多少？</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>扫描全脑 (<code>calculate_hidden_flow</code> 调用 <code>trace_important_states</code>)</strong>：</p>
+<ul>
+<li>它写了一个双重循环：<ul>
+<li><code>for layer in all_layers:</code> (遍历每一层)</li>
+<li><code>for token in all_tokens:</code> (遍历每一个词)</li>
+</ul>
+</li>
+<li>对每一个 (Layer, Token) 组合，都运行一次 <code>trace_with_patch</code>。</li>
+</ul>
+</li>
+</ol>
+<p><strong>代码片段解读</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">trace_with_patch</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="c1"># ...</span>
+    <span class="c1"># 1. 定义怎么加噪声 (noise_fn)</span>
+    <span class="c1"># 2. 定义怎么修复状态 (patch_rep)</span>
+        <span class="k">def</span><span class="w"> </span><span class="nf">patch_rep</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">layer</span><span class="p">):</span>
+            <span class="c1"># 如果是Embedding层，加噪声（Corrupt）</span>
+            <span class="k">if</span> <span class="n">layer</span> <span class="o">==</span> <span class="n">embed_layername</span><span class="p">:</span>
+                <span class="c1"># ... add noise ...</span>
+
+            <span class="c1"># 如果是我们要测试的那一层，把Clean状态的值(h[0])复制给Corrupt状态(h[1:])</span>
+            <span class="k">if</span> <span class="n">layer</span> <span class="ow">in</span> <span class="n">patch_spec</span><span class="p">:</span>
+                 <span class="n">h</span><span class="p">[</span><span class="mi">1</span><span class="p">:,</span> <span class="n">t</span><span class="p">]</span> <span class="o">=</span> <span class="n">h</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="n">t</span><span class="p">]</span> 
+            <span class="k">return</span> <span class="n">x</span>
+
+    <span class="c1"># 3. 带着这些修改规则运行模型</span>
+    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">no_grad</span><span class="p">(),</span> <span class="n">nethook</span><span class="o">.</span><span class="n">TraceDict</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">edit_output</span><span class="o">=</span><span class="n">patch_rep</span><span class="p">):</span>
+        <span class="n">outputs_exp</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="o">**</span><span class="n">inp</span><span class="p">)</span>
+</code></pre></div>
+
+<h4>第五步：绘制热力图 (Visualization)</h4>
+<p>代码位置：<code>plot_trace_heatmap</code></p>
+<ul>
+<li><strong>结果</strong>：你最终会得到一个二维矩阵 <code>differences</code>。<ul>
+<li><code>differences[token_i, layer_j]</code> 的值很高，意味着：只要恢复 (Token_i, Layer_j) 这个点的状态，模型就能从混乱中找回正确答案。</li>
+<li>这证明了 <strong>(Token_i, Layer_j) 是存储该知识的关键节点</strong>。</li>
+</ul>
+</li>
+<li><strong>输出</strong>：代码会把这个矩阵画成紫色/绿色的热力图并保存为 PDF。通常你会看到在 Subject 的最后一个 Token 的中层或高层区域有高亮，这就是 ROME 论文著名的结论（知识存储在 MLP 层）。</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底在干嘛？</h3>
+<p>他在做一个<strong>控制变量法的科学实验</strong>：</p>
+<ol>
+<li>让模型正常回答 -&gt; 记下答案。</li>
+<li>把主语（Subject）打码（加噪声） -&gt; 此时模型变傻。</li>
+<li><strong>一次只恢复一个神经节点</strong>的状态 -&gt; 看看模型有没有变聪明。</li>
+<li>如果恢复了某个节点，模型瞬间变聪明了，说明<strong>这个节点就是知识的所在地</strong>。</li>
+</ol>
+<p>希望这个列表和比喻能帮你理解这堆代码！如果有具体哪一行看不懂，可以继续问。</p>

@@ -1,0 +1,97 @@
+<h1>easyeditor/models/namet/compute_z.py</h1>
+<p>这份代码 <code>compute_z.py</code> 是<strong>模型编辑（Model Editing）</strong>算法（类似于 ROME 或 MEMIT）中的核心步骤之一。</p>
+<p>简单来说，它的任务是：<strong>“为了让模型学会新知识（比如把‘埃菲尔铁塔在巴黎’改成‘埃菲尔铁塔在罗马’），由于我们想修改某一层神经网络的输出，我们需要计算出那一层‘理想的输出向量’（即 Z 向量）应该是多少。”</strong></p>
+<p>我把这个过程拆解成一个 <strong>Task List (待办清单)</strong>，一步步带你读懂它在干什么。</p>
+<hr />
+<h3>核心任务：寻找“理想向量” Z</h3>
+<h4>✅ Task 1: 准备工具 (获取模型组件与处理分词)</h4>
+<p>在开始计算之前，需要拿到模型的“解码器”（把向量变回单词的层）以及处理好输入文本的格式。</p>
+<ul>
+<li><strong>代码位置</strong>: 函数开头到 <code>opt_target_ids = ...</code> 之前。</li>
+<li><strong>解释</strong>:<ul>
+<li><code>lm_w</code>, <code>lm_b</code>, <code>ln_f</code>: 获取模型最后一层（LM Head）的权重和偏置，以及LayerNorm层。这是为了在优化过程中，能把中间层的向量映射成最终的预测概率，从而计算 Loss。</li>
+<li><code>tok.add_bos_token</code>: 处理不同模型（如 Llama, Gemma, Mistral）对“句子开头符”的不同癖好。</li>
+<li><strong>难点</strong>: 代码花了很多行处理 <code>target_ids</code>（比如 " Rome" 前面的空格）。这是因为不同 Tokenizer 对空格的处理很恶心，必须确保我们优化的目标单词（Target）是完全正确的 Token ID。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 构建“教材” (Prompt Engineering)</h4>
+<p>为了训练出理想的向量，我们需要构造两类句子。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>rewriting_prompts, kl_prompts = ...</code> 附近。</li>
+<li><strong>解释</strong>:<ol>
+<li><strong>Rewriting Prompts (重写提示)</strong>: 用来教模型新知识的句子。<ul>
+<li>例如：<code>"The Eiffel Tower is located in"</code> + <code>" Rome"</code> (目标)。</li>
+<li>目的：让模型在这个上下文中预测出新目标。</li>
+</ul>
+</li>
+<li><strong>KL Prompts (保持提示)</strong>: 用来防止模型“变傻”的句子。<ul>
+<li>例如：<code>"The Eiffel Tower is a"</code>。</li>
+<li>目的：让模型在一般性描述上保持原有的概率分布（KL散度），不要因为改了一个事实就把语法或常识忘光了。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 3: 确定“手术位置” (定位 Subject)</h4>
+<p>我们需要知道在句子的哪个位置注入修改。通常是主语（Subject）的最后一个 Token。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>lookup_idxs = ...</code></li>
+<li><strong>解释</strong>:<ul>
+<li>调用 <code>find_fact_lookup_idx</code>。</li>
+<li>比如句子是 "The Eiffel Tower is in..."，我们要找 "Tower" 这个词对应的位置。</li>
+<li><strong>逻辑</strong>: 我们假设只要修改了 "Tower" 这个位置的语义向量，后面的 "is in..." 就会顺理成章地预测出 "Rome"。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 设定“拦截器” (Hook &amp; Delta)</h4>
+<p>这是魔法发生的地方。我们要人为地在神经网络中间插入一个可训练的变量。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>delta = torch.zeros...</code> 和 <code>def edit_output_fn...</code></li>
+<li><strong>解释</strong>:<ul>
+<li><code>delta</code>: 这是一个全零初始化的张量，<strong>它就是我们要训练的主角</strong>。</li>
+<li><code>edit_output_fn</code>: 这是一个 Hook 函数（钩子）。</li>
+<li><strong>操作</strong>: 当模型向前传播算到 <code>layer</code> 这一层，且位置是 <code>lookup_idxs</code>（手术位置）时，强行把当前的输出 <code>cur_out</code> 加上 <code>delta</code>。</li>
+<li><strong>公式</strong>: $h_{final} = h_{original} + \delta$</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 开启优化循环 (Optimization Loop)</h4>
+<p>现在开始“炼丹”。通过梯度下降，调整 <code>delta</code> 的值，让它满足我们的要求。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>for it in range(opt_steps): ...</code></li>
+<li><strong>解释</strong>:<ol>
+<li><strong>Forward (前向传播)</strong>: 带着 <code>delta</code> 跑一遍模型。</li>
+<li><strong>计算 Loss (损失函数)</strong>: 我们有三个目标，合成了总 Loss：<ul>
+<li><strong>NLL Loss (负对数似然)</strong>: 也就是 <code>nll_loss</code>。目标是让模型在 <code>rewriting_prompts</code> 下，预测出新目标（如 "Rome"）的概率最大化。</li>
+<li><strong>KL Loss</strong>: 也就是 <code>kl_loss</code>。目标是让模型在 <code>kl_prompts</code> 下的输出分布，跟没修改前（<code>kl_distr_init</code>）尽可能一致。这叫“保留通用能力”。</li>
+<li><strong>Weight Decay</strong>: 也就是 <code>weight_decay</code>。限制 <code>delta</code> 不要变得太大，防止数值爆炸。</li>
+</ul>
+</li>
+<li><strong>Backward (反向传播)</strong>: <code>loss.backward()</code>，计算梯度。</li>
+<li><strong>Update</strong>: <code>opt.step()</code>，更新 <code>delta</code>。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 6: 约束与输出 (Projection &amp; Return)</h4>
+<p>优化完成后，做最后的检查和打包。</p>
+<ul>
+<li><strong>代码位置</strong>: 循环结束后。</li>
+<li><strong>解释</strong>:<ul>
+<li><strong>Project (投影)</strong>: 如果 <code>delta</code> 的模长（Norm）太大，把它强行缩放回一个合理的范围（L2 ball）。这是为了保证修改的稳定性。</li>
+<li><strong>Result</strong>: 最终的理想向量 $Z = \text{Target} = \text{Target}_{init} + \delta$。</li>
+<li><strong>返回值</strong>: 返回这个 Target 向量。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底在干嘛？</h3>
+<p>想象你在教一个学生（模型）。
+1.  <strong>Task 1-3</strong>: 你准备了一道题：“埃菲尔铁塔在哪？”，并告诉他标准答案是“罗马”（虽然是错的，但你要强行植入这个记忆）。
+2.  <strong>Task 4</strong>: 你在他的脑神经（第 <code>layer</code> 层）里接了一根电线（<code>delta</code>）。
+3.  <strong>Task 5</strong>: 你不断调节这根电线的电压（优化 <code>delta</code>），直到：
+    *   他能大声回答“罗马”（NLL Loss 低）。
+    *   但他还能正常造句，不会变成傻子（KL Loss 低）。
+    *   电压不要太高把脑子烧了（Weight Decay）。
+4.  <strong>Task 6</strong>: 调节完毕，你记录下这根电线最终的电压状态，这就是我们要的 <strong>Z 向量</strong>。</p>
+<p>后续的算法步骤（不在本文件中）会利用这个 Z 向量去更新模型的权重矩阵（Weights），从而永久固化这个修改。</p>

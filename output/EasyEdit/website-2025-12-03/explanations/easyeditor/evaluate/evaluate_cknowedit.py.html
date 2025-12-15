@@ -1,0 +1,77 @@
+<h1>easyeditor/evaluate/evaluate_cknowedit.py</h1>
+<p>这份代码其实是一个<strong>自动阅卷脚本</strong>。</p>
+<p>它的场景通常是：你跑了一个大模型知识编辑（Knowledge Editing）的实验，生成了一个结果文件（JSON格式），然后把这个文件丢给这个脚本，脚本会检查格式对不对，然后根据你生成的答案质量给你打分。</p>
+<p>为了让你更容易理解，我把它想象成一个<strong>阅卷老师</strong>的工作流程，列一个 <strong>To-Do List</strong>：</p>
+<h3>阅卷老师的任务清单 (Task List)</h3>
+<h4>Phase 1: 考前准备 (初始化与读取)</h4>
+<ol>
+<li><strong>[读取指令]</strong>: 脚本启动时，先读取命令行传进来的参数（告诉脚本“考卷”在哪里，“成绩单”要写到哪里）。</li>
+<li><strong>[加载工具]</strong>: 准备好打分需要的“尺子”和“参考书”，比如 <code>Rouge</code>（文本重合度计算工具）、<code>BLEU</code>（翻译质量常用指标）、<code>SentenceTransformer</code>（计算句子语义相似度的模型）。</li>
+</ol>
+<h4>Phase 2: 资格审查 (格式检查 <code>check_format</code>)</h4>
+<p>在正式看内容之前，先看卷面合不合格。如果这一步挂了，直接给0分并报错。
+1.  <strong>[检查数据量]</strong>: 打开你的提交文件，检查里面的题目数量是否太少（<code>len &lt; 3</code> 就会报错 <code>DatasizeError</code>）。
+2.  <strong>[检查试卷结构]</strong>: 检查每一道题是不是包含了必要的字段（<code>sample_format</code> 函数）。
+    *   必须包含：<code>pre</code>（编辑前）, <code>case_id</code>（题目ID）, <code>requested_rewrite</code>（要求编辑的内容）, <code>post</code>（编辑后生成的答案）。
+    *   <code>post</code> 里面必须包含：<code>rewrite_ans</code>（编辑回答）, <code>rephrase_ans</code>（重述回答）, <code>locality_ans</code>（无关知识回答）, <code>portability_ans</code>（迁移性回答）, <code>fluency</code>（流畅度）。
+3.  <strong>[检查题目顺序]</strong>: 检查 <code>case_id</code> 是不是连号的（1, 2, 3...），防止你漏题或乱序。</p>
+<h4>Phase 3: 正式阅卷 (计算分数 <code>eval_score</code>)</h4>
+<p>如果格式没问题，开始针对四个维度进行打分。打分的核心函数是 <code>compute_acc</code>（计算生成文本和标准答案的相似度）。</p>
+<ol>
+<li>
+<p><strong>[维度一：编辑准确性 (Edit_acc)]</strong>:</p>
+<ul>
+<li><strong>任务</strong>: 检查模型是否成功把旧知识修改成了新知识。</li>
+<li><strong>动作</strong>: 对比你的 <code>rewrite_ans</code> 和标准答案 <code>target_new</code>。</li>
+<li><strong>算法</strong>: 结合 ROUGE-L（字面重合度）和 Bert Score（语义相似度）算出得分。</li>
+</ul>
+</li>
+<li>
+<p><strong>[维度二：迁移性 (Portability)]</strong>:</p>
+<ul>
+<li><strong>任务</strong>: 检查模型是否能举一反三。比如把“美国总统”改成“特朗普”，问“白宫现在住谁”，模型也得答“特朗普”。</li>
+<li><strong>动作</strong>: 对比你的 <code>portability_ans</code> 和标准答案。</li>
+<li><strong>算法</strong>: 同上，计算语义相似度。</li>
+</ul>
+</li>
+<li>
+<p><strong>[维度三：局部性/非相关性 (Locality)]</strong>:</p>
+<ul>
+<li><strong>任务</strong>: 检查模型有没有“改坏了”。比如改了“美国总统”，问“法国总统是谁”应该保持不变，不能乱改。</li>
+<li><strong>动作</strong>: 对比你的 <code>locality_ans</code> 和标准答案（通常是原始事实）。</li>
+<li><strong>算法</strong>: 同上，计算语义相似度。</li>
+</ul>
+</li>
+<li>
+<p><strong>[维度四：流畅性 (Fluency)]</strong>:</p>
+<ul>
+<li><strong>任务</strong>: 检查生成的句子通不通顺。</li>
+<li><strong>动作</strong>: 直接读取你文件中计算好的 <code>ngram_entropy</code>（熵值），熵越低通常意味着越重复或不自然，这里代码逻辑是取平均值并乘以10。</li>
+</ul>
+</li>
+</ol>
+<h4>Phase 4: 算出总分 (写成绩单 <code>report_score</code>)</h4>
+<ol>
+<li>
+<p><strong>[加权计算]</strong>: 根据重要程度，把上面四个维度的分数加权求和。</p>
+<ul>
+<li><strong>公式</strong>:
+    $$总分 = 编辑准确性 \times 0.2 + 迁移性 \times 0.35 + 局部性 \times 0.35 + 流畅性 \times 0.1$$</li>
+<li><em>注意：这里迁移性和局部性的权重最高（各35%），说明这个评测非常看重模型改完知识后的副作用控制和推理能力。</em></li>
+</ul>
+</li>
+<li>
+<p><strong>[输出结果]</strong>: 把最终分数、各单项分数写入到输出的 JSON 文件中，并标记 <code>success: True</code>。</p>
+</li>
+</ol>
+<hr />
+<h3>补充解释：核心打分函数 <code>compute_acc</code> 怎么算的？</h3>
+<p>代码里有一个通用的打分函数 <code>compute_acc</code>，它并没有只用一种标准，而是：
+1.  <strong>算 BLEU</strong>: 传统的机器翻译指标。
+2.  <strong>算 ROUGE (1, 2, L)</strong>: 也就是看你的答案和标准答案有多少词是重叠的。
+3.  <strong>算 Bert Score</strong>: 用 <code>paraphrase-multilingual-MiniLM-L12-v2</code> 这个模型把句子变成向量，算余弦相似度。这比单纯看词重叠更高级，能看懂“意思是否一样”。</p>
+<p><strong>最终该函数返回的 <code>final_score</code> 是：</strong>
+$$ (ROUGE\text{-}L + BertScore) / 2 \times 100 $$
+也就是取了“字面相似度”和“语义相似度”的平均值。</p>
+<h3>总结</h3>
+<p>这段代码就是一个<strong>严格的判卷机器</strong>。它先看你卷面整不整洁（格式检查），然后从四个角度（改对没、能不能推理、有没有改坏别的地方、话说得溜不溜）去对比你的答案和标准答案，最后加权算出一个总分。</p>

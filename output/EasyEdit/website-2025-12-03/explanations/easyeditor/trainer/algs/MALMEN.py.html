@@ -1,0 +1,104 @@
+<h1>easyeditor/trainer/algs/MALMEN.py</h1>
+<p>这份代码确实比较晦涩，因为它涉及到了<strong>元学习（Meta-Learning）</strong>和<strong>超网络（Hypernetwork）</strong>的概念。</p>
+<p>简单来说，MALMEN 不是直接训练大模型（LLM），而是<strong>训练一个小模型（Hypernetwork），让这个小模型去“预测”大模型应该怎么修改参数</strong>。</p>
+<p>这就好比：你不是自己去修车，而是训练了一个“修理机器人”。你只要告诉机器人哪里坏了，机器人就会自动算出该拧哪个螺丝、拧几圈。</p>
+<p>下面我为你列一个 <strong>Task To-Do List</strong>，通过这个清单，结合代码一步步给你拆解它的工作流程。</p>
+<hr />
+<h3>📝 MALMEN 的工作流程 To-Do List</h3>
+<p>在这个脚本中，<code>train</code> 函数是总指挥。每一次训练迭代，实际上是在执行以下任务：</p>
+<ol>
+<li><strong>[准备阶段]</strong>：冻结大模型，准备好那个负责修改参数的“修理工”（即 Hypernetwork <code>self.net</code>）。</li>
+<li><strong>[诊断] (Cache)</strong>：把要修改的数据输入大模型，观察大模型内部的反应（获取 Key 和 Value 梯度）。</li>
+<li><strong>[开处方] (Predict Shift)</strong>：让“修理工”根据诊断结果，计算出大模型的参数应该增加或减少多少（<code>param_shifts</code>）。</li>
+<li><strong>[试手术] (Edit Model)</strong>：把计算出的参数增量应用到大模型上（暂时修改）。</li>
+<li><strong>[复查] (Compute Loss)</strong>：<ul>
+<li><strong>编辑成功率</strong>：检查修改后的模型是否记住了新知识？</li>
+<li><strong>副作用检查</strong>：检查修改后的模型是否把旧知识搞乱了？（Locality Loss）。</li>
+</ul>
+</li>
+<li><strong>[撤销手术]</strong>：为了计算梯度，先把大模型恢复原状（或者在反向传播后恢复）。</li>
+<li><strong>[培训修理工] (Update Hypernet)</strong>：根据刚才“复查”的结果，去更新“修理工”的脑子，让它下次算得更准。</li>
+</ol>
+<hr />
+<h3>🔍 详细代码拆解</h3>
+<h4>1. 初始化 (<code>__init__</code>)：招聘修理工</h4>
+<p>代码开头部分。
+*   <strong>动作</strong>：
+    *   <code>self.model</code>: 加载你的大模型（如 Llama, GPT）。
+    *   <code>param.requires_grad = False</code>: <strong>重点！</strong> 把大模型锁死，不让它直接更新参数。
+    *   <code>self.net</code>: 初始化 <code>MALMENNet</code>。这就是那个<strong>“修理工”</strong>（超网络）。只有它的参数是 <code>requires_grad=True</code>，我们需要训练的是它。</p>
+<h4>2. 诊断阶段 (<code>cache</code> 函数)</h4>
+<p>对应代码中的 <code>module_kv_map = self.cache(batch_dv["edit_inner"])</code>。</p>
+<ul>
+<li><strong>目的</strong>：确定大模型里哪些神经元被激活了，以及如果要改变输出，这些神经元应该怎么变。</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li>把编辑样本（比如“谁是美国总统？-&gt; 奥巴马”）输入模型。</li>
+<li><code>TracerDict</code>: 这是一个钩子工具，它像听诊器一样，把大模型特定层（<code>config.inner_params</code>）的输入（Keys）和关于Loss的梯度（Values）记录下来。</li>
+<li><strong>人话</strong>：通过这一步，我们拿到了“病灶”的位置（Keys）和修改方向的线索（Values）。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 开处方阶段 (<code>predict_param_shifts</code> 函数)</h4>
+<p>对应代码中的 <code>param_shifts = self.predict_param_shifts(module_kv_map)</code>。</p>
+<ul>
+<li><strong>目的</strong>：计算参数修改量 $\Delta W$。</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li>它从 <code>module_kv_map</code> 拿到刚才的 Keys 和 Values。</li>
+<li>把这些数据喂给 <code>self.net</code>（那个修理工小网络）。</li>
+<li><code>torch.linalg.solve</code>: 这里用了一个数学公式（最小二乘法的变体）来求解参数变化量。</li>
+<li><strong>结果</strong>：输出 <code>param_shifts</code>，这是一个字典，告诉大模型：“第3层的权重矩阵，请加上这个矩阵；第5层的权重，请减去那个矩阵”。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 试手术与复查 (<code>train</code> 函数的核心循环)</h4>
+<p>这是 <code>train</code> 函数中间最长的那一段。</p>
+<ul>
+<li>
+<p><strong>第一步：应用修改</strong>
+    <code>python
+    self.edit_model(param_shifts, False) 
+    # False 表示不是反向操作，是正向加上去</code>
+    现在，内存里的 LLM 已经被临时修改了。</p>
+</li>
+<li>
+<p><strong>第二步：检查编辑效果 (Gen Loss)</strong>
+    <code>python
+    logits = self.model(...) # 用修改后的模型跑一遍
+    loss = cross_entropy(...) # 看看是不是学会了新知识
+    loss.backward() # 计算梯度</code></p>
+</li>
+<li>
+<p><strong>第三步：撤销修改 (为了下一步计算)</strong>
+    <code>python
+    self.edit_model(param_shifts, True) 
+    # True 表示 is_reverse，把刚才加的权重减回去，恢复原样</code>
+    <em>注意：代码里为了节省显存或逻辑需要，可能会在计算 Locality Loss 之前反复进行“修改-撤销”的操作。</em></p>
+</li>
+<li>
+<p><strong>第四步：检查副作用 (Loc Loss)</strong>
+    代码逻辑是：先算一个原始模型的输出 <code>refer_logits</code>，然后应用修改，再算一个新输出 <code>logits</code>。
+    <code>python
+    loss = kl_div(refer_logits, logits, ...)</code>
+    我们希望修改后的模型，在无关问题上的回答（Locality）和修改前越像越好（KL 散度越小越好）。</p>
+</li>
+</ul>
+<h4>5. 培训修理工 (<code>update_hypernet</code> 函数)</h4>
+<p>这是最难懂的部分，涉及元梯度的更新。</p>
+<ul>
+<li><strong>目的</strong>：我们刚才算出了 <code>gen_loss</code> 和 <code>loc_loss</code>。但我们不能直接去改大模型。我们需要利用这些 Loss 的梯度，去更新 <code>self.net</code>（修理工）。</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li><code>module_grad</code>: 获取大模型权重的梯度。这代表“如果直接改大模型，应该怎么改”。</li>
+<li>但是我们不能直接改大模型，我们要问：<strong>“修理工 self.net 刚才预测的 param_shifts 离完美答案差多少？”</strong></li>
+<li>通过一系列复杂的矩阵运算（链式法则），把大模型的梯度回传给 <code>self.net</code> 的参数（包括 <code>lamda</code> 和内部网络参数）。</li>
+<li><code>self.opt.step()</code>: 更新 <code>self.net</code> 的权重。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这篇代码讲的是一个叫 <strong>MALMEN</strong> 的算法。</p>
+<p><strong>一句话总结：</strong>
+它不直接训练大模型，而是观察大模型对数据的反应（Cache），然后让一个辅助网络（Hypernetwork）计算出一组参数增量（Predict），把增量加上去（Edit），看看效果好不好，最后根据效果去优化那个辅助网络（Update Hypernet）。</p>
+<p><strong>你的学习路线建议：</strong>
+1.  先看 <code>train</code> 函数，理清 <code>cache</code> -&gt; <code>predict</code> -&gt; <code>edit</code> -&gt; <code>loss</code> -&gt; <code>update</code> 这个大循环。
+2.  忽略数学细节（比如 <code>torch.linalg.solve</code> 里的具体公式），只需知道它是为了算出一个“最佳修改量”。
+3.  重点理解 <code>EditableModel</code> 的概念：模型是可以随时被“热更新”参数的。</p>

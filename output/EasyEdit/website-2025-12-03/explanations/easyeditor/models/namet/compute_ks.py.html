@@ -1,0 +1,100 @@
+<h1>easyeditor/models/namet/compute_ks.py</h1>
+<p>这段代码看起来确实比较抽象，因为它涉及到了<strong>大模型编辑（Model Editing）</strong>的核心逻辑，特别是类似于 ROME 或 MEMIT 算法中的<strong>计算 Key 向量</strong>的过程。</p>
+<p>简单来说，这段代码的目标是：<strong>找出模型在看到特定“主语”（比如“埃隆·马斯克”）时，神经元会产生什么样的激活反应。</strong> 为了让这个反应更准确、更通用，它用了多种不同的句子模板去“测试”模型，最后取平均值。</p>
+<p>为了让你更容易理解，我把这段代码做的事情拆解成一个 <strong>“任务清单 (To-Do List)”</strong>，我们一步步来打勾完成。</p>
+<hr />
+<h3>📝 任务清单：计算 $k$ (Compute Keys) 的全过程</h3>
+<h4>✅ 任务 1：准备素材（数据膨胀）</h4>
+<p><strong>目标</strong>：要把只有一条的“原始请求”，变成几十条“测试句子”。
+<strong>代码对应</strong>：<code>all_temps</code> 和 <code>trigger_words</code> 的生成部分。</p>
+<ul>
+<li><strong>原来的情况</strong>：你只有一个请求，比如 <code>{"subject": "Steve Jobs", "prompt": "Steve Jobs is the founder of"}</code>。</li>
+<li><strong>代码的思考</strong>：只测这一句话太片面了。我们要用很多不同的模板把“Steve Jobs”包起来，比如：<ul>
+<li>"Tell me about <strong>Steve Jobs</strong>."</li>
+<li>"Who is <strong>Steve Jobs</strong>?"</li>
+<li>"<strong>Steve Jobs</strong> is known for..."</li>
+</ul>
+</li>
+<li><strong>执行动作</strong>：代码把所有的 <code>requests</code> 和所有的 <code>context_templates</code>（上下文模板）进行排列组合。<ul>
+<li><code>all_temps</code> 变成了包含几十个句子的列表。</li>
+<li><code>trigger_words</code> 变成了对应的几十个主语（都是 "Steve Jobs"）。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ 任务 2：捕捉大脑信号（获取激活值）</h4>
+<p><strong>目标</strong>：把这些句子喂给模型，看看模型在读到“主语”那一瞬间，指定层的神经元在想什么。
+<strong>代码对应</strong>：<code>get_module_input_output_at_words(...)</code>。</p>
+<ul>
+<li><strong>执行动作</strong>：<ol>
+<li>运行模型（Forward pass）。</li>
+<li>定位到你指定的 <code>layer</code>（比如第 5 层）。</li>
+<li>定位到 <code>trigger_words</code>（比如 "Steve Jobs"）对应的 Token 位置。</li>
+<li><strong>截获</strong>该位置的输入向量（这就是我们要的 $k$，即 Key）。</li>
+</ol>
+</li>
+<li><strong>结果</strong>：得到了 <code>layer_ks</code>。这是一个巨大的张量（Tensor），里面存了所有测试句子的神经元激活数值。</li>
+</ul>
+<h4>✅ 任务 3：分组归类（处理变长模板）</h4>
+<p><strong>目标</strong>：搞清楚哪些测试句子属于同一组，方便后面取平均。
+<strong>代码对应</strong>：<code>context_type_lens</code> 和 <code>context_type_csum</code>。</p>
+<ul>
+<li><strong>背景</strong>：我们的模板可能有多种类型。比如“维基百科风格”有 5 句，“对话风格”有 3 句。</li>
+<li><strong>执行动作</strong>：<ul>
+<li>计算每种类型的模板有多少个 (<code>context_type_lens</code>)。</li>
+<li>计算累加和 (<code>np.cumsum</code>)，相当于划定“起止分界线”，告诉程序第 0-5 句是一组，第 6-8 句是下一组。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ 任务 4：去噪求平均（核心计算）</h4>
+<p><strong>目标</strong>：单个句子的信号可能有噪声，我们要通过“两层平均”来提取最稳健的特征。
+<strong>代码对应</strong>：双重 <code>for</code> 循环和 <code>.mean(0)</code>。</p>
+<ul>
+<li>
+<p><strong>第一层循环 (遍历每个 Request)</strong>：</p>
+<ul>
+<li>代码：<code>for i in range(0, layer_ks.size(0), context_len):</code></li>
+<li>解释：一次处理一个知识点（比如先处理 Steve Jobs，处理完再处理 Elon Musk）。</li>
+</ul>
+</li>
+<li>
+<p><strong>第二层循环 (组内平均)</strong>：</p>
+<ul>
+<li>代码：<code>tmp.append(layer_ks[i + start : i + end].mean(0))</code></li>
+<li>解释：先把“维基百科风格”的那 5 个句子的向量取平均，得到一个代表向量；再把“对话风格”的那 3 个取平均。</li>
+<li><strong>为什么？</strong> 消除同一种语境下的细微措辞差异。</li>
+</ul>
+</li>
+<li>
+<p><strong>最后的合并 (组间平均)</strong>：</p>
+<ul>
+<li>代码：<code>ans.append(torch.stack(tmp, 0).mean(0))</code></li>
+<li>解释：现在手里有“维基百科风格代表向量”和“对话风格代表向量”，把它们再取一次平均。</li>
+<li><strong>为什么？</strong> 得到一个<strong>不论在什么语境下</strong>，模型代表这个主语的“终极特征向量”。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ 任务 5：打包发货</h4>
+<p><strong>目标</strong>：把计算好的最终向量堆叠起来返回。
+<strong>代码对应</strong>：<code>return torch.stack(ans, dim=0)</code></p>
+<ul>
+<li><strong>结果</strong>：返回一个张量，形状通常是 <code>[请求数量, 隐藏层维度]</code>。比如你有 4 个编辑请求，模型维度是 4096，返回的就是 <code>[4, 4096]</code>。</li>
+</ul>
+<hr />
+<h3>💡 总结：这段代码到底在干嘛？</h3>
+<p>打个比方：</p>
+<p>你想知道<strong>你的朋友小明</strong>长什么样（获取特征 $k$），以便给他画一张像（编辑模型）。</p>
+<ol>
+<li><strong>任务 1 (准备)</strong>：你不能只看他一张照片。你让他换不同的衣服、去不同的地方（套用不同的 Context Templates）。<ul>
+<li>场景A：穿西装在办公室（5张照片）</li>
+<li>场景B：穿运动服在球场（3张照片）</li>
+</ul>
+</li>
+<li><strong>任务 2 (捕捉)</strong>：你拿着相机咔咔拍照（运行模型获取 <code>layer_ks</code>）。</li>
+<li><strong>任务 4 (平均)</strong>：<ul>
+<li>先把“穿西装”的 5 张照片叠在一起取平均，得到“商务小明”的特征。</li>
+<li>再把“穿运动服”的 3 张照片叠在一起取平均，得到“运动小明”的特征。</li>
+<li>最后，把“商务小明”和“运动小明”再平均一下，得到<strong>最本质的“小明”特征</strong>。</li>
+</ul>
+</li>
+</ol>
+<p><strong>这段代码就是通过这种“多角度拍照 + 取平均”的方法，计算出模型心中对于那个“主语”最准确、最通用的认知向量（Key）。</strong></p>

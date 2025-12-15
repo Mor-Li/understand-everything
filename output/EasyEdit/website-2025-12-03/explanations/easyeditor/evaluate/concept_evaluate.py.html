@@ -1,0 +1,113 @@
+<h1>easyeditor/evaluate/concept_evaluate.py</h1>
+<p>这份代码的核心功能是<strong>“阅卷”</strong>。</p>
+<p>具体来说，当我们对一个大模型（LLM）进行“知识编辑”（比如强行让它记住“埃隆·马斯克是美国总统”这个错误知识，或者修正一个过时知识）之后，我们需要评估这次编辑的效果好不好。</p>
+<p>这段代码 <code>compute_concept_edit_quality</code> 就是用来生成这份“体检报告”的。</p>
+<p>为了让你更容易理解，我把它拆解成一个<strong>“任务清单 (Todo List)”</strong>，模拟一个老师检查学生（模型）是否学会了新知识的过程。</p>
+<hr />
+<h3>📋 任务清单：模型编辑效果评估流程</h3>
+<h4>1. 准备阶段：拿出考卷和标准答案</h4>
+<blockquote>
+<p><strong>代码对应：</strong> 函数开头的数据提取部分 (<code>target_new</code>, <code>ground_truth</code>, <code>PMT</code> 等)</p>
+</blockquote>
+<ul>
+<li><strong>Task:</strong> 确定我们要考什么。</li>
+<li><strong>解释:</strong><ul>
+<li><code>record</code>: 这是考题库。</li>
+<li><code>target_new</code>: 编辑后的新答案（比如“马斯克”）。</li>
+<li><code>ground_truth</code>: 原来的旧答案（比如“拜登”）。</li>
+<li><code>prompt</code>: 提问的问题（比如“谁是美国总统？”）。</li>
+<li><code>P</code>: 有时候需要给模型一些前缀提示（Prompt），这里也准备好。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 必做题：检查“死记硬背” (Rewrite Accuracy)</h4>
+<blockquote>
+<p><strong>代码对应：</strong> <code>compute_rewrite_or_rephrase_quality(..., rewrite_prompts, ...)</code></p>
+</blockquote>
+<ul>
+<li><strong>Task:</strong> 问模型刚才教它的原话，看它能不能答对。</li>
+<li><strong>解释:</strong><ul>
+<li>这是最基本的评估。如果我教了“A是B”，我直接问“A是啥？”，模型必须回答“B”。</li>
+<li>如果这一步都做不到，说明编辑完全失败。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 附加题：检查“融会贯通” (Concept Consistency)</h4>
+<blockquote>
+<p><strong>代码对应：</strong> <code>if test_concept_consistency: ... test_concept_gen(...)</code></p>
+</blockquote>
+<ul>
+<li><strong>Task:</strong> 让模型围绕这个新知识写一段话，看它是不是真的“信”了这个知识。</li>
+<li><strong>解释:</strong><ul>
+<li>这步是可选的。</li>
+<li>比如，模型虽然嘴上说“马斯克是总统”，但如果你让它写一篇关于白宫的新闻，它可能会露馅。</li>
+<li>这个测试就是让模型生成一段长文本 (<code>least_length_gen=40</code>)，看看它在自由发挥时是否还坚持这个新概念。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 变通题：检查“举一反三” (Rephrase Accuracy)</h4>
+<blockquote>
+<p><strong>代码对应：</strong> <code>if rephrase_prompts is not None: ... compute_rewrite_or_rephrase_quality(..., test_rephrase=True)</code></p>
+</blockquote>
+<ul>
+<li><strong>Task:</strong> 换个方式问同一个问题，看模型能不能答对。</li>
+<li><strong>解释:</strong><ul>
+<li>原问题：“谁是美国总统？” -&gt; 答案：“马斯克”。</li>
+<li><strong>Rephrase（重述）问题</strong>：“现在的白宫主人是谁？” 或者 “美利坚合众国的元首叫什么？”</li>
+<li>如果模型只能回答原问题，换个问法就不会了，说明它只是过拟合（死记硬背），没有真正理解概念。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 安全题：检查“副作用” (Locality)</h4>
+<blockquote>
+<p><strong>代码对应：</strong> <code>if 'locality' in record.keys() ... compute_locality_quality(...)</code></p>
+</blockquote>
+<ul>
+<li><strong>Task:</strong> 问一些完全无关的问题，确保模型没有变傻。</li>
+<li><strong>解释:</strong><ul>
+<li>我们修改了“美国总统”的知识，不能导致模型忘记“法国首都是巴黎”，也不能让它忘记“1+1=2”。</li>
+<li><code>Locality</code>（局部性）就是测试这些无关知识点的准确率。如果改了一个知识导致其他知识崩塌，那这个编辑方法也是失败的。</li>
+</ul>
+</li>
+</ul>
+<h4>6. 细节题：检查“具体实例” (Instance Change)</h4>
+<blockquote>
+<p><strong>代码对应：</strong> <code>if 'instance' in record.keys() ... test_instance_change(...)</code></p>
+</blockquote>
+<ul>
+<li><strong>Task:</strong> 检查特定个例的分类或属性是否发生了预期的变化。</li>
+<li><strong>解释:</strong><ul>
+<li>这通常用于<strong>概念编辑</strong>（Concept Editing）。</li>
+<li>比如，如果你把“狗”这个概念定义修改为“会飞的动物”。</li>
+<li>那么当你问“哈士奇会飞吗？”（这是一个 Instance），模型应该回答“Yes”。</li>
+<li>这个步骤就是检测这些具体的下级实例是否跟随上级概念发生了改变。</li>
+</ul>
+</li>
+</ul>
+<h4>7. 总结阶段：生成成绩单</h4>
+<blockquote>
+<p><strong>代码对应：</strong> <code>return ret</code></p>
+</blockquote>
+<ul>
+<li><strong>Task:</strong> 把上面所有测试的分数打包返回。</li>
+<li><strong>解释:</strong><ul>
+<li><code>ret</code> 字典里包含了：<ul>
+<li>改写成功率</li>
+<li>生成文本的一致性</li>
+<li>重述问题的成功率</li>
+<li>无关知识的保持率 (Locality)</li>
+<li>具体实例的变化情况 (Instance)</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结一下</h3>
+<p>这段代码就像是一个<strong>全方位的阅卷老师</strong>。当你的模型被“洗脑”或“修正”后，它通过以下四个维度来打分：</p>
+<ol>
+<li><strong>准不准</strong>（原题能不能答对？）</li>
+<li><strong>懂不懂</strong>（换个问法能不能答对？自由发挥会不会露馅？）</li>
+<li><strong>坏没坏</strong>（有没有把别的无关知识搞乱？）</li>
+<li><strong>细不细</strong>（具体的下级案例有没有跟着变？）</li>
+</ol>

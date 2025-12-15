@@ -1,0 +1,90 @@
+<h1>easyeditor/models/unke/compute_z.py</h1>
+<p>这份代码的核心目的是<strong>在一个特定的神经网络层中，寻找一个新的“特征向量”（Target Vector）</strong>。</p>
+<p>简单来说，它的逻辑是：<strong>“我不想改模型的所有参数，我只想算出：如果在这一层的这个位置，神经元的激活值变成什么样，模型就能吐出我想要的那个答案？”</strong></p>
+<p>为了让你听懂，我把这段代码拆解成一个 <strong>Task Todo List（任务清单）</strong>，我们一步步来完成这个任务。</p>
+<hr />
+<h3>任务清单：寻找“魔法向量” $z$</h3>
+<h4>Task 1: 准备原材料 (获取模型参数与数据处理)</h4>
+<p><strong>代码位置：</strong> 开头 ~ <code>lookup_idxs = ...</code></p>
+<ul>
+<li><strong>要做什么：</strong> 也就是备菜。我们需要拿到模型的“嘴巴”（输出层 LM Head）和“喉咙”（LayerNorm），以及把我们要教给模型的“问题”和“答案”切好（Tokenize）。</li>
+<li><strong>代码解读：</strong><ul>
+<li><code>lm_w, ln_f</code>: 获取模型最后的线性层和归一化层，后面算 Loss 要用。</li>
+<li><code>input_ids</code>: 把 <code>data["question"]</code> 和 <code>data["answer"]</code> 拼起来变成一串数字。</li>
+<li><code>rewriting_targets</code>: 这是一个掩码（Mask）。意思是：我们在训练时，只关心模型有没有学会“答案”部分，“问题”部分的预测对错我们不管（设为 -100）。</li>
+<li><code>lookup_idxs</code>: 关键点！这决定了我们要去修改<strong>哪一个 Token</strong> 的隐藏状态。通常是问题结束的那个位置。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 定义我们要优化的“变量” (初始化 Delta)</h4>
+<p><strong>代码位置：</strong> <code>delta = torch.zeros(...)</code></p>
+<ul>
+<li><strong>要做什么：</strong> 我们不是要训练模型权重（Weights），而是要训练一个<strong>增量向量（Delta）</strong>。</li>
+<li><strong>观点：</strong><ul>
+<li>这就好比：我不给原本的画（模型参数）重画，我只想给画贴一张便利贴（Delta）。</li>
+<li><code>delta</code> 被设为 <code>requires_grad=True</code>，说明它是我们接下来唯一要更新的东西。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 设置“拦截器” (定义 Hook 函数)</h4>
+<p><strong>代码位置：</strong> <code>def edit_output_fn(cur_out, cur_layer): ...</code></p>
+<ul>
+<li><strong>要做什么：</strong> 这是全篇最骚的操作。我们要定义一个函数，能在模型思考的过程中“插手”。</li>
+<li><strong>步骤分解：</strong><ol>
+<li>当模型运行到指定的层 (<code>layer</code>) 时，暂停一下。</li>
+<li><code>target_init = ...</code>: 记录下模型原本在这个位置的输出（原本的记忆）。</li>
+<li><code>cur_out ... += delta</code>: <strong>强行注入！</strong> 把我们正在训练的 <code>delta</code> 加到原本的输出上。</li>
+<li><strong>目的：</strong> 让模型以为这一层的输出就是 <code>原本值 + Delta</code>，然后继续往后传。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 4: 开始特训 (优化循环)</h4>
+<p><strong>代码位置：</strong> <code>for it in range(hparams.v_num_grad_steps): ...</code></p>
+<ul>
+<li><strong>要做什么：</strong> 通过反复尝试，找到那个最完美的 <code>delta</code>。</li>
+<li><strong>流程：</strong><ol>
+<li><strong>前向传播 (Forward)：</strong> 让模型读入问题。注意，这里用了 <code>nethook.TraceDict</code>，这会激活我们在 Task 3 里写的拦截器。模型此时使用的是“被篡改”的中间状态。</li>
+<li><strong>算分 (Compute Loss)：</strong><ul>
+<li><code>nll_loss</code>: 模型现在的输出，离标准答案（Answer）有多远？（越小越好）。</li>
+<li><code>weight_decay</code>: <code>delta</code> 不能太大，不能把原本的记忆改得面目全非。我们要找最小的修改量。（正则化）。</li>
+<li><code>loss = nll_loss + weight_decay</code>: 总分。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>Task 5: 反向传播与修正 (Backprop &amp; Project)</h4>
+<p><strong>代码位置：</strong> <code>loss.backward()</code> ~ <code>delta[...] = ...</code></p>
+<ul>
+<li><strong>要做什么：</strong> 根据刚才算的 Loss，告诉 <code>delta</code> 应该怎么变。</li>
+<li><strong>观点：</strong><ul>
+<li><code>opt.step()</code>: 更新 <code>delta</code> 的数值。</li>
+<li><strong>Project (投影限制)</strong>: <code>if delta.norm() &gt; max_norm ...</code>。<ul>
+<li>这是一个安全阀。如果算出来的 <code>delta</code> 太大（改动太剧烈），就强行把它按比例缩小。保证我们只是微调，而不是炸毁模型。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>Task 6: 交卷 (返回结果)</h4>
+<p><strong>代码位置：</strong> <code>target = target_init + delta</code></p>
+<ul>
+<li><strong>要做什么：</strong> 训练结束，把最终的混合体交出去。</li>
+<li><strong>结论：</strong><ul>
+<li>函数最后返回的是 <code>target</code>。</li>
+<li><code>target</code> = <code>模型原本在这个位置的反应</code> + <code>我们训练出来的微调量</code>。</li>
+<li><strong>意义：</strong> 这个 <code>target</code> 向量就是 UnKE 算法认为的“新知识的物理形态”。后续步骤（不在这个文件里）会想办法更新模型的参数，让模型以后不需要挂外挂，自己也能产生这个 <code>target</code> 向量。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结一下这段代码在干嘛</h3>
+<p><strong>一句话解释：</strong>
+这段代码在<strong>逆向工程</strong>一个完美的神经元激活状态。</p>
+<p><strong>通俗类比：</strong>
+*   <strong>模型</strong>是一个厨师。
+*   <strong>输入</strong>是食材（问题），<strong>输出</strong>是菜（答案）。
+*   现在厨师做出的菜不对（回答错误）。
+*   <strong>compute_z</strong> 的作用是：我不教厨师怎么切菜（不改前面层的参数），我直接跑到他炒菜的中间环节，试着往锅里加一勺<strong>特制调料（Delta）</strong>。
+*   我通过不断试吃（计算 Loss），调整这勺调料的配方。
+*   最后，我把这就着了完美调料的“半成品菜”（Target Vector）端出来，告诉系统：“以后这道菜在这个环节，就得是这个味道！”</p>

@@ -1,0 +1,119 @@
+<h1>easyeditor/models/mend/data_classes/fever.py</h1>
+<p>完全没问题。这段代码确实比较抽象，因为它涉及到<strong>大模型知识编辑（Model Editing）</strong>这个比较前沿且特殊的领域，特别是 MEND (Model Editor Networks with Gradient Decomposition) 这个算法。</p>
+<p>简单来说，这个文件的作用是：<strong>把原始数据（FEVER 事实核查数据集）转换成 MEND 算法训练时需要的特殊格式。</strong></p>
+<p>为了让你看懂，我制定了下面这个 <strong>Task List（学习清单）</strong>，我们将分 5 步来拆解它：</p>
+<h3>📋 学习清单 (Task List)</h3>
+<ol>
+<li><strong>宏观定位</strong>：搞清楚这个类 (<code>BinaryAugmentedKILT</code>) 到底是干嘛的？</li>
+<li><strong>数据准备 (<code>__init__</code>)</strong>：原始数据长什么样？我们在筛选什么？</li>
+<li><strong>单条样本处理 (<code>__getitem__</code>)</strong>：每一条数据包含哪些关键信息（原句、重述句、反事实标签）？</li>
+<li><strong>打包成批 (<code>collate_fn</code>)</strong>：怎么把一堆数据拼成一个 Batch？这里面藏着“编辑”的逻辑。</li>
+<li><strong>核心生成器 (<code>edit_generator</code>)</strong>：最终喂给模型的 4 个关键部分是什么？</li>
+</ol>
+<hr />
+<h3>Task 1: 宏观定位</h3>
+<p>首先，这个类叫 <code>BinaryAugmentedKILT</code>。
+*   <strong>Binary</strong>: 二分类任务。在 FEVER 数据集中，主要是判断一个声明是 <code>SUPPORTS</code>（支持/正确）还是 <code>REFUTES</code>（反驳/错误）。
+*   <strong>Augmented</strong>: 增强。意味着数据里不仅有原句，还有“重述句”（意思一样写法不一样）和“替代句”（意思相反）。
+*   <strong>KILT</strong>: 这是一个著名的知识密集型任务基准库。</p>
+<p><strong>总结</strong>：这个类的任务是<strong>加载数据，并模拟“修改模型记忆”的场景</strong>。比如：模型原本认为“地球是平的”，我们要教它“地球是圆的”，同时还要保证它能听懂“大地是圆球状的”（泛化），且不要忘记“月亮是圆的”（保持性）。</p>
+<hr />
+<h3>Task 2: 数据准备 (<code>__init__</code>)</h3>
+<p>看代码的 <code>__init__</code> 部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">with</span> <span class="n">jsonlines</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="n">data_path</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+    <span class="k">for</span> <span class="n">d</span> <span class="ow">in</span> <span class="n">f</span><span class="p">:</span>
+        <span class="c1"># 筛选条件：必须同时拥有“替代答案(alternatives)”和“重述句(filtered_rephrases)”</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">d</span><span class="p">[</span><span class="s2">&quot;alternatives&quot;</span><span class="p">])</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="n">d</span><span class="p">[</span><span class="s2">&quot;filtered_rephrases&quot;</span><span class="p">])</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">extract</span><span class="p">(</span><span class="n">d</span><span class="p">))</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：并不是所有数据都能用来训练“编辑”。</li>
+<li><strong>原因</strong>：为了训练模型编辑，我们需要三种东西：<ol>
+<li><strong>Input</strong>: 原始问题。</li>
+<li><strong>Rephrase</strong>: 同样意思的另一句话（用来测试编辑是否成功）。</li>
+<li><strong>Alternatives</strong>: 另一个可能的答案（通常用于生成需要修改成的“新目标”）。</li>
+</ol>
+</li>
+<li>如果一条数据缺胳膊少腿，直接丢弃。</li>
+</ul>
+<hr />
+<h3>Task 3: 单条样本处理 (<code>__getitem__</code>)</h3>
+<p>这是最关键的逻辑之一，看 <code>output</code> 里的字段：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 随机选一个重述句，比如原句是“小明喜欢苹果”，重述句是“苹果是小明喜欢的”</span>
+<span class="n">rephrase</span> <span class="o">=</span> <span class="n">random</span><span class="o">.</span><span class="n">choice</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">data</span><span class="p">[</span><span class="n">item</span><span class="p">][</span><span class="s2">&quot;filtered_rephrases&quot;</span><span class="p">])</span>
+
+<span class="n">output</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s2">&quot;src&quot;</span><span class="p">:</span> <span class="n">obj</span><span class="p">[</span><span class="s2">&quot;input&quot;</span><span class="p">],</span>      <span class="c1"># 原始输入</span>
+    <span class="s2">&quot;rephrase&quot;</span><span class="p">:</span> <span class="n">rephrase</span><span class="p">,</span>     <span class="c1"># 重述输入</span>
+    <span class="s2">&quot;pred&quot;</span><span class="p">:</span> <span class="o">...</span><span class="p">,</span>              <span class="c1"># 模型原本的预测结果</span>
+    <span class="s2">&quot;alt&quot;</span><span class="p">:</span> <span class="o">...</span><span class="p">,</span>               <span class="c1"># 备选答案（我们要把模型改成这个）</span>
+
+    <span class="c1"># 【重点】条件输入 (Condition Input)</span>
+    <span class="c1"># 格式：原预测 &gt;&gt; 目标预测 || 输入文本</span>
+    <span class="s2">&quot;cond_flip&quot;</span><span class="p">:</span> <span class="s2">&quot;</span><span class="si">{}</span><span class="s2"> &gt;&gt; </span><span class="si">{}</span><span class="s2"> || </span><span class="si">{}</span><span class="s2">&quot;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">obj</span><span class="p">[</span><span class="s2">&quot;prediction&quot;</span><span class="p">],</span> <span class="n">obj</span><span class="p">[</span><span class="s2">&quot;alternatives&quot;</span><span class="p">][</span><span class="mi">0</span><span class="p">],</span> <span class="n">obj</span><span class="p">[</span><span class="s2">&quot;input&quot;</span><span class="p">]),</span>
+    <span class="s2">&quot;cond_orig&quot;</span><span class="p">:</span> <span class="s2">&quot;</span><span class="si">{}</span><span class="s2"> &gt;&gt; </span><span class="si">{}</span><span class="s2"> || </span><span class="si">{}</span><span class="s2">&quot;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">obj</span><span class="p">[</span><span class="s2">&quot;prediction&quot;</span><span class="p">],</span> <span class="n">obj</span><span class="p">[</span><span class="s2">&quot;prediction&quot;</span><span class="p">],</span> <span class="n">obj</span><span class="p">[</span><span class="s2">&quot;input&quot;</span><span class="p">]),</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：MEND 算法是基于“条件”来编辑的。</li>
+<li><strong>解释</strong>：<ul>
+<li><code>cond_flip</code> (翻转条件): 告诉模型，“虽然你以前觉得是 A，但现在我要你针对这句话，把答案改成 B”。</li>
+<li><code>cond_orig</code> (保持条件): 告诉模型，“保持原样，原来是 A，现在还是 A”。</li>
+</ul>
+</li>
+<li>这一步把单纯的文本数据，构造成了<strong>“指令”</strong>。</li>
+</ul>
+<hr />
+<h3>Task 4: 打包成批 (<code>collate_fn</code>)</h3>
+<p>这一步把多条数据组合起来。这里有一个非常特殊的逻辑：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># batch 是一个列表，比如包含 10 条数据</span>
+<span class="c1"># 代码逻辑：前 9 条是用来保持记忆的(Locality)，最后 1 条是用来做编辑任务的(Edit)</span>
+
+<span class="n">src</span> <span class="o">=</span> <span class="p">[</span><span class="n">b</span><span class="p">[</span><span class="s2">&quot;src&quot;</span><span class="p">]</span> <span class="k">for</span> <span class="n">b</span> <span class="ow">in</span> <span class="n">batch</span><span class="p">]</span>
+<span class="c1"># 只有最后一条数据（编辑样本）需要重述句，用来测试编辑效果</span>
+<span class="n">rephrase</span> <span class="o">=</span> <span class="p">[</span><span class="n">batch</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">][</span><span class="s2">&quot;rephrase&quot;</span><span class="p">]]</span> 
+
+<span class="c1"># 50% 的概率决定这次训练是“修改记忆”还是“保持记忆”</span>
+<span class="n">flip_label</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">random</span><span class="o">.</span><span class="n">uniform</span><span class="p">()</span> <span class="o">&gt;</span> <span class="mf">0.5</span> 
+
+<span class="n">labels</span> <span class="o">=</span> <span class="p">[</span><span class="n">b</span><span class="p">[</span><span class="s2">&quot;label&quot;</span><span class="p">]</span> <span class="k">for</span> <span class="n">b</span> <span class="ow">in</span> <span class="n">batch</span><span class="p">]</span>
+<span class="c1"># 默认情况，最后一条的标签设为模型原本的预测（即不修改）</span>
+<span class="n">labels</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="n">predictions</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> 
+<span class="n">cond</span> <span class="o">=</span> <span class="p">[</span><span class="n">batch</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">][</span><span class="s2">&quot;cond_orig&quot;</span><span class="p">]]</span> <span class="c1"># 默认条件是“保持原样”</span>
+
+<span class="k">if</span> <span class="n">flip_label</span><span class="p">:</span>
+    <span class="c1"># 如果随机到了要翻转（编辑）：</span>
+    <span class="n">labels</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">=</span> <span class="n">batch</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">][</span><span class="s2">&quot;alt&quot;</span><span class="p">]</span>   <span class="c1"># 标签改成备选答案（新知识）</span>
+    <span class="n">cond</span> <span class="o">=</span> <span class="p">[</span><span class="n">batch</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">][</span><span class="s2">&quot;cond_flip&quot;</span><span class="p">]]</span> <span class="c1"># 条件改成“请翻转”的指令</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：训练 MEND 时，一个 Batch 里混合了“路人甲”（不需要修改的数据）和“主角”（需要修改的数据）。</li>
+<li><strong>解释</strong>：<ul>
+<li><strong>Locality (前 N-1 个)</strong>: 这些数据用来约束模型，不要改了某一个知识把其他知识都搞乱了。</li>
+<li><strong>Edit (第 N 个)</strong>: 这是本次训练的目标，要根据 <code>cond</code> 指令去修改参数。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 5: 核心生成器 (<code>edit_generator</code>)</h3>
+<p>这是最终给到 PyTorch 训练循环的数据结构。它调用了上面的 <code>collate_fn</code> 并把结果拆分为 4 个部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">batch</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s2">&quot;edit_inner&quot;</span><span class="p">:</span> <span class="n">edit_inner</span><span class="p">,</span> <span class="c1"># 用于计算梯度的编辑样本</span>
+    <span class="s2">&quot;edit_outer&quot;</span><span class="p">:</span> <span class="n">edit_outer</span><span class="p">,</span> <span class="c1"># 用于验证编辑效果的样本（通常是重述句）</span>
+    <span class="s2">&quot;loc&quot;</span><span class="p">:</span> <span class="n">loc</span><span class="p">,</span>               <span class="c1"># 局部性样本（不应该被改变的数据）</span>
+    <span class="s2">&quot;cond&quot;</span><span class="p">:</span> <span class="n">cond</span><span class="p">,</span>             <span class="c1"># 编辑指令（输入A，原预测B，新目标C）</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<ul>
+<li><strong>edit_inner</strong>: 比如“美国总统是谁？”，模型答“特朗普”，标签设为“拜登”。模型会基于这个计算怎么改参数。</li>
+<li><strong>edit_outer</strong>: 比如“白宫的主人是谁？”，标签也是“拜登”。模型改完参数后，用这个测一下，看它是不是真的学会了（泛化），而不是死记硬背了上一句话。</li>
+<li><strong>loc</strong>: 比如“法国首都是哪？”，标签“巴黎”。用来确保改了美国总统后，没有把法国首都搞错。</li>
+<li><strong>cond</strong>: MEND 网络的特殊输入，相当于一个“元指令”，指导模型如何利用梯度去更新权重。</li>
+</ul>
+<h3>总结</h3>
+<p>这个脚本在做的事情就是：
+<strong>“我想训练一个编辑器。我从数据堆里挑出一个倒霉蛋（第 N 个样本），随机决定是让它保持原样还是把它改成相反的结论。同时，我找了一堆陪练（前 N-1 个样本）来确保修改不会破坏其他记忆。最后我把这些数据打包好，分成了‘用来学的’、‘用来测的’、‘用来保持的’和‘指令’四份，喂给 MEND 模型。”</strong></p>

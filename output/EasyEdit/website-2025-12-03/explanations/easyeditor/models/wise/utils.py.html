@@ -1,0 +1,101 @@
+<h1>easyeditor/models/wise/utils.py</h1>
+<p>完全没问题。这个文件 <code>utils.py</code> 虽然看起来很乱，但它其实只做了一件事：<strong>为“模型编辑”（Model Editing）准备工具和数据</strong>。</p>
+<p>所谓的“模型编辑”，就是想办法修改大模型里的一条特定知识（比如把“美国总统是拜登”改成“美国总统是特朗普”），同时不破坏模型里的其他知识。</p>
+<p>为了让你读懂这个代码，我们可以把它想象成一个 <strong>“知识手术前的准备清单” (To-Do List)</strong>。</p>
+<p>我们将代码里的函数归类到下面这个清单的 4 个步骤中：</p>
+<hr />
+<h3>✅ Task 1: 准备手术工具（基础辅助函数）</h3>
+<p>在开始处理数据之前，我们需要一些像螺丝刀一样的小工具，用来定位和查找东西。</p>
+<ul>
+<li><strong><code>find_sublist_start_index(list1, list2)</code></strong><ul>
+<li><strong>任务</strong>：在一个长列表里找一个小列表的位置。</li>
+<li><strong>场景</strong>：比如句子是“埃隆马斯克是特斯拉的CEO”，我们要找到“埃隆马斯克”这几个字在整句话里的起始位置。这对后续精准“动手术”至关重要。</li>
+</ul>
+</li>
+<li><strong><code>parent_module(model, pname)</code></strong><ul>
+<li><strong>任务</strong>：根据名字找到模型里的具体某一层（Layer）。</li>
+<li><strong>场景</strong>：我们要修改模型的参数，得先顺藤摸瓜找到那个参数属于哪一层。</li>
+</ul>
+</li>
+<li><strong><code>uuid()</code> &amp; <code>ckpt_dir()</code></strong><ul>
+<li><strong>任务</strong>：生成唯一ID和创建文件夹。</li>
+<li><strong>场景</strong>：存存档用的，比较简单。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 检查病人身体状况（模型参数管理）</h3>
+<p>在修改模型之前，我们需要查看模型的参数（权重），看看哪些能改，哪些不能改。</p>
+<ul>
+<li><strong><code>get_params(model)</code> / <code>get_inner_params(...)</code> / <code>param_subset(...)</code></strong><ul>
+<li><strong>任务</strong>：把模型里的参数提取出来，或者提取特定名称的参数。</li>
+<li><strong>场景</strong>：把模型权重拿出来放到桌子上，准备计算梯度。</li>
+</ul>
+</li>
+<li><strong><code>print_trainable_parameters(model, ...)</code></strong><ul>
+<li><strong>任务</strong>：算一算有多少参数是我们要训练的，有多少是冻结不动的。</li>
+<li><strong>场景</strong>：模型编辑通常只改很少一部分参数（比如 0.1%），这个函数用来确认我们没有不小心把整个模型都重训了。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 准备手术台上的数据（核心：Tokenization &amp; Masking）</h3>
+<p><strong>这是整个文件中最重要、最复杂的部分。</strong> 模型看不懂文字和图片，我们要把它们转换成数字，并且标记出“哪里是我们要改的知识点”。</p>
+<ul>
+<li>
+<p><strong><code>tokenize(batch, tokenizer, ...)</code></strong> (处理纯文本)</p>
+<ul>
+<li><strong>第一步（拼接）</strong>：把用户的 Prompt（提示词）和 Target（目标回答）拼在一起。如果用了 Chat 模板（比如 Llama-2-chat），它会加上 <code>&lt;user&gt;</code> 等特殊标记。</li>
+<li><strong>第二步（转数字）</strong>：用 <code>tokenizer</code> 把文字变成 ID。</li>
+<li><strong>第三步（Label Masking）</strong>：计算 Loss 时，我们通常只关心模型生成的回答对不对，不关心问题。所以这里把“问题部分”的 label 设为 <code>-100</code>（意思是计算误差时忽略这部分）。</li>
+<li><strong>第四步（核心：Subject Masking）</strong>：<ul>
+<li><strong>逻辑</strong>：代码里不仅有 Prompt，还有一个 <code>loc_prompt</code> (Locality Prompt，即“主体/主语”)。比如句子是“巴黎是法国的首都”，Subject 就是“巴黎”。</li>
+<li><strong>操作</strong>：它循环遍历每一句话，找到 Subject 在句子中的位置（用到 Task 1 的查找函数）。</li>
+<li><strong>产出</strong>：生成两个面具（Mask）：<ul>
+<li><code>act_mask</code> (Activation Mask)：<strong>只标记 Subject</strong>（例如“巴黎”）。这可能是为了让模型在更新时，特别关注这个主体的激活值。</li>
+<li><code>deact_mask</code> (Deactivation Mask)：<strong>标记除了 Subject 以外的所有地方</strong>。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>总结</strong>：这个函数的目的是告诉模型：“嘿，这句话里‘巴黎’这个词是重点，我要对它做特殊处理”。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>multimodal_tokenize(...)</code></strong> (处理多模态：图+文)</p>
+<ul>
+<li><strong>任务</strong>：和上面一样，但是增加了图片（Image）或视频（Video）的处理。</li>
+<li><strong>逻辑</strong>：把图片塞进 Prompt 里，处理成多模态模型能懂的格式，然后同样去计算 <code>act_mask</code> 和 <code>deact_mask</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 术中监控与辅助（训练控制）</h3>
+<p>手术（训练）过程中，我们需要监控指标，决定什么时候停下来，或者给模型加点“麻醉剂”（上下文增强）。</p>
+<ul>
+<li><strong><code>EarlyStopMeter</code></strong><ul>
+<li><strong>任务</strong>：监控 Loss（误差）。</li>
+<li><strong>场景</strong>：如果 Loss 变得很小且不再下降了，就告诉程序“可以停了，编辑完成了”，防止过拟合。</li>
+</ul>
+</li>
+<li><strong><code>EditingMeanAct</code></strong><ul>
+<li><strong>任务</strong>：计算平均激活值。</li>
+<li><strong>场景</strong>：可能是用来统计编辑过程中神经元的活跃程度。</li>
+</ul>
+</li>
+<li><strong><code>get_context_templates(...)</code></strong><ul>
+<li><strong>任务</strong>：生成各种各样的前缀。</li>
+<li><strong>场景</strong>：为了让编辑后的知识更稳固，不仅要训练“巴黎是哪里？”，还要训练“<strong>我知道</strong>巴黎是哪里”、“<strong>因为</strong>巴黎是哪里”。这个函数利用模型自己生成一些前缀（比如 "I", "You", "Because"），用来做数据增强。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这篇代码在讲什么观点？</h3>
+<p>这篇代码本身不包含复杂的算法观点，但它<strong>透露了 WISE 这个模型编辑方法的核心逻辑</strong>：</p>
+<ol>
+<li><strong>精准定位</strong>：它非常在意<strong>Subject（主体）</strong>的位置。通过 <code>act_mask</code> 和 <code>deact_mask</code> 可以看出，WISE 方法试图把“关于主体的知识”和“句子里的其他信息”分离开来处理。</li>
+<li><strong>局部更新</strong>：它不想全量微调，而是想通过控制 mask，只更新与特定实体相关的激活模式。</li>
+<li><strong>多模态兼容</strong>：它不仅想改文字知识，还想改“看图说话”的能力（因为有 <code>multimodal_tokenize</code>）。</li>
+</ol>
+<p><strong>简单的一句话总结：</strong>
+这是一个<strong>数据加工厂</strong>，它把原始的“问题+答案+实体”，加工成模型训练需要的“数字ID+标签+实体位置面具”，顺便带了一些监控训练进度的仪表盘。</p>

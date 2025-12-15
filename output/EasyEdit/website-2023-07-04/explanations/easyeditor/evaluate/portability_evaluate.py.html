@@ -1,0 +1,103 @@
+<h1>easyeditor/evaluate/portability_evaluate.py</h1>
+<p>这份代码主要是在做大模型编辑（Model Editing）后的<strong>“迁移性评估”（Portability Evaluation）</strong>。</p>
+<p>简单来说，当我们教会模型一个新知识（比如“美国总统是拜登”）后，我们不仅希望它能回答“谁是美国总统？”，还希望它能回答相关的、稍作变形的问题（比如“拜登是哪个国家的总统？”）。这个代码就是在计算模型在这些<strong>相关问题</strong>上的回答准确率。</p>
+<p>为了让你听懂，我把这段代码执行的过程想象成给机器下达的一个 <strong>“阅卷任务清单” (Task To-Do List)</strong>。</p>
+<hr />
+<h3>阅卷任务清单 (Task To-Do List)</h3>
+<p>这段代码的逻辑就像老师在批改试卷，步骤如下：</p>
+<h4>✅ 任务 1：准备阅卷环境 (Setup)</h4>
+<ul>
+<li><strong>目标</strong>：拿到考生（模型）、题目（Prompt）、标准答案（Ground Truth）和考试规则。</li>
+<li><strong>代码对应</strong>：<code>compute_portability_quality</code> 函数的开头。</li>
+<li><strong>动作</strong>：<ol>
+<li>确认模型是谁（是 GPT 这种接龙型选手，还是 T5 这种翻译型选手？）。</li>
+<li>拿到题目（例如：“法国的首都是？”）。</li>
+<li>拿到正确答案（例如：“巴黎”）。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ 任务 2：根据考生类型选择考法 (Routing)</h4>
+<ul>
+<li><strong>目标</strong>：不同类型的模型，测试方法不一样。</li>
+<li><strong>代码对应</strong>：<code>if 't5' in model_name... elif 'gpt' in model_name...</code></li>
+<li><strong>分支 A（如果是 T5/Seq2Seq 模型）</strong>：<ul>
+<li>跳转到任务 3A。</li>
+</ul>
+</li>
+<li><strong>分支 B（如果是 GPT/Decoder-only 模型）</strong>：<ul>
+<li>跳转到任务 3B。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ 任务 3A：测试 T5 类模型 (Seq2Seq Evaluation)</h4>
+<ul>
+<li><strong>场景</strong>：这种模型像做翻译题，读完完整的问题，直接写出完整的答案。</li>
+<li><strong>代码对应</strong>：<code>test_seq2seq_batch_prediction_acc</code> 函数。</li>
+<li><strong>步骤</strong>：<ol>
+<li>把“问题”喂给模型的输入端（Encoder）。</li>
+<li>把“标准答案”喂给模型的输出端（Decoder）。</li>
+<li><strong>核心检查</strong>：模型生成的每一个词，是不是和标准答案一模一样？</li>
+<li><strong>打分</strong>：计算匹配的准确率。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ 任务 3B：测试 GPT 类模型 (Causal LM Evaluation)</h4>
+<ul>
+<li><strong>场景</strong>：这种模型像做“文字接龙”，它是一个字一个字往后猜的。</li>
+<li><strong>代码对应</strong>：<code>test_batch_prediction_acc</code> 函数。</li>
+<li><strong>难点</strong>：GPT 是一路生成的，我们需要一步步验证它是否“想”输出正确答案。</li>
+<li><strong>步骤</strong>：<ol>
+<li><strong>拆解答案</strong>：把标准答案（比如 " Paris"）拆成 token。</li>
+<li><strong>构建接龙序列</strong>：<ul>
+<li>第一次问：输入 "法国首都是？" -&gt; 看它下一词是否预测 " P"？</li>
+<li>第二次问：输入 "法国首都是？ P" -&gt; 看它下一词是否预测 "aris"？</li>
+</ul>
+</li>
+<li><strong>核心检查</strong>：看模型在每一步预测的概率最高的词，是不是标准答案里的下一个词。</li>
+<li><strong>打分</strong>：计算所有步骤预测正确的平均值。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ 任务 4：计算最终得分 (Final Calculation)</h4>
+<ul>
+<li><strong>目标</strong>：把刚才测出来的准确率打包。</li>
+<li><strong>代码对应</strong>：<code>compute_portability_quality</code> 的最后部分。</li>
+<li><strong>动作</strong>：<ul>
+<li>把准确率（probs）放进一个字典里，标签叫 <code>{key}_acc</code>。</li>
+<li>交卷（return）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>逐个函数详细解读（中文大白话）</h3>
+<p>现在你对流程有了概念，我们再看一眼具体的代码块是干嘛的：</p>
+<h4>1. <code>compute_portability_quality</code> (总指挥)</h4>
+<p>这是入口函数。
+*   它不干具体的活，只负责分流。
+*   如果是 GPT 类模型，它做了一个很骚的操作：<strong>手动构造输入列表</strong>。
+    <code>python
+    # 这一段是在把答案拆开，拼接到问题后面，为了做“接龙测试”
+    inp_prompts = [prompt + tok.decode(target_tok[:i]) ...]
+    inp_targets = [tok.decode(target_tok[i]) ...]</code>
+    意思就是：为了测 GPT，它把“问题+答案的前半截”作为输入，让 GPT 猜“答案的下一个字”。</p>
+<h4>2. <code>test_batch_prediction_acc</code> (GPT 类考官)</h4>
+<p>这是最难懂的部分，专门测 GPT、Llama 这种模型。
+*   <strong>数据准备</strong>：把文本转成 Tensor（数字张量）扔进 GPU。
+*   <strong>模型预测</strong>：<code>logits = model(**prompt_tok)</code>。拿到模型对下一个词的预测概率。
+*   <strong>提取答案</strong>：
+    *   代码里有一大段关于 <code>padding_side</code> 和 <code>torch.gather</code> 的逻辑。
+    *   <strong>人话解释</strong>：因为是批量（Batch）处理，有的句子长有的短，短的补了零（Padding）。这段代码在费劲地<strong>找到每个句子真正的“最后一个词”的位置</strong>，因为那是模型预测下一个词的地方。
+*   <strong>比对</strong>：<code>ans == correct_id</code>。模型猜的词（<code>ans</code>）和标准答案的词（<code>correct_id</code>）一样吗？
+*   <strong>返回</strong>：返回平均准确率。</p>
+<h4>3. <code>test_seq2seq_batch_prediction_acc</code> (T5 类考官)</h4>
+<p>这是测 T5、BART 这种模型的。
+*   逻辑简单很多。它显式地把 <code>prompt</code> 给 Encoder，把 <code>target</code> 给 Decoder。
+*   它检查模型 Decoder 输出的每一个 token 是否等于 Target 的 token。
+*   <code>trg_tok['input_ids'][:,:-1] == ans[:,:-1]</code>：这就行比对两个序列是否一致。</p>
+<h3>总结</h3>
+<p>这个文件的核心观点是：
+<strong>要评估一个模型（特别是编辑过的模型）在某个知识点上的迁移能力，最好的办法是看它在给定提示下，生成标准答案的概率（或准确率）有多高。</strong></p>
+<ul>
+<li>对于 GPT，看它能不能顺着问题一个字一个字把答案接出来。</li>
+<li>对于 T5，看它能不能把问题翻译成答案。</li>
+</ul>

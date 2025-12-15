@@ -1,0 +1,99 @@
+<h1>easyeditor/models/defer/DEFER.py</h1>
+<p>这份代码实现了一种叫做 <strong>DEFER</strong> 的模型编辑（Model Editing）算法。</p>
+<p>简单来说，它的核心思想是：<strong>不要直接修改大模型原本的参数（因为容易把模型改坏），而是给模型“打个补丁”。</strong> 这个补丁会检测输入，如果是需要修改的知识，就拦截下来自己处理；如果是其他知识，就放行让原模型处理。</p>
+<p>为了让你更容易理解，我把这份代码的逻辑拆解成一个 <strong>5步走的 Task List</strong>，我们一步一步来看。</p>
+<hr />
+<h3>📋 Task List: DEFER 算法执行流程</h3>
+<ol>
+<li><strong>准备阶段 (Setup)</strong>: 找到要动手术的层，冻结原模型，插入“拦截器”。</li>
+<li><strong>构造拦截器 (The Adaptor)</strong>: 定义两个小网络，一个负责“判断是否拦截”，一个负责“生成新答案”。</li>
+<li><strong>前向传播 (Forward)</strong>: 数据流经拦截器时的逻辑（这是核心）。</li>
+<li><strong>编辑训练 (Editing)</strong>: 针对特定知识，训练这两个小网络。</li>
+<li><strong>推理使用 (Inference)</strong>: 训练好后，如何使用它来回答问题。</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>Task 1: 准备阶段 (Setup)</h4>
+<p><strong>代码对应:</strong> <code>class DEFER</code> 的 <code>__init__</code> 方法。</p>
+<ul>
+<li><strong>目标</strong>: 既然我们要给模型打补丁，首先得选定在哪里打。通常选在 Transformer 的某一层（比如 MLP 层）。</li>
+<li><strong>操作</strong>:<ol>
+<li><strong>冻结参数</strong>: <code>p.requires_grad = False</code>。把原模型所有的参数都锁死，不许动。这样能保证原本的能力不丢失。</li>
+<li><strong>偷梁换柱</strong>: 代码里找到指定的层（<code>original_layer</code>），然后用一个自定义的类 <code>DeferAdaptor</code> 把这一层包裹起来，替换掉原本的层。</li>
+<li><em>代码证据</em>: <code>setattr(edit_module, layer_name, DeferAdaptor(...))</code>。这一步之后，数据流经这一层时，实际上流经的是我们的 <code>DeferAdaptor</code>。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 2: 构造拦截器 (The Adaptor)</h4>
+<p><strong>代码对应:</strong> <code>class DeferAdaptor</code> 的 <code>__init__</code> 方法。</p>
+<ul>
+<li><strong>目标</strong>: 这个“补丁”内部长什么样？它需要两个新部件。</li>
+<li><strong>部件 1 (门控/开关)</strong>: <code>self.defer = torch.nn.Linear(..., 1)</code>。<ul>
+<li>这是一个非常小的线性层。它的作用是给当前的输入打分。如果分数高，说明这个输入是我们“编辑过”的知识，需要拦截。</li>
+</ul>
+</li>
+<li><strong>部件 2 (新值预测)</strong>: <code>self.predict_values = torch.nn.Linear(...)</code>。<ul>
+<li>这是另一个小线性层。如果决定拦截，这个层负责输出新的结果（即修正后的知识）。</li>
+</ul>
+</li>
+<li><strong>原封不动</strong>: <code>self.original_layer = layer</code>。它还保留了原来的层，以便在不拦截时使用。</li>
+</ul>
+<h4>Task 3: 前向传播 (Forward) —— 核心逻辑</h4>
+<p><strong>代码对应:</strong> <code>class DeferAdaptor</code> 的 <code>forward</code> 方法。</p>
+<ul>
+<li><strong>场景</strong>: 当数据来到这一层时，会发生什么？</li>
+<li><strong>步骤</strong>:<ol>
+<li><strong>原路计算</strong>: <code>layer_out = self.original_layer(*args)</code>。先让原模型算一遍，得到原始输出。</li>
+<li><strong>计算开关</strong>: <code>defer = torch.sigmoid(self.defer(query))</code>。看一眼当前的输入（query），算出一个 0 到 1 之间的概率值。</li>
+<li><strong>计算新值</strong>: <code>values = self.predict_values(query)</code>。计算如果我们要修改，新结果该是什么。</li>
+</ol>
+</li>
+<li><strong>关键分支</strong>:<ul>
+<li><strong>如果是训练中 (Training)</strong>:<ul>
+<li>公式: <code>defer * values + (1-defer) * layer_out</code></li>
+<li>解释: 这是一个<strong>软混合</strong>。它同时保留新旧结果，按比例混合。为什么要这样？因为只有这样是连续可导的，才能用梯度下降法来更新参数。</li>
+</ul>
+</li>
+<li><strong>如果是使用中 (Inference/Not Training)</strong>:<ul>
+<li>公式: <code>torch.where((defer &gt;= self.threshold), values, layer_out)</code></li>
+<li>解释: 这是一个<strong>硬开关</strong>。如果 <code>defer</code> 分数超过阈值（比如0.5），直接丢弃原结果，完全使用新结果 <code>values</code>；否则完全使用原结果 <code>layer_out</code>。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 编辑训练 (Editing)</h4>
+<p><strong>代码对应:</strong> <code>class DEFER</code> 的 <code>edit</code> 方法。</p>
+<ul>
+<li><strong>目标</strong>: 用户给了一个新知识（比如“埃菲尔铁塔在柏林”——虽然是错的，但假设我们要让模型记住它），我们需要让模型学会这个。</li>
+<li><strong>操作</strong>:<ol>
+<li><strong>开启训练模式</strong>: 设置 <code>training=True</code>，解冻那两个小线性层。</li>
+<li><strong>跑循环 (Loop)</strong>:<ul>
+<li>把输入扔进模型。</li>
+<li>计算 Loss（让模型的输出接近目标“柏林”）。</li>
+<li><strong>反向传播 (Backward)</strong>: 这里的梯度只会更新 <code>defer</code> 层（让它学会对“埃菲尔铁塔”这个输入亮绿灯）和 <code>predict_values</code> 层（让它学会输出“柏林”对应的向量）。</li>
+<li>原模型的其他参数纹丝不动。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>Task 5: 推理使用 (Inference)</h4>
+<p><strong>代码对应:</strong> <code>class DEFER</code> 的 <code>generate</code> 方法 以及 <code>DeferAdaptor</code> 的 <code>forward</code> (else 分支)。</p>
+<ul>
+<li><strong>目标</strong>: 训练完了，现在测试一下。</li>
+<li><strong>操作</strong>:<ol>
+<li>设置 <code>training=False</code>。</li>
+<li>当遇到刚才编辑过的输入（埃菲尔铁塔）时，<code>defer</code> 层算出高分，触发阈值，模型直接输出 <code>predict_values</code> 的结果（柏林）。</li>
+<li>当遇到没见过的输入（比如“中国的首都是哪里”），<code>defer</code> 层算出低分，不触发阈值，模型直接输出 <code>original_layer</code> 的结果（北京），保持原有的智商。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结 (Summary)</h3>
+<p><strong>DEFER 这份代码讲的就是：</strong></p>
+<p>不要去动大模型原本复杂的脑神经（Weights），而是给它装一个<strong>外挂（Adaptor）</strong>。
+这个外挂有一个<strong>探测器（Defer layer）</strong>和一个<strong>新知识库（Predict Values layer）</strong>。
+*   探测器发现是“特例”时，就强行覆盖输出。
+*   探测器发现是“普通情况”时，就假装无事发生，让大模型按原样输出。</p>
+<p>这就是为什么它叫 <strong>DEFER (推迟/顺延/遵从)</strong> —— 实际上它是指根据情况决定是遵从原模型，还是遵从新插入的补丁。</p>

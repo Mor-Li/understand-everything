@@ -1,0 +1,111 @@
+<h1>easyeditor/models/rome/compute_v.py</h1>
+<p>这份代码 <code>compute_v.py</code> 是 ROME (Rank-One Model Editing) 算法的核心部分之一。</p>
+<p>简单来说，ROME 试图通过修改模型中某一层（Layer）的一个神经元矩阵，把旧知识（比如“埃菲尔铁塔在<strong>巴黎</strong>”）改成新知识（比如“埃菲尔铁塔在<strong>罗马</strong>”）。</p>
+<p>要做到这一点，算法需要知道两个向量：
+1.  <strong>$k$ (Key)</strong>:  代表“埃菲尔铁塔”这个主语在模型里的特征（在这个文件里叫 <code>left_vector</code>，是作为参数传进来的）。
+2.  <strong>$v$ (Value)</strong>: 代表模型看到主语后，应该输出什么信号才能让最终结果变成“罗马”。</p>
+<p><strong>这个文件的任务就是：计算出这个 $v$ 向量（即代码里的 <code>right_vector</code>）。</strong></p>
+<p>为了让你听懂，我把这个过程拆解成一个 <strong>Task List (待办清单)</strong>，我们一步步看代码是怎么执行的：</p>
+<hr />
+<h3>✅ Task 1: 准备工作 (数据与Tokenizer)</h3>
+<p><strong>代码位置：</strong> 函数开头部分，<code>rewriting_prompts</code> 和 <code>input_tok</code> 定义处。</p>
+<ul>
+<li><strong>目标：</strong> 把人类语言变成机器能懂的数字 ID。</li>
+<li><strong>具体步骤：</strong><ol>
+<li>拿到用户输入的 Prompt（比如 "The Eiffel Tower is located in"）和新目标 Target（比如 "Rome"）。</li>
+<li><strong>构造两类句子</strong>：<ul>
+<li><strong>重写句 (Rewriting Prompts)</strong>: 用来教模型新知识的。例如 <code>["The Eiffel Tower is located in", "The Eiffel Tower is in"]</code> + "Rome"。</li>
+<li><strong>保持句 (KL Prompts)</strong>: 用来防止模型变傻的。例如 <code>["The Eiffel Tower is a"]</code>。我们希望修改后，模型对这些普通句子的预测分布不要变太乱（保持原样）。</li>
+</ul>
+</li>
+<li><strong>计算索引 (Lookup Indices)</strong>: 找到句子中“主语”（Subject，如 "Eiffel Tower"）最后一个 token 的位置。ROME 认为知识存储在主语的最后一个 token 对应的向量里。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 2: 设定优化目标 (Optimization Setup)</h3>
+<p><strong>代码位置：</strong> <code>delta = torch.zeros(...)</code> 和 <code>opt = torch.optim.Adam(...)</code>。</p>
+<ul>
+<li><strong>目标：</strong> 我们不知道直接算 $v$ 的公式是什么，所以我们决定用 <strong>“试错法”（优化）</strong> 来找。</li>
+<li><strong>具体步骤：</strong><ol>
+<li><strong>定义变量 $\delta$ (Delta)</strong>: 这是一个全零初始化的向量，它是<strong>可训练的</strong> (<code>requires_grad=True</code>)。</li>
+<li><strong>物理含义</strong>：$\delta$ 代表我们需要在“埃菲尔铁塔”这个位置的原始输出上，<strong>加上多少偏移量</strong>，才能迫使模型最终输出“罗马”。</li>
+<li><strong>目标向量 $v^*$</strong>: 最终我们想要的理想输出是 <code>target = 原始输出 + delta</code>。</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 3: 开启“试错”循环 (The Optimization Loop)</h3>
+<p><strong>代码位置：</strong> <code>for it in range(hparams.v_num_grad_steps):</code> 及其内部。</p>
+<p>这是整个文件最核心的部分。我们通过不断的循环来调整 $\delta$。</p>
+<ul>
+<li>
+<p><strong>Step 3.1: 前向传播 (Forward Pass)</strong></p>
+<ul>
+<li>把句子喂给模型。</li>
+<li><strong>关键操作 (Hook)</strong>: 在代码里的 <code>edit_output_fn</code>。当模型运行到指定的 Layer（比如第 5 层）处理到“主语”位置时，<strong>强行把 $\delta$ 加到当前的输出向量上</strong>。</li>
+<li>这就好比做脑科手术，在特定神经元那里注入了一剂电流（$\delta$）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.2: 计算损失 (Compute Loss)</strong></p>
+<ul>
+<li>我们需要衡量注入 $\delta$ 后效果好不好，由三部分组成：<ol>
+<li><strong>NLL Loss (改写成功率)</strong>: 模型现在预测下一个词是 "Rome" 的概率大吗？（越大越好，Loss 越小）。</li>
+<li><strong>KL Loss (副作用控制)</strong>: 对于那些“保持句”（如 "Eiffel Tower is a..."），模型的预测分布和修改前相比，变化大吗？（越小越好）。</li>
+<li><strong>Weight Decay (正则化)</strong>: $\delta$ 向量不要太大，太大了容易破坏模型稳定性。</li>
+</ol>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.3: 反向传播 (Backprop &amp; Update)</strong></p>
+<ul>
+<li>根据 Loss，计算梯度，告诉 $\delta$ 应该往哪个方向变。</li>
+<li><code>opt.step()</code>: 更新 $\delta$ 的数值。</li>
+<li><strong>投影 (Project)</strong>: 如果 $\delta$ 变得太长了，把它缩放一下（<code>clamp_norm_factor</code>），防止它无限膨胀。</li>
+</ul>
+</li>
+<li>
+<p><strong>结果：</strong> 循环结束后，我们找到了一个完美的 $\delta$，使得：<code>原始输出 + delta</code> $\approx$ <code>能让模型说出"罗马"的向量</code>。</p>
+</li>
+</ul>
+<h3>✅ Task 4: 计算最终的 $v$ 向量 (Solve for Right Vector)</h3>
+<p><strong>代码位置：</strong> 循环结束后的 <code>target = target_init + delta</code> 和 <code>right_vector = ...</code>。</p>
+<ul>
+<li><strong>目标：</strong> 现在我们知道了<strong>理想的输出</strong>应该是多少（即 <code>target</code>），我们需要反推，为了达到这个效果，我们要更新的权重矩阵 $v$ 应该是多少。</li>
+<li><strong>数学逻辑</strong>：<ol>
+<li>获取当前的输入 <code>cur_input</code> ($k$) 和当前的输出 <code>cur_output</code>。</li>
+<li>我们想要的新输出是 <code>target</code>。</li>
+<li>根据 ROME 的推导公式（基于最小二乘法的秩为1的更新），计算 <code>right_vector</code>。</li>
+<li><strong>代码公式</strong>：
+    <code>python
+    right_vector = (target - cur_output) / torch.dot(cur_input, left_vector)</code><ul>
+<li>这里 <code>left_vector</code> 是外部传进来的（通常是 $C^{-1}k$，即协方差矩阵逆乘以键向量）。</li>
+<li>这个公式本质上是在解线性方程，算出我们要把权重矩阵往哪个方向推，才能填补 <code>target</code> 和 <code>cur_output</code> 之间的差距。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h3>✅ Task 5: 返回结果</h3>
+<p><strong>代码位置：</strong> <code>return right_vector</code></p>
+<ul>
+<li><strong>总结：</strong> 函数把算出来的 <code>right_vector</code> 交给上级程序。上级程序会用这个向量去修改模型的权重矩阵 $W$，完成知识编辑。</li>
+</ul>
+<hr />
+<h3>总结一下这段代码在干嘛：</h3>
+<p>你把这段代码想象成一个 <strong>“神枪手校准器”</strong>：</p>
+<ol>
+<li><strong>目标</strong>：原本枪打在靶心左边（输出旧知识），现在想让它打在靶心右边（输出新知识）。</li>
+<li><strong>过程</strong>：<ul>
+<li>先不直接动枪（权重）。</li>
+<li>而是试着在子弹飞出枪口的瞬间吹一口气（加上 $\delta$）。</li>
+<li>不断调整吹气的力度和方向（优化循环），直到子弹精准命中新靶心，且不影响打其他靶子。</li>
+</ul>
+</li>
+<li><strong>收尾</strong>：<ul>
+<li>确定了这口气（$\delta$）该怎么吹之后。</li>
+<li>计算一下，为了达到“吹气”后的同等效果，我应该把枪管（权重 $v$）往哪里歪一点点。</li>
+<li>输出这个“歪枪管”的参数。</li>
+</ul>
+</li>
+</ol>

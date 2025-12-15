@@ -1,0 +1,93 @@
+<h1>steer/models/model_wrapper.py</h1>
+<p>这份代码是一个用于<strong>大模型（LLM）“转向”（Steering）和“干预”（Intervention）</strong>的底层框架。</p>
+<p>简单来说，它的作用是<strong>把大模型“切开”</strong>，在模型思考的过程中，实时地<strong>观察</strong>它的想法（Activations），并且<strong>修改</strong>它的想法，从而控制模型的输出行为（比如让它变得更诚实、更像某个角色，或者去除某种偏见）。</p>
+<p>为了让你读懂，我把理解这份代码的过程拆解成一个 <strong>5步走的 Task List</strong>，我们一步步来拆解：</p>
+<hr />
+<h3>📋 Task 1: 理解核心概念——什么是“Wrapper”（包装器）？</h3>
+<p><strong>观点：</strong>
+原本的模型像一个黑盒子，输入 <code>A</code>，直接出 <code>B</code>。我们没法在中间插手。
+这个文件的核心思想是<strong>“中间人攻击”</strong>。它不直接使用原始的 PyTorch 层，而是给每一层穿上一件“马甲”（Wrapper）。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>AttnWrapper</code>, <code>MLPWrapper</code></li>
+<li><strong>通俗解释：</strong><ul>
+<li><strong>原本：</strong> <code>Attention层(输入) = 输出</code></li>
+<li><strong>现在：</strong> <code>AttnWrapper</code> 接收输入 -&gt; 调用原本的 <code>Attention层</code> -&gt; <strong>把结果偷偷存下来 (<code>self.activations</code>)</strong> -&gt; <strong>甚至加上一点东西 (<code>add</code>)</strong> -&gt; 返回修改后的输出。</li>
+<li><strong>目的：</strong> 这样我们就可以在模型运行每一层时，偷看它的“脑电波”（激活值），或者给它“植入念头”（修改激活值）。</li>
+</ul>
+</li>
+</ul>
+<h3>📋 Task 2: 理解核心工人——<code>BlockOutputWrapper</code></h3>
+<p>这是整个文件最复杂的类，也是干活的主力。一个 Transformer 模型由很多层（Block）组成，这个类负责包装每一层。</p>
+<p><strong>观点：</strong>
+如果你想改变模型的走向，你必须拦截它的 <code>forward</code>（前向传播）过程。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>BlockOutputWrapper.forward</code> 函数</li>
+<li><strong>流程解析：</strong><ol>
+<li><strong>正常计算：</strong> <code>output = self.block(*args, **kwargs)</code> —— 先让原模型算出原本的结果。</li>
+<li><strong>偷看（Save）：</strong> <code>if self.save_activations: self.activations = output[0]</code> —— 把原本的思考结果存下来。</li>
+<li><strong>干预（Intervention - 重点）：</strong><ul>
+<li><strong>Activation Addition (加法干预):</strong> 代码里检查 <code>self.add_activations_dict</code>。如果有值，就调用 <code>add_vector_from_position</code>。</li>
+<li><em>意思是：</em> 在原本的思考结果上，加上一个特定的向量（Steering Vector）。比如加上一个代表“愤怒”的向量，模型接下来的输出就会带有愤怒的情绪。</li>
+<li><strong>Complex Intervention (复杂干预):</strong> 代码里检查 <code>self.intervention_dict</code>。这允许运行更复杂的自定义逻辑来修改输出。</li>
+</ul>
+</li>
+<li><strong>放行：</strong> 把修改后的结果 <code>output</code> 传给下一层。</li>
+</ol>
+</li>
+</ul>
+<h3>📋 Task 3: 理解总指挥——<code>BaseModelWrapper</code></h3>
+<p>有了上面的“工人”，我们需要一个“包工头”来组装整个模型。</p>
+<p><strong>观点：</strong>
+不同的模型（Llama, GPT, Qwen）结构不一样，我们需要一个统一的接口来管理它们。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>BaseModelWrapper</code> 及其子类 (<code>LlamaWrapper</code>, <code>GPTWrapper</code> 等)</li>
+<li><strong>主要任务：</strong><ol>
+<li><strong>加载模型：</strong> 支持 HuggingFace 模型或者 vLLM（一种加速推理库）。</li>
+<li><strong>狸猫换太子 (<code>_adapt_model_layers</code>)：</strong> 这是最关键的一步。它遍历模型原本的所有层，把它们替换成我们上面定义的 <code>BlockOutputWrapper</code>。<ul>
+<li><em>代码：</em> <code>self.model.model.layers[i] = BlockOutputWrapper(...)</code></li>
+</ul>
+</li>
+<li><strong>下达指令：</strong> 提供了 <code>set_add_activations</code> 和 <code>set_intervention</code> 方法。<ul>
+<li>用户调用这些方法，Wrapper 就会把干预向量塞到指定的层里去。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h3>📋 Task 4: 理解另一种干预方式——<code>LM Steer</code></h3>
+<p>除了在中间层修改，还有一种修改方式是直接改模型的<strong>最后一层</strong>（输出层）。</p>
+<p><strong>观点：</strong>
+有时候我们不改思考过程，而是改它“说话”的方式（Output Embeddings）。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>replace_final_layer</code> 方法</li>
+<li><strong>逻辑：</strong><ul>
+<li>它会冻结模型参数。</li>
+<li>把原本的 <code>lm_head</code>（负责把向量转成词的层）替换成一个自定义的 <code>Projected_Adaptor</code>（在 <code>steer</code> 变量里）。</li>
+<li>这允许在生成词汇概率之前，对输出向量进行矩阵乘法或加法操作。</li>
+</ul>
+</li>
+</ul>
+<h3>📋 Task 5: 辅助功能——复位与生成</h3>
+<p>做了手术（干预）之后，还得能恢复原状，或者进行推理。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>reset</code>, <code>ori_generate</code></li>
+<li><strong>逻辑：</strong><ul>
+<li><strong>生成 (<code>ori_generate</code>)：</strong> 在生成文本时，它会临时保存当前的干预配置，生成完后再恢复，防止状态污染。</li>
+<li><strong>复位 (<code>reset</code>)：</strong> 清除掉之前设置的所有干预向量（把 <code>add_activations_dict</code> 清空），让模型变回原始状态。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个文件讲了什么？</h3>
+<p>这是一个<strong>大模型手术台</strong>。</p>
+<ol>
+<li><strong>它不训练模型</strong>，而是在模型<strong>推理（Inference）</strong>的时候起作用。</li>
+<li>它通过<strong>Wrapper（包装器）</strong>技术，接管了模型的所有层。</li>
+<li>它允许你做两件事：<ul>
+<li><strong>读：</strong> 每一层在想什么？（获取 Activations）</li>
+<li><strong>写：</strong> 强行修改某一层在想什么。（Activation Addition / Steering）</li>
+</ul>
+</li>
+</ol>
+<p><strong>你的学习路径建议：</strong>
+先看 <code>BlockOutputWrapper</code> 的 <code>forward</code> 函数，那是心脏。只要看懂它在 <code>output</code> 上加了东西，你就看懂了 80%。</p>

@@ -1,0 +1,111 @@
+<h1>easyeditor/models/pmet/compute_ks.py</h1>
+<p>这份代码确实比较晦涩，因为它涉及到了大模型（LLM）底层参数编辑的核心逻辑，而且包含了很多张量（Tensor）维度的变换。</p>
+<p>简单来说，<strong>这个文件的目的是为了“定位”知识在模型大脑中的位置</strong>。</p>
+<p>在模型编辑（如 ROME, MEMIT, PMET 算法）中，我们通常把模型的某一层看作是一个 <strong>Key-Value（键-值）存储器</strong>。
+*   <strong>Key ($k$)</strong>: 代表“主语”的特征向量（比如“埃菲尔铁塔”这个概念在模型里的数字化表示）。
+*   <strong>Value ($v$)</strong>: 代表关于这个主语的知识（比如“位于巴黎”）。</p>
+<p><strong>这个文件的任务就是计算出准确的 $k$（Key）。</strong></p>
+<p>为了让你听懂，我把这个过程拆解成一个 <strong>4步走的 Task List</strong>：</p>
+<h3>Task List: 计算 $k$ 向量的步骤</h3>
+<ol>
+<li><strong>Task 1: 准备“诱饵” (构造多样化的输入)</strong><ul>
+<li><strong>目的</strong>: 为了获得一个通用的、不偏科的“主语”表示，我们需要用不同的句式来提问同一个东西。</li>
+<li><strong>代码对应</strong>: 列表推导式部分。</li>
+</ul>
+</li>
+<li><strong>Task 2: 垂钓 (提取模型内部特征)</strong><ul>
+<li><strong>目的</strong>: 把这些句子喂给模型，截获模型在处理到“主语”那个词时的脑电波（激活值）。</li>
+<li><strong>代码对应</strong>: <code>get_modules_input_output_at_words</code>。</li>
+</ul>
+</li>
+<li><strong>Task 3: 归类 (数据切分)</strong><ul>
+<li><strong>目的</strong>: 刚才是一股脑把所有句子的特征都提取出来了，现在要把它们按照不同的请求（Request）和模版类型分堆。</li>
+<li><strong>代码对应</strong>: <code>np.cumsum</code> 和 <code>context_len</code> 相关的逻辑。</li>
+</ul>
+</li>
+<li><strong>Task 4: 提纯 (计算平均值)</strong><ul>
+<li><strong>目的</strong>: 为了消除噪声，把同一个主语在不同句式下的特征向量取平均值，得到最终最稳健的 $k$。</li>
+<li><strong>代码对应</strong>: <code>for</code> 循环中的 <code>.mean(0)</code>。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>Task 1: 准备“诱饵” (构造输入)</h4>
+<p>假设我们要编辑的知识是 <code>request = {"prompt": "Steve Jobs", "subject": "Steve Jobs"}</code>。
+如果只用一句话 "Steve Jobs founded Apple"，提取出来的特征可能带有 "founded Apple" 的语境偏差。</p>
+<p>为了得到纯粹的 "Steve Jobs" 的概念向量，PMET 算法使用了一堆模版 (<code>context_templates</code>)，比如：
+*   "{} is the creator of..."
+*   "The famous {}..."
+*   "Who is {}?"</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这里的代码在把 request 里的 prompt 填入各种 template</span>
+<span class="n">context_templates</span><span class="o">=</span><span class="p">[</span>
+    <span class="n">context</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">request</span><span class="p">[</span><span class="s2">&quot;prompt&quot;</span><span class="p">])</span>
+    <span class="k">for</span> <span class="n">request</span> <span class="ow">in</span> <span class="n">requests</span>
+    <span class="k">for</span> <span class="n">context_type</span> <span class="ow">in</span> <span class="n">context_templates</span>
+    <span class="k">for</span> <span class="n">context</span> <span class="ow">in</span> <span class="n">context_type</span>
+<span class="p">]</span>
+<span class="c1"># 结果变成了一个巨大的句子列表：</span>
+<span class="c1"># [&quot;Steve Jobs is the creator...&quot;, &quot;The famous Steve Jobs...&quot;, &quot;Who is Steve Jobs?&quot;, ...]</span>
+</code></pre></div>
+
+<h4>Task 2: 垂钓 (提取特征)</h4>
+<p>有了这堆句子，我们需要让模型阅读它们。但是我们不关心模型输出了什么文本，我们只关心模型<strong>中间某一层（layer）</strong>，在读到 <strong>"Jobs"（主语的最后一个token）</strong> 这一瞬间，神经元的数值是多少。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这是一个外部辅助函数，负责跑模型</span>
+<span class="n">layers_ks</span><span class="p">[</span><span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="n">get_modules_input_output_at_words</span><span class="p">(</span>
+    <span class="n">model</span><span class="p">,</span>
+    <span class="n">tok</span><span class="p">,</span>
+    <span class="n">layer</span><span class="p">,</span>
+    <span class="o">...</span><span class="p">,</span>
+    <span class="n">words</span><span class="o">=</span><span class="p">[</span><span class="o">...</span><span class="p">],</span> <span class="c1"># 告诉函数我们要截获哪个词（subject）的向量</span>
+    <span class="o">...</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p><strong>这一步跑完，<code>layers_ks</code> 里存的是一堆向量（Tensor）。</strong> 假设你有 1 个 Request，用了 10 个模版，这里就会得到 10 个向量。</p>
+<h4>Task 3 &amp; 4: 归类与提纯 (核心难点)</h4>
+<p>这部分是代码里最难懂的循环逻辑。</p>
+<p>因为 <code>get_modules_input_output_at_words</code> 为了并行加速，是一次性把所有 Request 的所有 Template 的句子都跑完了，返回的是一个巨大的扁平化 Tensor。</p>
+<p>我们需要把它切开，还原回“每个 Request 对应一组向量”，然后算出平均值。</p>
+<p><strong>代码逻辑图解：</strong></p>
+<p>假设我们有 1 个 Request，用了 2 种类型的模版（Context Type A 有 2 句，Context Type B 有 3 句），一共 5 句。
+生成的向量 Tensor 长度是 5。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 计算每个类型有几句话</span>
+<span class="n">context_type_lens</span> <span class="o">=</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">]</span> 
+
+<span class="c1"># 2. 计算切分点 (Cumulative Sum)</span>
+<span class="n">context_type_csum</span> <span class="o">=</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">5</span><span class="p">]</span> 
+<span class="c1"># 意思是：0-2 是第一类模版，2-5 是第二类模版</span>
+
+<span class="c1"># 3. 开始循环切分和平均</span>
+<span class="n">ans</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="c1"># 外层循环：遍历每一个 Request (这里假设步长是 context_len，即每次处理一个 Request 的所有句子)</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">total_size</span><span class="p">,</span> <span class="n">context_len</span><span class="p">):</span> 
+    <span class="n">tmp</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="c1"># 内层循环：遍历模版类型</span>
+    <span class="k">for</span> <span class="n">j</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">context_type_csum</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">):</span>
+        <span class="n">start</span><span class="p">,</span> <span class="n">end</span> <span class="o">=</span> <span class="n">context_type_csum</span><span class="p">[</span><span class="n">j</span><span class="p">],</span> <span class="n">context_type_csum</span><span class="p">[</span><span class="n">j</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span>
+
+        <span class="c1"># 【关键操作】：切片 -&gt; 取平均</span>
+        <span class="c1"># 把该类型下的所有句子的向量拿出来，取平均值</span>
+        <span class="n">tmp</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">layers_ks</span><span class="p">[</span><span class="o">...</span><span class="p">][</span><span class="n">i</span> <span class="o">+</span> <span class="n">start</span> <span class="p">:</span> <span class="n">i</span> <span class="o">+</span> <span class="n">end</span><span class="p">]</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="mi">0</span><span class="p">))</span>
+
+    <span class="c1"># 最后，把不同模版类型的平均值，再取一次平均（或者堆叠后取平均）</span>
+    <span class="n">ans</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">tmp</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="mi">0</span><span class="p">))</span>
+
+<span class="c1"># 最终结果：layers_ks 更新为计算好的平均向量</span>
+<span class="n">layers_ks</span><span class="p">[</span><span class="n">rewrite_module_tmp</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">ans</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+</code></pre></div>
+
+<h3>总结</h3>
+<p>这段代码其实就在做一件事：</p>
+<blockquote>
+<p><strong>为了获得一个概念（如 Steve Jobs）在模型某一层最准确的、通用的数学表示（Key），我们把这个词放在几十种不同的句子里喂给模型，记录下每次的反应，然后算出一个“平均反应”。</strong></p>
+</blockquote>
+<ul>
+<li><code>compute_ks_parallel</code>: 同时计算多个模块（比如 MLP 的输入和输出）的 Key。</li>
+<li><code>compute_ks</code>: 只计算一个模块的 Key。</li>
+</ul>
+<p>这就是所谓的 "Compute $k$s" (Compute Keys)。</p>

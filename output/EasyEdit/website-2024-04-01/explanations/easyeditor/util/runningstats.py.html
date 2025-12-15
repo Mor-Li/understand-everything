@@ -1,0 +1,94 @@
+<h1>easyeditor/util/runningstats.py</h1>
+<p>这份代码 <code>runningstats.py</code> 的核心作用是：<strong>在不把所有数据一次性读入内存的情况下，计算大规模数据的统计特征（如均值、方差、协方差、分位数等）。</strong></p>
+<p>也就是所谓的“流式计算”或“在线统计”（Running Statistics）。</p>
+<p>为了让你看懂，我把它想象成一个<strong>“任务清单（Todo List）”</strong>，按照你如果要使用这个工具，需要经历的步骤来讲解。</p>
+<hr />
+<h3>核心任务流程 (Task Todo List)</h3>
+<p>如果你要使用这个文件里的功能，你的脑海里应该有这样一个流程图：</p>
+<h4>✅ Step 1: 决定你要算什么 (Choose a Stat)</h4>
+<p>首先，你需要明确你想从数据中知道什么？
+*   想知道平均值？ $\rightarrow$ 用 <code>Mean()</code> 类
+*   想知道波动大不大（方差）？ $\rightarrow$ 用 <code>Variance()</code> 类
+*   想知道两个变量的相关性？ $\rightarrow$ 用 <code>Covariance()</code> 类
+*   想知道数据的分布情况（中位数、99%分位点）？ $\rightarrow$ 用 <code>Quantile()</code> 类
+*   想一次性算好几个指标？ $\rightarrow$ 用 <code>CombinedStat()</code> 类</p>
+<h4>✅ Step 2: 创建统计器 (Initialization)</h4>
+<p>像买一个计算器一样，先实例化一个对象。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 比如我想算均值</span>
+<span class="n">stat</span> <span class="o">=</span> <span class="n">Mean</span><span class="p">()</span> 
+</code></pre></div>
+
+<h4>✅ Step 3: 分批喂数据 (Feeding Batches)</h4>
+<p>这是这个文件最核心的设计理念。因为数据量可能很大（比如 1TB 的图片特征），你不能一次性全读进来。你需要一小批一小批地读（Batch），然后喂给统计器。
+*   <strong>动作</strong>：调用 <code>.add(batch_data)</code> 方法。
+*   <strong>原理</strong>：统计器内部会更新它的状态（比如当前的“总和”和“样本总数”），但不会保存原始数据（除了 <code>History</code> 类），所以非常省内存。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 假设你有 100 个 batch 的数据</span>
+<span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">data_loader</span><span class="p">:</span>
+    <span class="n">stat</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span> <span class="c1"># 统计器吃掉这个 batch，更新内部状态</span>
+</code></pre></div>
+
+<h4>✅ Step 4: 获取结果 (Readout)</h4>
+<p>当你喂完了所有数据，或者在任何你想查看的时候，问统计器要结果。
+*   <strong>动作</strong>：调用 <code>.mean()</code>, <code>.variance()</code>, <code>.quantile()</code> 等方法。</p>
+<div class="codehilite"><pre><span></span><code><span class="nb">print</span><span class="p">(</span><span class="n">stat</span><span class="o">.</span><span class="n">mean</span><span class="p">())</span> <span class="c1"># 输出最终计算好的均值</span>
+</code></pre></div>
+
+<h4>✅ Step 5: (进阶) 自动管理与缓存 (The <code>tally</code> function)</h4>
+<p>如果你觉得写循环太麻烦，或者你想把算好的结果存下来（缓存），下次直接读文件而不用重算，就用文件里的 <code>tally</code> 函数。它是这个文件的<strong>大管家</strong>。</p>
+<hr />
+<h3>详细观点与代码对应讲解</h3>
+<p>现在我们按照上面的流程，结合代码里的具体类，讲讲文中的核心观点：</p>
+<h4>1. “流式更新”观点 (Incremental Updates)</h4>
+<p><strong>代码对应：</strong> 所有 <code>Stat</code> 子类（如 <code>Mean</code>, <code>Variance</code>）里的 <code>add()</code> 方法。
+*   <strong>观点</strong>：传统的算均值是 <code>sum(all_data) / count</code>。但在流式计算中，每来一个新数据，我们需要用数学公式更新当前的均值，而不是重新加一遍。
+*   <strong>细节</strong>：代码中使用了 <strong>Chan-style update</strong>（一种数值稳定的算法），防止数据量太大或数值太小时出现精度丢失（NaN 或 误差巨大）。</p>
+<h4>2. “向量化”观点 (Vectorization)</h4>
+<p><strong>代码对应：</strong> 注释里提到的 <code>dimension 0 is batch, dimension 1 is feature</code>。
+*   <strong>观点</strong>：这个工具不是一次只算一个数的均值。它是为深度学习设计的。
+*   <strong>解释</strong>：假设你的输入是 <code>[Batch_Size=64, Features=1024]</code>。它会同时维护 1024 个特征的均值。<code>stat.add()</code> 接收的是矩阵，算出来的也是向量。</p>
+<h4>3. “缓存与懒加载”观点 (Caching with <code>tally</code>)</h4>
+<p><strong>代码对应：</strong> <code>def tally(...)</code> 函数和 <code>load_cached_state</code>, <code>save_cached_state</code>。
+*   <strong>观点</strong>：算大数据统计很慢，算过一次就不想算第二次。
+*   <strong>逻辑</strong>：
+    1.  你调用 <code>tally(stat, dataset, cache='result.npz')</code>。
+    2.  程序检查 <code>'result.npz'</code> 存不存在。
+    3.  <strong>如果存在</strong>：直接读取文件，填入 <code>stat</code> 对象，跳过计算循环（懒加载）。
+    4.  <strong>如果不存在</strong>：创建一个数据加载器（DataLoader），让你去跑循环。跑完后，自动把结果存入 <code>'result.npz'</code>。</p>
+<h4>4. 特殊统计器的实现观点</h4>
+<ul>
+<li>
+<p><strong><code>Quantile</code> (分位数)</strong>：</p>
+<ul>
+<li><strong>难点</strong>：算中位数通常需要把数据<strong>排序</strong>。数据量无限大时，你无法排序。</li>
+<li><strong>代码解法</strong>：它实现了一个复杂的随机算法（KLL algorithm）。它保留一部分数据作为“草图”（Sketch），通过概率论保证估算的误差极小，同时只占用很少内存。这是代码里最复杂的一个类。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>Covariance</code> (协方差)</strong>：</p>
+<ul>
+<li><strong>难点</strong>：直接算 <code>E[XY] - E[X]E[Y]</code> 在数值上不稳定。</li>
+<li><strong>代码解法</strong>：利用累积的方式更新协方差矩阵，保证在 GPU 上也能稳定运行。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>CombinedStat</code> (组合统计)</strong>：</p>
+<ul>
+<li><strong>观点</strong>：有时候我想一次遍历就把均值、方差、分位数全算出来，不想遍历三遍数据。</li>
+<li><strong>用法</strong>：<code>cs = CombinedStat(m=Mean(), q=Quantile())</code>。调用 <code>cs.add(x)</code> 时，它会自动分发给内部的 <code>m</code> 和 <code>q</code>。</li>
+</ul>
+</li>
+</ul>
+<h3>总结：如何读这份代码？</h3>
+<p>不要试图一行行读完所有数学公式。你只需要关注以下三个层面：</p>
+<ol>
+<li><strong>Base Class (<code>Stat</code>)</strong>: 它是接口定义，规定了大家都要有 <code>add</code>, <code>state_dict</code> (存盘), <code>load_state_dict</code> (读盘)。</li>
+<li><strong>Manager (<code>tally</code>)</strong>: 它是流程控制者，负责连接 数据集 &lt;-&gt; 统计器 &lt;-&gt; 硬盘缓存。</li>
+<li><strong>Workers (具体类)</strong>:<ul>
+<li>如果你只关心平均值，只看 <code>Mean</code> 类。</li>
+<li>如果你关心分布，看 <code>Quantile</code> 类。</li>
+<li><code>add()</code> 方法里就是具体的数学实现公式。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话总结这个文件：</strong>
+这是一个<strong>支持 GPU 加速</strong>、<strong>内存友好</strong>、<strong>支持断点缓存</strong>的 PyTorch <strong>在线统计计数器</strong>工具箱。</p>

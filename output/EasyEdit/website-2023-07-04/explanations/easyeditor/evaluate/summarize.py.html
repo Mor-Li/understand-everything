@@ -1,0 +1,74 @@
+<h1>easyeditor/evaluate/summarize.py</h1>
+<p>没问题。这份代码 <code>summarize.py</code> 的核心作用就是<strong>“阅卷打分”</strong>。</p>
+<p>在对大模型进行知识编辑（Model Editing）后，我们需要知道编辑效果好不好。这个脚本就是用来读取编辑后的结果文件，计算各种指标，最后给出一个总结报告。</p>
+<p>为了让你更容易理解，我把这个脚本的工作流程拆解成一个 <strong>Task List (任务清单)</strong>，就像给一个实习生布置任务一样，一步步带你看它是怎么工作的。</p>
+<hr />
+<h3>📋 任务清单：模型编辑效果评估流程</h3>
+<h4>Task 1: 确定要检查哪些文件夹 (Setup)</h4>
+<p><strong>代码位置:</strong> <code>main</code> 函数开头
+<strong>任务描述:</strong>
+你需要告诉脚本去哪里找“考卷”。
+*   <code>dir_name</code>: 存放结果的主目录。
+*   <code>runs</code>: 如果只想看特定的某几次运行结果，可以在这里指定。
+*   脚本会遍历目录下的所有子文件夹（每一次运行是一个子文件夹）。</p>
+<h4>Task 2: 收集每一道题的答题卡 (Looping &amp; Loading)</h4>
+<p><strong>代码位置:</strong> <code>for run_dir in ...</code> 和 <code>for case_file in files:</code>
+<strong>任务描述:</strong>
+*   进入一个运行目录（比如 <code>run_001</code>）。
+*   找到里面所有的 <code>case_*.json</code> 文件。每一个 <code>case</code> 就是一次编辑测试（比如把“埃菲尔铁塔在巴黎”改成“埃菲尔铁塔在罗马”）。
+*   按顺序读取这些 JSON 文件，提取里面的数据。</p>
+<h4>Task 3: 批改“编辑成功率” (Rewrite Evaluation)</h4>
+<p><strong>代码位置:</strong> <code>for key in ["rewrite_prompts_probs", ...]</code>
+<strong>核心逻辑:</strong>
+我们希望模型在被编辑后，对于<strong>目标问题</strong>（Rewrite Prompts），更倾向于生成<strong>新答案</strong>，而不是<strong>旧答案</strong>。
+*   <strong>指标:</strong> <code>rewrite_success</code>
+*   <strong>判断标准:</strong> 代码中有 <code>x["target_true"] &gt; x["target_new"]</code>。
+    *   这里的数值通常是 Loss（损失值，越小越好）或者 NLL（负对数似然）。
+    *   如果 <strong>旧答案的Loss &gt; 新答案的Loss</strong>，说明模型觉得新答案更对。这就记为一次“成功”。
+*   <strong>动作:</strong> 计算所有 case 的平均成功率。</p>
+<h4>Task 4: 批改“举一反三能力” (Paraphrase Evaluation)</h4>
+<p><strong>代码位置:</strong> 同上，关键词是 <code>paraphrase_prompts_probs</code>
+<strong>核心逻辑:</strong>
+如果我问“埃菲尔铁塔在哪？”模型答对了。那我换个问法“也就是那个著名的铁塔坐落于何处？”，模型也得能答出新答案。
+*   <strong>指标:</strong> <code>paraphrase_success</code>
+*   <strong>判断标准:</strong> 和上面一样，看新答案的 Loss 是否低于旧答案。这是衡量<strong>泛化性 (Generalization)</strong> 的关键。</p>
+<h4>Task 5: 批改“不要乱改无关知识” (Neighborhood Evaluation)</h4>
+<p><strong>代码位置:</strong> <code>sum_key_discrete = f"neighborhood_success"</code>
+<strong>核心逻辑:</strong>
+编辑“埃菲尔铁塔”不应该影响“自由女神像”的知识。这叫<strong>局部性 (Locality/Specificity)</strong>。
+*   <strong>指标:</strong> <code>neighborhood_success</code>
+*   <strong>判断标准:</strong> 代码比较复杂：<code>not ((x &lt; x_new) ^ (y &lt; y_new))</code>。
+    *   简单来说，它在比较编辑前（Pre）和编辑后（Post），模型对无关知识的判断逻辑是否保持一致。
+    *   如果编辑前后，模型对邻域知识的看法没有发生剧烈反转，就算通过。
+    *   或者在 <code>zsRE</code> 数据集中，直接比较 <code>neighborhood_prompts_correct</code> 是否相等。</p>
+<h4>Task 6: 统计生成质量 (Generation Metrics)</h4>
+<p><strong>代码位置:</strong> <code>for key in ["ngram_entropy", ...]</code>
+<strong>任务描述:</strong>
+除了看概率，还要看模型生成的文本是否通顺。
+*   <strong>Entropy (熵):</strong> 文本的多样性，不能老是重复一句话。
+*   <strong>Essence Score:</strong> 语义匹配度。
+*   脚本直接把这些分数存起来，准备算平均值。</p>
+<h4>Task 7: 算总分 (Aggregation &amp; Scoring)</h4>
+<p><strong>代码位置:</strong> <code>cur_sum = {k: (np.mean(v), np.std(v)) ...}</code>
+<strong>任务描述:</strong>
+现在手里有一堆 0 和 1（成功或失败）以及各种分数。
+1.  <strong>算平均值:</strong> 把所有 case 的分数取平均（Mean）和标准差（Std）。
+2.  <strong>算综合得分 (Score):</strong>
+    *   代码使用了 <code>hmean</code> (调和平均数)。
+    *   <strong>公式:</strong> <code>Score = hmean([Rewrite, Paraphrase, Neighborhood])</code>
+    *   <strong>为什么用调和平均？</strong> 就像“木桶效应”。如果你的编辑成功率很高，但把其他知识都搞坏了（Neighborhood低），调和平均数会把你拉得很低。它要求模型在<strong>有效性、泛化性、局部性</strong>三方面都要好。</p>
+<h4>Task 8: 打印成绩单 (Output)</h4>
+<p><strong>代码位置:</strong> <code>pprint(cur_sum)</code>
+<strong>任务描述:</strong>
+*   把分数乘以 100（变成百分制）。
+*   保留两位小数。
+*   打印在屏幕上，并存入列表返回。</p>
+<hr />
+<h3>总结一下文中的核心观点（通过代码体现）</h3>
+<p>这段代码其实隐含了评价大模型知识编辑的<strong>“黄金三角”</strong>标准：</p>
+<ol>
+<li><strong>Efficacy (有效性/Rewrite):</strong> 编辑真的生效了吗？（对应 <code>rewrite_success</code>）</li>
+<li><strong>Generalization (泛化性/Paraphrase):</strong> 换个说法问，模型还能答对吗？（对应 <code>paraphrase_success</code>）</li>
+<li><strong>Specificity/Locality (特异性/Neighborhood):</strong> 编辑有没有破坏无关的知识？（对应 <code>neighborhood_success</code>）</li>
+</ol>
+<p><strong>最终的 <code>score</code> 是这三者的调和平均</strong>，意味着一个好的编辑算法必须在这三方面都表现优秀，不能偏科。</p>

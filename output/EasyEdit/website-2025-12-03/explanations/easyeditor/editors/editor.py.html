@@ -1,0 +1,156 @@
+<h1>easyeditor/editors/editor.py</h1>
+<p>这份代码是 <strong><code>EasyEditor</code></strong> 库的核心控制器。你可以把它想象成一个 <strong>“大模型手术台”</strong> 或者 <strong>“总指挥”</strong>。</p>
+<p>它的核心任务是：<strong>加载一个大语言模型（LLM），然后根据你的指令，精准地修改模型内部的某条知识（比如把“现任美国总统是拜登”修改为“现任美国总统是特朗普”），并评估修改是否成功。</strong></p>
+<p>为了让你听懂，我把这个代码的逻辑拆解成一个 <strong>“给模型做手术”的任务清单 (Todo List)</strong>，然后一步步给你讲。</p>
+<hr />
+<h3>📋 任务清单 (Task Todo List)</h3>
+<p>如果这份代码是一个人，他在工作时会遵循以下步骤：</p>
+<ol>
+<li>
+<p><strong>准备阶段 (Initialization)</strong>:</p>
+<ul>
+<li>[ ] 读取配置单（HyperParams）：确定要修哪个模型？用哪种手术方案（算法）？</li>
+<li>[ ] 搬运器材（Load Model）：把大模型（如 LLaMA, GPT, ChatGLM）和分词器（Tokenizer）加载到显存里。</li>
+</ul>
+</li>
+<li>
+<p><strong>接单阶段 (Receive Requests)</strong>:</p>
+<ul>
+<li>[ ] 接收客户需求：用户想改什么？（比如：提示词是什么？新的目标答案是什么？）</li>
+<li>[ ] 整理数据：把用户的输入打包成标准格式（Requests）。</li>
+</ul>
+</li>
+<li>
+<p><strong>术前检查 (Pre-Edit Evaluation)</strong>:</p>
+<ul>
+<li>[ ] 测基准：在没动手之前，先测一下模型现在的回答是什么，准确率多少。</li>
+</ul>
+</li>
+<li>
+<p><strong>手术阶段 (Apply Algorithm)</strong>:</p>
+<ul>
+<li>[ ] <strong>核心动作</strong>：调用具体的算法（如 ROME, MEMIT, LoRA 等）去修改模型的神经元权重。</li>
+<li>[ ] 备份（Optional）：如果是为了测试，先把原始权重备份一下，方便一会儿恢复。</li>
+</ul>
+</li>
+<li>
+<p><strong>术后复查 (Post-Edit Evaluation)</strong>:</p>
+<ul>
+<li>[ ] 查疗效：修改后，模型能不能输出新的答案？（Reliability）</li>
+<li>[ ] 查副作用：模型有没有变傻？有没有改坏别的东西？（Locality / Portability）</li>
+</ul>
+</li>
+<li>
+<p><strong>收尾阶段 (Cleanup/Restore)</strong>:</p>
+<ul>
+<li>[ ] 恢复现场：如果你只是想做实验而不是永久修改，就把模型权重恢复成原样，准备处理下一个请求。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🧐 逐步讲解 (Step-by-Step Code Walkthrough)</h3>
+<p>现在我们要结合代码，把上面的清单对应起来。</p>
+<h4>1. 准备阶段：<code>__init__</code> (构造函数)</h4>
+<p><strong>代码位置：</strong> <code>class BaseEditor</code> -&gt; <code>def __init__(self, hparams):</code></p>
+<ul>
+<li><strong>讲观点：</strong> 做任何事之前，先得有工具。</li>
+<li><strong>代码在干啥：</strong><ul>
+<li>它查看 <code>hparams.model_name</code>（比如 "llama-2-7b"）。</li>
+<li>然后写了一大堆 <code>if-elif-else</code>，这是为了兼容市面上各种模型（LLaMA, GPT, T5, ChatGLM, Qwen 等）。</li>
+<li><strong>关键点</strong>：它会把模型加载到 GPU (<code>cuda</code>) 上，准备好分词器 (<code>self.tok</code>)。如果是 <code>QLoRA</code> 这种算法，它还会配置量化（4bit加载）来省显存。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 接单阶段：<code>edit</code> 和 <code>batch_edit</code></h4>
+<p><strong>代码位置：</strong> <code>def edit(...)</code> 和 <code>def batch_edit(...)</code></p>
+<ul>
+<li><strong>讲观点：</strong> 这是一个入口函数，用户只管调用这个，不需要管内部细节。</li>
+<li><strong>代码在干啥：</strong><ul>
+<li>用户输入 <code>prompts</code>（比如 "埃菲尔铁塔在哪里？"）和 <code>target_new</code>（比如 "在柏林" —— 强行修改知识）。</li>
+<li><code>_prepare_requests</code>: 把这些零散的字符串打包成一个标准的列表，方便后面处理。</li>
+<li><strong>区别</strong>：<ul>
+<li><code>edit</code>: 处理单个或少量编辑。</li>
+<li><code>batch_edit</code>: 如果有一万条知识要改，这个函数会把它们切成小块（Chunks），一批一批地改，防止显存爆炸。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>3. 核心循环：<code>edit_requests</code> (最重要的部分)</h4>
+<p><strong>代码位置：</strong> <code>def edit_requests(...)</code></p>
+<p>这是整个文件的<strong>心脏</strong>。它控制了“术前检查 -&gt; 手术 -&gt; 术后复查”的流程。</p>
+<ul>
+<li>
+<p><strong>Step 3.1: 术前检查 (Pre-Edit)</strong>
+    <code>python
+    # 代码片段示意
+    metrics = {"pre": compute_edit_quality(...)}</code></p>
+<ul>
+<li>在修改前，先算一下模型对这个问题的得分。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.2: 执行手术 (Apply Algo)</strong>
+    <code>python
+    # 代码片段示意
+    edited_model, weights_copy = self.apply_algo(...)</code></p>
+<ul>
+<li><code>self.apply_algo</code> 是从外部字典里拿到的具体算法（比如 ROME 或 MEMIT）。</li>
+<li>它把模型传进去，算法在里面一顿操作，返回一个<strong>修改后的模型 (<code>edited_model</code>)</strong>。</li>
+<li><code>weights_copy</code>: 这是原始权重的备份，像游戏的“存档”。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.3: 术后复查 (Post-Edit)</strong>
+    <code>python
+    # 代码片段示意
+    "post": compute_edit_quality(edited_model, ...)</code></p>
+<ul>
+<li>用修改后的模型再跑一遍测试。如果成功，模型现在应该回答你设定的新答案。</li>
+<li>这里还会检查 <strong>Locality（局部性）</strong>：比如你改了“埃菲尔铁塔”，系统会问“自由女神像在哪里？”，确保模型没把自由女神像也改到柏林去。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.4: 决定是否连续修改 (Sequential Edit)</strong></p>
+<ul>
+<li><strong>情况 A：连续修改 (<code>sequential_edit=True</code>)</strong><ul>
+<li>你想让模型<strong>同时</strong>记住 10 个新知识。</li>
+<li>代码逻辑：保留 <code>edited_model</code>，在这个基础上继续改下一个。</li>
+</ul>
+</li>
+<li><strong>情况 B：独立测试 (<code>sequential_edit=False</code>)</strong><ul>
+<li>你想测试 10 个不同的案例，但它们互不影响。</li>
+<li>代码逻辑：改完一个，测完数据，马上<strong>回档</strong>（Restore weights）。
+```python</li>
+</ul>
+<h1>回档代码示意</h1>
+<p>with torch.no_grad():
+    for k, v in weights_copy.items():
+        nethook.get_parameter(self.model, k)[...] = v # 把旧参数覆盖回去
+```</p>
+</li>
+</ul>
+</li>
+</ul>
+<h4>4. 另一种测试：<code>generate_edit</code></h4>
+<p><strong>代码位置：</strong> <code>def generate_edit(...)</code></p>
+<ul>
+<li><strong>讲观点：</strong> 前面的 <code>edit</code> 主要是算分数（概率），有时候我们想亲眼看看模型<strong>生成了什么话</strong>。</li>
+<li><strong>代码在干啥：</strong><ul>
+<li>逻辑和 <code>edit_requests</code> 几乎一样。</li>
+<li>区别在于它调用了 <code>model.generate()</code>，真的让模型写作文。</li>
+<li>它会对比 <code>pre</code>（改之前生成的文本）和 <code>post</code>（改之后生成的文本）。</li>
+<li>它还会测 <code>fluency</code>（流畅度），看看模型改完后会不会说话结巴。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结文中的核心观点</h3>
+<p>这个文件本身不提出新的算法观点，它的观点在于<strong>工程架构设计</strong>：</p>
+<ol>
+<li><strong>统一接口</strong>：无论你用 LLaMA 还是 GPT，无论你用 ROME 算法还是 LoRA 算法，我都用同一个 <code>BaseEditor</code> 类来管理。</li>
+<li><strong>安全回滚</strong>：强调在实验环境下，修改完必须能恢复（Restore），保证实验数据的纯净。</li>
+<li><strong>多维评估</strong>：修改知识不仅仅是看“改没改成功”（Rewrite Accuracy），还要看“有没有改坏别处”（Locality）和“能不能举一反三”（Portability）。</li>
+</ol>
+<p><strong>一句话总结：</strong>
+这是一个<strong>大模型知识编辑的“施工队队长”</strong>，负责把材料（模型）拉来，指挥工人（算法）干活，并负责干活前后的质量检测。</p>

@@ -1,0 +1,87 @@
+<h1>easyeditor/models/rome/repr_tools.py</h1>
+<p>这份代码确实看起来有点绕，因为它涉及到了大模型（LLM）底层比较“手术刀”级别的操作。</p>
+<p>简单来说，这个文件的核心目的是：<strong>给模型一句话（比如“埃菲尔铁塔在巴黎”），找到“埃菲尔铁塔”这几个字在模型某一层（比如第5层）的“脑电波”（向量表示/Hidden State）。</strong></p>
+<p>为了让你看懂，我把阅读这份代码分解成一个 <strong>“三步走”的 Task List（任务清单）</strong>。我们像剥洋葱一样，从最基础的工具函数开始，最后看主函数。</p>
+<hr />
+<h3>🟢 Task 1: 定位目标——“它在哪？”</h3>
+<p><strong>函数：<code>get_words_idxs_in_templates</code></strong></p>
+<p>在提取特征之前，我们必须先知道目标词（Subject）在整句话的第几个 Token 上。</p>
+<ul>
+<li><strong>场景设定：</strong><ul>
+<li><strong>模版 (<code>context_templates</code>)</strong>：<code>"{} is the capital of France"</code></li>
+<li><strong>填入词 (<code>words</code>)</strong>：<code>"Paris"</code></li>
+<li><strong>完整句子</strong>：<code>"Paris is the capital of France"</code></li>
+</ul>
+</li>
+<li><strong>难点：</strong> 经过 Tokenizer（分词器）后，<code>Paris</code> 可能占 1 个 token，也可能占多个。我们需要精确算出它在整个序列中的索引位置（Index）。</li>
+</ul>
+<p><strong>代码逻辑解读：</strong>
+1.  <strong>检查模版</strong>：<code>assert ... count("{}") == 1</code> 确保模版里只有一个 <code>{}</code> 挖空处。
+2.  <strong>计算长度（精髓部分）</strong>：
+    *   它没有直接去搜单词，而是用了“长度相减法”。
+    *   <code>prefix</code> (前缀)：<code>""</code> (空字符串，因为 <code>{}</code> 在开头)
+    *   <code>prefix + word</code>：<code>"Paris"</code>
+    *   <code>prefix + word + suffix</code>：<code>"Paris is the capital of France"</code>
+    *   通过分别对上面三段进行 <code>tok.encode</code>，计算出各自的长度。
+3.  <strong>确定位置 (<code>subtoken</code> 参数)</strong>：
+    *   如果是 <code>"last"</code>：目标位置 = 前缀长度 + 单词长度 - 1。（即单词的最后一个 token）。
+    *   如果是 <code>"first"</code>：目标位置 = 前缀长度。（即单词的第一个 token）。
+    *   这也是 ROME 算法的关键，通常我们需要修改的是 Subject 的<strong>最后一个 Token</strong> 的信息。</p>
+<blockquote>
+<p><strong>总结 Task 1</strong>：这个函数不跑模型，只玩分词器。它负责算数，算出目标词在句子里的坐标（Index）。</p>
+</blockquote>
+<hr />
+<h3>🟡 Task 2: 脑科手术——“把数据取出来”</h3>
+<p><strong>函数：<code>get_reprs_at_idxs</code></strong></p>
+<p>知道了坐标（Index），现在要真正把模型跑起来，去抓取那个位置的向量。</p>
+<ul>
+<li><strong>输入：</strong><ul>
+<li><code>contexts</code>：完整的句子列表。</li>
+<li><code>idxs</code>：Task 1 算出来的坐标列表。</li>
+<li><code>layer</code>：要去哪一层抓取（比如第 10 层）。</li>
+<li><code>module_template</code>：层的名字格式（比如 <code>transformer.h.{}</code>）。</li>
+<li><code>track</code>：抓输入（"in"）还是抓输出（"out"）。</li>
+</ul>
+</li>
+</ul>
+<p><strong>代码逻辑解读：</strong>
+1.  <strong>分批处理 (<code>_batch</code> 函数)</strong>：
+    *   如果一次性处理几千个句子显存会爆，所以它写了个 <code>yield</code> 生成器，每次处理 <code>n=128</code> 个句子。
+2.  <strong>钩子技术 (<code>nethook.Trace</code>)</strong>：
+    *   这是最核心的黑科技。<code>with nethook.Trace(...) as tr:</code>
+    *   它的作用是：当模型运行 <code>model(**contexts_tok)</code> 时，<strong>暂停</strong>在指定的 <code>layer</code>，把流经这一层的数据（Tensor）偷出来，存到 <code>tr</code> 变量里，然后让模型继续跑。
+    *   这就好比在水管的中间装了个水表。
+3.  <strong>提取特定位置 (<code>_process</code> 函数)</strong>：
+    *   拿到了整层的数据（比如 <code>[Batch, Sequence_Length, Hidden_Dim]</code>）。
+    *   利用之前算的 <code>idxs</code>，只把对应位置的向量抠出来。
+    *   <code>cur_repr[i][idx_list]</code>：第 <code>i</code> 个句子的第 <code>idx</code> 个位置。
+4.  <strong>返回结果</strong>：把所有批次的结果拼起来 (<code>torch.stack</code>) 返回。</p>
+<blockquote>
+<p><strong>总结 Task 2</strong>：这是干脏活累活的。它负责把句子喂给模型，用钩子（Hook）截获中间层的向量，并只保留我们需要的那几个位置的数据。</p>
+</blockquote>
+<hr />
+<h3>🔴 Task 3: 总指挥——“统筹安排”</h3>
+<p><strong>函数：<code>get_reprs_at_word_tokens</code></strong></p>
+<p>这是外部调用的入口函数，它负责把 Task 1 和 Task 2 串联起来。</p>
+<p><strong>代码逻辑解读：</strong>
+1.  <strong>接收指令</strong>：用户给它模版、单词、层数等。
+2.  <strong>调用 Task 1</strong>：<code>idxs = get_words_idxs_in_templates(...)</code> —— 先算出坐标。
+3.  <strong>准备句子</strong>：<code>[context_templates[i].format(words[i])...]</code> —— 把单词填进模版，生成完整句子。
+4.  <strong>调用 Task 2</strong>：<code>return get_reprs_at_idxs(...)</code> —— 带着句子和坐标，去模型里取向量。</p>
+<hr />
+<h3>📝 最终复盘（大白话总结）</h3>
+<p>假如你要研究 ROME 算法（模型编辑），你想知道模型看到“Steve Jobs”这个名字时，第 5 层的神经元在想什么。</p>
+<ol>
+<li>你调用 <strong><code>get_reprs_at_word_tokens</code></strong>（Task 3，总包工头）。</li>
+<li>工头先找 <strong><code>get_words_idxs_in_templates</code></strong>（Task 1，测量员）：<ul>
+<li>测量员说：“Steve Jobs”在这个句子里占了第 3 和第 4 个位置，你要的是最后一个，所以坐标是 <strong>4</strong>。</li>
+</ul>
+</li>
+<li>工头再找 <strong><code>get_reprs_at_idxs</code></strong>（Task 2，外科医生）：<ul>
+<li>医生把句子喂给模型。</li>
+<li>在模型运行到第 5 层时，医生用手术刀（Hook）切开，把第 4 个位置的数值（Tensor）取了出来。</li>
+</ul>
+</li>
+<li>工头把这个 Tensor 交给你。</li>
+</ol>
+<p>这就是这个文件的全部内容。它是 ROME 算法用来<strong>“读取内隐状态”</strong>的基础工具。</p>

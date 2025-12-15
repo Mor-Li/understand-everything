@@ -1,0 +1,96 @@
+<h1>easyeditor/trainer/models.py</h1>
+<p>这个文件的核心作用就像是一个<strong>“模型工厂”</strong>（Factory）。它的主要任务是根据你提供的配置文件（<code>config</code>），帮你把<strong>模型（Model）</strong>和<strong>分词器（Tokenizer）</strong>加载好，并根据需要对模型进行一些“魔改”（比如修改精度、冻结参数、修改Dropout等）。</p>
+<p>为了让你更容易理解，我把它拆解成一个<strong>任务清单（To-Do List）</strong>，然后一步步给你解释代码是怎么完成这些任务的。</p>
+<hr />
+<h3>📋 任务清单 (To-Do List)</h3>
+<p>这段代码实际上是在执行以下流程：</p>
+<ol>
+<li><strong>准备工具</strong>：定义一个能自动转换数据精度（如 32位浮点 -&gt; 16位浮点）的工具模块。</li>
+<li><strong>定义特定模型</strong>：如果你需要用 BERT 做简单的分类任务，这里预定义了一个简单的结构。</li>
+<li><strong>加载模型 (核心任务)</strong>：<ul>
+<li>检查配置：你要加载哪种模型？(BERT? BLIP-2? MiniGPT-4? 还是通用的 HuggingFace 模型?)</li>
+<li>实例化模型：根据名字把模型从硬盘或网络加载进内存。</li>
+<li><strong>魔改 1 (Dropout)</strong>：如果配置要求，修改模型内部所有 Dropout 层的概率。</li>
+<li><strong>检查参数</strong>：确保你想编辑的参数（<code>inner_params</code>）在模型里真的存在。</li>
+<li><strong>魔改 2 (混合精度)</strong>：如果为了省显存用了半精度（bfloat16），需要把部分层转回全精度（float32）以保证计算准确性，并给它们装上“转换器”。</li>
+</ul>
+</li>
+<li><strong>加载分词器</strong>：根据配置加载对应的 Tokenizer，并处理 GPT-2 的特殊情况。</li>
+</ol>
+<hr />
+<h3>🧐 逐步详解 (Step-by-Step)</h3>
+<p>下面我按照上面的清单，把代码拆开来讲：</p>
+<h4>第一步：准备工具 <code>CastModule</code></h4>
+<p><strong>代码位置</strong>：<code>class CastModule(nn.Module): ...</code></p>
+<ul>
+<li><strong>这是啥？</strong>
+    这是一个“适配器”。</li>
+<li><strong>为什么要用它？</strong>
+    在深度学习中，为了省显存，我们常把模型参数变成 <code>bfloat16</code> (半精度)。但是，有些关键层（比如我们要编辑的层）如果用半精度计算会不准，必须用 <code>float32</code> (全精度)。
+    当数据从 <code>float32</code> 的层流向 <code>bfloat16</code> 的层时，代码会报错。这个模块的作用就是包裹住某一层，自动把输入转成需要的格式，算完后再转成输出需要的格式。</li>
+<li><strong>白话解释</strong>：就像电源转接头，把 220V 转成 110V，让电器能正常工作。</li>
+</ul>
+<h4>第二步：定义特定模型 <code>BertClassifier</code></h4>
+<p><strong>代码位置</strong>：<code>class BertClassifier(torch.nn.Module): ...</code></p>
+<ul>
+<li><strong>这是啥？</strong>
+    一个简单的 BERT 分类器。</li>
+<li><strong>做了什么？</strong>
+    它加载一个预训练的 BERT，然后在他屁股后面接了一个 <code>Linear(hidden_dim, 1)</code>。</li>
+<li><strong>用途</strong>：通常用于二分类任务或者简单的判别任务。</li>
+</ul>
+<h4>第三步：加载模型 <code>get_model(config)</code> (这是全文件最重要的地方)</h4>
+<p><strong>代码位置</strong>：<code>def get_model(config): ...</code></p>
+<p>这个函数是一个巨大的 <code>if-else</code> 判断：</p>
+<ol>
+<li>
+<p><strong>判断模型类型</strong>：</p>
+<ul>
+<li><code>if config.model_class == "BertClassifier"</code>: 加载上面定义的简单 BERT。</li>
+<li><code>elif config.model_name == "blip2"</code>: 加载多模态模型 BLIP-2（处理图文的）。</li>
+<li><code>elif config.model_name == "minigpt4"</code>: 加载 MiniGPT-4（也是图文模型）。</li>
+<li><code>else</code>: <strong>最常用的情况</strong>。直接利用 HuggingFace 的 <code>transformers</code> 库加载通用的语言模型（如 Llama, GPT-J, OPT 等）。</li>
+</ul>
+</li>
+<li>
+<p><strong>修改 Dropout (魔改 1)</strong>：</p>
+<ul>
+<li><strong>代码</strong>：<code>if config.dropout is not None:</code></li>
+<li><strong>逻辑</strong>：遍历模型里所有的层。如果发现是 <code>Dropout</code> 层，就把它的丢弃概率改成配置文件里指定的值。</li>
+<li><strong>目的</strong>：有时候为了微调或编辑模型，需要控制随机性。</li>
+</ul>
+</li>
+<li>
+<p><strong>参数检查</strong>：</p>
+<ul>
+<li><strong>代码</strong>：<code>bad_inner_params = ...</code></li>
+<li><strong>逻辑</strong>：你可能在配置里写了“我要编辑第5层的权重”。这段代码会检查模型里到底有没有“第5层”。如果没有，直接报错，防止后面瞎跑。</li>
+</ul>
+</li>
+<li>
+<p><strong>混合精度处理 (魔改 2)</strong>：</p>
+<ul>
+<li><strong>代码</strong>：<code>if config.no_grad_layers is not None:</code></li>
+<li><strong>逻辑</strong>：这是最复杂的一段。<ul>
+<li>如果开了 <code>config.half</code>，先把模型转成 <code>bfloat16</code>。</li>
+<li>但是！根据 <code>config.no_grad_layers</code> 的设置，把<strong>某些层</strong>强制转回 <code>float32</code>（为了精度）。</li>
+<li>因为层与层之间精度不一样了，所以用第一步定义的 <code>CastModule</code> 把这些层包裹起来，处理数据类型的转换。</li>
+<li>最后，因为它包裹了一层 <code>CastModule</code>，导致参数的名字变了（多了一级 <code>.underlying</code>），所以代码最后还很贴心地帮你把配置文件里的参数名也更新了。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<h4>第四步：加载分词器 <code>get_tokenizer(config)</code></h4>
+<p><strong>代码位置</strong>：<code>def get_tokenizer(config): ...</code></p>
+<ul>
+<li><strong>逻辑</strong>：调用 <code>transformers</code> 库加载分词器。</li>
+<li><strong>特例处理</strong>：<ul>
+<li>如果是 GPT-2 系列的分词器，因为它们原生没有“填充符”（pad token），代码强制把“结束符”（eos token）当作填充符用，并设置从左边开始填充（<code>padding_side = 'left'</code>）。这是生成式模型常见的设置，防止生成时位置错乱。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件就是 <strong>EasyEditor</strong> 库的<strong>后勤部长</strong>。</p>
+<p>不管你想编辑 Llama 还是 MiniGPT-4，不管你想用全精度还是半精度，只要调用 <code>get_model</code> 和 <code>get_tokenizer</code>，它就会帮你把一切杂活干好，给你返回一个准备就绪的 <code>model</code> 和 <code>tokenizer</code> 对象，让你专注于后面的模型编辑算法。</p>

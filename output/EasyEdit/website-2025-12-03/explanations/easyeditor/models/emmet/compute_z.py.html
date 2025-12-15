@@ -1,0 +1,123 @@
+<h1>easyeditor/models/emmet/compute_z.py</h1>
+<p>这份代码的核心逻辑是 <strong>“模型编辑”（Model Editing）</strong> 算法（很可能是 ROME 或 EMMET 算法）中的关键一步。</p>
+<p>简单来说，它的目的是：<strong>如果不修改模型权重，仅仅修改某一层的一个神经元激活值（Activation），我需要把它改成什么样，才能让模型输出我想要的新知识？</strong></p>
+<p>这个文件算出的是一个<strong>“目标向量”（Target Vector / $z$）</strong>。</p>
+<p>为了让你看懂，我把这个过程拆解成一个 <strong>Task Todo List</strong>，模拟程序的执行流程：</p>
+<h3>核心任务：计算目标向量 $z$</h3>
+<h4>第一阶段：准备原材料 (Preparation)</h4>
+<ol>
+<li><strong>获取“判卷老师”</strong>：拿到模型的输出层（LM Head）的权重。因为我们要算 Loss，必须知道模型最终输出的词是什么。</li>
+<li><strong>确定“标准答案”</strong>：把你想要注入的新知识（比如 <code>target_new</code>: "Rome"）转换成 Token ID。</li>
+<li><strong>准备“考题”</strong>：<ul>
+<li><strong>重写题</strong>：包含主语的句子（比如 "The Eiffel Tower is located in"），用来训练模型学会新知识。</li>
+<li><strong>保持题 (KL Prompts)</strong>：无关的句子（比如 "The sky is a"），用来确保模型在学新知识时，不要把原来的通用能力搞坏了。</li>
+</ul>
+</li>
+<li><strong>定位“手术位置”</strong>：找到主语（比如 "Eiffel Tower"）在句子中对应的 Token 位置。我们只修改这个位置的向量。</li>
+</ol>
+<h4>第二阶段：设置变量与钩子 (Setup Optimization)</h4>
+<ol>
+<li><strong>初始化变量 $\delta$ (Delta)</strong>：创建一个全为 0 的向量，并设置 <code>requires_grad=True</code>。<ul>
+<li><em>通俗解释</em>：这就是我们要寻找的“修改量”。最终的目标向量 = 原始向量 + $\delta$。</li>
+</ul>
+</li>
+<li><strong>定义“手术刀” (Hook Function)</strong>：定义 <code>edit_output_fn</code>。<ul>
+<li><em>逻辑</em>：当模型运行到指定层（<code>layer</code>）时，强行把计算出的结果加上 $\delta$。</li>
+</ul>
+</li>
+</ol>
+<h4>第三阶段：寻找最佳向量 (Optimization Loop)</h4>
+<ol>
+<li><strong>开始循环 (Gradient Descent)</strong>：进行多次迭代（比如 20 次），不断调整 $\delta$。<ul>
+<li><strong>前向传播</strong>：带着 $\delta$ 跑一遍模型。</li>
+<li><strong>计算 Loss (三个指标)</strong>：<ol>
+<li><strong>NLL Loss (学会新知识)</strong>：模型现在预测出 "Rome" 的概率大吗？越大 Loss 越小。</li>
+<li><strong>KL Loss (别忘旧本领)</strong>：模型对无关句子的预测分布，和没修改前差别大吗？越小越好。</li>
+<li><strong>Weight Decay (动作别太大)</strong>：$\delta$ 的数值别太夸张，尽可能微调。</li>
+</ol>
+</li>
+<li><strong>反向传播</strong>：根据 Loss 自动调整 $\delta$ 的数值。</li>
+<li><strong>约束 (Projection)</strong>：如果 $\delta$ 太大了，强行把它缩小（Project within L2 ball），防止破坏模型的数值稳定性。</li>
+</ul>
+</li>
+</ol>
+<h4>第四阶段：输出结果 (Finalize)</h4>
+<ol>
+<li><strong>计算最终目标</strong>：<code>target = 原始向量 + 训练好的 delta</code>。</li>
+<li><strong>交卷</strong>：返回这个 <code>target</code> 向量。</li>
+</ol>
+<hr />
+<h3>详细代码对应讲解</h3>
+<p>现在如果你对照着代码看，就会清晰很多：</p>
+<h4>1. 准备阶段</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 获取输出层权重，用来算最后的概率</span>
+<span class="n">lm_w</span><span class="p">,</span> <span class="n">ln_f</span> <span class="o">=</span> <span class="n">nethook</span><span class="o">.</span><span class="n">get_parameter</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="o">...</span><span class="p">),</span> <span class="o">...</span> 
+
+<span class="c1"># 把目标词（比如 &quot;Rome&quot;）变成 ID</span>
+<span class="n">target_ids</span> <span class="o">=</span> <span class="n">tok</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="n">request</span><span class="p">[</span><span class="s2">&quot;target_new&quot;</span><span class="p">],</span> <span class="o">...</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span> 
+
+<span class="c1"># 拼凑 Prompt。rewriting_prompts 是要改的，kl_prompts 是用来保持稳定的</span>
+<span class="n">all_prompts</span> <span class="o">=</span> <span class="n">rewriting_prompts</span> <span class="o">+</span> <span class="n">kl_prompts</span> 
+
+<span class="c1"># 找到主语（Subject）在句子里的位置，比如 &quot;Steve Jobs&quot; 在第几个 token</span>
+<span class="n">lookup_idxs</span> <span class="o">=</span> <span class="p">[</span><span class="n">find_fact_lookup_idx</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="o">...</span><span class="p">]</span>
+</code></pre></div>
+
+<h4>2. 设置变量</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这就是我们要训练的变量 delta，一开始全是 0</span>
+<span class="n">delta</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">((</span><span class="n">model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">n_embd</span><span class="p">,),</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+
+<span class="c1"># 这是一个 Hook 函数，它会在模型运行时被调用</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">edit_output_fn</span><span class="p">(</span><span class="n">cur_out</span><span class="p">,</span> <span class="n">cur_layer</span><span class="p">):</span>
+    <span class="c1"># 记录一下原始的向量长啥样 (target_init)</span>
+    <span class="k">if</span> <span class="n">target_init</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">target_init</span> <span class="o">=</span> <span class="n">cur_out</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="mi">0</span><span class="p">,</span> <span class="n">lookup_idxs</span><span class="p">[</span><span class="mi">0</span><span class="p">]]</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">clone</span><span class="p">()</span>
+
+    <span class="c1"># 【关键操作】 把 delta 加到当前的输出上！</span>
+    <span class="c1"># 这就是模拟“如果这一层的神经元被修改了，会发生什么”</span>
+    <span class="n">cur_out</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="n">idx</span><span class="p">,</span> <span class="n">i</span><span class="p">,</span> <span class="p">:]</span> <span class="o">+=</span> <span class="n">delta</span> 
+    <span class="k">return</span> <span class="n">cur_out</span>
+</code></pre></div>
+
+<h4>3. 优化循环 (The Loop)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">opt</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">optim</span><span class="o">.</span><span class="n">Adam</span><span class="p">([</span><span class="n">delta</span><span class="p">],</span> <span class="n">lr</span><span class="o">=</span><span class="n">hparams</span><span class="o">.</span><span class="n">v_lr</span><span class="p">)</span> <span class="c1"># 使用 Adam 优化器</span>
+
+<span class="k">for</span> <span class="n">it</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">hparams</span><span class="o">.</span><span class="n">v_num_grad_steps</span><span class="p">):</span> <span class="c1"># 循环迭代</span>
+    <span class="c1"># 带着 hook 运行模型</span>
+    <span class="k">with</span> <span class="n">nethook</span><span class="o">.</span><span class="n">TraceDict</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">edit_output</span><span class="o">=</span><span class="n">edit_output_fn</span><span class="p">)</span> <span class="k">as</span> <span class="n">tr</span><span class="p">:</span>
+        <span class="n">logits</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="o">**</span><span class="n">input_tok</span><span class="p">)</span><span class="o">.</span><span class="n">logits</span>
+
+    <span class="c1"># --- 计算 Loss ---</span>
+    <span class="c1"># 1. 预测新词的 Loss (NLL)</span>
+    <span class="n">log_probs</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">log_softmax</span><span class="p">(</span><span class="n">ln_f</span><span class="p">(</span><span class="n">full_repr</span><span class="p">)</span> <span class="o">@</span> <span class="n">lm_w</span> <span class="o">+</span> <span class="n">lm_b</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
+    <span class="n">loss</span> <span class="o">=</span> <span class="o">...</span> <span class="c1"># 比较 log_probs 和 rewriting_targets</span>
+
+    <span class="c1"># 2. 保持稳定性的 Loss (KL Divergence)</span>
+    <span class="n">kl_loss</span> <span class="o">=</span> <span class="o">...</span>
+
+    <span class="c1"># 3. 让 delta 别太大的 Loss (Weight Decay)</span>
+    <span class="n">weight_decay</span> <span class="o">=</span> <span class="o">...</span>
+
+    <span class="c1"># 总 Loss</span>
+    <span class="n">loss</span> <span class="o">=</span> <span class="n">nll_loss</span> <span class="o">+</span> <span class="n">kl_loss</span> <span class="o">+</span> <span class="n">weight_decay</span>
+
+    <span class="c1"># 反向传播，更新 delta</span>
+    <span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+    <span class="n">opt</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+
+    <span class="c1"># 限制 delta 的大小，不能无限大</span>
+    <span class="k">if</span> <span class="n">delta</span><span class="o">.</span><span class="n">norm</span><span class="p">()</span> <span class="o">&gt;</span> <span class="n">max_norm</span><span class="p">:</span>
+        <span class="n">delta</span><span class="p">[</span><span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="n">delta</span> <span class="o">*</span> <span class="n">max_norm</span> <span class="o">/</span> <span class="n">delta</span><span class="o">.</span><span class="n">norm</span><span class="p">()</span>
+</code></pre></div>
+
+<h4>4. 结果</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 最终我们要的向量 = 原始向量 + 训练出来的微调量</span>
+<span class="n">target</span> <span class="o">=</span> <span class="n">target_init</span> <span class="o">+</span> <span class="n">delta</span>
+<span class="k">return</span> <span class="n">target</span>
+</code></pre></div>
+
+<h3>总结</h3>
+<p>这个脚本就像是一个<strong>“逆向工程”</strong>。
+通常我们训练模型是：给数据 -&gt; 算 Loss -&gt; 改模型权重。
+这里是：<strong>不改模型权重</strong> -&gt; 算 Loss -&gt; <strong>改中间层的激活值 (Activation)</strong>。</p>
+<p>算出这个 <code>target</code> 之后，后续的步骤（不在这个文件中）通常会利用这个 <code>target</code> 去反推应该如何修改 MLP 层的权重矩阵，从而永久性地把这个知识写入模型。</p>

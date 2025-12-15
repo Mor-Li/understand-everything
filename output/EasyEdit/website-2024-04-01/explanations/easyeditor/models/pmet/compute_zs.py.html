@@ -1,0 +1,134 @@
+<h1>easyeditor/models/pmet/compute_zs.py</h1>
+<p>这份代码文件 <code>compute_zs.py</code> 是 <strong>PMET (Probabilistic Model Editing with Transformer)</strong> 算法的核心部分之一。它的主要目的是<strong>计算出一个（或两个）“目标向量”</strong>。</p>
+<p>简单来说，模型编辑通过修改模型某一层的参数（矩阵），让模型记住新的知识。为了修改这个矩阵，我们需要知道：<strong>在这个位置，模型的输出向量应该变成什么样，才能让最后输出的结果变成我们想要的那个词？</strong></p>
+<p>这个文件就是在通过“优化（Optimization）”的过程，反推算出这个理想的“目标向量”。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>Task List (任务清单)</strong>，然后一步步解释。</p>
+<hr />
+<h3>核心任务清单 (Task List)</h3>
+<ol>
+<li><strong>准备阶段 (Preparation)</strong>：<ul>
+<li>提取模型参数（LM Head 权重）。</li>
+<li>把目标单词（Target Word，比如要把“巴黎”改成“罗马”）转换成 Token ID。</li>
+<li>构建输入句子（Prompts），包括用来训练的句子和用来保持稳定性的句子（KL Prompts）。</li>
+</ul>
+</li>
+<li><strong>定位阶段 (Localization)</strong>：<ul>
+<li>找到句子中“主语”（Subject，比如“埃菲尔铁塔”）所在的 Token 位置。我们只修改这里的隐藏状态。</li>
+</ul>
+</li>
+<li><strong>初始化变量 (Initialization)</strong>：<ul>
+<li>创建可以学习的变量 <code>delta</code>（增量）。这是我们需要通过梯度下降算出来的“修改量”。</li>
+<li>PMET 算法比较特殊，它同时计算 <strong>Attention 层的增量</strong> (<code>delta_attn</code>) 和 <strong>MLP 层的增量</strong> (<code>delta_mlp</code>)。</li>
+</ul>
+</li>
+<li><strong>定义干预函数 (Define Intervention Hook)</strong>：<ul>
+<li>定义一个函数，告诉模型：“当你运行到这一层时，把刚才定义的 <code>delta</code> 强行加到主语的隐藏状态上”。</li>
+</ul>
+</li>
+<li><strong>执行优化循环 (Optimization Loop)</strong>：<ul>
+<li><strong>前向传播</strong>：带着干预函数运行模型。</li>
+<li><strong>计算 Loss</strong>：<ul>
+<li>让模型预测出新目标（NLL Loss）。</li>
+<li>让模型在无关内容上保持不变（KL Loss）。</li>
+<li>让修改量不要太大（Weight Decay）。</li>
+</ul>
+</li>
+<li><strong>反向传播</strong>：更新 <code>delta</code>。</li>
+</ul>
+</li>
+<li><strong>输出结果 (Output)</strong>：<ul>
+<li>计算最终的目标向量 <code>v* = 原始向量 + delta</code>。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<p>下面我针对代码中的关键逻辑，对应上面的 List 给你讲讲。这里主要讲解 <code>compute_zs</code> 函数（它是 PMET 的特色，计算两个向量），<code>compute_z</code> 是计算单个向量的简化版。</p>
+<h4>Step 1: 准备阶段</h4>
+<p>代码开头部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 获取最后的线性层参数，用来计算概率</span>
+<span class="n">lm_w</span><span class="p">,</span> <span class="n">ln_f</span> <span class="o">=</span> <span class="o">...</span> 
+
+<span class="c1"># 把我们想要的新知识（request[&quot;target_new&quot;]）变成数字ID</span>
+<span class="n">target_ids</span> <span class="o">=</span> <span class="n">tok</span><span class="p">(</span><span class="n">request</span><span class="p">[</span><span class="s2">&quot;target_new&quot;</span><span class="p">],</span> <span class="o">...</span>
+
+<span class="c1"># 构造 Prompt。</span>
+<span class="c1"># rewriting_prompts: 用来教模型新知识，例如 &quot;Eiffel Tower is located in&quot;</span>
+<span class="c1"># kl_prompts: 用来防止模型变傻，例如 &quot;Apple is a&quot; (这种普通句子不应该受影响)</span>
+<span class="n">all_prompts</span> <span class="o">=</span> <span class="n">rewriting_prompts</span> <span class="o">+</span> <span class="n">kl_prompts</span>
+</code></pre></div>
+
+<p><strong>观点</strong>：模型编辑不是只看一句话，而是看一组句子。同时，为了保证模型的通用能力不下降，引入了 KL Divergence 约束。</p>
+<h4>Step 2: 定位阶段</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 找到 &quot;Subject&quot; 在句子里的位置</span>
+<span class="n">lookup_idxs</span> <span class="o">=</span> <span class="p">[</span>
+    <span class="n">find_fact_lookup_idx</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">prompt</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">all_prompts</span><span class="p">)</span>
+<span class="p">]</span>
+</code></pre></div>
+
+<p><strong>观点</strong>：我们不修改整句话的向量，只修改“主语”最后一个 Token 的向量。因为之前的研究（如 ROME）发现，主语的这个位置是知识存储的关键点。</p>
+<h4>Step 3 &amp; 4: 初始化变量与干预函数</h4>
+<p>这是最核心的部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 初始化两个全零的可学习向量，requires_grad=True 表示我们要训练它们</span>
+<span class="n">delta_attn</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">delta_mlp</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+
+<span class="c1"># 定义 Hook 函数</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">edit_output_fn</span><span class="p">(</span><span class="n">cur_out</span><span class="p">,</span> <span class="n">cur_layer</span><span class="p">):</span>
+    <span class="c1"># ... 省略记录初始值代码 ...</span>
+
+    <span class="c1"># 如果当前层是 MLP 层，加上 delta_mlp</span>
+    <span class="k">if</span> <span class="n">cur_layer</span> <span class="o">==</span> <span class="n">hparams</span><span class="o">.</span><span class="n">mlp_module_tmp</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">layer</span><span class="p">):</span>
+        <span class="n">cur_out</span><span class="p">[</span><span class="n">i</span><span class="p">,</span> <span class="n">idx</span><span class="p">,</span> <span class="p">:]</span> <span class="o">+=</span> <span class="n">delta_mlp</span>
+
+    <span class="c1"># 如果当前层是 Attention 层，加上 delta_attn</span>
+    <span class="k">if</span> <span class="n">cur_layer</span> <span class="o">==</span> <span class="n">hparams</span><span class="o">.</span><span class="n">attn_module_tmp</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">layer</span><span class="p">):</span>
+        <span class="n">cur_out</span><span class="p">[</span><span class="n">i</span><span class="p">,</span> <span class="n">idx</span><span class="p">,</span> <span class="p">:]</span> <span class="o">+=</span> <span class="n">delta_attn</span>
+    <span class="k">return</span> <span class="n">cur_out</span>
+</code></pre></div>
+
+<p><strong>观点</strong>：这里体现了 PMET 和 ROME 的区别。ROME 假设知识主要在 MLP 层，只求一个 delta。<strong>PMET 认为知识分布在 Attention 和 MLP 的输出中</strong>，所以它试图同时寻找两个最优的修正向量。</p>
+<h4>Step 5: 优化循环 (Optimization Loop)</h4>
+<p>这是一个标准的 PyTorch 训练循环，但不是训练模型参数，而是训练 <code>delta</code>。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">opt</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">optim</span><span class="o">.</span><span class="n">Adam</span><span class="p">([</span><span class="n">delta_mlp</span><span class="p">,</span> <span class="n">delta_attn</span><span class="p">],</span> <span class="n">lr</span><span class="o">=</span><span class="n">hparams</span><span class="o">.</span><span class="n">v_lr</span><span class="p">)</span>
+
+<span class="k">for</span> <span class="n">it</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">hparams</span><span class="o">.</span><span class="n">v_num_grad_steps</span><span class="p">):</span> <span class="c1"># 迭代很多次</span>
+    <span class="c1"># 1. 带着 Hook 跑模型</span>
+    <span class="k">with</span> <span class="n">nethook</span><span class="o">.</span><span class="n">TraceDict</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">edit_output</span><span class="o">=</span><span class="n">edit_output_fn</span><span class="p">)</span> <span class="k">as</span> <span class="n">tr</span><span class="p">:</span>
+        <span class="n">logits</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="o">**</span><span class="n">input_tok</span><span class="p">)</span><span class="o">.</span><span class="n">logits</span>
+
+    <span class="c1"># 2. 计算 Loss</span>
+    <span class="c1"># Loss 1: NLL Loss (让模型输出 target_new 的概率变大)</span>
+    <span class="n">nll_loss</span> <span class="o">=</span> <span class="o">...</span> 
+    <span class="c1"># Loss 2: KL Loss (让模型在无关句子上的输出分布不要变)</span>
+    <span class="n">kl_loss</span> <span class="o">=</span> <span class="o">...</span>
+    <span class="c1"># Loss 3: 正则化 (让 delta 不要变得无穷大，保持数值稳定)</span>
+    <span class="n">weight_decay</span> <span class="o">=</span> <span class="o">...</span>
+
+    <span class="n">loss</span> <span class="o">=</span> <span class="n">nll_loss</span> <span class="o">+</span> <span class="n">kl_loss</span> <span class="o">+</span> <span class="n">weight_decay</span>
+
+    <span class="c1"># 3. 反向传播更新 delta</span>
+    <span class="n">loss</span><span class="o">.</span><span class="n">backward</span><span class="p">()</span>
+    <span class="n">opt</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+
+    <span class="c1"># 4. 投影 (Project): 如果 delta 太长了，把它缩放回来，防止过拟合</span>
+    <span class="k">if</span> <span class="n">delta_mlp</span><span class="o">.</span><span class="n">norm</span><span class="p">()</span> <span class="o">&gt;</span> <span class="n">max_norm</span><span class="p">:</span> <span class="o">...</span>
+</code></pre></div>
+
+<p><strong>观点</strong>：这是一个“逆向工程”的过程。我们要找的不是“模型参数”，而是一个“中间激活值”。我们问模型：“如果在第 L 层，主语的表示加上了 <code>delta</code>，你能在最后输出我想要的词吗？”如果不可以，就调整 <code>delta</code>，直到可以为止。</p>
+<h4>Step 6: 输出结果</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">target_attn</span> <span class="o">=</span> <span class="n">target_init_attn</span> <span class="o">+</span> <span class="n">delta_attn</span>
+<span class="n">target_mlp</span> <span class="o">=</span> <span class="n">target_init_mlp</span> <span class="o">+</span> <span class="n">delta_mlp</span>
+<span class="k">return</span> <span class="n">target_attn</span><span class="p">,</span> <span class="n">target_mlp</span>
+</code></pre></div>
+
+<p><strong>观点</strong>：函数最终返回的是 <strong>修改后的理想向量</strong>。
+后续的代码（不在这个文件里）会利用这个 <code>target_attn</code> 和 <code>target_mlp</code>，通过最小二乘法（Least Squares）去反解出模型权重的更新量 $\Delta W$，从而永久修改模型。</p>
+<h3>总结</h3>
+<p>这个脚本就像是在做一个<strong>微创手术前的模拟</strong>：
+1.  <strong>病人</strong>：大语言模型。
+2.  <strong>手术目标</strong>：让它把“埃菲尔铁塔”和“罗马”关联起来。
+3.  <strong>手术手段</strong>：在第 <code>layer</code> 层的 Attention 和 MLP 输出处注入电流（<code>delta</code>）。
+4.  <strong>模拟过程 (<code>compute_zs</code>)</strong>：不断调整电流的大小和方向，直到病人的大脑最后能输出“罗马”，同时不影响它识别“苹果”。
+5.  <strong>输出</strong>：记下这股理想的电流及其产生的状态（Target Vectors），交给下一步去修改物理线路（权重）。</p>

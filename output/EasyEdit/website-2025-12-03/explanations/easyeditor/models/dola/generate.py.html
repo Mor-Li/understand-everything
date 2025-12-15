@@ -1,0 +1,97 @@
+<h1>easyeditor/models/dola/generate.py</h1>
+<p>这份代码其实是在实现一种叫做 <strong>DoLa (Decoding by Contrasting Layers)</strong> 的大模型生成策略。</p>
+<p>简单来说，普通的模型生成只看“最后一层”的输出。而 <strong>DoLa</strong> 认为：模型“较早的层”学到的是浅层的、语法性的东西，而“较后的层”学到的是事实性的知识。通过<strong>对比</strong>这两者的差异，可以减少幻觉，提高事实准确性。</p>
+<p>为了让你看懂，我把这段代码执行的逻辑拆解成一个 <strong>Task Todo List（任务清单）</strong>。代码就是按照这个清单一步步干活的。</p>
+<hr />
+<h3>📋 任务清单：DoLa 生成全过程</h3>
+<h4>第一阶段：准备工作 (对应函数 <code>generate</code>)</h4>
+<p>这一部分和普通的大模型生成（如 HuggingFace 的 generate）几乎一样，主要是在做“安检”和“打包”。</p>
+<ul>
+<li><strong>[ ] Task 1: 检查配置单</strong><ul>
+<li>检查用户传进来的参数（比如 <code>generation_config</code>）。</li>
+<li>如果没有设置 <code>pad_token</code>，就把 <code>eos_token</code> 当作填充符。</li>
+<li>确认是否要用多张显卡同步 (<code>synced_gpus</code>)。</li>
+</ul>
+</li>
+<li><strong>[ ] Task 2: 处理输入数据</strong><ul>
+<li>把输入的文本（Prompt）转换成模型能懂的 Tensor 格式。</li>
+<li>确认是否需要 <code>attention_mask</code>（告诉模型哪些词是填充的，不要看）。</li>
+</ul>
+</li>
+<li><strong>[ ] Task 3: 决定停止条件</strong><ul>
+<li>设置好“什么时候停”：比如最大长度是多少？生成了“句号”要不要停？</li>
+</ul>
+</li>
+<li><strong>[ ] Task 4: 转交任务</strong><ul>
+<li>把所有准备好的东西打包，交给核心工头函数：<code>_dola_decoding</code>。</li>
+<li><em>(代码最后一行调用了 <code>result = _dola_decoding(...)</code>)</em></li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>第二阶段：DoLa 核心初始化 (对应函数 <code>_dola_decoding</code>)</h4>
+<p>这里开始进入 DoLa 特有的逻辑。</p>
+<ul>
+<li><strong>[ ] Task 5: 挑选“对比层” (Candidate Layers)</strong><ul>
+<li><strong>核心逻辑</strong>：DoLa 需要拿“最终层”和“中间层”打架。这里要决定选哪些“中间层”。</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li>如果用户设了 <code>dola_layers='low'</code>：选前半部分的层（比如第 0, 2, 4...层）。</li>
+<li>如果用户设了 <code>dola_layers='high'</code>：选后半部分的层（比如第 20, 22, 24...层）。</li>
+<li>这些层被称为 <code>candidate_premature_layers</code>（候选早熟层）。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>第三阶段：生成循环 (Loop)</h4>
+<p>这是生成每一个字的过程，就像写作文，一个字一个字往外蹦。</p>
+<ul>
+<li><strong>[ ] Task 6: 模型前向传播 (Forward Pass)</strong><ul>
+<li>把当前的句子扔进模型。</li>
+<li><strong>关键点</strong>：不仅要拿到<strong>最后一层</strong>的输出 (<code>final_logits</code>)，还要把所有<strong>中间层</strong>的隐状态 (<code>hidden_states</code>) 都拿出来。</li>
+</ul>
+</li>
+<li><strong>[ ] Task 7: 计算“早熟层”的输出</strong><ul>
+<li>遍历刚才选好的那些 <code>candidate_premature_layers</code>。</li>
+<li>把这些层的隐状态，通过 <code>lm_head</code>（语言头，把隐状态转为词表概率），计算出如果只用这一层，模型想说什么。</li>
+<li>结果存入 <code>candidate_premature_logits</code>。</li>
+</ul>
+</li>
+<li><strong>[ ] Task 8: 【DoLa 核心】对比并选择 (对应函数 <code>_dola_select_contrast</code>)</strong><ul>
+<li><strong>子任务 8.1：计算差异 (JS Divergence)</strong><ul>
+<li>比较“最终层”的概率分布和“所有候选早熟层”的概率分布。</li>
+<li>找出那个跟最终层<strong>差异最大</strong>的早熟层（或者说最能代表“无脑直觉”的那一层）。</li>
+</ul>
+</li>
+<li><strong>子任务 8.2：做减法 (Contrast)</strong><ul>
+<li>用公式：<code>最终层Logits - 选中的早熟层Logits</code>。</li>
+<li><em>解释</em>：把“最终层”里包含的“早熟层”的成分减掉，剩下的就是更深思熟虑的“事实性”成分。</li>
+<li>同时会做一个 <code>_relative_top_filter</code>，把概率太低的词直接过滤掉，防止减法减出乱码。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>[ ] Task 9: 选词 (Sampling/Argmax)</strong><ul>
+<li>拿着 Task 8 算出来的那个“对比后的分数” (<code>next_token_scores</code>)。</li>
+<li>如果是贪婪搜索，就选分数最高的词；如果是采样，就按概率抽一个词。</li>
+</ul>
+</li>
+<li><strong>[ ] Task 10: 拼接并继续</strong><ul>
+<li>把选好的这个词拼接到输入句子的后面。</li>
+<li>检查是否满足停止条件（Task 3 设定的）。</li>
+<li>如果没停，<strong>回到 [ ] Task 6</strong>，继续生成下一个字。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码在干嘛？</h3>
+<p>这段代码就是重写了 <code>HuggingFace</code> 的 <code>generate</code> 函数。</p>
+<p><strong>普通的 <code>generate</code> 是：</strong>
+1. 输入 -&gt; 模型 -&gt; 最后一层 -&gt; 选词 -&gt; 输出。</p>
+<p><strong>这个 <code>DoLa generate</code> 是：</strong>
+1. 输入 -&gt; 模型 -&gt; <strong>拿到最后一层 + 拿到第16、18、20层</strong>。
+2. <strong>比较</strong>：看看第16、18、20层里，哪一层跟最后一层差别最有趣。
+3. <strong>相减</strong>：<code>最后一层 - 那个中间层</code> = <strong>更纯粹的事实</strong>。
+4. 用减完的结果 -&gt; 选词 -&gt; 输出。</p>
+<p>这就是这篇代码观点的核心：<strong>通过放大深层网络和浅层网络的差异，来强迫模型说真话。</strong></p>

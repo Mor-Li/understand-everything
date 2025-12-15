@@ -1,0 +1,70 @@
+<h1>easyeditor/trainer/algs/MALMEN.py</h1>
+<p>这份代码实现了一个叫 <strong>MALMEN</strong> 的算法。简单来说，它的目的是<strong>训练一个“修改器”（Hypernetwork），这个修改器能迅速算出如何调整大模型（如 GPT、Llama）的参数，从而让大模型记住新的知识，同时不忘记旧的知识。</strong></p>
+<p>我们可以把这个过程想象成<strong>给大模型做微创手术</strong>。MALMEN 就是那个拿手术刀的医生。</p>
+<p>为了让你看懂，我把这份代码的逻辑拆解成一个 <strong>TODO List（任务清单）</strong>，我们一步步来完成这个“手术”流程：</p>
+<hr />
+<h3>📋 任务清单：MALMEN 的工作流程</h3>
+<h4>Task 1: 准备手术器材 (初始化)</h4>
+<p><strong>对应代码：</strong> <code>__init__</code>
+*   <strong>目标</strong>：确定我们要修大模型的哪几层神经元，并建立一个“修改器网络”（Hypernetwork）。
+*   <strong>解读</strong>：
+    1.  <strong>冻结大模型</strong>：<code>param.requires_grad = False</code>。我们不重新训练整个大模型（太慢了），我们只动一小部分。
+    2.  <strong>选定位置</strong>：<code>config.inner_params</code> 指定了要修改大模型的哪些层（比如第 10 层的 MLP）。
+    3.  <strong>创建修改器</strong>：<code>self.net = nn.ModuleDict(...)</code>。这里创建了 <code>MALMENNet</code>。
+        *   <strong>关键点</strong>：<code>MALMENNet</code> 是一个元网络（Meta-Network）。它的输入不是文本，而是大模型的“神经元激活状态”和“误差梯度”；它的输出是“参数的修改量”。</p>
+<h4>Task 2: 诊断病情 (收集信息)</h4>
+<p><strong>对应代码：</strong> <code>cache(self, batch)</code>
+*   <strong>目标</strong>：给定一个错误的知识（比如“法国首都是罗马”），看看大模型现在的反应是什么，并计算出纠正这个错误所需的原始梯度。
+*   <strong>解读</strong>：
+    1.  <strong>试探运行</strong>：把输入（Input）喂给大模型，算一下 Loss。
+    2.  <strong>捕捉信号</strong>：使用 <code>TracerDict</code>（这是一个钩子工具）截获指定层（Task 1 中选定的层）的两个关键数据：
+        *   <strong>Keys (输入激活值)</strong>：这一层神经元接收到了什么信号？
+        *   <strong>Values Grad (梯度)</strong>：为了修正错误，这一层的输出应该往哪个方向变？
+    3.  <strong>缓存</strong>：把这些 Keys 和 Gradients 存起来，作为下一步的原料。</p>
+<h4>Task 3: 制定手术方案 (预测参数变化)</h4>
+<p><strong>对应代码：</strong> <code>predict_param_shifts(self, module_kv_map)</code>
+*   <strong>目标</strong>：利用 Task 2 收集到的信息，通过“修改器”计算出大模型参数具体该怎么变（Delta W）。
+*   <strong>解读</strong>：
+    1.  <strong>输入</strong>：把 Task 2 拿到的 Keys 和 Gradients 喂给 <code>self.net</code> (MALMENNet)。
+    2.  <strong>数学魔法</strong>：代码中出现了 <code>torch.linalg.solve</code> 和 <code>keys.T @ keys</code>。这实际上是在解一个<strong>最小二乘法（Least Squares）</strong>问题。
+        *   MALMEN 的核心思想是：不要用原本慢吞吞的梯度下降（SGD），而是直接用数学公式解出“最优参数更新量”。
+    3.  <strong>输出</strong>：<code>param_shifts</code>。这是一个字典，告诉我们：每一层的权重矩阵（Weight）应该加上多少数值。</p>
+<h4>Task 4: 执行手术 (修改模型)</h4>
+<p><strong>对应代码：</strong> <code>edit_model(self, param_shifts, is_reverse)</code>
+*   <strong>目标</strong>：把 Task 3 算出来的 <code>param_shifts</code> 加到大模型的权重上。
+*   <strong>解读</strong>：
+    *   <strong>应用修改</strong>：<code>module.weight.data += param_shift</code>。直接修改大模型的参数。
+    *   <strong>可逆操作</strong>：注意参数 <code>is_reverse</code>。
+        *   如果 <code>False</code>：做手术（加上偏移量）。
+        *   如果 <code>True</code>：撤销手术（减去偏移量）。
+        *   <strong>为什么要撤销？</strong> 因为我们在训练“修改器”时，为了省显存和保证环境纯净，每次训练完一个批次，通常会把大模型还原。</p>
+<h4>Task 5: 医术考核 (计算 Loss 并训练)</h4>
+<p><strong>对应代码：</strong> <code>train(self, batch)</code>
+*   <strong>目标</strong>：模拟一次编辑过程，看看改得好不好，然后根据结果优化“修改器”本身。
+*   <strong>解读</strong>：
+    这个函数把上面所有步骤串起来了：
+    1.  <strong>收集信息</strong>：调用 <code>cache()</code>。
+    2.  <strong>预测方案</strong>：调用 <code>predict_param_shifts()</code>。
+    3.  <strong>做手术</strong>：调用 <code>edit_model(..., False)</code>。
+    4.  <strong>考核 (计算 Loss)</strong>：
+        *   <strong>Gen Loss (编辑成功率)</strong>：模型现在能回答正确了吗？（比如“法国首都是巴黎”）。
+        *   <strong>Loc Loss (局部性/防遗忘)</strong>：模型有没有把别的东西搞坏？（比如“中国首都是北京”还得是对的，不能因为改了法国就忘了中国）。这里用了 <code>kl_div</code>（KL散度）来让新模型和旧模型在无关问题上保持一致。
+    5.  <strong>复原</strong>：调用 <code>edit_model(..., True)</code>，把大模型复原，准备下一次迭代。
+    6.  <strong>提升医术</strong>：调用 <code>update_hypernet()</code>。</p>
+<h4>Task 6: 总结经验 (反向传播)</h4>
+<p><strong>对应代码：</strong> <code>update_hypernet(self, ...)</code>
+*   <strong>目标</strong>：根据 Task 5 中的考核结果（Loss），更新 <code>MALMENNet</code> 的参数。
+*   <strong>解读</strong>：
+    *   这是最难懂的部分。它计算了针对 <code>MALMENNet</code> 参数的梯度。
+    *   注意：我们<strong>不更新大模型</strong>，我们更新的是<strong>那个负责预测如何修改大模型的网络</strong>。
+    *   <code>self.opt.step()</code>：优化器步进，让“修改器”在下一次预测时更准。</p>
+<hr />
+<h3>总结：这段代码在干嘛？</h3>
+<p>如果把大模型比作一个<strong>学生</strong>，MALMEN 不是直接教学生（Fine-tuning），而是训练一个<strong>辅导员</strong>（Hypernetwork）。</p>
+<ol>
+<li><strong><code>cache</code></strong>：辅导员观察学生哪里不懂。</li>
+<li><strong><code>predict_param_shifts</code></strong>：辅导员思考该怎么点拨学生（生成参数更新量）。</li>
+<li><strong><code>edit_model</code></strong>：学生接受点拨（修改参数）。</li>
+<li><strong><code>train</code></strong>：我们要考核这个辅导员，看他点拨得好不好（既要学会新题，又不能忘旧题）。如果辅导员教得不好，就调整辅导员的脑子（<code>update_hypernet</code>）。</li>
+</ol>
+<p>你现在可以试着顺着这个逻辑，从 <code>train</code> 函数入手，看它是如何一步步调用其他函数的。</p>

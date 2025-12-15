@@ -1,0 +1,86 @@
+<h1>easyeditor/evaluate/eval_utils_counterfact.py</h1>
+<p>这段代码的核心目的是<strong>给“做过手术”的模型打分</strong>。</p>
+<p>简单来说，你刚刚对一个大模型进行了一次“知识编辑”（Model Editing），比如强行把模型认知中的“埃菲尔铁塔在巴黎”改成了“埃菲尔铁塔在西雅图”。</p>
+<p>这个文件的作用就是<strong>考试</strong>：
+1.  <strong>考记忆</strong>：模型真的记住“在西雅图”了吗？
+2.  <strong>考泛化</strong>：换个说法问（“那个著名的铁塔在哪？”），模型还能答对吗？
+3.  <strong>考副作用</strong>：模型有没有变傻？（比如问“自由女神像在哪”，它会不会也乱答？）</p>
+<p>下面我为你列一个 Task Todo List，并逐步拆解代码的逻辑。</p>
+<hr />
+<h3>📋 评估任务清单 (Todo List)</h3>
+<ol>
+<li><strong>准备考题 (Data Prep)</strong>：从数据集中提取出要问的问题（Prompt）和标准答案（Target）。</li>
+<li><strong>打包试卷 (Batching)</strong>：为了算得快，把所有类型的问题混在一起，一次性扔给模型处理。</li>
+<li><strong>核心阅卷 (Prediction)</strong>：计算模型对“新答案”和“旧答案”的认可度（概率）。<ul>
+<li><em>分支任务 A</em>：如果是 GPT 类模型（Decoder-only），用一种算分法。</li>
+<li><em>分支任务 B</em>：如果是 T5 类模型（Seq2Seq），用另一种算分法。</li>
+</ul>
+</li>
+<li><strong>整理成绩 (Unpacking)</strong>：把混在一起的分数重新分类，看看各项指标（重写成功率、泛化性、邻域稳定性等）分别是多少。</li>
+<li><strong>附加题 (Generation - 代码中被注释掉的部分)</strong>：让模型自由发挥写一段话，检查它说话是否罗嗦、是否离题。</li>
+</ol>
+<hr />
+<h3>💡 逐步详细讲解</h3>
+<h4>第一步：准备考题 (Data Preparation)</h4>
+<p><strong>代码位置</strong>：<code>compute_rewrite_quality_counterfact</code> 函数的前半部分。</p>
+<p><strong>讲解</strong>：
+你需要测试模型是否真的变了。代码从 <code>record</code>（记录）里拿出了三样东西：
+*   <strong>Subject</strong>: 主体（例如 "Eiffel Tower"）。
+*   <strong>Target New</strong>: 你想植入的新知识（例如 "Seattle"）。
+*   <strong>Target True</strong>: 模型原本的旧知识（例如 "Paris"）。</p>
+<p>然后它准备了四类考题（Prompts）：
+1.  <strong>Rewrite Prompts</strong>: 直接问（“埃菲尔铁塔在哪？”）。
+2.  <strong>Paraphrase Prompts</strong>: 换个法子问（“那个也就是在法国的高塔叫啥来着...哦不对，现在是在哪？”）。这是为了测<strong>泛化性</strong>。
+3.  <strong>Neighborhood Prompts</strong>: 问邻居知识（“自由女神像在哪？”）。这是为了测<strong>特异性</strong>（别改了一个把别的也改坏了）。
+4.  <strong>Attribute Prompts</strong>: 问主体的其他属性（“埃菲尔铁塔多高？”）。这也是测有没有副作用。</p>
+<h4>第二步：打包试卷 (Batching)</h4>
+<p><strong>代码位置</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">prob_prompts</span> <span class="o">=</span> <span class="p">[</span><span class="n">rewrite_prompts</span><span class="p">,</span> <span class="n">paraphrase_prompts</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
+<span class="c1"># ...</span>
+<span class="nb">list</span><span class="p">(</span><span class="n">chain</span><span class="p">(</span><span class="o">*</span><span class="n">prob_prompts</span><span class="p">))</span>
+</code></pre></div>
+
+<p><strong>讲解</strong>：
+模型运行一次很慢。如果一题一题问，要跑很久。
+这里用 <code>chain</code> 把上面四类问题串成一个超级长的列表。不管是什么类型的问题，先统一塞进 GPU 里算一遍再说。</p>
+<h4>第三步：核心阅卷 (Prediction)</h4>
+<p><strong>代码位置</strong>：调用 <code>test_batch_prediction</code> 或 <code>test_seq2seq_batch_prediction</code>。</p>
+<p><strong>讲解</strong>：
+这是最难懂的部分。它的核心逻辑不是让模型“生成”文本，而是<strong>计算概率（PPL/Loss）</strong>。</p>
+<p>假设问题是：“埃菲尔铁塔位于__”
+*   <strong>Target New</strong>: 西雅图
+*   <strong>Target True</strong>: 巴黎</p>
+<p>代码会计算：
+1.  在“埃菲尔铁塔位于”后面接“西雅图”的概率得分（Loss越低得分越高）。
+2.  在“埃菲尔铁塔位于”后面接“巴黎”的概率得分。</p>
+<p><strong>函数细节 (<code>test_batch_prediction</code>)</strong>：
+*   它把 <code>Prefix</code> (问题) 和 <code>Suffix</code> (答案) 拼起来。
+*   <code>logits = model(**prompt_tok).logits</code>: 让模型算一遍。
+*   循环中的 <code>results[i] += -log_softmax(...)</code>: 这就是在算<strong>负对数似然（Negative Log Likelihood）</strong>。
+    *   简单理解：<strong>数值越小，代表模型觉得这句话越通顺、越可能是真的。</strong>
+    *   代码里算的是 loss（损失），所以它其实是在看模型对“新知识”有多惊讶。如果不惊讶（Loss低），说明编辑成功了。</p>
+<h4>第四步：整理成绩 (Unpacking)</h4>
+<p><strong>代码位置</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">cutoffs</span> <span class="o">=</span> <span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">+</span> <span class="n">np</span><span class="o">.</span><span class="n">cumsum</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="n">ret_probs</span> <span class="o">=</span> <span class="o">...</span>
+<span class="n">ret</span> <span class="o">=</span> <span class="p">{</span> <span class="o">...</span> <span class="p">}</span>
+</code></pre></div>
+
+<p><strong>讲解</strong>：
+刚才为了快，我们把四类问题混在一起考了。现在拿到了一个长长的分数列表。
+这一步就是根据之前每一类问题的长度，把分数切分开。
+*   <code>rewrite_prompts_probs</code>: 重写成功了吗？
+*   <code>neighborhood_prompts_probs</code>: 邻居知识坏了吗？</p>
+<p>最后返回一个字典 <code>ret</code>，里面装着所有分数的对比。</p>
+<h4>第五步：附加题 (Generation - 可选)</h4>
+<p><strong>代码位置</strong>：<code>test_generation</code> 以及后面定义的 <code>n_gram_entropy</code> 等函数。
+<em>(注意：主函数里这部分代码被注释掉了 <code>if snips is not None:</code>，说明在某些简易评估中可能不跑这一步)</em></p>
+<p><strong>讲解</strong>：
+有时候光看概率不够，还要看模型能不能写出人话。
+*   <strong>Generation</strong>: 给个开头，让模型自己往下编 (<code>generate_fast</code>)。
+*   <strong>n_gram_entropy</strong>: 检查<strong>重复度</strong>。如果模型坏了，可能会一直复读“西雅图 西雅图 西雅图”，这个指标能测出来。
+*   <strong>tfidf_similarity</strong>: 检查<strong>相关性</strong>。模型生成的文本是不是跟我们要的话题有关？</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件的逻辑就是：
+<strong>“我给你改了个知识点，现在我要拿四套卷子（直接问、变着法问、问不相关的、问属性）来测你。我不是看你写什么，而是看你对‘新答案’和‘旧答案’哪个更眼熟（概率更高）。”</strong></p>

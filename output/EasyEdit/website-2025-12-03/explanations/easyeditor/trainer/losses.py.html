@@ -1,0 +1,58 @@
+<h1>easyeditor/trainer/losses.py</h1>
+<p>这份代码文件 <code>easyeditor/trainer/losses.py</code> 的核心作用是定义了<strong>“如何衡量模型表现”</strong>以及<strong>“如何计算模型的损失（Loss）”</strong>。</p>
+<p>在“模型编辑（Model Editing）”这个领域，我们通常有两个目标：
+1.  <strong>有效性（Reliability/Efficacy）：</strong> 模型要学会新知识（比如把“法国首都是巴黎”改成“法国首都是伦敦”）。
+2.  <strong>局部性（Locality）：</strong> 模型不能忘记旧知识，也不能乱改无关的知识（比如不能把“1+1=2”也改坏了）。</p>
+<p>为了帮你读懂代码，我把这份代码拆解成一个 <strong>“模型编辑训练师的 To-Do List”</strong>，每个任务对应代码中的一部分。</p>
+<hr />
+<h3>📋 任务清单：模型编辑训练师的 To-Do List</h3>
+<h4>✅ Task 1: 准备工作 —— 处理“无用数据” (Masking)</h4>
+<p><strong>场景</strong>：大模型处理句子时长短不一，短句子后面会补零（Padding）。算分的时候，不能把补零的那些位置也算进去，否则分数就不准了。
+*   <strong>代码对应</strong>：<code>masked_mean</code>, <code>mask_hf_labels</code>
+*   <strong>白话解释</strong>：
+    *   <code>mask_hf_labels</code>: 把标签里的 <code>-100</code>（HuggingFace默认的忽略标记）改成 <code>0</code>，防止程序报错，并记下哪些位置是有效的。
+    *   <code>masked_mean</code>: 算平均分的时候，只算有效位置的分数，忽略那些补零的占位符。</p>
+<h4>✅ Task 2: 核心任务 —— 算算模型“答对了吗”？ (Log Probs &amp; NLL)</h4>
+<p><strong>场景</strong>：你要教模型新知识，你需要知道它现在的预测概率是多少，离正确答案有多远。
+*   <strong>代码对应</strong>：<code>multiclass_log_probs</code>, <code>masked_log_probs</code>
+*   <strong>核心逻辑</strong>：
+    1.  <strong>Shift (移位)</strong>: 在训练语言模型（如GPT）时，输入是 "A B C"，目标是预测 "B C D"。代码里 <code>if shift...</code> 就是在做这种错位对齐。
+    2.  <strong>Gather (提取)</strong>: 模型会预测几万个词的概率，我们只关心<strong>正确答案</strong>那个词的概率是多少。
+    3.  <strong>NLL (负对数似然)</strong>: 这是最常用的 Loss。概率越高，NLL 越低（Loss 越小）。
+    4.  <strong>Unlikelihood (非似然)</strong>: 代码里有一段 <code>if kwargs["unlikelihood"]</code>。这是为了让模型“讨厌”某些错误的旧知识（比如降低“巴黎”的概率），同时“喜欢”新知识。
+*   <strong>输出</strong>：这个函数返回一个字典，包含准确率 (<code>acc</code>)、对数概率 (<code>log_prob</code>)、Loss (<code>nll</code>) 等。</p>
+<h4>✅ Task 3: 约束任务 —— 别让模型“精神分裂” (KL Divergence)</h4>
+<p><strong>场景</strong>：你修改了模型的一个知识点，但你很怕模型因此“崩坏”，导致它对其他无关问题的回答发生剧烈变化。
+*   <strong>代码对应</strong>：<code>kl_loc_loss</code> (KL Locality Loss)
+*   <strong>核心逻辑</strong>：
+    *   输入：<code>pre</code> (编辑前模型的输出) 和 <code>post</code> (编辑后模型的输出)。
+    *   目的：计算这两个输出分布的<strong>KL散度</strong>（衡量两个分布差异的指标）。
+    *   <strong>观点</strong>：对于无关的输入（Locality dataset），我们希望 <code>pre</code> 和 <code>post</code> 越像越好，差异越小越好。所以这个 Loss 越小，说明模型越稳定，没有“忘本”。</p>
+<h4>✅ Task 4: 进阶任务 —— 只有二选一的时候怎么办？ (Binary Classification)</h4>
+<p><strong>场景</strong>：有时候任务很简单，只是判断“是/否”或者分类（比如情感分类），不是生成长文本。
+*   <strong>代码对应</strong>：<code>binary_log_probs</code>
+*   <strong>核心逻辑</strong>：
+    *   用 <code>sigmoid</code> 而不是 <code>softmax</code>。
+    *   计算二分类的准确率和概率。</p>
+<h4>✅ Task 5: 最终验收 —— 综合评分 (Edit Score)</h4>
+<p><strong>场景</strong>：这是该代码库特定的一个评估指标，可能用于某种特定任务（如性格编辑或特定话题编辑）。
+*   <strong>代码对应</strong>：<code>es</code>
+*   <strong>核心逻辑</strong>：
+    *   它比较了编辑前 (<code>pre</code>) 和编辑后 (<code>post</code>) 在<strong>正样本</strong>（pos）和<strong>负样本</strong>（neg）上的表现。
+    *   <code>z_per</code>: 衡量个性（Personality）是否区分开了（正样本概率 - 负样本概率）。
+    *   <code>z_topic</code>: 衡量话题（Topic）是否被强化了（编辑后概率 - 编辑前概率）。
+    *   <strong>观点</strong>：一个好的编辑，应该让模型在特定话题上的表现变强，且能区分正负样本。</p>
+<hr />
+<h3>🚀 总结：代码阅读路线图</h3>
+<p>如果你想彻底看懂，建议按这个顺序看函数：</p>
+<ol>
+<li><strong>先看 <code>masked_mean</code></strong>: 这是最基础的数学工具，理解它是为了“忽略无效数据”。</li>
+<li><strong>重点看 <code>multiclass_log_probs</code></strong>: 这是<strong>最重要</strong>的函数。<ul>
+<li>忽略 <code>inner_sent</code> 那些复杂的 <code>if</code>，先看最基本的逻辑：<code>log_softmax</code> -&gt; <code>gather</code> -&gt; <code>mean</code>。这就是标准的语言模型 Loss 计算。</li>
+</ul>
+</li>
+<li><strong>再看 <code>kl_loc_loss</code></strong>: 理解这是为了保护模型“不被改坏”的约束项。</li>
+<li><strong>最后看 <code>es</code></strong>: 这是一个特定业务逻辑的打分器，不影响对整体训练流程的理解。</li>
+</ol>
+<p><strong>一句话总结文中观点：</strong>
+这个文件不涉及复杂的网络结构，它只是定义了<strong>尺子</strong>。它用 NLL 衡量“学得好不好”，用 KL 散度衡量“有没有改坏”，用 Accuracy 衡量“答没答对”。</p>

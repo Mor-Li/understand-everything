@@ -1,0 +1,96 @@
+<h1>easyeditor/models/melo/peft_egg/docs/source/task_guides/clm-prompt-tuning.mdx</h1>
+<p>这份文件其实是一个<strong>技术教程（Tutorial）</strong>。</p>
+<p>它的核心目的是教你如何使用 Hugging Face 的 <code>PEFT</code> 库（Parameter-Efficient Fine-Tuning，参数高效微调），通过一种叫做 <strong>Prompt Tuning（提示词微调）</strong> 的技术，来训练一个大模型完成特定的任务（在这里是<strong>分类推特上的推文是否在抱怨</strong>）。</p>
+<p>简单来说，它的中心思想是：<strong>不要重新训练整个大模型（太贵、太慢），而是冻结大模型，只训练这模型输入端的一小撮“虚拟提示词”，就能让模型学会新任务。</strong></p>
+<p>下面我为你列一个任务清单（To-Do List），然后一步步拆解文中的观点。</p>
+<h3>📋 任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>环境准备</strong>：安装必要的代码库 (<code>peft</code>, <code>transformers</code>, <code>datasets</code>)。</li>
+<li><strong>配置设定 (Config)</strong>：定义我们要用什么模型，以及“提示词微调”的具体参数。</li>
+<li><strong>数据准备 (Data)</strong>：下载推特数据集，把数字标签（0, 1）转换成文字标签（"complaint"）。</li>
+<li><strong>数据预处理 (Preprocessing)</strong>：把数据整理成模型能读懂的格式（Tokenization），并处理好长度对齐。</li>
+<li><strong>模型构建 (Model Setup)</strong>：加载基础大模型，并给它“穿上”PEFT的外套（应用 Prompt Tuning 配置）。</li>
+<li><strong>训练 (Training)</strong>：运行训练循环，更新那那一小撮参数。</li>
+<li><strong>保存与推理 (Inference)</strong>：保存训练好的小参数包，加载它，并输入一句新话测试效果。</li>
+</ol>
+<hr />
+<h3>🪜 一步步详细讲解</h3>
+<h4>第一步：概念与配置 (Setup)</h4>
+<p><strong>文中观点：</strong>
+Prompt Tuning 是一种“加法”方法。我们不动原来的模型（weights are frozen），只在输入层加几个“虚拟 Token”让模型去学。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">peft_config</span> <span class="o">=</span> <span class="n">PromptTuningConfig</span><span class="p">(</span>
+    <span class="n">task_type</span><span class="o">=</span><span class="n">TaskType</span><span class="o">.</span><span class="n">CAUSAL_LM</span><span class="p">,</span> <span class="c1"># 任务类型：因果语言模型（就是像GPT那样续写文本）</span>
+    <span class="n">prompt_tuning_init</span><span class="o">=</span><span class="n">PromptTuningInit</span><span class="o">.</span><span class="n">TEXT</span><span class="p">,</span> <span class="c1"># 初始化方式：用一段文字开始</span>
+    <span class="n">num_virtual_tokens</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span> <span class="c1"># 关键点：我们只训练这 8 个虚拟 token</span>
+    <span class="n">prompt_tuning_init_text</span><span class="o">=</span><span class="s2">&quot;Classify if the tweet is a complaint or not:&quot;</span><span class="p">,</span> <span class="c1"># 初始提示词</span>
+    <span class="o">...</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>白话解释</strong>：这步就像是在告诉电脑：“我要训练一个模型，但我只允许你改动输入框里的 8 个单词的权重，原本的大脑（几亿个参数）不许动。初始的提示是‘请分类这条推特...’，你自己慢慢优化这几个词的意思。”</li>
+</ul>
+<h4>第二步：加载并清洗数据 (Load Dataset)</h4>
+<p><strong>文中观点：</strong>
+使用 <code>twitter_complaints</code> 数据集。原始数据里标签是数字（Label: 2），我们需要把它变成人话。</p>
+<p><strong>代码解读：</strong>
+利用 <code>.map()</code> 函数，把 <code>Label: 2</code> 映射成 <code>text_label: "no complaint"</code>。
+*   <strong>白话解释</strong>：模型是生成文字的，它看不懂“类别2”，它需要学会输出“无抱怨”这个词。所以我们要把数据里的答案改成文字。</p>
+<h4>第三步：数据预处理 (Preprocess - 最复杂的一步)</h4>
+<p><strong>文中观点：</strong>
+我们需要把输入文本和标签拼在一起，变成模型能训练的序列。</p>
+<p><strong>代码逻辑拆解：</strong>
+1.  <strong>拼接格式</strong>：把数据拼成 <code>Tweet text : [推文内容] Label : [标签]</code> 的样子。
+2.  <strong>Masking (掩码)</strong>：
+    *   在训练时，我们不希望模型去学习“如何复述推文”，只希望它学习“如何预测标签”。
+    *   代码里 <code>labels["input_ids"][i] = [-100] * ...</code> 这行就是把推文部分的 loss 屏蔽掉（-100 在 PyTorch 里通常代表忽略计算损失）。
+3.  <strong>Padding (填充)</strong>：把所有句子补齐到相同长度（<code>max_length=64</code>）。</p>
+<ul>
+<li><strong>白话解释</strong>：这步是在做“填空题”的试卷。<ul>
+<li>题目是：“推特：我没水喝了。 标签：____”</li>
+<li>答案是：“抱怨”。</li>
+<li>我们告诉模型：你只要把横线填对就行，前面的题目内容不用你背（通过 Masking 实现）。</li>
+</ul>
+</li>
+</ul>
+<h4>第四步：模型“瘦身” (Train - PEFT Model)</h4>
+<p><strong>文中观点：</strong>
+加载基础模型 <code>bloomz-560m</code>，然后应用 <code>get_peft_model</code>。</p>
+<p><strong>关键代码输出：</strong></p>
+<div class="codehilite"><pre><span></span><code>trainable params: 8192 || all params: 559222784 || trainable%: 0.00146...
+</code></pre></div>
+
+<ul>
+<li><strong>白话解释 (重点！)</strong>：<ul>
+<li>原来的模型有 <strong>5.59亿</strong> 个参数。</li>
+<li>使用了 Prompt Tuning 后，我们需要训练的参数只有 <strong>8192</strong> 个。</li>
+<li><strong>这只有原模型的 0.001%！</strong> 这就是为什么它叫“参数高效微调”。你用个普通显卡就能跑，而且速度飞快。</li>
+</ul>
+</li>
+</ul>
+<h4>第五步：训练循环 (Training Loop)</h4>
+<p><strong>文中观点：</strong>
+标准的 PyTorch 训练流程。</p>
+<p><strong>代码解读：</strong>
+<code>model.train()</code> -&gt; <code>loss.backward()</code> -&gt; <code>optimizer.step()</code>。
+*   <strong>白话解释</strong>：这就好比学生在刷题。模型看推文 -&gt; 猜标签 -&gt; 对答案 -&gt; 发现错了 -&gt; 修改那 8 个虚拟 Token 的权重 -&gt; 下一题。</p>
+<h4>第六步：推理与测试 (Inference)</h4>
+<p><strong>文中观点：</strong>
+训练完了，怎么用？我们需要加载基础模型 + 训练好的“补丁”（Adapter）。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 生成时</span>
+<span class="n">outputs</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">max_new_tokens</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">batch_decode</span><span class="p">(</span><span class="o">...</span><span class="p">))</span>
+</code></pre></div>
+
+<ul>
+<li><strong>白话解释</strong>：<ul>
+<li>你给模型一句新话：“@nationalgridus 我没水了，账单也付了，能处理下吗？”</li>
+<li>模型结合它学到的那 8 个“魔法 Token”，理解了这是要分类，并且能根据语义续写出：“complaint”（抱怨）。</li>
+</ul>
+</li>
+</ul>
+<h3>总结文中的核心价值</h3>
+<p>这篇文章其实就是想告诉你：
+<strong>以前微调大模型要改几亿个参数，又贵又慢；现在用 PEFT 的 Prompt Tuning，只需要训练几千个参数，就能让同一个大模型学会分类推特，而且效果还不错，模型文件大小也只有几十KB（而不是几个GB）。</strong></p>

@@ -1,0 +1,77 @@
+<h1>easyeditor/dataset/AKEW_both.py</h1>
+<p>这份代码确实看起来比较繁杂，因为它涉及到了<strong>大模型知识编辑（Knowledge Editing）</strong>的具体实现细节。</p>
+<p>简单来说，这个文件的作用是：<strong>把原始的文本数据（比如 JSON 文件），转换成模型训练或评估时能“吃”进去的格式（PyTorch Tensors）。</strong></p>
+<p>为了让你听懂，我把阅读这份代码拆解成一个 <strong>5步走的 Task List</strong>，我们一步步来“通关”。</p>
+<hr />
+<h3>Task List: 阅读指南</h3>
+<ol>
+<li><strong>Task 1: 理解背景（这是在干什么？）</strong> -&gt; 搞懂“知识编辑”的数据结构。</li>
+<li><strong>Task 2: 搞懂“方言”（Helper Functions）</strong> -&gt; 也就是文件开头那一堆 <code>get_llama...</code> 函数。</li>
+<li><strong>Task 3: 数据的入口（Init）</strong> -&gt; <code>__init__</code> 函数在加载什么文件。</li>
+<li><strong>Task 4: 数据清洗车间（Process）</strong> -&gt; 如何把乱七八糟的 JSON 变成统一的字典。</li>
+<li><strong>Task 5: 打包发货（Collate）</strong> -&gt; <code>collate_fn</code> 是怎么把文字变成数字张量的。</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>Task 1: 理解背景（这是在干什么？）</h4>
+<p>这个文件是为 <strong>AKEW (A Knowledge Editing Welfare)</strong> 这个项目服务的。
+<strong>核心目标</strong>：我们要让大模型“修改记忆”。比如，模型原来认为“美国总统是拜登”，我们要训练它改成“美国总统是特朗普”。</p>
+<p>为了做到这一点，数据通常包含以下几个关键部分：
+*   <strong>Prompt (Src)</strong>: 提示词，例如 "Who is the president of USA?"
+*   <strong>Target New (Trg)</strong>: 新的答案，例如 "Trump"。
+*   <strong>Ground Truth</strong>: 旧的/原本正确的答案，例如 "Biden"。
+*   <strong>Locality</strong>: 邻域数据。为了防止模型改傻了（改了总统却忘了美国首都在哪），需要一些不应该被改变的数据来做约束。</p>
+<h4>Task 2: 搞懂“方言”（Helper Functions）</h4>
+<p><strong>代码位置</strong>：文件最开头的 <code>get_llama_with_answer</code>, <code>get_qwen_without_answer</code> 等函数。</p>
+<p><strong>解释</strong>：
+不同的模型（Llama, Qwen, Vicuna）有不同的<strong>对话模板（Chat Template）</strong>。
+大模型不仅仅是续写，它们通常经过了指令微调（Instruction Tuning）。为了让模型听懂那是“用户说的话”还是“助手说的话”，需要加上特殊的符号。</p>
+<ul>
+<li><strong>例子</strong>：<ul>
+<li><strong>Llama 3</strong> 喜欢用 <code>&lt;|start_header_id|&gt;user...</code></li>
+<li><strong>Qwen (千问)</strong> 喜欢用 <code>&lt;|im_start|&gt;user...</code></li>
+<li><strong>Vicuna</strong> 喜欢用 <code>USER: ... ASSISTANT:</code></li>
+</ul>
+</li>
+</ul>
+<p><strong>这部分代码的作用</strong>：就是给输入的文本“加特技”（加特殊标签），把普通的问题包装成特定模型能读懂的对话格式。</p>
+<h4>Task 3: 数据的入口（Init）</h4>
+<p><strong>代码位置</strong>：<code>class AKEWUnifiedDataset</code> -&gt; <code>__init__</code> 方法。</p>
+<p><strong>解释</strong>：
+这是数据集的初始化。它做了两件事：
+1.  <strong>选文件</strong>：根据你传入的 <code>dataset_type</code>（比如 <code>counterfact</code>, <code>wikiupdate</code>），决定去读硬盘上的哪个 JSON 文件。
+2.  <strong>选分词器 (Tokenizer)</strong>：根据你用的模型（Llama, Qwen, Mistral 等），加载对应的分词器。分词器负责把文字变成数字。这里还专门处理了 padding（填充）符号的问题，比如 GPT2 和 Llama 需要左侧填充。</p>
+<h4>Task 4: 数据清洗车间（Process）</h4>
+<p><strong>代码位置</strong>：<code>_process_structured_format</code> 和 <code>_process_unstructured_format</code> 以及下面的一堆 <code>_process_xxx</code> 函数。</p>
+<p><strong>解释</strong>：
+原始的 JSON 数据可能长得很乱，不同的数据集字段名不一样。这个环节是把它们统一成一个标准的<strong>Python 字典</strong>。</p>
+<p>代码分了两种模式：
+*   <strong>Structured (结构化)</strong>: 传统的编辑格式。
+    *   提取出 <code>prompt</code> (问题), <code>target_new</code> (新知识), <code>locality</code> (用于保持稳定性的知识)。
+*   <strong>Unstructured (非结构化/自由文本)</strong>: 针对对话模型的格式。
+    *   这里会调用 <strong>Task 2</strong> 中的 helper functions，把问题包装成 <code>&lt;|user|&gt;...</code> 的格式。
+    *   它会根据当前模型是 Llama 还是 Qwen，生成不同的 <code>question</code> 和 <code>answer</code> 字段。</p>
+<p><strong>举个代码中的例子 (<code>_process_wikiupdate_structured</code>)</strong>：
+它把 JSON 里的 <code>requested_rewrite</code> 拿出来，拆解成：
+*   <code>subject</code>: 主语
+*   <code>prompt</code>: 问题
+*   <code>target_new</code>: 新答案
+*   <code>ground_truth</code>: 旧答案</p>
+<h4>Task 5: 打包发货（Collate）</h4>
+<p><strong>代码位置</strong>：<code>collate_fn</code> 和 <code>collate_gpt_fn</code>。</p>
+<p><strong>解释</strong>：
+这是 PyTorch <code>DataLoader</code> 用到的核心函数。当训练开始时，模型是一批一批（Batch）吃数据的。这个函数负责把 <strong>Task 4</strong> 里的那堆字典，转换成 <strong>PyTorch Tensor（张量）</strong>。</p>
+<p>它做了这么几件事：
+1.  <strong>Tokenization</strong>: 调用 <code>self.tok()</code> 把文本（"Who is president?"）变成数字 ID 序列（<code>[123, 456, 789]</code>）。
+2.  <strong>Padding</strong>: 因为一个 Batch 里句子长短不一，要把短的句子补齐（Pad）到 <code>max_length</code>。
+3.  <strong>Label Masking (<code>get_edit_labels</code>)</strong>:
+    *   在训练时，我们通常只希望模型学习<strong>输出</strong>（Answer），而不计算<strong>输入</strong>（Prompt）的 Loss。
+    *   所以这里会把 Prompt 部分的 Label 设置为 <code>-100</code>（PyTorch 中代表忽略该位置的 Loss）。
+4.  <strong>打包</strong>: 最后返回一个包含 <code>input_ids</code>, <code>attention_mask</code>, <code>labels</code> 的大字典，直接扔进 GPU 训练。</p>
+<hr />
+<h3>总结</h3>
+<p>这篇代码其实就是一个<strong>高级服务员</strong>：
+1.  <strong>看菜单</strong> (<code>__init__</code>)：确定今天要上什么菜（数据集）。
+2.  <strong>摆盘</strong> (<code>Helper Functions</code>)：根据客人的习惯（Llama/Qwen），把菜摆成特定的样子（加特殊Token）。
+3.  <strong>备菜</strong> (<code>Process</code>)：把原始食材（JSON）洗净切好，分类放进盘子（统一字典格式）。
+4.  <strong>上菜</strong> (<code>Collate</code>)：把一桌子的菜打包好，转换成机器能吃的形式（Tensor），端上去（送入 GPU）。</p>

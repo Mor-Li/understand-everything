@@ -1,0 +1,76 @@
+<h1>easyeditor/models/ft/ft_main.py</h1>
+<p>这份代码实现了<strong>Fine-Tuning (微调)</strong> 的逻辑，专门用于“模型编辑”（Model Editing）。简单来说，它的目的是：<strong>通过少量的训练步骤，强行让模型记住一个新的知识点（比如：把“埃菲尔铁塔在哪？”的答案从“巴黎”改成“罗马”），同时尽量不破坏原来的其他知识。</strong></p>
+<p>为了让你听懂，我把这段代码想象成一个<strong>“装修队队长”</strong>拿到了一份<strong>“房屋改造任务书”</strong>。</p>
+<p>下面是这个“队长”执行任务的 <strong>Todo List（任务清单）</strong>，每一步对应代码中的逻辑：</p>
+<hr />
+<h3>任务阶段一：准备工作 (由 <code>apply_ft_to_model</code> 函数负责)</h3>
+<p><strong>Task 1: 接单与复制图纸</strong>
+*   <strong>代码逻辑</strong>: 检查是否需要 <code>copy=True</code>。
+*   <strong>人话解释</strong>: 客户问：“你要在原房子上改，还是先建个模型屋改改看？”如果要复制，就先深拷贝一份模型，防止把原版搞坏了。</p>
+<p><strong>Task 2: 把活儿派给工头</strong>
+*   <strong>代码逻辑</strong>: 调用 <code>execute_ft(model, ...)</code>。
+*   <strong>人话解释</strong>: 队长不亲自干脏活，把具体的计算任务交给工头（<code>execute_ft</code> 函数），告诉他：“去算出我们需要改哪些砖头，改多少。”</p>
+<hr />
+<h3>任务阶段二：施工计算 (核心逻辑，由 <code>execute_ft</code> 函数负责)</h3>
+<p><strong>Task 3: 确认修改目标 (Prompt -&gt; Target)</strong>
+*   <strong>代码逻辑</strong>: 处理 <code>requests</code>，给 <code>target_new</code> 前面加空格（为了分词正确）。
+*   <strong>人话解释</strong>: 明确任务目标。比如输入是“美国总统是”，目标输出要改成“奥巴马”。</p>
+<p><strong>Task 4: 锁定要敲的墙 (定位权重)</strong>
+*   <strong>代码逻辑</strong>: 遍历 <code>model.named_parameters()</code>，根据 <code>hparams.layers</code> 里的配置筛选出需要更新的层（weights）。
+*   <strong>人话解释</strong>: 我们不能把整栋楼都拆了。只允许修改第20层到25层的某几面墙（特定层的参数）。</p>
+<p><strong>Task 5: 拍照留底 (备份旧权重)</strong>
+*   <strong>代码逻辑</strong>: <code>weights_copy = {k: v.detach().clone() ...}</code>
+*   <strong>人话解释</strong>: 在动工前，把那几面墙原来的样子拍个照存起来。一是方便以后恢复，二是用来限制修改幅度（不能改得面目全非）。</p>
+<p><strong>Task 6: 准备工具 (配置优化器)</strong>
+*   <strong>代码逻辑</strong>: <code>torch.optim.Adam(...)</code>
+*   <strong>人话解释</strong>: 拿出锤子和铲子（Adam优化器），设定好施工力度（学习率 <code>lr</code>）。</p>
+<p><strong>Task 7: 开始特训 (循环迭代 <code>for it in range(hparams.num_steps)</code>)</strong>
+这是最复杂的一步，相当于在一个小黑屋里反复教模型说话：</p>
+<ul>
+<li><strong>7.1 喂数据</strong>: 把“问题”和“新答案”变成机器能读懂的数字（Tokenization）。</li>
+<li><strong>7.2 算分 (计算 Loss)</strong>:<ul>
+<li>代码里有很多 <code>if/else</code> (T5, ChatGLM, prompt_last, target_new)。</li>
+<li><strong>人话解释</strong>: 让模型试着回答。<ul>
+<li>如果是 T5 模型，用 T5 的方式算错得离谱不离谱。</li>
+<li>如果是 ChatGLM，处理一下特殊的掩码。</li>
+<li>如果是普通模型（Llama等）：<ul>
+<li><code>prompt_last</code>: 只看问题说完后的第一个词对不对。</li>
+<li><code>target_new</code>: 看整句新答案说得顺不顺。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>最终得到一个 <code>loss</code>（错误率）。</li>
+</ul>
+</li>
+<li><strong>7.3 纠错 (Backward &amp; Step)</strong>:<ul>
+<li><strong>代码逻辑</strong>: <code>loss.backward()</code>, <code>opt.step()</code></li>
+<li><strong>人话解释</strong>: 根据错误率，告诉模型：“你错了！往这边改！”然后锤子落下，修改墙体参数。</li>
+</ul>
+</li>
+<li><strong>7.4 严控违建 (Norm Constraint)</strong>:<ul>
+<li><strong>代码逻辑</strong>: <code>torch.clamp(v, min=old-eps, max=old+eps)</code></li>
+<li><strong>人话解释</strong>: <strong>这一步很重要！</strong> 改完之后，工头会拿出之前的照片（Task 5的备份）对比。如果某块砖改动太大（超过 <code>eps</code>），就强行把它按回去一点。这是为了防止模型学会了新知识，却忘了怎么说人话（防止灾难性遗忘）。</li>
+</ul>
+</li>
+</ul>
+<p><strong>Task 8: 这里的活干完了，生成变更单 (Deltas)</strong>
+*   <strong>代码逻辑</strong>: <code>deltas = weights - weights_copy</code>
+*   <strong>人话解释</strong>: 算出“新墙”和“旧墙”的区别。
+*   <strong>代码逻辑</strong>: <code>v[...] = weights_copy[k]</code> (Restore state)
+*   <strong>人话解释</strong>: <strong>注意！</strong> <code>execute_ft</code> 这个函数很讲究，它算完之后，会把模型<strong>恢复成原样</strong>。它只返回一个“变更单”（Deltas），而不是直接把模型改了。</p>
+<hr />
+<h3>任务阶段三：正式交付 (回到 <code>apply_ft_to_model</code>)</h3>
+<p><strong>Task 9: 正式实施装修</strong>
+*   <strong>代码逻辑</strong>:
+    <code>python
+    for w_name, upd_matrix in deltas.items():
+        w[...] += upd_matrix</code>
+*   <strong>人话解释</strong>: 拿着工头给的“变更单”（Deltas），在真正的模型上执行加法操作。
+    *   <code>新权重 = 旧权重 + 变更量</code></p>
+<p><strong>Task 10: 清理现场并交房</strong>
+*   <strong>代码逻辑</strong>: 清理内存，返回 <code>model</code> 和 <code>weights_copy</code>。
+*   <strong>人话解释</strong>: 把修改后的模型交给客户。</p>
+<hr />
+<h3>总结</h3>
+<p>这个脚本就是：<strong>锁定模型的一小部分参数 -&gt; 针对新知识进行高强度的针对性训练 -&gt; 限制训练幅度防止改崩了 -&gt; 算出参数的变化量 -&gt; 应用到模型上。</strong></p>

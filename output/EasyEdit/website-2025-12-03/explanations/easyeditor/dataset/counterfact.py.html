@@ -1,0 +1,108 @@
+<h1>easyeditor/dataset/counterfact.py</h1>
+<p>这份代码是 <strong>EasyEditor</strong> 项目的一部分，专门用于处理 <strong>CounterFact</strong> 数据集。</p>
+<p>简单来说，这个文件的作用是：<strong>把原始的文本数据（比如 JSON 文件）转化成模型（如 GPT、Llama）能够读懂的 Tensor（张量）格式，以便训练模型进行“知识编辑”。</strong></p>
+<p>所谓的“知识编辑”（Model Editing），就是想教会模型一个新的知识（哪怕是错的，叫 CounterFact），同时保证模型不傻（能举一反三），且不坏（不破坏原有的无关知识）。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>Task To-Do List</strong>，然后一步步讲解。</p>
+<hr />
+<h3>📋 核心任务清单 (Task To-Do List)</h3>
+<p>要理解这个代码，你只需要关注它完成的这三个主要任务：</p>
+<ol>
+<li>
+<p><strong>Task 1: 初始化与准备 (Initialization)</strong></p>
+<ul>
+<li>加载配置文件。</li>
+<li>准备好“翻译官”（Tokenizer，把字变成数字）。</li>
+<li>把原始数据文件（JSON）读进内存。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 2: 提取单条数据 (Fetching)</strong></p>
+<ul>
+<li>根据索引号，从内存里拿出一组原始数据（比如第 5 条）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 3: 数据打包与格式化 (Collating) —— </strong>这是最核心的部分****</p>
+<ul>
+<li>把一堆数据（Batch）凑在一起。</li>
+<li><strong>分类处理</strong>：把数据分成“原本的问题”、“目标答案”、“重述的问题”和“不相关的问题”。</li>
+<li><strong>数字化</strong>：把这些文字统统变成数字 ID。</li>
+<li><strong>生成标签</strong>：告诉模型哪些地方需要学习，哪些地方需要忽略（Masking）。</li>
+<li><strong>区分模型</strong>：针对 GPT 类模型和其他模型做不同的拼接处理。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🔍 逐步详解 (Step-by-Step)</h3>
+<h4>Step 1: 初始化 (<code>__init__</code>)</h4>
+<p>这是类的启动阶段。</p>
+<ul>
+<li><strong>设定路径和配置</strong>：代码读取了 <code>config</code>，确定了句子最大长度 (<code>max_length</code>)。</li>
+<li><strong>加载 Tokenizer (翻译官)</strong>：<ul>
+<li>代码里有一大段 <code>if isinstance(tokenizer, ...)</code>。</li>
+<li><strong>观点</strong>：对于 GPT2 或 Llama 这种生成式模型，代码强制设置了 <code>padding_side = 'left'</code>（左侧填充）。</li>
+<li><em>为什么？</em> 因为生成模型是向右预测的，如果在右边补零（padding），会干扰生成结果。左边补零不影响右边的生成。</li>
+</ul>
+</li>
+<li><strong>加载数据</strong>：<code>json.load(f)</code> 把硬盘上的数据读到了 <code>self.data</code> 里。</li>
+</ul>
+<h4>Step 2: 获取数据 (<code>__getitem__</code>)</h4>
+<p>非常简单，就是为了让 PyTorch 的 DataLoader 能够通过 <code>dataset[i]</code> 拿到第 <code>i</code> 条数据。它返回的是原始字典。</p>
+<h4>Step 3: 数据打包 (<code>collate_fn</code> 和 <code>collate_gpt_fn</code>)</h4>
+<p>这是你最看不懂的地方，也是逻辑最密集的。这里有两个函数，逻辑类似，区别在于<strong>输入文本的拼接方式</strong>。我们以 <code>collate_gpt_fn</code>（针对 GPT 类模型）为例，因为它更常用。</p>
+<p>这一步是在构建“知识编辑”的三大指标数据：</p>
+<p><strong>1. 准备原材料 (Raw Data Extraction):</strong>
+代码从 batch 里提取了四种关键文本：
+*   <strong><code>src</code> (Source/Prompt)</strong>: 提示词。例如：“埃菲尔铁塔位于”。
+*   <strong><code>trg</code> (Target)</strong>: 我们想让模型学会的新知识（即便是假的）。例如：“罗马”（原本是巴黎，现在强行改成罗马）。
+*   <strong><code>rephrase</code> (Generalization)</strong>: 换个说法问。例如：“去哪里看埃菲尔铁塔？”（用来测试模型是否真的学会了，而不是死记硬背）。
+*   <strong><code>loc</code> (Locality/Neighborhood)</strong>: 也就是“不相关的问题”。例如：“自由女神像位于”。（用来测试模型修改完埃菲尔铁塔后，会不会把自由女神像的位置也搞乱了）。</p>
+<p><strong>2. 文本拼接 (Concatenation - GPT 特有逻辑):</strong>
+在 <code>collate_gpt_fn</code> 中：
+*   GPT 是生成模型，它需要看到上文预测下文。
+*   所以代码把 <code>Prompt</code> 和 <code>Target</code> 拼在了一起。
+    *   比如变成：“埃菲尔铁塔位于 罗马”。
+*   <code>rephrase</code> 和 <code>loc</code> 也都拼上了对应的答案。</p>
+<p><strong>3. 数字化 (Tokenization):</strong>
+*   代码调用 <code>self.tok(...)</code>。
+*   把上面的字符串全部变成 Tensor（数字矩阵），比如 <code>[101, 234, 555...]</code>。
+*   同时生成 <code>attention_mask</code>（告诉模型哪些是补零的废话，不要看）。</p>
+<p><strong>4. 组装训练目标 (<code>edit_inner</code>, <code>edit_rephrase</code>, <code>loc</code>):</strong>
+最后返回的大字典里包含三个核心部分：</p>
+<ul>
+<li>
+<p><strong><code>edit_inner</code> (用于训练修改)</strong>:</p>
+<ul>
+<li>这是用来教模型的主力数据。</li>
+<li><strong>关键点</strong>：<code>edit_labels</code>。代码调用了 <code>get_edit_labels</code>。它把 Padding 的部分的 Label 设为 <code>-100</code>。在 PyTorch 里，Label 为 -100 的位置<strong>不计算 Loss（损失）</strong>。这意味着模型不需要学习怎么预测“补零位”，只需要学习有意义的词。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>edit_rephrase</code> (用于测试泛化)</strong>:</p>
+<ul>
+<li>用来评估模型：我换个问法，你还能答对“罗马”吗？</li>
+</ul>
+</li>
+<li>
+<p><strong><code>loc</code> (用于测试局部性)</strong>:</p>
+<ul>
+<li>用来评估模型：我问你“自由女神像”，你可别也答成“罗马”或者乱码了。这里需要模型保持原样。</li>
+</ul>
+</li>
+</ul>
+<h4>补充：<code>cond</code> 是什么？</h4>
+<p>代码里还有个 <code>cond</code>：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">cond</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;</span><span class="si">{}</span><span class="s2"> &gt;&gt; </span><span class="si">{}</span><span class="s2"> || </span><span class="si">{}</span><span class="s2">&quot;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">b</span><span class="p">[</span><span class="s1">&#39;ground_truth&#39;</span><span class="p">],</span> <span class="n">b</span><span class="p">[</span><span class="s2">&quot;target_new&quot;</span><span class="p">],</span> <span class="n">b</span><span class="p">[</span><span class="s1">&#39;prompt&#39;</span><span class="p">])</span> <span class="o">...</span><span class="p">]</span>
+</code></pre></div>
+
+<p>这是为了配合 <strong>SERAC</strong> 这种特定的编辑算法。SERAC 需要一个额外的分类器，输入格式就是这种“旧答案 &gt;&gt; 新答案 || 问题”的特殊字符串。如果不用 SERAC 算法，这部分可能用不上。</p>
+<hr />
+<h3>💡 总结 (Wrap up)</h3>
+<p>这个文件的逻辑就是：</p>
+<ol>
+<li><strong>读数据</strong>：把“要把 A 改成 B”这种数据读进来。</li>
+<li><strong>分流</strong>：把数据拆成“教学用的”、“考试用的（换个问法）”、“防副作用用的（无关问题）”。</li>
+<li><strong>翻译</strong>：把文字变成 GPT 能吃的 Tensor。</li>
+<li><strong>打包</strong>：把这些 Tensor 塞进一个字典，丢给 GPU 去训练。</li>
+</ol>
+<p>如果你是在做 Model Editing 的实验，这个 Dataset 类就是你的“数据供货商”。</p>

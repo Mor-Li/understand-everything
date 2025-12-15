@@ -1,0 +1,90 @@
+<h1>easyeditor/models/melo/peft_egg/src/peft/tuners/melo.py</h1>
+<p>这份代码实现了一个名为 <strong>MELO (Model Editing with LOra)</strong> 的算法。</p>
+<p>简单来说，它的核心思想是：<strong>不是对所有输入都使用同一套 LoRA 参数，而是根据输入内容的“相似度”，动态地从一个“数据库”中检索出特定的 LoRA 参数块来处理当前的输入。</strong> 这通常用于“模型编辑”（Model Editing），即让模型修正某个特定知识（比如“法国首都是哪里”）而不影响其他知识。</p>
+<p>为了让你看懂，我制定了一个 <strong>学习任务清单 (Todo List)</strong>，我们按照这个顺序一步步拆解代码。</p>
+<hr />
+<h3>📋 学习任务清单 (Task Todo List)</h3>
+<ol>
+<li><strong>Task 1: 搞懂配置 (Config)</strong> - 看看 MELO 比普通 LoRA 多了什么参数。</li>
+<li><strong>Task 2: 搞懂架构 (Model Structure)</strong> - 这里的层被分为了两类：“指挥官”和“执行者”。</li>
+<li><strong>Task 3: 核心大脑 (VecDB)</strong> - 理解它是如何通过“向量数据库”来记忆和区分不同输入的。</li>
+<li><strong>Task 4: 指挥官 (GraceLayer)</strong> - 理解这一层是如何根据输入，算出“我们要用哪一块 LoRA”。</li>
+<li><strong>Task 5: 执行者 (Dynamic LoRA)</strong> - 理解 LoRA 层是如何根据指挥官的命令，动态加载参数的。</li>
+</ol>
+<hr />
+<h3>🚀 逐步解析 (Step-by-Step Guide)</h3>
+<h4>Task 1: 搞懂配置 (<code>MeloConfig</code>)</h4>
+<p>首先看代码开头的 <code>MeloConfig</code> 类。它继承自 <code>PeftConfig</code>。
+除了标准的 LoRA 参数（如 <code>r</code>, <code>lora_alpha</code>），它多了两个关键字段：</p>
+<ul>
+<li><strong><code>grace_layer</code></strong>: 这是一个字符串。它指定了模型中的<strong>某一层</strong>作为“指挥官”（Grace Layer）。这一层负责判断当前输入属于哪个“知识点”。</li>
+<li><strong><code>grace_config</code></strong>: 这是一个字典，包含了向量数据库的配置（比如半径 <code>radius</code> 等）。</li>
+</ul>
+<p><strong>观点 1：</strong> MELO 不是全局微调，它依赖于一个特定的“Grace Layer”来充当路由（Router）。</p>
+<h4>Task 2: 搞懂架构 (<code>MeloModel</code>)</h4>
+<p>看 <code>MeloModel</code> 类，特别是 <code>_find_and_replace</code> 和 <code>_find_and_replace_grace</code> 方法。
+代码逻辑是这样的：</p>
+<ol>
+<li>它遍历模型的所有层。</li>
+<li>如果某层名字匹配 <code>grace_layer</code>，把它替换成 <strong><code>GraceLinear</code></strong>（指挥官）。</li>
+<li>如果某层名字匹配 <code>target_modules</code>（需要加 LoRA 的层），把它替换成 <strong><code>Linear</code></strong> (继承自 <code>LoraLayer</code>，执行者)。</li>
+</ol>
+<p><strong>观点 2：</strong> 模型里现在有两种特殊的层。一种负责“查表”（GraceLinear），一种负责“干活”（LoraLayer）。</p>
+<h4>Task 3: 核心大脑 (<code>VecDB</code>)</h4>
+<p>这是全篇最难也是最核心的部分。看 <code>class VecDB</code>。
+它是一个简单的<strong>向量数据库</strong>，用来存储“编辑过的知识点的特征”。</p>
+<ul>
+<li><strong><code>table</code></strong>: 存数据的列表。每一行代表一个“簇”（Cluster），包含：<ul>
+<li><code>cluster_center</code>: 这个簇的中心向量（Key）。</li>
+<li><code>radius</code>: 这个簇的半径（在这个范围内都算这个簇）。</li>
+<li><code>points</code>: 具体的样本点。</li>
+</ul>
+</li>
+<li><strong><code>add_cluster</code></strong>: 当遇到全新的知识（新编辑任务）时，开辟一个新的簇。</li>
+<li><strong><code>search_database</code></strong>: 给定一个输入（Query），计算它和所有簇中心的距离。</li>
+<li><strong><code>search_cluster</code></strong>: 判断输入是否落在某个簇的半径内。<ul>
+<li>如果在半径内 -&gt; 返回对应的 <strong>Block ID</strong>（LoRA 参数块的编号）。</li>
+<li>如果不在 -&gt; 返回 <code>NO_LORA</code>（不进行修改）。</li>
+</ul>
+</li>
+</ul>
+<p><strong>观点 3：</strong> MELO 维护了一个外挂的数据库。输入进来后，先算距离。如果输入和之前教过的某个知识很像（距离近），就激活对应的 LoRA；否则就当无事发生。</p>
+<h4>Task 4: 指挥官 (<code>GraceLinear</code>)</h4>
+<p>看 <code>class GraceLinear</code>，它继承自 <code>nn.Linear</code> 和 <code>GraceLayer</code>。</p>
+<p>它的 <code>forward</code> 函数逻辑如下：
+1.  <strong>正常计算</strong>：先做原本的 Linear 运算，得到 <code>layer_out</code>。
+2.  <strong>提取特征</strong>：取 <code>layer_out</code> 的一部分作为 Query（查询向量）。
+3.  <strong>查库 (<code>search</code>)</strong>：调用 <code>VecDB</code>，问：“这个输入属于哪个簇？”
+4.  <strong>发布命令</strong>：得到结果 <code>lora_block_mapping</code>（比如 <code>[0, -100, 5]</code>，代表第1个样本用0号LoRA，第2个不用，第3个用5号）。
+5.  <strong>全局广播</strong>：它把这个结果赋值给全局变量 <code>LORA_BLOCK_MAPPING</code>。</p>
+<p><strong>训练时的特殊逻辑</strong>：如果是训练阶段，它还会负责 <code>add_cluster</code>（添加新知识）或者 <code>split_cluster_radii_in_half</code>（如果新旧知识冲突了，就缩小半径，把它们区分开）。</p>
+<p><strong>观点 4：</strong> GraceLayer 不直接修改输出，它的作用是<strong>打标签</strong>。它告诉后面的层：“注意了，当前处理的是第 X 号知识点，请准备好对应的参数。”</p>
+<h4>Task 5: 执行者 (<code>Linear</code> 和 <code>dynamic</code>)</h4>
+<p>最后看 <code>class Linear</code>（在文件后半部分）和 <code>class dynamic</code>。</p>
+<p>普通的 LoRA 是 <code>x @ A @ B</code>。
+MELO 的 LoRA 是 <strong>动态的</strong>。</p>
+<ol>
+<li><strong><code>dynamic</code> 类</strong>：这是一个辅助类。它维护了一个巨大的参数池（比如 rank=100），但每次只切一小块出来用（比如 rank=1）。</li>
+<li><strong><code>Linear.forward</code></strong>：<ul>
+<li>它读取全局的 <code>LORA_BLOCK_MAPPING</code>（就是刚才指挥官发布的命令）。</li>
+<li>如果命令是 <code>NO_LORA</code>，就只做原始的前向传播。</li>
+<li>如果命令是具体的 ID（比如 Block 5）：<ul>
+<li><code>nd_lora_A</code> 和 <code>nd_lora_B</code> 会根据 ID，从大参数池里切出属于 Block 5 的那一小片参数。</li>
+<li>计算 <code>x @ lora_A_block_5 @ lora_B_block_5</code>。</li>
+<li>把结果加到原始输出上。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<p><strong>观点 5：</strong> 这就是“多路复用”的 LoRA。虽然看起来只有一个 LoRA 层，但实际上内部藏了成百上千个小的 LoRA 块。根据输入的不同，实时切换使用哪一块。</p>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>把所有步骤串起来，MELO 的工作流是这样的：</p>
+<ol>
+<li><strong>输入进来</strong> -&gt; 经过前面的层。</li>
+<li><strong>到达 GraceLayer (指挥官)</strong> -&gt; 提取特征 -&gt; 去 VecDB 查一下 -&gt; <strong>“哦，这个输入是关于‘法国首都’的，对应 ID=5”</strong> -&gt; 将 ID=5 写入全局变量。</li>
+<li><strong>到达 LoraLayer (执行者)</strong> -&gt; 看到全局变量是 ID=5 -&gt; <strong>“好，我调用第 5 号 LoRA 参数块”</strong> -&gt; 计算并修正输出。</li>
+<li><strong>输出</strong> -&gt; 得到修正后的结果（比如输出“巴黎”）。</li>
+</ol>
+<p>如果不匹配任何簇（ID=NO_LORA），则模型按原样输出，保证了非编辑知识的稳定性。</p>

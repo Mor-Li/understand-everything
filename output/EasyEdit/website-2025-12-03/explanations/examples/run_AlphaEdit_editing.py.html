@@ -1,0 +1,110 @@
+<h1>examples/run_AlphaEdit_editing.py</h1>
+<p>这个脚本 <code>run_AlphaEdit_editing.py</code> 的核心作用是：<strong>给大模型“做手术”</strong>。</p>
+<p>也就是我们常说的<strong>大模型知识编辑（Model Editing）</strong>。它的目的是在不重新训练整个模型的情况下，精准地修改模型里的某一条知识（比如把“法国首都是巴黎”改成“法国首都是里昂”），同时不破坏模型里的其他知识。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“主刀医生的手术清单” (Task Todo List)</strong>，我们一步步来看。</p>
+<hr />
+<h3>📋 Task 1: 确定手术方案 (配置参数)</h3>
+<p><strong>目标</strong>：告诉程序我们要用什么方法、修什么模型、用什么数据。</p>
+<p>在代码的 <code>if __name__ == "__main__":</code> 之后，程序做的第一件事就是“听指挥”。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>parser = argparse.ArgumentParser()...</code> 到 <code>args = parser.parse_args()</code>。</li>
+<li><strong>通俗解释</strong>：
+    当你运行这个脚本时，你需要通过命令行告诉它：<ol>
+<li><code>--editing_method</code>: 用哪种手术刀？(比如 AlphaEdit, ROME, MEMIT 等)。</li>
+<li><code>--hparams_dir</code>: 手术的具体参数在哪？(比如模型路径、学习率等配置文件)。</li>
+<li><code>--data_dir</code>: 病人数据（要修改的知识）在哪？</li>
+<li><code>--data_type</code>: 数据集是哪一种？(ZsRE, CF, MCF 是三种常用的测试数据集)。</li>
+</ol>
+</li>
+</ul>
+<h3>📋 Task 2: 准备手术器械 (加载超参数)</h3>
+<p><strong>目标</strong>：根据你选择的方法，加载对应的配置工具类。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    if args.editing_method == 'FT':
+        editing_hparams = FTHyperParams
+    # ... (中间略)
+    elif args.editing_method == 'AlphaEdit':
+        editing_hparams = AlphaEditHyperParams</code></li>
+<li><strong>通俗解释</strong>：
+    如果你选了 <code>AlphaEdit</code> 方法，程序就会去拿 <code>AlphaEdit</code> 专用的“说明书”（HyperParams）。这决定了后面如何加载模型配置。</li>
+</ul>
+<h3>📋 Task 3: 诊断与数据准备 (加载/下载数据集)</h3>
+<p><strong>目标</strong>：把要修改的知识整理成模型能看懂的格式。这是代码里最长的一段逻辑。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>if args.data_type == 'ZsRE': ... elif ...</code> 这一大段。</li>
+<li><strong>通俗解释</strong>：
+    它根据你选的数据集（比如 <code>ZsRE</code>），去读取 JSON 文件。如果没有文件，它会自动下载 (<code>torch.hub.download_url_to_file</code>)。
+    它把数据整理成了这几个关键部分：<ol>
+<li><strong><code>prompts</code> (问题)</strong>: 比如 "The president of the US is"（美国总统是）。</li>
+<li><strong><code>target_new</code> (新目标)</strong>: 比如 "Ultraman"（奥特曼）。<em>（我们要强行让模型认为美国总统是奥特曼）</em></li>
+<li><strong><code>subject</code> (主体)</strong>: "US"（美国）。</li>
+<li><strong><code>rephrase_prompts</code> (同义句)</strong>: 用来测试泛化能力的，比如 "Who leads the US?"。如果手术成功，问这个也得回答奥特曼。</li>
+<li><strong><code>locality_inputs</code> (邻域测试)</strong>: 用来测试副作用的。比如问 "The president of France is"，模型不应该回答奥特曼，应该保持原样。</li>
+</ol>
+</li>
+</ul>
+<h3>📋 Task 4: 医生进场 (初始化编辑器)</h3>
+<p><strong>目标</strong>：加载大模型（LLM）和编辑算法。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    hparams = editing_hparams.from_hparams(f'{args.hparams_dir}')
+    # ...
+    editor = BaseEditor.from_hparams(hparams)</code></li>
+<li><strong>通俗解释</strong>：
+    <code>BaseEditor</code> 是这里的总管。它会根据刚才加载的配置（hparams），把真正的 PyTorch 模型（比如 Llama-2 或 GPT-J）加载到显卡里，并准备好对应的编辑算法。</li>
+</ul>
+<h3>📋 Task 5: 开始手术 (执行编辑)</h3>
+<p><strong>目标</strong>：这是全篇最核心的一行代码，执行真正的知识修改。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    metrics, edited_model, _ = editor.edit(
+        prompts=prompts,
+        rephrase_prompts=rephrase_prompts,
+        target_new=target_new,
+        subject=subject,
+        locality_inputs=locality_inputs,
+        keep_original_weight=True,  # 这里的 True 可能是指不覆盖原文件，或者保留原始权重副本
+        sequential_edit=args.sequential_edit, # 是否连续编辑多条知识
+        test_generation=True, # 编辑完顺便生成一下看看效果
+    )</code></li>
+<li><strong>通俗解释</strong>：
+    调用 <code>editor.edit</code> 函数。这个函数内部会：<ol>
+<li>计算梯度的变化或者权重的更新矩阵（取决于用的什么算法，比如 AlphaEdit）。</li>
+<li>直接修改模型的权重参数。</li>
+<li><strong>测试 (Metrics)</strong>：修改完立刻做测试，看看：<ul>
+<li><strong>Efficacy</strong>: 改成功了吗？</li>
+<li><strong>Generalization</strong>: 换个问法还能答对吗？</li>
+<li><strong>Specificity</strong>: 有没有改坏别的东西？</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h3>📋 Task 6: 写手术报告 (保存结果)</h3>
+<p><strong>目标</strong>：把测试指标保存成 JSON 文件，并打印摘要。</p>
+<ul>
+<li>
+<p><strong>代码对应</strong>：
+    ```python
+    with open(output_file, 'w') as f:
+        json.dump(metrics, f, indent=4)</p>
+<p>if len(metrics) &gt; 0:
+    summary_metrics(metrics)
+<code>``
+*   **通俗解释**：
+把刚才测试的评分（metrics）存到</code>outputs<code>文件夹里。最后</code>summary_metrics` 会在屏幕上打印一个平均分，告诉你这次批量修改的整体效果如何。</p>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个脚本就是一个<strong>自动化的流水线</strong>：
+1.  <strong>接收指令</strong>（我要改什么模型，用什么算法）。
+2.  <strong>准备数据</strong>（把“原来的知识”和“想篡改成的知识”准备好）。
+3.  <strong>加载模型</strong>。
+4.  <strong>注入修改</strong>（修改模型权重）。
+5.  <strong>输出体检报告</strong>（修改成功率多少，副作用多少）。</p>
+<p>你之所以之前看不懂，可能是被中间那一大段处理 <code>ZsRE/CF/MCF</code> 数据的代码干扰了，那只是在做<strong>数据格式清洗</strong>而已，核心逻辑其实就是最后那几行 <code>editor.edit()</code>。</p>

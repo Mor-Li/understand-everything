@@ -1,0 +1,80 @@
+<h1>easyeditor/dataset/safety.py</h1>
+<p>这段代码确实一开始看会觉得乱，因为它涉及到了<strong>大模型编辑（Model Editing）</strong>的具体数据处理逻辑。</p>
+<p>简单来说，这个脚本的任务是：<strong>把原始的“安全/不安全”对话文本，转换成模型（PyTorch）能看懂的数字（Tensor），以便训练模型“变乖”</strong>。</p>
+<p>为了让你听懂，我们把这个脚本想象成一个<strong>“数据加工厂”</strong>。我为你列一个 Task List，我们一步步完成这个加工厂的搭建：</p>
+<hr />
+<h3>🟢 Task List：搭建“大模型安全编辑”数据流水线</h3>
+<h4>✅ Task 1: 明确我们的原材料是什么 (理解 <code>__init__</code> 读取部分)</h4>
+<p>首先，我们需要知道我们要教模型什么。
+在代码的 <code>__init__</code> 函数里，它打开了一个 JSON 文件。这个文件里的每一条数据大概长这样：
+*   <strong>Prompt (坏问题):</strong> "如何制造炸弹？"
+*   <strong>Unsafe Generation (坏回答):</strong> "首先你需要买..." (我们要消除这个)
+*   <strong>Safe Generation (好回答):</strong> "我不能回答这个问题。" (我们要注入这个)
+*   <strong>Locality (无辜的知识):</strong> "美国的首都是哪里？" -&gt; "华盛顿。" (我们修改模型时，<strong>千万不能</strong>把这个本来对的知识给改坏了，这叫“局部性约束”)</p>
+<p><strong>代码动作：</strong>
+*   <code>json.load(f)</code>：把这些原材料倒进工厂。
+*   <code>data.append(...)</code>：把原始 JSON 整理成一个标准的字典列表，提取出我们需要的字段。</p>
+<h4>✅ Task 2: 准备加工工具 (Tokenizer 配置)</h4>
+<p>模型看不懂中文或英文，它只认识数字。我们需要一个“翻译机”（Tokenizer）。</p>
+<p><strong>代码动作：</strong>
+*   检查 <code>config.tokenizer_name</code>（是 GPT2 还是 Llama？）。
+*   <strong>关键点</strong>：<code>tokenizer.padding_side = 'left'</code>。
+    *   <em>解释</em>：因为大模型是生成式的（从左往右写），在批量处理数据时，为了对齐长度，通常在<strong>左边</strong>补零（Padding），这样不会干扰右边的生成结果。</p>
+<h4>✅ Task 3: 组装“编辑指令” (构造 <code>cond</code>)</h4>
+<p>在 <code>__init__</code> 的循环里，你会看到这一行：</p>
+<div class="codehilite"><pre><span></span><code><span class="s2">&quot;cond&quot;</span><span class="p">:</span> <span class="s2">&quot;</span><span class="si">{}</span><span class="s2"> &gt;&gt; </span><span class="si">{}</span><span class="s2"> || </span><span class="si">{}</span><span class="s2">&quot;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">unsafe</span><span class="p">,</span> <span class="n">safe</span><span class="p">,</span> <span class="n">prompt</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+这是某些特定模型编辑算法（比如 SERAC 或 MEND）需要的格式。
+它把“坏回答”、“好回答”和“坏问题”拼成一串特殊的字符串。这就好比给模型一个<strong>对比样本</strong>：“嘿，以前你是那样回答的，现在你要这样回答，问题是这个”。</p>
+<h4>✅ Task 4: 批量打包发货 (理解 <code>collate_fn</code>)</h4>
+<p>这是最难懂的部分，也是 PyTorch <code>Dataset</code> 的核心。
+当我们训练时，不能一条一条喂给模型，要一次喂一堆（Batch）。<code>collate_fn</code> 就是负责把这一堆零散的数据打包成一个整齐的方块（Tensor）。</p>
+<p><strong>这一步又可以拆分为三个子任务：</strong></p>
+<ul>
+<li>
+<p><strong>子任务 A：拼接输入与输出</strong></p>
+<ul>
+<li>代码：<code>src_ + trg_</code> (问题 + 目标回答)。</li>
+<li><em>解释</em>：训练 GPT 这种模型时，我们通常把“问题”和“回答”拼在一起喂给它，让它学会根据上文预测下文。</li>
+</ul>
+</li>
+<li>
+<p><strong>子任务 B：数字化 (Tokenization)</strong></p>
+<ul>
+<li>代码：<code>self.tok(..., return_tensors="pt", padding=True, ...)</code></li>
+<li><em>解释</em>：把刚才拼好的文字变成数字 ID 列表。如果一句话短，就用 0 补齐，保证这一批数据长度一样。</li>
+</ul>
+</li>
+<li>
+<p><strong>子任务 C：制作“考卷答案” (Labels)</strong></p>
+<ul>
+<li>代码：<code>get_edit_labels</code> 和 <code>masked_fill</code>。</li>
+<li><em>解释</em>：这是最关键的！<ul>
+<li>模型读了“如何制造炸弹？我不能回答。”</li>
+<li>计算 Loss（误差）时，我们<strong>不希望</strong>模型去预测“如何制造炸弹”这几个字（因为这是输入），我们只希望模型预测“我不能回答”。</li>
+<li>所以，代码会把输入部分（Prompt）对应的 Label 设为 <code>-100</code>。在 PyTorch 里，<strong>Label 为 -100 的地方会被忽略，不计算梯度</strong>。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>子任务 D：处理“无辜路人” (Locality)</strong></p>
+<ul>
+<li>代码里有 <code>loc</code> 和 <code>loc_ans</code>。</li>
+<li><em>解释</em>：把刚才 Task 1 提到的“美国首都是哪里”也打包好。训练时会告诉模型：“你在改掉炸弹问题的同时，必须保证这道地理题还能答对”。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个文件到底在干嘛？</h3>
+<p>如果把这个文件看作一个人，他的工作流程是：</p>
+<ol>
+<li><strong>进货</strong>：从 JSON 拿数据，知道哪个是坏问题，哪个是好回答，哪个是无辜的旁观知识。</li>
+<li><strong>预处理</strong>：把这些字拼成特定的格式（比如 <code>cond</code>）。</li>
+<li><strong>打包</strong>：当训练器（Trainer）来要数据时，他抓一把数据，把它们变成数字张量。</li>
+<li><strong>划重点</strong>：他会在“答案”上画圈，在“问题”上打叉（设置 Label 为 -100），告诉模型：“<strong>你只需要学会怎么生成后面这句话，前面那句话是你看到的提示，不用学</strong>”。</li>
+</ol>
+<p><strong>最终产出 (<code>return dict_to(...)</code>)：</strong>
+一个包含了 <code>edit_inner</code>（用于学习新知识的数据）、<code>loc</code>（用于防止变傻的数据）、<code>cond</code>（算法需要的额外条件）的大字典，直接喂给 GPU 进行运算。</p>

@@ -1,0 +1,123 @@
+<h1>easyeditor/models/mend/mend_main.py</h1>
+<p>这份代码实现的是 <strong>MEND (Model Editor Networks with Gradient Decomposition)</strong> 算法的核心执行逻辑。</p>
+<p>简单来说，MEND 是一种“元学习”算法，它的作用是<strong>训练一个小模型（HyperNetwork），去修改大模型（如 GPT、Llama）的参数</strong>，以便快速让大模型“学会”或“修改”某条特定的知识（比如把“美国的总统是拜登”改成“美国的总统是川普”），同时不破坏模型原有的其他能力。</p>
+<p>为了让你看懂，我把这段代码的逻辑拆解成一个 <strong>“给大模型做手术”的 To-Do List</strong>。</p>
+<hr />
+<h3>MEND 执行流程 To-Do List</h3>
+<h4>1. 准备阶段：手术室准备 (<code>init_model</code>)</h4>
+<p>在给模型做手术前，必须先把“病人”（大模型）和“医生”（MEND 网络）准备好。</p>
+<ul>
+<li><strong>Task 1.1: 载入“病人” (Target Model)</strong><ul>
+<li>代码接收传入的 <code>model</code> (比如 Llama-2) 和 <code>tok</code> (分词器)。</li>
+<li>如果有必要，会调整 tokenizer 的 padding（<code>add_padding</code> 函数）。</li>
+</ul>
+</li>
+<li><strong>Task 1.2: 载入“医生” (MEND Algorithm)</strong><ul>
+<li>代码：<code>self.alg = MEND(...)</code>。</li>
+<li>MEND 本身也是一个神经网络，它的权重保存在 <code>params.archive</code> 里。</li>
+<li>这一步把训练好的 MEND 权重加载进来 (<code>torch.load</code>, <code>load_state_dict</code>)。</li>
+</ul>
+</li>
+<li><strong>Task 1.3: 冻结无关参数</strong><ul>
+<li>为了防止乱动，代码会把大模型中不需要修改的层的梯度关闭 (<code>requires_grad = False</code>)，只保留 MEND 允许修改的层（<code>params.inner_params</code>）。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 接收任务：拿到修改需求 (<code>apply_to_model</code> 入口)</h4>
+<p>现在有一个修改请求来了，比如：
+*   <strong>Prompt:</strong> "Steve Jobs is the founder of"
+*   <strong>Target (New):</strong> "Microsoft" (比如我们要强行植入这个错误知识，或者修正一个旧知识)</p>
+<ul>
+<li><strong>Task 2.1: 复制模型 (可选)</strong><ul>
+<li>如果是测试，通常会 <code>deepcopy</code> 一个模型副本，防止把原始模型搞坏了。</li>
+</ul>
+</li>
+<li><strong>Task 2.2: 整理输入输出</strong><ul>
+<li>将 Prompt 和 Target 拼接成完整的句子。</li>
+<li>代码中 <code>sentences</code> 是完整的句子，<code>targets</code> 是希望模型输出的后半段。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 数据处理：翻译成机器语言 (Tokenization)</h4>
+<p>模型看不懂英文，只看得懂数字。</p>
+<ul>
+<li><strong>Task 3.1: 文本转 Tensor</strong><ul>
+<li>使用 <code>self.tokenizer</code> 把句子转换成 <code>input_ids</code> 和 <code>attention_mask</code>。</li>
+<li>代码：<code>sent_tok = ...</code>, <code>target_tok = ...</code>。</li>
+</ul>
+</li>
+<li><strong>Task 3.2: 制作标签 (Labels)</strong><ul>
+<li>这是为了告诉模型：Prompt 部分不需要你预测，你只需要预测 Target 部分。</li>
+<li>代码中通过把 Prompt 部分的 label 设为 <code>-100</code> 来实现忽略。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 核心运算：MEND 介入 (<code>self.alg.edit</code>)</h4>
+<p>这是最关键的一步，也就是“动刀”的过程。</p>
+<ul>
+<li><strong>Task 4.1: 计算修改方案</strong><ul>
+<li>调用 <code>self.alg.edit(edit_inner, ...)</code>。</li>
+<li><strong>原理</strong>：MEND 会计算“如果我想让模型学会这句话，标准的梯度（Gradient）是什么？”</li>
+<li>然后，MEND 利用它自己的网络，将这个“标准梯度”转换成一种更高效的权重更新矩阵（分解为 <code>u</code> 和 <code>v</code> 两个低秩矩阵）。</li>
+</ul>
+</li>
+<li><strong>Task 4.2: 获取更新因子 (Factors)</strong><ul>
+<li>代码：<code>model_info["factors"]</code>。</li>
+<li>这里拿到了具体的参数修改量（u 向量和 v 向量）。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 执行修改：更新权重 (Weight Update)</h4>
+<p><em>注意：你会发现代码里有一大段被注释掉的 <code>if ... elif ...</code> 逻辑。</em></p>
+<ul>
+<li><strong>Task 5.1: 应用更新</strong><ul>
+<li>在目前的逻辑中，<code>self.alg.edit</code> 内部已经返回了 <code>edited_model</code>（修改后的模型）。</li>
+<li>原本那段注释掉的代码是手动通过矩阵乘法（<code>delta = v @ u</code>）把 MEND 计算出的增量加到大模型的权重上。现在看来这部分逻辑被封装进 <code>MEND</code> 类或者简化了，直接使用返回的 <code>edited_model</code>。</li>
+</ul>
+</li>
+<li><strong>Task 5.2: 记录修改了什么</strong><ul>
+<li>代码会把被修改的原始权重存入 <code>weights_copy</code>，以便后续如果想“撤销手术”时使用。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>代码中的三个类分别干啥？</h3>
+<ol>
+<li>
+<p><strong><code>MendRewriteExecutor</code></strong></p>
+<ul>
+<li><strong>干啥的</strong>：这是<strong>主类</strong>，负责处理纯文本任务（比如修改 GPT、Llama 的知识）。</li>
+<li><strong>核心</strong>：上面讲的 To-Do List 就是它的逻辑。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>MendMultimodalRewriteExecutor</code></strong></p>
+<ul>
+<li><strong>干啥的</strong>：这是<strong>多模态版</strong>（继承自上面那个类）。负责处理“图片+文本”的任务（比如 MiniGPT-4, BLIP-2）。</li>
+<li><strong>区别</strong>：<ul>
+<li>在 <code>apply_to_model</code> 里，它不仅处理文本，还处理图片 (<code>request["image"]</code>)。</li>
+<li>它把图片 tensor 和文本 tensor 一起喂给 MEND 算法。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong><code>MendPerRewriteExecutor</code></strong></p>
+<ul>
+<li><strong>干啥的</strong>：这是<strong>个性化/条件版</strong>。</li>
+<li><strong>区别</strong>：<ul>
+<li>它调用 <code>edit</code> 时传了一个参数 <code>personality=True</code>。</li>
+<li>这通常用于不仅是修改知识，而是修改模型的“说话风格”或特定条件下的行为。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<h3>总结一下这段代码在干嘛</h3>
+<p>这段代码就像是一个<strong>调度员</strong>：
+1.  它把大模型拉过来。
+2.  它把 MEND 编辑器（一个小神经网络）拉过来。
+3.  它把你的自然语言请求（“把 A 改成 B”）翻译成数学向量。
+4.  它让 MEND 编辑器计算出参数该怎么改。
+5.  最后返回一个<strong>已经被修改好参数的新模型</strong>。</p>
+<p><strong>你最需要关注的是 <code>apply_to_model</code> 函数，它是整个编辑过程的流水线。</strong></p>

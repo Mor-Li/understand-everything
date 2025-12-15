@@ -1,0 +1,139 @@
+<h1>easyeditor/trainer/algs/local_nn.py</h1>
+<p>这段代码确实写得比较抽象，因为它不仅仅是定义一个普通的神经网络，而是为了<strong>模型编辑（Model Editing）</strong>这个特定任务设计的。在模型编辑中，我们通常希望网络在<strong>初始状态下“什么都不做”</strong>（即输出等于输入，或者输出为0），然后通过训练慢慢学会去“修改”某些东西。</p>
+<p>为了帮你读懂，我制定了一个 <strong>5步走的 Task List</strong>，我们一步步拆解它的核心逻辑。</p>
+<hr />
+<h3>📋 学习任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1：理解积木块 —— <code>LRLinear</code> (低秩线性层)</strong></li>
+<li><strong>Task 2：理解“模式”开关 —— <code>n_modes</code> (条件控制)</strong></li>
+<li><strong>Task 3：理解组合体 —— <code>IDMLP</code> (恒等映射网络)</strong></li>
+<li><strong>Task 4：理解大杂烩 —— <code>MLP</code> 及其复杂的初始化</strong></li>
+<li><strong>Task 5：总结 —— 为什么 EasyEditor 需要这个文件？</strong></li>
+</ol>
+<hr />
+<h3>🟢 Task 1：理解积木块 —— <code>LRLinear</code></h3>
+<p><strong>目标</strong>：看懂 <code>class LRLinear(nn.Module)</code>。</p>
+<p>普通的线性层（<code>nn.Linear</code>）是用一个大矩阵 $W$ 来做乘法：$y = xW$。
+但是这个类叫 <code>LRLinear</code> (Low-Rank Linear)，它想省参数。</p>
+<ul>
+<li>
+<p><strong>核心逻辑</strong>：它不存大矩阵 $W$，而是存两个小矩阵 $U$ 和 $V$。</p>
+<ul>
+<li>$W \approx U \times V$</li>
+<li>代码位置 (Line 52-53)：
+    <code>python
+    self.u = nn.Parameter(torch.zeros(outf, mid_dim))
+    self.v = nn.Parameter(torch.randn(mid_dim, inf))</code></li>
+<li><strong>作用</strong>：大幅减少参数量。比如 $1000 \times 1000$ 的矩阵有一百万个参数，如果拆成 $1000 \times 10$ 和 $10 \times 1000$，就只有两万个参数。</li>
+</ul>
+</li>
+<li>
+<p><strong>特殊的初始化 (Line 51-60)</strong>：</p>
+<ul>
+<li>如果 <code>init="id"</code>（Identity，恒等）：它把 $U$ 设为0。这意味着初始时刻，这一层的输出（在加上输入之前）是 0。</li>
+<li>这为了实现“初始时刻不改变输入”做铺垫。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🟢 Task 2：理解“模式”开关 —— <code>n_modes</code></h3>
+<p><strong>目标</strong>：看懂 <code>LRLinear</code> 里的 <code>mode</code> 相关的代码。</p>
+<p>你会在代码里看到 <code>mode_shift</code> 和 <code>mode_scale</code> (Line 63-66)。这是干嘛的？</p>
+<ul>
+<li><strong>核心逻辑</strong>：这是一个<strong>条件控制（Conditional）</strong>机制。<ul>
+<li>想象这个网络是一个多功能工具。输入 <code>x</code> 是一样的，但我告诉网络：“现在是<strong>模式1</strong>”，它就输出结果A；我说“现在是<strong>模式2</strong>”，它就输出结果B。</li>
+</ul>
+</li>
+<li><strong>代码实现</strong>：<ul>
+<li>它用 <code>Embedding</code> 存了一组“缩放系数 (scale)”和“偏移量 (shift)”。</li>
+<li>计算公式 (Line 90-91)：
+    <code>python
+    scale, shift = self.mode_scale(mode), self.mode_shift(mode)
+    pre_act = pre_act * scale + shift</code></li>
+<li>这就像是给神经网络装了一个<strong>旋钮</strong>，根据 <code>mode</code> 的不同，调整这一层的激活值。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🟢 Task 3：理解组合体 —— <code>IDMLP</code></h3>
+<p><strong>目标</strong>：看懂 <code>class IDMLP(nn.Module)</code>。</p>
+<p><strong>名字含义</strong>：ID = Identity (恒等)，MLP = 多层感知机。
+<strong>设计目的</strong>：这个网络的<strong>初始目标</strong>是：输入什么，就输出什么 ($f(x) \approx x$)。</p>
+<ul>
+<li><strong>核心逻辑</strong>：<ul>
+<li>它堆叠了几个我们刚才看的 <code>LRLinear</code> 层。</li>
+<li>在 <code>LRLinear</code> 的 <code>forward</code> 最后有这么一句 (Line 96)：
+    <code>python
+    if self.init == "id":
+        return acts + x  # 关键！残差连接</code></li>
+<li>因为 <code>LRLinear</code> 初始化时 $U$ 是0，所以 <code>acts</code> 是0。</li>
+<li>结果就是：<code>0 + x = x</code>。</li>
+</ul>
+</li>
+<li><strong>结论</strong>：<code>IDMLP</code> 就是一堆带有残差连接（Residual Connection）的层，初始状态下它就像一根导线，直接把输入传到输出，没有任何变化。训练开始后，它才慢慢学会在这个 <code>x</code> 上加一点点修改。</li>
+</ul>
+<hr />
+<h3>🟢 Task 4：理解大杂烩 —— <code>MLP</code> 及其复杂的初始化</h3>
+<p><strong>目标</strong>：看懂 <code>class MLP(nn.Module)</code> 及其眼花缭乱的 <code>init</code>。</p>
+<p>这是一个通用的 MLP 类，但它为了支持“初始输出等于输入”废了很大劲。最难懂的是 <code>init="id"</code> 时的逻辑 (Line 160-170)。</p>
+<ul>
+<li>
+<p><strong>如果你选 <code>init="id_alpha"</code> (Line 144, 189)</strong>：</p>
+<ul>
+<li>这是最简单的实现方式。</li>
+<li>公式：<code>output = x + alpha * network(x)</code>。</li>
+<li>它初始化一个参数 <code>alpha = 0</code>。所以初始输出就是 <code>x</code>。这叫 <strong>Zero-init 技巧</strong>。</li>
+</ul>
+</li>
+<li>
+<p><strong>如果你选 <code>init="id"</code> (最难懂的部分)</strong>：</p>
+<ul>
+<li>它试图用 ReLU 激活函数来实现恒等映射。</li>
+<li><strong>难点</strong>：ReLU 会把负数变成 0，怎么保证信息不丢失？</li>
+<li><strong>魔法 (Line 162-169)</strong>：<ul>
+<li>它在第一层把权重设为 $[I, -I]$（正单位阵和负单位阵）。</li>
+<li>如果输入是 <code>5</code>：正通道变成 <code>5</code>，负通道变成 <code>-5</code> (被ReLU变成0)。</li>
+<li>如果输入是 <code>-5</code>：正通道变成 <code>-5</code> (被ReLU变成0)，负通道变成 <code>5</code>。</li>
+<li><strong>最后一层</strong>：再把它们减回来。</li>
+</ul>
+</li>
+<li><strong>通俗解释</strong>：就像把一张纸（数据）撕成两半（正负部分），分别处理，最后再拼回去。这样即使中间经过了 ReLU，也能还原出原始的 <code>x</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🟢 Task 5：总结 —— 为什么 EasyEditor 需要这个文件？</h3>
+<p><strong>全篇的核心观点</strong>：</p>
+<p>在<strong>大模型编辑（Model Editing）</strong>算法（比如 MEND, SERAC 等）中，我们需要训练一个小网络（HyperNetwork）来预测权重的修改量。</p>
+<ol>
+<li><strong>稳定性需求</strong>：当我们刚开始训练这个编辑器时，我们希望它<strong>不要</strong>瞎改模型。最好的初始状态是“修改量为0”或者“输出等于输入”。</li>
+<li><strong>这就是这个文件的作用</strong>：<ul>
+<li><code>IDMLP</code> 和 <code>MLP(init='id')</code> 保证了网络在<strong>刚初始化还没训练时</strong>，输出 $y \approx x$。</li>
+<li><code>LRLinear</code> 保证了参数量很小，训练得快，显存占用低。</li>
+<li><code>mode</code> 机制允许同一个小网络针对不同的层（Layer 1, Layer 2...）学习不同的编辑策略。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话总结这个文件：</strong></p>
+<blockquote>
+<p>这是一个<strong>专门为模型编辑设计的、参数高效的、支持条件控制的</strong>神经网络工具箱，其核心特性是<strong>初始状态下能保证输出等于输入（不破坏原始模型）</strong>。</p>
+</blockquote>
+<hr />
+<h3>🧪 验证一下 (看最后的 <code>__main__</code> 代码)</h3>
+<p>你看文件最后的测试代码就明白了：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 普通 MLP</span>
+<span class="n">m0</span> <span class="o">=</span> <span class="n">MLP</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> 
+<span class="nb">print</span><span class="p">(</span><span class="s2">&quot;y0&quot;</span><span class="p">,</span> <span class="p">(</span><span class="n">y0</span> <span class="o">-</span> <span class="n">x</span><span class="p">)</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">())</span> 
+<span class="c1"># 结果：误差很大，assert not torch.allclose(y0, x) -&gt; 初始状态是乱输出的</span>
+
+<span class="c1"># ID 初始化 MLP</span>
+<span class="n">m1</span> <span class="o">=</span> <span class="n">MLP</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="s2">&quot;id&quot;</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">&quot;y1&quot;</span><span class="p">,</span> <span class="p">(</span><span class="n">y1</span> <span class="o">-</span> <span class="n">x</span><span class="p">)</span><span class="o">.</span><span class="n">abs</span><span class="p">()</span><span class="o">.</span><span class="n">max</span><span class="p">())</span>
+<span class="c1"># 结果：误差为0，assert torch.allclose(y1, x) -&gt; 初始状态输出等于输入</span>
+
+<span class="c1"># Alpha 初始化 MLP</span>
+<span class="n">m2</span> <span class="o">=</span> <span class="n">MLP</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">init</span><span class="o">=</span><span class="s2">&quot;id_alpha&quot;</span><span class="p">)</span>
+<span class="c1"># 结果：误差为0，assert torch.allclose(y2, x) -&gt; 初始状态输出等于输入</span>
+</code></pre></div>
+
+<p>这证明了该文件的核心目的就是为了造出 <code>m1</code> 和 <code>m2</code> 这种“乖巧”的网络。</p>

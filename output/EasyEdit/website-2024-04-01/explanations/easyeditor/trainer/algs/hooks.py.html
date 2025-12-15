@@ -1,0 +1,101 @@
+<h1>easyeditor/trainer/algs/hooks.py</h1>
+<p>这段代码确实看起来比较晦涩，因为它涉及到了 PyTorch 比较底层的机制——<strong>Hook（钩子）</strong>。</p>
+<p>简单来说，这段代码的作用是：<strong>给神经网络装上“窃听器”，在模型运行的过程中，偷偷把特定层的“输入数据”和“反向传播回来的梯度信息”截获并保存下来。</strong></p>
+<p>为了让你彻底搞懂，我为你制定了一个 <strong>5步走的“学习任务清单” (To-Do List)</strong>。请跟随这个清单，一步步解锁它的逻辑。</p>
+<hr />
+<h3>✅ Task 1：理解核心概念——什么是“Hook”？</h3>
+<p>在看代码之前，先建立一个心理模型。</p>
+<ul>
+<li><strong>场景</strong>：想象模型是一个复杂的流水线工厂。数据从一头进去，经过很多机器（层），最后产出结果。</li>
+<li><strong>问题</strong>：通常我们只能看到开头和结尾。如果我们想知道中间某台机器（比如第 5 层线性层）当时处理了什么数据，或者出了什么故障（梯度），该怎么办？</li>
+<li><strong>解决方案 (Hook)</strong>：Hook 就像是一个<strong>外挂的“窃听器”或“检查站”</strong>。<ul>
+<li><strong>Forward Hook</strong>：装在机器入口。当原料（数据）流进去时，它会暂停一下，把原料复印一份存起来，然后让原料继续流。</li>
+<li><strong>Backward Hook</strong>：装在机器出口的反方向。当反馈信号（梯度）传回来时，它截获信号，复印一份，然后放行。</li>
+</ul>
+</li>
+</ul>
+<p><strong>结论</strong>：这段代码就是在定义这两种“窃听器”。</p>
+<hr />
+<h3>✅ Task 2：分析 Forward Hook (窃听输入)</h3>
+<p>请看代码中的 <code>linear_forward_hook</code> 函数：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">linear_forward_hook</span><span class="p">(</span><span class="n">mod</span><span class="p">,</span> <span class="n">activations</span><span class="p">,</span> <span class="n">output</span><span class="p">):</span>
+    <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">activations</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span>
+    <span class="c1"># 重点在这里：</span>
+    <span class="n">mod</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">__x__</span> <span class="o">=</span> <span class="n">activations</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span>
+</code></pre></div>
+
+<ul>
+<li><strong>什么时候触发？</strong> 当数据向前传播（Forward），流经这个层的时候。</li>
+<li><strong>做了什么？</strong><ol>
+<li>拿到 <code>activations</code>（这就是输入给这一层的数据 $x$）。</li>
+<li><code>.detach()</code>：把它从计算图中切断（只想要数值，不想要它的梯度历史）。</li>
+<li><code>mod.weight.__x__ = ...</code>：<strong>关键动作！</strong> 它把这个输入数据 $x$，强行绑在了这一层的权重变量上，取名叫 <code>__x__</code>。</li>
+</ol>
+</li>
+<li><strong>目的</strong>：记住这一层刚才到底“看见”了什么输入。</li>
+</ul>
+<hr />
+<h3>✅ Task 3：分析 Backward Hook (窃听梯度)</h3>
+<p>请看代码中的 <code>linear_backward_hook</code> 函数：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">linear_backward_hook</span><span class="p">(</span><span class="n">mod</span><span class="p">,</span> <span class="n">grad_in</span><span class="p">,</span> <span class="n">grad_out</span><span class="p">):</span>
+    <span class="c1"># ... 省略检查代码 ...</span>
+    <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">mod</span><span class="o">.</span><span class="n">weight</span><span class="p">,</span> <span class="s2">&quot;__x__&quot;</span><span class="p">):</span>
+        <span class="c1"># 重点在这里：</span>
+        <span class="n">mod</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">__delta__</span> <span class="o">=</span> <span class="n">grad_out</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span>
+    <span class="c1"># ...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>什么时候触发？</strong> 当模型训练计算 Loss 后，进行反向传播（Backward）时。</li>
+<li><strong>做了什么？</strong><ol>
+<li>拿到 <code>grad_out</code>：这是从后面层传回来的梯度误差信号（通常记作 $\delta$ 或 $\frac{\partial L}{\partial y}$）。</li>
+<li><code>mod.weight.__delta__ = ...</code>：<strong>关键动作！</strong> 它把这个梯度信号，也强行绑在了权重变量上，取名叫 <code>__delta__</code>。</li>
+</ol>
+</li>
+<li><strong>目的</strong>：记住这一层收到了多少“整改意见”（误差信号）。</li>
+</ul>
+<hr />
+<h3>✅ Task 4：理解“为什么”要存这两个东西？</h3>
+<p>你可能会问：<em>PyTorch 不是自己会自动算梯度吗？为什么要手动存 <code>__x__</code> 和 <code>__delta__</code>？</em></p>
+<p>这是理解 <code>EasyEditor</code> 这类库的关键。</p>
+<ul>
+<li><strong>标准梯度公式</strong>：对于一个线性层 $y = Wx$，权重的梯度 $\frac{\partial L}{\partial W}$ 等于 <strong>输入 $x$ 乘以 误差 $\delta$</strong>（即 $x^T \cdot \delta$）。</li>
+<li><strong>代码的意图</strong>：<ul>
+<li>它不想让 PyTorch 直接更新权重。</li>
+<li>它想把 <strong>原材料 ($x$)</strong> 和 <strong>误差信号 ($\delta$)</strong> 先保存下来。</li>
+<li><strong>后续用途</strong>：在其他的代码里（这里没显示），算法会利用保存好的 <code>__x__</code> 和 <code>__delta__</code>，通过一种<strong>特殊的、非标准的公式</strong>来计算如何修改模型。这在“模型编辑”（Model Editing）或“元学习”（Meta-learning）中非常常见。</li>
+</ul>
+</li>
+</ul>
+<p><strong>总结</strong>：它在收集计算梯度的“原材料”，以便稍后进行“魔改”。</p>
+<hr />
+<h3>✅ Task 5：分析管理者 <code>hook_model</code></h3>
+<p>最后看 <code>hook_model</code> 函数，它是负责安装窃听器的工头。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">hook_model</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">pnames</span><span class="p">):</span>
+    <span class="n">handles</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="c1"># 遍历你想监听的参数名 (pnames)</span>
+    <span class="k">for</span> <span class="n">m</span> <span class="ow">in</span> <span class="p">[</span><span class="n">parent_module</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">pname</span><span class="p">)</span> <span class="k">for</span> <span class="n">pname</span> <span class="ow">in</span> <span class="n">pnames</span><span class="p">]:</span>
+        <span class="c1"># 安装反向窃听器</span>
+        <span class="n">handles</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">register_full_backward_hook</span><span class="p">(</span><span class="n">linear_backward_hook</span><span class="p">))</span>
+        <span class="c1"># 安装正向窃听器</span>
+        <span class="n">handles</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">register_forward_hook</span><span class="p">(</span><span class="n">linear_forward_hook</span><span class="p">))</span>
+
+    <span class="c1"># 把句柄存起来，方便以后拆除窃听器</span>
+    <span class="n">model</span><span class="o">.</span><span class="n">handles</span> <span class="o">=</span> <span class="n">handles</span>
+</code></pre></div>
+
+<ul>
+<li><strong>逻辑</strong>：<ol>
+<li>你告诉它你想监听哪些参数（<code>pnames</code>）。</li>
+<li><code>parent_module</code>：通过参数名找到它所属的层（比如通过 <code>layer1.weight</code> 找到 <code>layer1</code> 这个对象）。</li>
+<li><code>register_..._hook</code>：把刚才定义的两个函数挂载上去。</li>
+<li><code>handles</code>：这就好比窃听器的遥控器，存下来是为了以后能把这些 Hook 移除掉（<code>handle.remove()</code>），防止内存泄漏或影响后续操作。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结 (Takeaway)</h3>
+<p>如果让我用一句话讲完这个文件的故事：</p>
+<blockquote>
+<p><strong>这个文件定义了一套机制，用于在模型运行期间，把指定层的“输入($x$)”和“输出梯度($\delta$)”拦截并挂载到权重属性上，为后续使用自定义算法（而非标准 SGD）来更新模型做数据准备。</strong></p>
+</blockquote>

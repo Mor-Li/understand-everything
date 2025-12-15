@@ -1,0 +1,65 @@
+<h1>easyeditor/models/kn/knowledge_neurons/knowledge_neurons/knowledge_neurons.py</h1>
+<p>这份代码的核心思想基于一篇非常有名的论文（通常称为 <strong>Knowledge Neurons</strong>），其核心观点是：<strong>大语言模型中的具体知识（例如“法国的首都是巴黎”）存储在 Transformer 架构的前馈神经网络（Feed-Forward Network, FFN 或 MLP）层的特定神经元中。</strong></p>
+<p>这份代码 <code>KnowledgeNeurons</code> 类的作用就是：<strong>定位</strong>这些存储特定知识的神经元，并对它们进行<strong>修改</strong>（比如让模型忘记这个知识，或者修改这个知识）。</p>
+<p>为了让你读懂它，我把这个类的功能拆解成一个 <strong>“寻找并修改记忆”的 Task List（任务清单）</strong>，一步步带你看。</p>
+<hr />
+<h3>任务清单：如何像做脑科手术一样修改模型的记忆</h3>
+<h4>Task 1: 准备手术台 (初始化)</h4>
+<p><strong>代码对应：</strong> <code>__init__</code>
+*   <strong>在做什么：</strong>
+    *   你需要告诉代码你用的是什么模型（BERT, GPT-2, LLaMA, Qwen 等）。
+    *   因为不同模型的内部结构命名不一样（比如有的叫 <code>mlp.gate_proj</code>，有的叫 <code>intermediate</code>），这个初始化函数就像一张<strong>解剖图</strong>，定义了去哪里找“记忆区域”（即 MLP 层）。
+*   <strong>观点：</strong> 知识主要存储在 MLP 层的参数里，不同架构的模型虽然名字不同，但原理一致。</p>
+<h4>Task 2: 寻找“嫌疑”神经元 (计算贡献度)</h4>
+<p>这是最难理解的部分，也是代码的核心。我们要找到哪些神经元对输出“巴黎”这个词贡献最大。</p>
+<p><strong>代码对应：</strong> <code>get_scores</code> -&gt; <code>get_scores_for_layer</code>
+*   <strong>核心算法 (Integrated Gradients)：</strong>
+    *   代码里有一个 <code>scaled_input</code> 函数。
+    *   <strong>逻辑是这样的：</strong> 想象一个调光台灯。我们把某个神经元的激活值从 0（完全关闭）慢慢调大到正常值（比如分 20 步，<code>steps=20</code>）。
+    *   在每一步，我们都计算一下：<strong>“如果稍微动一下这个神经元，最终输出‘巴黎’的概率变化有多大？”</strong>（这就是求梯度 <code>torch.autograd.grad</code>）。
+    *   把这 20 步的变化累加起来，就是这个神经元的<strong>贡献分数 (Attribution Score)</strong>。
+*   <strong>观点：</strong> 只有那些在从“无”到“有”的过程中，持续对正确答案产生正向推动的神经元，才是真正的“知识神经元”。</p>
+<h4>Task 3: 筛选出“粗略”的嫌疑人 (初筛)</h4>
+<p><strong>代码对应：</strong> <code>get_coarse_neurons</code>
+*   <strong>在做什么：</strong>
+    *   计算完所有层、所有神经元的分数后，肯定有很多杂音。
+    *   我们要设定一个<strong>阈值 (Threshold)</strong> 或者百分比 (Percentile)。
+    *   比如：只保留分数排名前 1% 的神经元。
+*   <strong>观点：</strong> 并不是整个网络都在记这个知识，只有极少数（稀疏）的神经元在起关键作用。</p>
+<h4>Task 4: 确认真正的凶手 (精细筛选)</h4>
+<p><strong>代码对应：</strong> <code>get_refined_neurons</code>
+*   <strong>在做什么：</strong>
+    *   只用一句话（比如“法国的首都是哪里？”）找出来的神经元可能不准，可能是因为句式结构引起的，而不是因为知识本身。
+    *   这个函数要求你输入<strong>多个不同问法</strong>的提示词（Prompts），比如：
+        1.  “法国的首都是_”
+        2.  “巴黎是哪个国家的首都？<em>”
+        3.  “埃菲尔铁塔所在的城市是</em>”
+    *   <strong>取交集：</strong> 只有在所有这些问法中都活跃的神经元，才是真正存储“法国-巴黎”这个概念的<strong>Knowledge Neurons</strong>。</p>
+<h4>Task 5: 验证假设 (抑制/增强)</h4>
+<p>找到神经元后，我们需要验证到底对不对。</p>
+<p><strong>代码对应：</strong> <code>suppress_knowledge</code> (抑制) / <code>enhance_knowledge</code> (增强) / <code>modify_activations</code>
+*   <strong>实验：</strong>
+    *   <strong>抑制：</strong> 强制把这些神经元的输出设为 0（Mask 掉）。如果模型突然答不出“巴黎”了，说明找对了。
+    *   <strong>增强：</strong> 把这些神经元的输出放大（比如乘以 2）。如果模型回答“巴黎”的概率飙升，说明找对了。
+*   <strong>技术细节：</strong> 这里用到了 <code>patch_ff_layer</code>，本质上是一种 Hook 技术，在模型推理过程中临时篡改数据。</p>
+<h4>Task 6: 进行“脑科手术” (修改记忆)</h4>
+<p>最后一步，我们要永久性地修改模型，而不是临时的。</p>
+<p><strong>代码对应：</strong> <code>edit_knowledge</code> (修改) / <code>erase_knowledge</code> (擦除) / <code>modify_weights</code>
+*   <strong>在做什么：</strong>
+    *   <strong>擦除 (Erase)：</strong> 直接把这些神经元对应的权重参数（Weights）设为 0，或者设为“未知词”的向量。模型就会真的忘记这个知识。
+    *   <strong>修改 (Edit)：</strong> 这是一个更高级的操作。
+        *   假设要把“法国首都”从“巴黎”改成“伦敦”。
+        *   代码会计算“巴黎”的词向量和“伦敦”的词向量。
+        *   它会把神经元的权重减去“巴黎”的特征，加上“伦敦”的特征。
+        *   公式逻辑：<code>New_Weight = Old_Weight - Embedding(Paris) + Embedding(London)</code>。
+*   <strong>观点：</strong> 我们可以通过数学运算直接修改神经网络的权重矩阵，从而实现对特定事实的精准编辑，而不需要重新训练整个模型。</p>
+<hr />
+<h3>总结</h3>
+<p>这篇代码讲的就是一套<strong>定位-验证-修改</strong>的流程：</p>
+<ol>
+<li><strong>定位</strong>：通过积分梯度算法（Integrated Gradients）计算每个神经元对特定输出的贡献。</li>
+<li><strong>筛选</strong>：通过多样的 Prompt 过滤杂音，找到真正的“知识神经元”。</li>
+<li><strong>验证</strong>：通过临时干预激活值（Activations）来验证因果关系。</li>
+<li><strong>修改</strong>：通过修改权重矩阵（Weights）来永久改变模型的知识。</li>
+</ol>
+<p>你看不懂的地方可能主要在于 <code>get_scores_for_layer</code> 里的积分梯度计算，以及 <code>modify_weights</code> 里的向量加减，这些是实现“定位”和“手术”的数学工具。</p>

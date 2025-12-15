@@ -1,0 +1,128 @@
+<h1>easyeditor/models/mend/oracle.py</h1>
+<p>这份代码其实是一个<strong>验证性实验</strong>（Oracle Experiment）。它的核心目的是为了回答一个问题：</p>
+<blockquote>
+<p><strong>“如果我们想修改大模型里的一条知识，是不是只需要给它的权重矩阵加上一个非常简单的‘Rank-1（秩为1）’补丁就足够了？”</strong></p>
+</blockquote>
+<p>所谓的“Oracle”在这里的意思是“上帝视角”或“理想情况”。它不是用来快速编辑模型的算法，而是用来<strong>探测模型修改的理论上限</strong>。</p>
+<p>为了让你看懂，我把你当成这个程序的“项目经理”，给这段代码列一个 <strong>Task To-Do List（任务清单）</strong>，我们一步步把代码对应到任务上。</p>
+<hr />
+<h3>📋 任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>【准备阶段】</strong>：拿到要修改的模型和具体的修改数据（比如：“把法国的首都被改成伦敦”）。</li>
+<li><strong>【核心假设】</strong>：不对模型做全量微调，而是给指定层的权重 $W$ 强行挂载一个“外挂补丁” $\Delta W$。<strong>限制这个补丁必须是 Rank-1 的（即由两个向量 $u$ 和 $v$ 相乘得到）。</strong></li>
+<li><strong>【确立KPI】</strong>：定义什么叫“修改成功”？<ul>
+<li>目标 1：新知识要回答正确（Edit Success）。</li>
+<li>目标 2：旧知识不能变傻（Locality，即不破坏无关的知识）。</li>
+</ul>
+</li>
+<li><strong>【暴力破解】</strong>：利用梯度下降（SGD），强行算出这个最优的 $u$ 和 $v$ 向量是多少。</li>
+<li><strong>【验收测试】</strong>：看看最终能不能在保持模型不崩坏的前提下，把新知识注入进去。</li>
+</ol>
+<hr />
+<h3>🔍 逐步代码拆解</h3>
+<h4>Task 1: 准备阶段</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">test_rank1</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">dataset</span><span class="p">,</span> <span class="n">config</span><span class="p">):</span>
+    <span class="n">model</span><span class="o">.</span><span class="n">eval</span><span class="p">()</span>
+    <span class="n">generator</span> <span class="o">=</span> <span class="n">dataset</span><span class="o">.</span><span class="n">edit_generator</span><span class="p">(</span><span class="mi">21</span><span class="p">)</span> <span class="c1"># 获取一批编辑任务</span>
+    <span class="n">history</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">for</span> <span class="n">example</span> <span class="ow">in</span> <span class="n">generator</span><span class="p">:</span> <span class="c1"># 遍历每一个要修改的知识点</span>
+        <span class="c1"># ...</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+这就好比把病人（模型）推上手术台，准备好病历本（dataset）。<code>example</code> 里包含了我们要修改的问题（比如“法国首都是哪？”）和目标答案（“伦敦”），以及一些用于保持原样的无关文本。</p>
+<h4>Task 2: 定义“Rank-1 补丁” (核心中的核心)</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code>        <span class="n">edit_model</span> <span class="o">=</span> <span class="n">make_functional</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">track_higher_grads</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span> <span class="c1"># 让模型变成可手动替换参数的状态</span>
+        <span class="n">residuals</span> <span class="o">=</span> <span class="p">{}</span> <span class="c1"># 存放补丁</span>
+        <span class="n">opt_list</span> <span class="o">=</span> <span class="p">[]</span>  <span class="c1"># 存放需要优化的参数(u, v)</span>
+
+        <span class="k">for</span> <span class="n">n</span><span class="p">,</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">edit_model</span><span class="o">.</span><span class="n">named_parameters</span><span class="p">():</span>
+            <span class="k">if</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">config</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">inner_params</span><span class="p">:</span> <span class="c1"># 只修改配置文件里指定的层（比如MLP层）</span>
+                <span class="c1"># 初始化两个小向量 u 和 v</span>
+                <span class="n">u</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Parameter</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="n">p</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="mi">1</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">p</span><span class="o">.</span><span class="n">device</span><span class="p">)</span> <span class="o">*</span> <span class="n">std</span><span class="p">)</span>
+                <span class="n">v</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Parameter</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">p</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="n">device</span><span class="o">=</span><span class="n">p</span><span class="o">.</span><span class="n">device</span><span class="p">)</span> <span class="o">*</span> <span class="n">std</span><span class="p">)</span>
+
+                <span class="c1"># 确保 u 乘以 v 的形状和原权重 p 一样大</span>
+                <span class="k">assert</span> <span class="p">(</span><span class="n">u</span> <span class="o">@</span> <span class="n">v</span><span class="p">)</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="n">p</span><span class="o">.</span><span class="n">shape</span> 
+
+                <span class="n">residuals</span><span class="p">[</span><span class="n">n</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">u</span><span class="p">,</span> <span class="n">v</span><span class="p">)</span>
+                <span class="n">opt_list</span><span class="o">.</span><span class="n">extend</span><span class="p">([</span><span class="n">u</span><span class="p">,</span> <span class="n">v</span><span class="p">])</span> <span class="c1"># 我们只训练 u 和 v，不训练原模型参数</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+这是全篇观点的核心。
+通常微调模型是直接改巨大的权重矩阵 $W$。但作者认为，改知识不需要动全身，只需要加一个极其简单的变化量 $\Delta W$。
+数学上，$\Delta W = u \times v$ 被称为 <strong>Rank-1 矩阵</strong>。
+*   $W$ 可能是 $4096 \times 4096$ 的大矩阵（1600万参数）。
+*   $u$ 是 $4096 \times 1$，$v$ 是 $1 \times 4096$。它俩加起来只有 8192 个参数。
+<strong>观点：</strong> 作者想证明，哪怕只用这么一点点参数（两个向量），也足以改变模型的某条知识。</p>
+<h4>Task 3: 确立 KPI (Loss计算)</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code>        <span class="c1"># ... 在 while 循环中 ...</span>
+            <span class="c1"># 1. 拼装参数：新参数 = 原参数 + (u @ v)</span>
+            <span class="n">fast_params</span> <span class="o">=</span> <span class="p">[]</span>
+            <span class="k">for</span> <span class="n">n</span><span class="p">,</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">edit_model</span><span class="o">.</span><span class="n">named_parameters</span><span class="p">():</span>
+                <span class="k">if</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">residuals</span><span class="p">:</span>
+                    <span class="n">u</span><span class="p">,</span> <span class="n">v</span> <span class="o">=</span> <span class="n">residuals</span><span class="p">[</span><span class="n">n</span><span class="p">]</span>
+                    <span class="n">fast_params</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">p</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span> <span class="o">+</span> <span class="p">(</span><span class="n">u</span> <span class="o">@</span> <span class="n">v</span><span class="p">))</span> <span class="c1"># 加上补丁</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">fast_params</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">p</span><span class="o">.</span><span class="n">detach</span><span class="p">())</span>
+
+            <span class="c1"># 2. 计算 Locality Loss (旧知识不许变)</span>
+            <span class="n">loc_pred</span> <span class="o">=</span> <span class="n">edit_model</span><span class="p">(</span><span class="n">ids_train</span><span class="p">,</span> <span class="n">params</span><span class="o">=</span><span class="n">fast_params</span><span class="p">)</span>
+            <span class="n">loc_loss</span> <span class="o">=</span> <span class="n">kl_loc_loss</span><span class="p">(</span><span class="n">original_logits_train</span><span class="p">,</span> <span class="n">loc_pred</span><span class="p">)</span>
+
+            <span class="c1"># 3. 计算 Edit Loss (新知识要学会)</span>
+            <span class="n">pred_log</span> <span class="o">=</span> <span class="n">edit_model</span><span class="p">(</span><span class="n">example</span><span class="p">[</span><span class="s2">&quot;edit_inner_ids&quot;</span><span class="p">],</span> <span class="n">params</span><span class="o">=</span><span class="n">fast_params</span><span class="p">)</span>
+            <span class="n">prob_dict</span> <span class="o">=</span> <span class="n">masked_log_probs</span><span class="p">(</span><span class="n">pred_log</span><span class="p">,</span> <span class="n">example</span><span class="p">[</span><span class="s2">&quot;edit_inner_labels&quot;</span><span class="p">])</span>
+            <span class="n">edit_loss</span> <span class="o">=</span> <span class="n">prob_dict</span><span class="p">[</span><span class="s2">&quot;nll&quot;</span><span class="p">]</span>
+
+            <span class="c1"># 总 Loss</span>
+            <span class="n">loss</span> <span class="o">=</span> <span class="n">loc_loss</span> <span class="o">+</span> <span class="mf">0.0002</span> <span class="o">*</span> <span class="n">edit_loss</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+这里定义了怎么才算“好”。
+*   我们把 $u$ 和 $v$ 乘起来，加到原参数上，得到临时的新参数 <code>fast_params</code>。
+*   <strong>KPI 1 (Locality)</strong>: 用新参数预测无关数据 <code>ids_train</code>，结果必须和原模型 <code>original_logits</code> 差不多（用 KL 散度衡量）。
+*   <strong>KPI 2 (Edit)</strong>: 用新参数预测编辑数据，必须让目标答案的概率最大化（NLL Loss）。</p>
+<h4>Task 4: 暴力求解 (Optimization)</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code>        <span class="n">res_opt</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">optim</span><span class="o">.</span><span class="n">SGD</span><span class="p">(</span><span class="n">opt_list</span><span class="p">,</span> <span class="n">lr</span><span class="o">=</span><span class="mi">100</span><span class="p">)</span> <span class="c1"># 学习率极其巨大(100)，强行拟合</span>
+
+        <span class="k">while</span> <span class="n">acc</span> <span class="o">&lt;</span> <span class="mi">1</span> <span class="ow">and</span> <span class="n">it</span> <span class="o">&lt;</span> <span class="mi">1000</span><span class="p">:</span> <span class="c1"># 只要没学会，就一直循环，最多1000次</span>
+            <span class="c1"># ... (计算 loss) ...</span>
+
+            <span class="c1"># 梯度下降更新 u 和 v</span>
+            <span class="k">for</span> <span class="n">p</span><span class="p">,</span> <span class="n">g</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">opt_list</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">autograd</span><span class="o">.</span><span class="n">grad</span><span class="p">(</span><span class="n">loss</span><span class="p">,</span> <span class="n">opt_list</span><span class="p">)):</span>
+                <span class="n">p</span><span class="o">.</span><span class="n">grad</span> <span class="o">=</span> <span class="n">g</span>
+            <span class="n">res_opt</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+            <span class="n">res_opt</span><span class="o">.</span><span class="n">zero_grad</span><span class="p">()</span>
+
+            <span class="n">it</span> <span class="o">+=</span> <span class="mi">1</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+这是一个标准的训练循环。
+*   <strong>特别之处</strong>：我们只更新 $u$ 和 $v$。
+*   <strong>目的</strong>：这就是“Oracle（神谕）”的含义。我们在测试集上直接进行训练，看看“如果我拼了命地只优化这两个向量，能不能把这个知识改过来？”。如果这里都改不过来，那说明 Rank-1 的假设是错的，或者模型根本改不动。</p>
+<h4>Task 5: 验收测试</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code>        <span class="k">if</span> <span class="n">acc</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="n">history</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span> <span class="c1"># 成功改写</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">history</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span> <span class="c1"># 失败</span>
+
+        <span class="nb">print</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">history</span><span class="p">),</span> <span class="nb">sum</span><span class="p">(</span><span class="n">history</span><span class="p">)</span> <span class="o">/</span> <span class="nb">len</span><span class="p">(</span><span class="n">history</span><span class="p">),</span> <span class="n">ret</span><span class="o">.</span><span class="n">item</span><span class="p">())</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+最后统计成功率。如果大部分时候都能成功，就证明了<strong>Rank-1 更新在理论上是可行的</strong>。</p>
+<hr />
+<h3>💡 总结：文中的观点是什么？</h3>
+<p>这段代码并不是一个实际使用的“编辑器”（实际使用时你不可能知道目标答案后还训练1000次），而是一个<strong>可行性证明</strong>。</p>
+<p>它证明了：
+<strong>大模型中的单条知识编辑，可以被分解为极低秩（Low-Rank / Rank-1）的参数更新。</strong></p>
+<p>这意味着，未来的算法（比如 MEND 算法本身）不需要预测整个巨大的 $\Delta W$，只需要预测很小的向量 $u$ 和 $v$ 就能完成知识修改，这大大降低了编辑模型的难度和计算量。</p>

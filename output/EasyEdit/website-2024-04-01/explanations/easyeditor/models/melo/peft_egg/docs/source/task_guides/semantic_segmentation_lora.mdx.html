@@ -1,0 +1,94 @@
+<h1>easyeditor/models/melo/peft_egg/docs/source/task_guides/semantic_segmentation_lora.mdx</h1>
+<p>这份文档主要讲的是：<strong>如何使用一种叫 LoRA 的省钱、省力技术（PEFT），来微调一个图像分割模型（SegFormer）。</strong></p>
+<p>简单来说，就是教你如何不用重新训练整个巨大的AI模型，而是只训练其中极小的一部分（约14%的参数），就能让模型学会识别图片中的物体（语义分割）。</p>
+<p>为了让你看懂，我把整个流程拆解成一个 <strong>“任务清单 (To-Do List)”</strong>，然后一步步解释每个步骤在干什么。</p>
+<hr />
+<h3>📋 任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>环境准备</strong>：安装必要的软件包。</li>
+<li><strong>数据准备</strong>：下载图片数据，把图片处理成模型能看懂的格式。</li>
+<li><strong>模型准备 (核心步骤)</strong>：<ul>
+<li>加载基础模型 (SegFormer)。</li>
+<li><strong>配置 LoRA</strong>：告诉程序我们要“偷懒”训练哪部分。</li>
+<li><strong>关键设置</strong>：确保分类头（Decoder Head）被完全训练。</li>
+</ul>
+</li>
+<li><strong>训练配置</strong>：设置怎么考评模型（IoU），设置训练参数。</li>
+<li><strong>开始训练</strong>：运行训练代码。</li>
+<li><strong>保存与使用</strong>：保存训练好的小补丁，加载并测试一张新图片。</li>
+</ol>
+<hr />
+<h3>🧐 逐步详细讲解</h3>
+<h4>第一步：环境与数据准备 (Setup &amp; Data)</h4>
+<ul>
+<li><strong>安装库</strong>：文档开头让你 <code>pip install</code> 一堆库，其中 <code>peft</code> 是核心库（用来做轻量化微调的），<code>transformers</code> 是加载模型的。</li>
+<li><strong>加载数据集</strong>：<ul>
+<li>代码加载了 <code>scene_parse_150</code> 数据集（这是一个包含150种物体类别的场景图片集）。</li>
+<li>为了演示速度，文档里只取了前150张图片用来训练。</li>
+</ul>
+</li>
+<li><strong>标签映射 (Label Maps)</strong>：<ul>
+<li>建立字典：比如把数字 <code>0</code> 对应到 <code>墙</code>，把 <code>1</code> 对应到 <code>地板</code>。这样模型输出数字时，我们知道它代表什么。</li>
+</ul>
+</li>
+<li><strong>图像预处理 (Preprocessing)</strong>：<ul>
+<li><strong>关键点</strong>：模型看不懂原始JPG图片，需要用 <code>AutoImageProcessor</code> 把图片转成数字矩阵。</li>
+<li><strong>特殊处理</strong>：代码里写了一个 <code>handle_grayscale_image</code> 函数。这是为了防止遇到黑白图片（单通道）报错，强制把它们转成RGB三通道格式。</li>
+<li><strong>数据增强</strong>：用了 <code>ColorJitter</code> 随机调整亮度、对比度，让模型更“皮实”，不容易过拟合。</li>
+</ul>
+</li>
+</ul>
+<h4>第二步：评估指标 (Metrics)</h4>
+<ul>
+<li><strong>定义 IoU</strong>：仅仅知道“准确率”在图像分割里是不够的。这里用的是 <strong>IoU (交并比)</strong>。<ul>
+<li>简单理解：模型画出的轮廓，和真实物体的轮廓，重叠部分有多少？重叠越多，分数越高。</li>
+</ul>
+</li>
+</ul>
+<h4>第三步：模型准备 - 这里的“骚操作”最多 (Model Setup)</h4>
+<p>这是全文最核心的部分。</p>
+<ol>
+<li><strong>加载底模</strong>：<ul>
+<li>加载 <code>nvidia/mit-b0</code> (SegFormer的一个版本)。这时候模型是100%参数都要训练的。</li>
+</ul>
+</li>
+<li><strong>配置 LoRA (LoraConfig)</strong>：<ul>
+<li>我们不想训练100%的参数，太慢太贵。</li>
+<li><code>target_modules=["query", "value"]</code>：意思是只去训练模型注意力机制里的“查询”和“值”这两个矩阵（这属于LoRA的技术细节，你只需要知道这是在指定“动刀”的位置）。</li>
+</ul>
+</li>
+<li><strong>关键点：Modules to Save</strong>：<ul>
+<li><code>modules_to_save=["decode_head"]</code>：<strong>这句非常重要</strong>。</li>
+<li><strong>为什么？</strong> 因为LoRA通常是冻结大部分参数。但是，你的图像分割任务是新的（分类数量可能和原模型不一样），负责最终输出结果的“解码头 (decode_head)”必须是全新的、并且需要被完全训练的。如果冻结了它，模型就学不会新东西了。</li>
+</ul>
+</li>
+<li><strong>应用配置</strong>：<ul>
+<li>运行 <code>get_peft_model(model, config)</code>。</li>
+<li>结果：你会看到打印出的参数量，从几百万变成了一点点，<strong>只有约 14% 的参数需要训练</strong>。</li>
+</ul>
+</li>
+</ol>
+<h4>第四步：训练 (Training)</h4>
+<ul>
+<li><strong>TrainingArguments</strong>：设置学习率、跑几轮（Epochs）、批次大小（Batch size）。<ul>
+<li>注意有个参数 <code>remove_unused_columns=False</code>，这是为了防止程序自作聪明把图片数据列给删了。</li>
+</ul>
+</li>
+<li><strong>Trainer</strong>：把模型、数据、评估方法扔进去，运行 <code>trainer.train()</code>。机器开始干活。</li>
+</ul>
+<h4>第五步：保存与推理 (Save &amp; Inference)</h4>
+<ul>
+<li><strong>保存</strong>：<ul>
+<li>使用 <code>save_pretrained</code>。注意，这里保存的文件只有 <strong>2.2MB</strong>！</li>
+<li>这就是LoRA的威力。如果是保存完整模型，可能几百MB。现在只保存“补丁”文件，非常小，方便分享。</li>
+</ul>
+</li>
+<li><strong>推理 (Inference)</strong>：<ul>
+<li>当你要用这个模型时，先加载原始的 SegFormer 底模。</li>
+<li>然后用 <code>PeftModel.from_pretrained</code> 把你刚才训练那 2.2MB 的“补丁”贴上去。</li>
+<li>找一张网上的图，丢进去预测，最后画出彩色的分割图。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这篇文章就是在教你：<strong>不要重新造轮子。拿一个现成的厉害模型（SegFormer），用 LoRA 技术给它打个只有 2MB 大小的“补丁”，就能让它完成你指定的图像分割任务，既快又省显存。</strong></p>

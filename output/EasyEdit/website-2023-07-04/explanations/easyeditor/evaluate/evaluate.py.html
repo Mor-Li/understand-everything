@@ -1,0 +1,69 @@
+<h1>easyeditor/evaluate/evaluate.py</h1>
+<p>这份代码 <code>evaluate.py</code> 的核心作用是：<strong>给做完“脑部手术”（知识编辑）的大模型做一次全面的“术后体检”。</strong></p>
+<p>当我们修改了模型里的某一条知识（比如把“埃菲尔铁塔在巴黎”改成“埃菲尔铁塔在罗马”），我们需要确认三件事：
+1.  <strong>改成功了吗？</strong> (Efficacy)
+2.  <strong>模型变傻了吗？</strong> (Locality/Side Effects)
+3.  <strong>模型能举一反三吗？</strong> (Generalization/Portability)</p>
+<p>为了让你看懂，我把这个文件的逻辑拆解成一个 <strong>Task Todo List（任务清单）</strong>，带你一步步走完这个体检流程。</p>
+<hr />
+<h3>📋 任务清单：模型编辑效果评估流程</h3>
+<h4>Task 1: 准备体检数据 (Unpack Record)</h4>
+<p><strong>目标</strong>：拿到“手术”前后的对比数据。
+*   <strong>输入</strong>：<code>record</code> 字典。
+*   <strong>动作</strong>：提取出 Prompt（提示词，如“埃菲尔铁塔在”）、Target New（新目标，如“罗马”）、Ground Truth（原始事实，如“巴黎”）。
+*   <strong>代码对应</strong>：<code>compute_edit_quality</code> 函数的开头部分。</p>
+<h4>Task 2: 检查手术是否成功 (Rewrite Accuracy)</h4>
+<p><strong>目标</strong>：直接问模型新知识，看它能不能答对。
+*   <strong>动作</strong>：输入 <code>Prompt</code>（“埃菲尔铁塔在”），看模型输出是不是 <code>Target New</code>（“罗马”）。
+*   <strong>代码对应</strong>：调用 <code>compute_rewrite_or_rephrase_quality</code>，参数 <code>test_rephrase=False</code>。</p>
+<h4>Task 3: 检查是否能听懂人话 (Rephrase Accuracy)</h4>
+<p><strong>目标</strong>：换个说法问同一个知识，看模型是不是死记硬背。
+*   <strong>动作</strong>：输入 <code>Rephrase Prompt</code>（比如“那个著名的铁塔位于哪里？”），看模型是否依然回答 <code>Target New</code>（“罗马”）。
+*   <strong>代码对应</strong>：调用 <code>compute_rewrite_or_rephrase_quality</code>，参数 <code>test_rephrase=True</code>。</p>
+<h4>Task 4: 检查有无副作用 (Locality / Specificity)</h4>
+<p><strong>目标</strong>：确保模型没有忘记无关的知识（不要把“奥巴马是美国人”也改成了“罗马人”）。
+*   <strong>动作</strong>：输入无关的 <code>Locality Prompt</code>（比如“奥巴马是哪国人？”），看模型是否保持回答 <code>Ground Truth</code>（“美国”）。如果它回答“罗马”，说明手术失败，破坏了其他记忆。
+*   <strong>代码对应</strong>：遍历 <code>record['locality']</code>，调用 <code>compute_locality_quality</code>。</p>
+<h4>Task 5: 检查举一反三能力 (Portability)</h4>
+<p><strong>目标</strong>：看模型能不能利用新知识进行推理。
+*   <strong>动作</strong>：输入需要推理的问题（比如“埃菲尔铁塔所在城市的特色菜是什么？”）。如果模型真的认为铁塔在罗马，它应该回答“披萨”而不是“法式蜗牛”。
+*   <strong>代码对应</strong>：遍历 <code>record['portability']</code>，调用 <code>compute_portability_quality</code>（这个函数是从外部引用的）。</p>
+<h4>Task 6: 判卷打分 (Compute Metrics)</h4>
+<p><strong>目标</strong>：把模型的输出转化成 0 或 1 的分数。
+*   <strong>动作</strong>：比较模型生成的 Token 和我们期望的 Token 是否一致。
+    *   如果是 GPT 类模型（Decoder-only）：预测下一个词。
+    *   如果是 T5 类模型（Seq2Seq）：生成完整的答案序列。
+*   <strong>代码对应</strong>：底层函数 <code>test_batch_prediction_acc</code> (GPT) 和 <code>test_seq2seq_batch_prediction_acc</code> (T5)。</p>
+<hr />
+<h3>🧐 详细代码逻辑讲解</h3>
+<p>现在我们带着上面的 Task List，深入看几个核心函数：</p>
+<h4>1. 总指挥官：<code>compute_edit_quality</code></h4>
+<p>这是主入口函数。
+*   它接收 <code>model</code>（刚改完的模型）和 <code>record</code>（数据）。
+*   它依次执行 <strong>Task 2 (Rewrite)</strong>, <strong>Task 3 (Rephrase)</strong>, <strong>Task 4 (Locality)</strong>, <strong>Task 5 (Portability)</strong>。
+*   最后把所有分数打包成一个字典 <code>ret</code> 返回。</p>
+<h4>2. 核心检测员：<code>compute_rewrite_or_rephrase_quality</code></h4>
+<p>这个函数负责 Task 2 和 Task 3。
+*   它会判断模型是 T5 还是 GPT。
+*   <strong>如果是 GPT</strong>：它会把 Prompt 和 Target 拼起来，看模型预测 Target 每一个 Token 的概率是不是最大。
+*   <strong>如果是 T5</strong>：它直接让模型生成答案，看生成的跟 Target 是否一样。</p>
+<h4>3. 副作用检测员：<code>compute_locality_quality</code></h4>
+<p>这个函数负责 Task 4。
+*   逻辑和上面类似，但它的目标是<strong>保持不变</strong>。
+*   它会检查模型对无关问题的回答，并返回模型的原始输出（Token ID），方便后续比较是否和编辑前一致。</p>
+<h4>4. ICL 特供版：<code>compute_icl_edit_quality</code></h4>
+<p>这个函数是独立的，专门用于 <strong>In-Context Learning (ICL)</strong> 的评估。
+*   <strong>背景</strong>：有时候我们不改模型参数，只是在 Prompt 里给几个例子（Few-shot）让模型临时学会新知识。
+*   <strong>逻辑</strong>：它会构建一个包含示例的超长 Prompt（例如：<code>New Fact: ... Prompt: ...</code>），然后看模型能不能根据上下文答对。
+*   它同样会计算 <code>rewrite_acc</code> (重写准确率), <code>rephrase_acc</code> (重述准确率), 和 <code>locality</code> (邻域保持)。</p>
+<h4>5. 底层打分器：<code>test_batch_prediction_acc</code></h4>
+<p>这是最底层的“苦力”函数，专门给 GPT/Llama 这类模型打分。
+*   <strong>输入</strong>：Prompt 和 目标答案。
+*   <strong>操作</strong>：
+    1.  <code>model(**prompt_tok)</code>: 把 Prompt 喂给模型，拿到 Logits（概率分布）。
+    2.  <code>torch.argmax</code>: 找出模型觉得概率最大的那个词。
+    3.  <code>ans == correct_id</code>: 比较模型选的词和标准答案的词是否一样。
+*   <strong>输出</strong>：如果是 <code>locality=True</code>，直接返回模型输出了啥；否则返回准确率（0或1）。</p>
+<h3>总结</h3>
+<p>你不需要逐行读懂每一句 Python 代码。只需要记住：
+这个文件就是一个<strong>全自动化的考官</strong>。它手里拿着一份试卷（<code>record</code>），试卷里有必答题（Rewrite）、变式题（Rephrase）和干扰题（Locality）。它负责把这些题喂给模型，然后批改打分。</p>

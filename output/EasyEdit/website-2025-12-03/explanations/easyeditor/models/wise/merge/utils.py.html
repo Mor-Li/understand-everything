@@ -1,0 +1,88 @@
+<h1>easyeditor/models/wise/merge/utils.py</h1>
+<p>没问题，这段代码乍一看全是数学运算和PyTorch的函数，容易让人发懵。但其实它核心只做了一件事：<strong>“给数据减肥”</strong>（学术上叫“稀疏化”或“剪枝”）。</p>
+<p>结合文件路径 <code>easyeditor/.../merge/utils.py</code>，这通常用于模型融合（Model Merging）或模型编辑。意思是：我们有一堆参数（Tensor），我们不想全都要，只想保留一部分，把剩下的变成0。</p>
+<p>为了让你彻底搞懂，我为你制定了一个 <strong>5步走的学习任务清单（To-Do List）</strong>，我们一步步来拆解。</p>
+<hr />
+<h3>📝 任务清单：一步步读懂代码</h3>
+<h4>✅ Task 1: 理解核心目标 —— “我们要扔掉一部分数据”</h4>
+<p>首先，不要看具体函数，先看所有函数共有的两个参数：
+1.  <code>tensor</code>: 输入的数据（比如模型的一层权重）。
+2.  <code>density</code>: <strong>密度</strong>。这是一个 0 到 1 之间的数字。
+    *   如果 <code>density = 1.0</code>，意思是保留 100% 的数据（全都要）。
+    *   如果 <code>density = 0.1</code>，意思是只保留 10% 的数据，剩下 90% 全部变成 0。</p>
+<p><strong>结论：</strong> 这个文件的所有函数，都是为了根据 <code>density</code> 算出一个“面具”（Mask），把不需要的数字遮住（变成0）。</p>
+<hr />
+<h4>✅ Task 2: 搞懂第一种策略 —— <code>magnitude</code> (谁大留谁)</h4>
+<p>现在看第一个函数 <code>magnitude</code>。这是最直观的策略。</p>
+<ul>
+<li><strong>你的直觉：</strong> 如果我要删掉一些权重，我应该删掉那些接近 0 的（不重要的），保留那些绝对值很大的（起主要作用的）。</li>
+<li><strong>代码解读：</strong><ol>
+<li><code>k = int(density * ...)</code>: 算出具体要保留多少个数字（比如总共100个，density是0.2，那就保留20个）。</li>
+<li><code>w = tensor.abs()</code>: 把所有负数都变成正数（我们只看绝对值大小）。</li>
+<li><code>torch.topk(w, k=k)</code>: 这是核心函数。它会找出<strong>最大</strong>的 <code>k</code> 个数。</li>
+<li><code>mask</code>: 制作一个全是 0 的板子，把那 <code>k</code> 个最大的位置标为 1。</li>
+<li><code>return tensor * mask</code>: 原数据乘以 mask。只有标为 1 的位置保留原值，标为 0 的位置全变 0。</li>
+</ol>
+</li>
+</ul>
+<p><strong>一句话总结：</strong> <code>magnitude</code> 函数的作用是<strong>“保留绝对值最大的前 N% 个数据，其余清零”。</strong></p>
+<hr />
+<h4>✅ Task 3: 搞懂第二种策略 —— <code>bernoulli</code> (随机抽奖)</h4>
+<p>接着看第二个函数 <code>bernoulli</code>。</p>
+<ul>
+<li><strong>你的直觉：</strong> 有时候我们不想只留最大的，我们想随机保留一些，以此来保持数据的多样性，或者为了某种数学上的无偏估计。</li>
+<li><strong>代码解读：</strong><ol>
+<li><code>torch.full_like(..., fill_value=density)</code>: 制作一个概率表，每个位置的概率都是 <code>density</code> (比如 0.5)。</li>
+<li><code>torch.bernoulli(...)</code>: <strong>扔硬币环节</strong>。对每个数字扔一次硬币，有 <code>density</code> 的概率正面朝上（变成1），否则反面朝上（变成0）。</li>
+<li><code>tensor * mask</code>: 同样是把没抽中的数字变成 0。</li>
+</ol>
+</li>
+</ul>
+<p><strong>一句话总结：</strong> <code>bernoulli</code> 函数的作用是<strong>“不管数字大小，每个数字都有 N% 的概率被保留，纯看运气”。</strong></p>
+<hr />
+<h4>✅ Task 4: 理解进阶数学 —— 为什么要 <code>rescale</code> (缩放)?</h4>
+<p>在 <code>bernoulli</code> 函数里，有一段特殊的代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">rescale</span><span class="p">:</span>
+    <span class="n">res</span> <span class="o">/=</span> <span class="n">density</span>
+</code></pre></div>
+
+<p>这是什么意思？</p>
+<ul>
+<li><strong>场景：</strong> 假设你有一堆数字，总和是 100。</li>
+<li><strong>操作：</strong> 你随机扔掉了 50% 的数字（density=0.5）。</li>
+<li><strong>后果：</strong> 剩下的数字总和大概变成了 50。<strong>整体的“能量”或“强度”变弱了！</strong></li>
+<li><strong>补救（Rescale）：</strong> 为了让剩下的数字能代表原来的整体强度，我们需要把剩下的数字<strong>放大</strong>。<ul>
+<li>因为只留了 0.5，所以我们要除以 0.5（等于乘以 2）。</li>
+<li>这样，虽然数字变少了，但数学期望（Expectation）保持不变。</li>
+</ul>
+</li>
+</ul>
+<p><strong>结论：</strong> <code>rescale=True</code> 是为了让稀疏化后的矩阵在数学统计上和原矩阵保持一致的“强度”。</p>
+<hr />
+<h4>✅ Task 5: 最后的封装 —— 两个简单的马甲</h4>
+<p>最后两个函数只是为了方便调用 <code>bernoulli</code>：</p>
+<ol>
+<li>
+<p><strong><code>rescaled_random</code></strong>:</p>
+<ul>
+<li>调用 <code>bernoulli(..., rescale=True)</code>。</li>
+<li><strong>含义：</strong> 随机丢弃，但把剩下的数字放大，保持整体强度不变。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>random_wo_rescaled</code></strong>:</p>
+<ul>
+<li>调用 <code>bernoulli(..., rescale=False)</code>。</li>
+<li><strong>含义：</strong> 随机丢弃，剩下的数字保持原样。（wo = without）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🚀 最终总结 (Takeaway)</h3>
+<p>这个文件是 <strong>EasyEditor</strong> 用来处理模型权重的工具箱。在模型融合（Merge）或编辑时，我们通常计算出一个“变化量”（Delta Weights）。</p>
+<p>为了不破坏模型原有的知识，或者为了减少计算量，作者提供了两种<strong>“精简变化量”</strong>的方法：
+1.  <strong>Magnitude（掐尖）：</strong> 只保留变化最剧烈的地方（绝对值大）。
+2.  <strong>Bernoulli（随机）：</strong> 随机保留一部分变化，但可以通过 <code>rescale</code> 放大剩下的部分来模拟整体效果。</p>
+<p><strong>如果你要用这个代码：</strong>
+*   想稳健、保留最关键特征？用 <code>magnitude</code>。
+*   想做随机实验或无偏估计？用 <code>rescaled_random</code>。</p>

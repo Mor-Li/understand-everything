@@ -1,0 +1,124 @@
+<h1>easyeditor/models/mend/mend_main.py</h1>
+<p>这份代码确实涉及很多深度学习和模型编辑（Model Editing）的术语。简单来说，这个文件的作用是<strong>“给大模型做微创手术”</strong>。</p>
+<p>它的核心目标是：<strong>在不重新训练整个模型的情况下，快速修改模型里的某一条特定的知识（比如把“现任美国总统”从“拜登”改成“特朗普”），同时不破坏模型原有的其他能力。</strong></p>
+<p>我们可以把这个过程想象成一个<strong>修理工（Executor）</strong>接到任务去<strong>修理机器（Model）</strong>的过程。</p>
+<p>下面我为你列一个 Task Todo List，并逐步讲解代码是如何执行这些步骤的。</p>
+<hr />
+<h3>📋 MEND 模型编辑任务清单 (Todo List)</h3>
+<ol>
+<li><strong>准备工具箱 (Initialize)</strong>: 加载目标模型（病人）和 MEND 编辑器（手术刀）。</li>
+<li><strong>接收工单 (Receive Request)</strong>: 拿到要修改的具体内容（比如：把 A 改成 B）。</li>
+<li><strong>翻译指令 (Tokenize)</strong>: 把人类的语言翻译成机器能懂的数字信号。</li>
+<li><strong>计算手术方案 (Run MEND)</strong>: 运行 MEND 算法，计算出模型权重具体需要怎么变。</li>
+<li><strong>执行手术 (Apply Edits)</strong>: 修改模型内部的参数（Weights）。</li>
+<li><strong>多模态扩展 (Multimodal)</strong>: 如果是图文模型，如何处理图片输入。</li>
+</ol>
+<hr />
+<h3>🚀 逐步代码讲解</h3>
+<h4>Task 1: 准备工具箱 (Initialize)</h4>
+<p>在开始修改之前，必须先把环境搭好。这对应代码中的 <code>init_model</code> 方法。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>MendRewriteExecutor.init_model</code></li>
+<li><strong>发生了什么</strong>:<ol>
+<li><strong>加载目标模型</strong>: <code>self.model = model</code>。这是我们要修改的大语言模型（比如 GPT-2, LLaMA 等）。</li>
+<li><strong>加载 MEND 算法</strong>: <code>self.alg = MEND(...)</code>。MEND 是一个专门训练好的“超网络”（Hypernetwork）。它的作用不是生成文本，而是<strong>生成“参数的更新量”</strong>。</li>
+<li><strong>加载存档</strong>: <code>torch.load(params.archive)</code>。读取预先训练好的 MEND 参数。</li>
+<li><strong>冻结参数</strong>: <code>p.requires_grad = False</code>。为了省显存和计算，把不需要修改的参数锁死，只动我们需要改的那几层。</li>
+</ol>
+</li>
+</ul>
+<blockquote>
+<p><strong>通俗理解</strong>: 医生（Executor）穿好手术服，把病人（Model）推上台，并拿出了专门的手术刀（MEND 算法）。</p>
+</blockquote>
+<h4>Task 2: 接收工单 (Receive Request)</h4>
+<p>现在开始处理具体的修改请求。这对应 <code>apply_to_model</code> 方法的开头部分。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>apply_to_model</code> 方法的前几行。</li>
+<li><strong>输入数据</strong>: <code>requests</code> 列表。<ul>
+<li>例子: <code>{'prompt': 'Steve Jobs founded', 'target_new': 'Microsoft'}</code> (假设我们要强行让模型认为乔布斯创立了微软)。</li>
+</ul>
+</li>
+<li><strong>发生了什么</strong>:<ul>
+<li>代码把 <code>prompt</code> (提示词) 和 <code>target_new</code> (新目标) 拼接起来，形成完整的句子。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 翻译指令 (Tokenize)</h4>
+<p>模型看不懂英文，只看懂数字。</p>
+<ul>
+<li><strong>代码位置</strong>:
+    <code>python
+    sent_tok = self.tokenizer(sentences, ...)
+    target_tok = self.tokenizer(targets, ...)</code></li>
+<li><strong>发生了什么</strong>:<ol>
+<li>使用 <code>tokenizer</code> 把句子转换成 Tensor（张量/数字矩阵）。</li>
+<li><strong>制作标签 (Labels)</strong>: 代码中有一段复杂的 <code>label_tok</code> 处理逻辑。它的目的是告诉模型：“对于提示词部分（Steve Jobs founded），你不需要预测；但对于目标部分（Microsoft），你需要预测出来。” 这通过把提示词部分的 label 设为 <code>-100</code> 来实现（PyTorch 中忽略计算 loss 的标志）。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 4: 计算手术方案 (Run MEND) —— <strong>最核心的一步</strong></h4>
+<p>这是整个文件最神奇的地方。它不使用传统的梯度下降（Backpropagation）慢慢训练，而是用 MEND 网络直接预测出参数该怎么改。</p>
+<ul>
+<li><strong>代码位置</strong>:
+    <code>python
+    self.alg.eval()
+    edited_model, model_info = self.alg.edit(edit_inner, cond, return_factors=True)</code></li>
+<li><strong>发生了什么</strong>:<ol>
+<li><code>edit_inner</code>: 包含了我们刚才处理好的输入和标签。</li>
+<li><code>self.alg.edit(...)</code>: 调用 MEND 算法。MEND 会“看”一眼这个输入，然后通过通过梯度分解（Gradient Decomposition）的方法，快速计算出权重的<strong>变化因子 (Factors)</strong>。</li>
+<li><strong>Factors (u, v)</strong>: MEND 认为直接改巨大的权重矩阵太慢太难，所以它把变化量分解成两个小向量 <code>u</code> 和 <code>v</code>。修改量 $\Delta W = u \times v^T$。</li>
+</ol>
+</li>
+</ul>
+<blockquote>
+<p><strong>通俗理解</strong>: 医生没有把心脏拿出来修，而是根据 X 光片（Input/Gradient），计算出只需要在某根血管上缝两针（Factors）。</p>
+</blockquote>
+<h4>Task 5: 执行手术 (Apply Edits)</h4>
+<p>计算出了变化量，现在要把它们应用到模型上。</p>
+<ul>
+<li><strong>代码位置</strong>:
+    <code>python
+    with torch.no_grad():
+        for n, p in model.named_parameters():
+            # ...
+            if uname in torch_factors:
+                # ...
+                p.copy_(edited_model.model.state_dict()[n])</code></li>
+<li><strong>发生了什么</strong>:<ol>
+<li>遍历模型的所有参数。</li>
+<li>如果发现某个参数是 MEND 决定要修改的（<code>uname in torch_factors</code>），就用计算好的新参数覆盖旧参数 (<code>p.copy_</code>)。</li>
+<li><strong>备份</strong>: 代码里还有 <code>weights_copy</code>，用于备份旧参数，万一修坏了或者需要对比，可以恢复。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 6: 多模态扩展 (Multimodal)</h4>
+<p>文件下半部分的 <code>MendMultimodalRewriteExecutor</code> 类。</p>
+<ul>
+<li><strong>区别</strong>:<ul>
+<li>普通的 Executor 只处理文字。</li>
+<li>Multimodal Executor 处理 <strong>图片 + 文字</strong>。</li>
+</ul>
+</li>
+<li><strong>代码差异</strong>:<ul>
+<li>在 <code>apply_to_model</code> 里，它多处理了一个 <code>image</code> 输入：
+    <code>python
+    image = [request["image"]]
+    image = torch.stack(image, dim=0).to(model.device)</code></li>
+<li>它把图片和文本一起喂给 MEND 算法，让模型学会比如“这张图片里的人是奥巴马”这样的知识。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个脚本 <code>mend_main.py</code> 是一个<strong>执行器</strong>。</p>
+<ol>
+<li>它<strong>不负责训练</strong> MEND 算法本身（那是训练阶段的事）。</li>
+<li>它<strong>负责应用</strong> MEND：<ul>
+<li>拿到一个模型。</li>
+<li>拿到一个想修改的知识点。</li>
+<li>运行 MEND 算出参数改动。</li>
+<li>直接修改模型参数，返回一个“拥有新知识”的模型。</li>
+</ul>
+</li>
+</ol>
+<p>这就是为什么它叫 <code>RewriteExecutor</code>（重写执行器）。</p>

@@ -1,0 +1,72 @@
+<h1>easyeditor/editors/editor.py</h1>
+<p>这份代码是 <code>EasyEditor</code> 库的核心部分，它的角色相当于一个 <strong>“施工总指挥”</strong> 或者 <strong>“项目经理”</strong>。</p>
+<p>它本身并不包含具体的“修改模型神经元”的数学算法（那些算法在 <code>ALG_DICT</code> 里），它的工作是：<strong>加载模型 -&gt; 接收用户的修改指令 -&gt; 调度具体的算法去修改 -&gt; 评估修改好没好 -&gt; 报告结果。</strong></p>
+<p>为了让你看懂，我们可以把这个 <code>BaseEditor</code> 类的工作流程拆解成一个 <strong>Task Todo List（任务清单）</strong>。我们按照代码执行的逻辑顺序一步步来看：</p>
+<hr />
+<h3>📋 Task 1: 准备工具 (初始化阶段)</h3>
+<p><strong>对应代码：</strong> <code>__init__</code> 方法</p>
+<p>在你开始修改模型之前，必须先把模型搬运过来。
+1.  <strong>读取配置 (<code>hparams</code>)</strong>：你需要告诉它用什么算法（比如 ROME, MEMIT），改什么模型（比如 GPT-2, LLaMA）。
+2.  <strong>加载模型 (<code>Instantiating model</code>)</strong>：
+    *   代码会判断你是 <code>t5</code> 还是 <code>gpt</code> 系列的模型。
+    *   调用 <code>HuggingFace</code> 的库把模型下载或加载到内存里。
+    *   加载 <code>Tokenizer</code>（分词器），用来把文本变成数字。
+3.  <strong>搬运到显卡</strong>：<code>self.model.to(f'cuda:{hparams.device}')</code> 把模型放到 GPU 上，准备开工。</p>
+<hr />
+<h3>📋 Task 2: 整理需求 (数据预处理)</h3>
+<p><strong>对应代码：</strong> <code>_prepare_requests</code> 方法</p>
+<p>用户给的指令通常很随意，比如：“把‘美国总统’改成‘特朗普’”。指挥官需要把它整理成标准格式。
+1.  <strong>打包数据</strong>：它把用户的 <code>prompts</code>（提示词）、<code>target_new</code>（新目标）、<code>ground_truth</code>（原始真相）打包成一个字典列表 <code>requests</code>。
+2.  <strong>处理附加测试</strong>：
+    *   <strong>Locality (局部性)</strong>：用户可能会给一些不该被改变的句子（用来测试模型有没有改坏）。这里会把它们整理好。
+    *   <strong>Portability (迁移性)</strong>：用户可能会给一些同义句，看模型能不能举一反三。</p>
+<hr />
+<h3>📋 Task 3: 执行修改 (核心功能)</h3>
+<p><strong>对应代码：</strong> <code>edit</code> 方法 (这是最重要的方法)</p>
+<p>这是“做手术”的主流程。</p>
+<ol>
+<li><strong>检查输入</strong>：确认你给的提示词和目标是对齐的。</li>
+<li><strong>调度算法 (<code>self.apply_algo</code>)</strong>：<ul>
+<li>这是全篇最关键的一行。它调用具体的算法（比如 ROME 或 MEMIT）去修改模型的权重。</li>
+<li>它会返回：<code>edited_model</code> (改好的模型) 和 <code>weights_copy</code> (修改前的原始权重备份)。</li>
+</ul>
+</li>
+<li><strong>计时</strong>：记录修改花了多少秒。</li>
+</ol>
+<hr />
+<h3>📋 Task 4: 质量质检 (评估阶段)</h3>
+<p><strong>对应代码：</strong> <code>edit</code> 方法中的后半部分</p>
+<p>改完了不能直接交货，得由指挥官进行测试。</p>
+<ol>
+<li><strong>测后测 (<code>post</code>)</strong>：用改好的模型跑一遍提示词，看能不能输出 <code>target_new</code>。调用了 <code>compute_edit_quality</code>。</li>
+<li><strong>测前测 (<code>pre</code>)</strong>：<ul>
+<li>为了对比，代码利用 <code>weights_copy</code> 临时把模型权重<strong>还原</strong>回去。</li>
+<li>测一遍原始效果，看看修改前是啥样。</li>
+<li><em>注意：这里有一个神奇的操作，它为了省显存，是把权重换来换去，而不是加载两个大模型。</em></li>
+</ul>
+</li>
+<li><strong>局部性测试 (<code>Locality</code>)</strong>：检查模型有没有“脑损伤”。比如你改了“美国总统”，它不应该忘记“法国首都是巴黎”。如果这一项得分低，说明改坏了。</li>
+</ol>
+<hr />
+<h3>📋 Task 5: 批量处理 (进阶功能)</h3>
+<p><strong>对应代码：</strong> <code>batch_edit</code> 和 <code>edit_dataset</code></p>
+<p>有时候你要一次改一万个知识点，不能一个个来。</p>
+<ol>
+<li><strong><code>batch_edit</code></strong>：针对支持批量修改的算法（如 MEMIT）。它会把请求分成一块一块 (<code>_chunks</code>)，比如一次改 32 个，批量喂给算法。</li>
+<li><strong><code>edit_dataset</code></strong>：如果你有一个巨大的数据集文件，这个方法会帮你自动遍历整个文件，重复执行上面的 Task 3 和 Task 4。</li>
+</ol>
+<hr />
+<h3>总结：这段代码到底在讲啥？</h3>
+<p>如果你用大白话把这个文件翻译出来，它在说：</p>
+<blockquote>
+<p>“我是编辑部主任。
+1.  <strong>启动时</strong>：我会根据你的配置把模型（GPT/T5）加载好，放在显卡上。
+2.  <strong>你给我任务时 (<code>edit</code>)</strong>：我会把你给的‘提示词’和‘新答案’整理成工单。
+3.  <strong>干活时</strong>：我会喊具体的工人（算法，如 ROME）去调整模型的脑神经（权重）。
+4.  <strong>完工后</strong>：我会立刻做一张体检表。先测现在的回答对不对；再把权重倒回去，测原来的回答是啥，算出提升了多少；顺便测测有没有把别的地方改坏。
+5.  <strong>最后</strong>：把改好的模型和体检报告交给你。”</p>
+</blockquote>
+<p><strong>你需要重点关注的变量：</strong>
+*   <code>hparams</code>: 所有的设置都在这（用什么算法，显卡第几号）。
+*   <code>requests</code>: 整理好的修改需求列表。
+*   <code>weights_copy</code>: 原始权重的备份（用来后悔，或者用来做对比测试）。</p>

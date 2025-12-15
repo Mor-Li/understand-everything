@@ -1,0 +1,119 @@
+<h1>easyeditor/models/pmet/pmet_main.py</h1>
+<p>这份代码实现了一个叫做 <strong>PMET (Parallel Model Editing with Transformer)</strong> 的算法。</p>
+<p>简单来说，这个算法的目的是：<strong>给大模型做“微创手术”</strong>。
+比如，模型原本认为“埃菲尔铁塔在巴黎”，你想强行修改它的参数，让它认为“埃菲尔铁塔在罗马”，但同时<strong>不能破坏</strong>模型原本的其他知识（比如不能忘了“香蕉是黄色的”）。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>Task Todo List（任务清单）</strong>，然后对照代码一步步讲。</p>
+<hr />
+<h3>📋 PMET 算法执行清单 (Task Todo List)</h3>
+<ol>
+<li><strong>准备阶段</strong>：整理用户的修改请求（比如把“巴黎”改成“罗马”），备份模型原始参数（防止改坏了）。</li>
+<li><strong>计算目标 (Compute $Z$)</strong>：计算为了输出“罗马”，模型最后一层应该输出什么样的向量？（这是我们的终点）。</li>
+<li><strong>逐层计算输入 (Compute $K$)</strong>：在我们要修改的那些层，当前的输入信号长什么样？（这是我们的起点）。</li>
+<li><strong>计算更新量 (Compute Delta)</strong>：结合“起点”和“终点”，利用数学公式算出权重矩阵 $W$ 应该加多少数值（$\Delta W$）。<ul>
+<li><em>关键点</em>：这里引入了“协方差矩阵”，目的是确保修改只影响特定知识，不破坏其他知识。</li>
+</ul>
+</li>
+<li><strong>应用修改</strong>：把算出来的 $\Delta W$ 真正加到模型的参数里。</li>
+</ol>
+<hr />
+<h3>🔍 详细代码导读 (Step-by-Step)</h3>
+<p>现在我们按照上面的清单，深入代码的细节。</p>
+<h4>第一步：入口与准备 (Function: <code>apply_pmet_to_model</code>)</h4>
+<p>这是整个流程的总指挥。</p>
+<ul>
+<li><strong>代码位置</strong>：<code>apply_pmet_to_model</code> 函数开头。</li>
+<li><strong>逻辑</strong>：<ol>
+<li><code>if copy: model = deepcopy(model)</code>: 如果需要，先复制一个模型，别把原版搞坏了。</li>
+<li><code>deltas = execute_pmet(...)</code>: <strong>核心步骤</strong>。调用执行函数，计算出权重需要变化的数值（Delta）。</li>
+<li><code>w[...] += upd_matrix.float()</code>: <strong>应用修改</strong>。把算出来的变化量加到模型原本的权重上。</li>
+</ol>
+</li>
+</ul>
+<h4>第二步：核心计算流程 (Function: <code>execute_pmet</code>)</h4>
+<p>这是干脏活累活的地方。</p>
+<p><strong>2.1 整理 Prompt</strong>
+*   <strong>代码</strong>：
+    <code>python
+    if '{}' not in request['prompt']: ...</code>
+*   <strong>解释</strong>：把用户的输入格式化。比如把 "Eiffel Tower is in Paris" 变成 "{} is in Paris"，方便后续把 "Eiffel Tower" 填进去作为主语。</p>
+<p><strong>2.2 备份权重</strong>
+*   <strong>代码</strong>：
+    <code>python
+    weights = { ... nethook.get_parameter(...) }
+    weights_copy = { ... .clone() }</code>
+*   <strong>解释</strong>：把我们要修改的层（Attention层或MLP层）的权重先拿出来，并备份一份。</p>
+<p><strong>2.3 计算目标向量 $Z$ (Task List 第2项)</strong>
+*   <strong>代码</strong>：
+    <code>python
+    # Compute z for final layer
+    ...
+    cur_z_attn, cur_z_mlp = compute_zs(...)</code>
+*   <strong>解释</strong>：
+    *   我们需要知道，如果想让模型输出“罗马”，在模型的最后一层（Z层），它的隐藏状态向量（Hidden State）应该长什么样。
+    *   代码里有缓存机制（<code>cache_fname</code>），如果以前算过就直接读取，没算过就调用 <code>compute_zs</code> 算。
+    *   PMET 的特点是它可能同时修改 Attention 和 MLP 模块，所以你看到它分别处理了 <code>cur_z_attn</code> 和 <code>cur_z_mlp</code>。</p>
+<h4>第三步：逐层计算与更新 (Loop: <code>for i, layer in enumerate(hparams.layers)</code>)</h4>
+<p>这是最复杂的循环，它一层一层地去修改模型。</p>
+<p><strong>3.1 计算输入向量 $K$ (Task List 第3项)</strong>
+*   <strong>代码</strong>：
+    <code>python
+    layers_ks = compute_ks(...)</code>
+*   <strong>解释</strong>：
+    *   对于我们要修改的第 <code>layer</code> 层，当输入 "Eiffel Tower" 时，这一层接收到的输入信号是什么？记为 $k$。
+    *   我们希望：<strong>输入 $k$ $\times$ 新权重 $\approx$ 目标输出 $z$</strong>。</p>
+<p><strong>3.2 计算残差 (Targets)</strong>
+*   <strong>代码</strong>：
+    <code>python
+    cur_zs = get_module_input_output_at_words(...)
+    targets = z_list[rewrite_module_name] - cur_zs</code>
+*   <strong>解释</strong>：
+    *   <code>cur_zs</code> 是当前这一层实际输出的值。
+    *   <code>targets</code> 是我们<strong>希望</strong>它输出的值与<strong>实际</strong>输出值的差（即：我们需要填补的差距）。</p>
+<p><strong>3.3 获取协方差矩阵 (Covariance)</strong>
+*   <strong>代码</strong>：
+    <code>python
+    cov = get_cov(...)</code>
+*   <strong>解释</strong>：
+    *   这是为了<strong>保护模型原有知识</strong>。
+    *   <code>cov</code> 统计了模型在读大量普通文本（Wikipedia等）时，这一层的激活模式。
+    *   在更新公式里除以这个 <code>cov</code>，意思就是：“在大家通常不怎么激活的方向上多改点，在大家经常激活的重要方向上少改点，以免改坏了通用能力”。</p>
+<p><strong>3.4 计算更新矩阵 (The Equation)</strong>
+*   <strong>代码</strong>：
+    <code>python
+    upd_matrix = (targets / np.sqrt(...)) @ layer_ks.T @ torch.inverse(layer_ks @ layer_ks.T + hparams.mom2_update_weight * cov.double())</code>
+*   <strong>解释</strong>：
+    *   这就是传说中的 <strong>最小二乘法解 (Least Squares Solution)</strong>。
+    *   它试图找到一个矩阵 <code>upd_matrix</code>，使得加上它之后，输入 $k$ 能映射到目标 $z$，同时最小化对其他知识的干扰（由 <code>cov</code> 控制）。
+    *   公式逻辑：$\Delta W = \text{Error} \times k^T \times (C + \lambda I)^{-1}$。</p>
+<p><strong>3.5 临时应用更新</strong>
+*   <strong>代码</strong>：
+    <code>python
+    weights[weight_name][...] = weights_copy[weight_name] + upd_matrix.float()
+    deltas[weight_name] = upd_matrix</code>
+*   <strong>解释</strong>：
+    *   算出这一层的更新量后，<strong>立刻</strong>把它加到模型里。
+    *   <strong>为什么？</strong> 因为下一层的计算依赖于上一层的输出。如果上一层改了，传给下一层的信号也会变，所以必须边改边算。</p>
+<h4>第四步：收尾</h4>
+<ul>
+<li><strong>代码</strong>：
+    <code>python
+    # Restore state of original model
+    nethook.get_parameter(model, k)[...] = weights_copy[k]
+    return deltas</code></li>
+<li><strong>解释</strong>：<ul>
+<li><code>execute_pmet</code> 函数承诺不直接永久修改传入的 <code>model</code> 对象（它只负责计算），所以它最后把模型恢复原状。</li>
+<li>它返回 <code>deltas</code>（所有层的修改量）。</li>
+<li>真正的永久修改是在最外层的 <code>apply_pmet_to_model</code> 里完成的。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结：这个文件到底在干嘛？</h3>
+<p>这个文件就是 <strong>PMET 算法的施工队</strong>。</p>
+<ol>
+<li>它<strong>不训练</strong>模型（没有反向传播 Backpropagation）。</li>
+<li>它用<strong>解析解（数学公式直接算）</strong>来得出权重应该改多少。</li>
+<li>它利用了 <code>compute_ks</code> (算输入特征) 和 <code>compute_zs</code> (算目标特征)，结合 <code>get_cov</code> (统计特征分布)，算出最优的权重修改方案。</li>
+</ol>
+<p><strong>一句话人话总结：</strong>
+它计算出了一组新的参数，强行插入到模型的 Attention 和 MLP 层中，让模型在看到特定主语（如“埃菲尔铁塔”）时，不仅能联想到新的宾语（如“罗马”），还能尽量不把脑子里的其他知识搞乱。</p>

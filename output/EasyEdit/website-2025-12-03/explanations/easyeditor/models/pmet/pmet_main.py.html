@@ -1,0 +1,133 @@
+<h1>easyeditor/models/pmet/pmet_main.py</h1>
+<p>这份代码确实比较晦涩，因为它涉及到了<strong>大模型编辑（Model Editing）</strong>的核心算法（PMET，类似于 ROME/MEMIT 算法的改进版）。简单来说，它的目的是：<strong>不动模型的大部分参数，只精确修改一点点权重，让模型记住一个新的知识（比如：把“法国首都是巴黎”改成“法国首都是罗马”），同时不破坏模型原有的能力。</strong></p>
+<p>为了让你看懂，我把它拆解成一个<strong>任务清单 (To-Do List)</strong>，然后一步步对照代码讲解。</p>
+<hr />
+<h3>📋 PMET 算法执行任务清单 (To-Do List)</h3>
+<p>整个流程可以归纳为 5 个主要步骤：</p>
+<ol>
+<li><strong>[准备阶段] 初始化与预处理</strong><ul>
+<li>备份原始模型权重（防止改坏了）。</li>
+<li>格式化输入的 Prompt（提示词）。</li>
+</ul>
+</li>
+<li><strong>[目标计算] 计算最后一层的目标向量 $Z$ (Compute Z)</strong><ul>
+<li>问：为了输出新的答案（比如“罗马”），模型最后一层的隐藏状态（Hidden State）应该变成什么样？</li>
+<li>答：算出这个理想的向量 $Z$。</li>
+</ul>
+</li>
+<li><strong>[输入计算] 计算各层的输入特征 $K$ (Compute K)</strong><ul>
+<li>问：当输入 Prompt 时，我们要修改的那几层（Layer）实际上接收到了什么输入信号？</li>
+<li>答：算出这些输入特征 $K$。</li>
+</ul>
+</li>
+<li><strong>[核心解算] 逐层计算权重修改量 $\Delta W$ (Solve for Delta)</strong><ul>
+<li>问：已知输入是 $K$，目标是 $Z$，还要保证不破坏原来的知识（利用协方差矩阵 $C$），权重 $W$ 应该怎么改？</li>
+<li>答：利用最小二乘法公式算出权重的变化量 <code>upd_matrix</code>。</li>
+</ul>
+</li>
+<li><strong>[应用阶段] 写入新权重 (Apply)</strong><ul>
+<li>把算出来的变化量加到模型原来的权重上。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>📖 逐步代码讲解</h3>
+<h4>1. [准备阶段] 初始化与预处理</h4>
+<p><strong>对应函数：</strong> <code>apply_pmet_to_model</code> 和 <code>execute_pmet</code> 的开头部分。</p>
+<ul>
+<li><strong>代码行为：</strong><ul>
+<li><code>apply_pmet_to_model</code> 是入口。它先调用 <code>execute_pmet</code> 去计算“还要改多少”（即 <code>deltas</code>），然后用 <code>w[...] += upd_matrix</code> 把改动加上去。</li>
+<li>
+<p>在 <code>execute_pmet</code> 里：
+    ```python
+    # 这里的逻辑是给 prompt 里的 subject 占位，比如把 "Steve Jobs" 替换成 "{}"
+    if '{}' not in request['prompt']:
+        requests[i]['prompt'] = requests[i]['prompt'].replace(requests[i]['subject'], '{}')</p>
+<h1>获取要修改的层的原始权重，并备份一份 weights_copy</h1>
+<p>weights = { ... }
+weights_copy = { ... }
+```
+*   <strong>白话解释：</strong> 就像做手术前先要把病人麻醉并标记好手术部位。这里先整理好句子格式，并把原来的脑子（权重）备份一下，方便计算差值。</p>
+</li>
+</ul>
+</li>
+</ul>
+<h4>2. [目标计算] 计算最后一层的目标向量 $Z$</h4>
+<p><strong>对应代码：</strong> <code>execute_pmet</code> 中的 <code># Compute z for final layer</code> 部分。</p>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>python
+    # 计算 Z 向量（理想的输出向量）
+    cur_z_attn, cur_z_mlp = compute_zs(
+        model, tok, request, hparams, z_layer, context_templates
+    )
+    # PMET 的特点可能是同时考虑 Attention 和 MLP 的输出
+    z_list[rewrite_module_name].append(cur_z)</code></li>
+<li><strong>白话解释：</strong><ul>
+<li>模型原来的逻辑是：输入 "法国首都是" -&gt; 输出 "巴黎"。</li>
+<li>我们要告诉模型：不对，你要输出 "罗马"。</li>
+<li><code>compute_zs</code> 就是利用梯度下降或者优化算法，反推出：<strong>为了让下一个词大概率是“罗马”，最后一层的神经元激活值（向量）应该是多少？</strong> 这个值就是 $Z$。</li>
+</ul>
+</li>
+</ul>
+<h4>3. [输入计算] 计算各层的输入特征 $K$</h4>
+<p><strong>对应代码：</strong> <code>execute_pmet</code> 中 <code># Insert</code> 循环里的第一步。</p>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>python
+    # 计算 K (Key)，即每一层的输入
+    if 'gpt-j' in model.config._name_or_path ...:
+        layers_ks = compute_ks_parallel(...) 
+    else:
+        layers_ks = compute_ks(...)</code></li>
+<li><strong>白话解释：</strong><ul>
+<li>我们要修改中间的某几层（比如第 5 层到第 10 层）。</li>
+<li>我们需要知道，当模型读到 "法国首都是" 这句话时，第 5 层的输入具体数值是什么？这个输入数值就是 $K$。</li>
+<li><strong>为什么叫 Key？</strong> 就像查字典，输入是 Key，输出是 Value。我们要修改字典的内容，首先得知道查字典时的索引 Key 是什么。</li>
+</ul>
+</li>
+</ul>
+<h4>4. [核心解算] 逐层计算权重修改量 $\Delta W$</h4>
+<p><strong>对应代码：</strong> <code>execute_pmet</code> 中最复杂的数学计算部分。</p>
+<ul>
+<li>
+<p><strong>代码片段：</strong>
+    ```python
+    # 1. 获取当前这一层的实际输出 cur_zs
+    cur_zs = get_module_input_output_at_words(...)[1].T</p>
+<h1>2. 计算残差 targets (我们需要弥补的差距)</h1>
+<h1>目标 Z 减去 当前输出 h，就是还需要填补的坑</h1>
+<p>targets = z_list[rewrite_module_name] - cur_zs </p>
+<h1>3. 获取协方差矩阵 cov (代表了模型原有的通用知识)</h1>
+<p>cov = get_cov(...)</p>
+<h1>4. 【最核心公式】计算更新矩阵 upd_matrix</h1>
+<h1>公式逻辑： Delta = R * K^T * (K*K^T + C)^(-1)</h1>
+<h1>这里的数学原理是 Ridge Regression (岭回归) 或 最小二乘法</h1>
+<p>upd_matrix = (targets / np.sqrt((len(hparams.layers) - i ))) @ layer_ks.T @ torch.inverse(layer_ks @ layer_ks.T + hparams.mom2_update_weight * cov.double())
+<code>``
+*   **白话解释：**
+*   这是整个算法的灵魂。
+*</code>targets<code>(残差)：我现在能输出什么，距离理想的 $Z$ 差多少？
+*</code>cov<code>(协方差)：这代表了“以前学过的所有知识的分布”。为什么要加它？为了**防止过拟合**。我们不能为了记住“法国首都是罗马”，就把“苹果是红的”给忘了。加上</code>cov<code>相当于告诉算法：“在修改权重的方向时，尽量不要去动那些对其他知识很重要的方向”。
+*</code>upd_matrix`：最后解出一个矩阵，这个矩阵就是我们要加到原参数上的“补丁”。</p>
+</li>
+</ul>
+<h4>5. [应用阶段] 写入新权重</h4>
+<p><strong>对应代码：</strong> <code>apply_pmet_to_model</code> 的最后部分。</p>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>python
+    with torch.no_grad():
+        for w_name, upd_matrix in deltas.items():
+            w = nethook.get_parameter(model, w_name)
+            # 把算出来的补丁加到原权重上
+            w[...] += upd_matrix.float()</code></li>
+<li><strong>白话解释：</strong><ul>
+<li>手术完成，缝合伤口。模型现在已经拥有了新的记忆。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这段代码其实就是在解一个线性方程组：$W_{new} \cdot K \approx Z$。
+但为了不破坏旧知识，它加了一个约束项（协方差矩阵），变成了一个带正则化的最小二乘问题。</p>
+<p><strong>PMET (Parallel Model Editing)</strong> 相比于基础的 ROME/MEMIT，其特殊之处在于代码中的 <code>rewrite_module_names</code> 和 <code>compute_ks_parallel</code>，这暗示它可能同时在修改 Transformer 里的 Attention 层和 MLP 层（或者并行的多个模块），以获得更强的编辑效果。</p>

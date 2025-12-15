@@ -1,0 +1,100 @@
+<h1>easyeditor/models/memit/memit_main.py</h1>
+<p>这份代码实现了 <strong>MEMIT (Mass-Editing Memory in a Transformer)</strong> 算法的核心逻辑。</p>
+<p>简单来说，MEMIT 的目的是<strong>给大模型“做手术”</strong>。你想让模型记住一批新的知识（比如“埃菲尔铁塔在罗马”——虽然是错的，但如果是为了测试编辑能力），同时不破坏模型原有的其他知识。</p>
+<p>为了让你听懂，我把整个过程想象成<strong>“包工头给大楼（模型）装修（修改记忆）”</strong>的过程。</p>
+<p>下面是这份代码执行时的 <strong>To-Do List (任务清单)</strong>，我们一步步来看：</p>
+<h3>📝 MEMIT 任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>📋 施工准备 (预处理请求)</strong><ul>
+<li>整理用户的修改请求，确保格式正确。</li>
+</ul>
+</li>
+<li><strong>🎯 确定最终目标 (计算 Z)</strong><ul>
+<li>算出模型在修改后，最后一层应该输出什么向量。</li>
+</ul>
+</li>
+<li><strong>🏗️ 逐层施工 (核心循环)</strong><ul>
+<li><strong>Step 3.1:</strong> 看看当前层收到了什么信号 (计算 K)。</li>
+<li><strong>Step 3.2:</strong> 看看离最终目标还差多少 (计算残差)。</li>
+<li><strong>Step 3.3:</strong> 决定这一层要承担多少工作量 (分配残差)。</li>
+<li><strong>Step 3.4:</strong> 参考“承重墙图纸” (协方差矩阵)，计算如何敲墙才不会楼塌 (计算更新量)。</li>
+<li><strong>Step 3.5:</strong> 临时把这一层修好，方便下一层继续施工。</li>
+</ul>
+</li>
+<li><strong>🔨 正式交付 (应用权重)</strong><ul>
+<li>把计算好的所有修改方案，永久写入模型。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🔍 详细步骤讲解</h3>
+<h4>1. 📋 施工准备 (预处理请求)</h4>
+<p><strong>代码位置:</strong> <code>execute_memit</code> 函数的前半部分。</p>
+<ul>
+<li><strong>逻辑:</strong> 模型对空格很敏感，代码首先给目标词（<code>target_new</code>）前面加空格。然后检查提示词（Prompt）里有没有包含要把主体（Subject）替换掉的占位符 <code>{}</code>。</li>
+<li><strong>人话:</strong> 就像装修前先要把家具搬开，把图纸上的“卧室”标记清楚，确保不会砸错房间。</li>
+</ul>
+<h4>2. 🎯 确定最终目标 (计算 Z)</h4>
+<p><strong>代码位置:</strong> <code>compute_z</code> 相关部分。</p>
+<ul>
+<li><strong>逻辑:</strong> <code>z_layer</code> 是我们要修改的最后一层。代码计算：当输入是 <code>request</code> 时，为了让模型输出新的答案，最后一层的输出向量（Vector）应该是多少？这个向量被称为 $z$。</li>
+<li><strong>人话:</strong> 比如你想把“法国的首都是_”改成“伦敦”。这一步就是算出，当模型读到“是”字的时候，脑子里的电流信号必须变成什么样，才能在下一步蹦出“伦敦”这个词。这是我们的<strong>最终目的地</strong>。</li>
+</ul>
+<h4>3. 🏗️ 逐层施工 (核心循环 - 最难懂的部分)</h4>
+<p><strong>代码位置:</strong> <code>for i, layer in enumerate(hparams.layers):</code> 循环内部。</p>
+<p>MEMIT 的精髓在于它不是只改一层，而是分摊到多层（比如第4, 5, 6层）。它从第一层开始改。</p>
+<ul>
+<li>
+<p><strong>Step 3.1: 看看当前层收到了什么信号 (计算 K)</strong></p>
+<ul>
+<li><strong>代码:</strong> <code>compute_ks(...)</code></li>
+<li><strong>逻辑:</strong> 计算当输入提示词时，这一层接收到的输入（Key）是什么。</li>
+<li><strong>人话:</strong> 这一层是第4层，我要知道第3层传给我了什么信号，我才能知道怎么处理。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.2: 看看离最终目标还差多少 (计算残差)</strong></p>
+<ul>
+<li><strong>代码:</strong> <code>targets = zs - cur_zs</code></li>
+<li><strong>逻辑:</strong> <code>zs</code> 是最终目标，<code>cur_zs</code> 是当前模型如果不修改会输出什么。两者的差值就是 Error (误差)。</li>
+<li><strong>人话:</strong> 目标是去“伦敦”，现在模型想去“巴黎”。这个偏差就是我们要修正的距离。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.3: 决定这一层要承担多少工作量 (分配残差)</strong></p>
+<ul>
+<li><strong>代码:</strong> <code>resid = targets / (len(hparams.layers) - i)</code></li>
+<li><strong>逻辑:</strong> 剩下的误差除以剩下的层数。</li>
+<li><strong>人话:</strong> 假设还要修3层，总共有300块砖要搬。这一层别太累，先搬100块，剩下的200块留给后面两层。这样修改比较平滑，不容易把模型改坏。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.4: 参考“承重墙图纸” (使用协方差矩阵)</strong></p>
+<ul>
+<li><strong>代码:</strong> <code>get_cov(...)</code> 和 <code>torch.linalg.solve(...)</code></li>
+<li><strong>逻辑:</strong> 这里用到了 <code>cov</code> (协方差矩阵)。这是预先计算好的，代表了模型在处理普通文本时的参数分布。</li>
+<li><strong>公式意义:</strong> $W_{new} = W_{old} + \Delta$。为了求 $\Delta$，代码求解了一个线性方程。目的是：<strong>既要最大化地修正当前的误差，又要最小化对其他无关知识的破坏</strong>。</li>
+<li><strong>人话:</strong> 这一步是核心。我要砸墙（修改参数），但我不能瞎砸，否则“埃菲尔铁塔”改对了，“美国总统”是谁却忘了。<code>cov</code> 就像承重墙图纸，告诉算法哪些参数不能动，哪些可以动。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.5: 临时把这一层修好</strong></p>
+<ul>
+<li><strong>代码:</strong> <code>weights[weight_name][...] = weights_copy[weight_name] + upd_matrix</code></li>
+<li><strong>逻辑:</strong> 在内存里先把这一层的权重改了。</li>
+<li><strong>为什么:</strong> 因为是一个循环！第5层的输入依赖于第4层的输出。如果我不先把第4层改了，计算第5层的时候拿到的输入就是旧的，那后面就全乱套了。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 🔨 正式交付 (应用权重)</h4>
+<p><strong>代码位置:</strong> <code>apply_memit_to_model</code> 函数。</p>
+<ul>
+<li><strong>逻辑:</strong> <code>execute_memit</code> 只是计算出了 <code>deltas</code> (变化量)，并且在函数结束时把模型恢复原状了（为了安全）。<code>apply_memit_to_model</code> 拿到这些 <code>deltas</code>，真正地把它们加到原始模型的权重里去。</li>
+<li><strong>人话:</strong> 刚才是在草稿纸上演算了一遍装修流程。现在确认无误，施工队正式进场，把墙砸了，把新砖砌上去。</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件的核心思想是：<strong>分摊压力，保护旧知</strong>。</p>
+<ul>
+<li><strong>分摊压力:</strong> 不在一个层把所有事做完，而是分摊到多个层，每层修一点。</li>
+<li><strong>保护旧知:</strong> 利用协方差矩阵（Covariance Matrix），确保修改参数时，只针对当前的 Prompt 生效，尽量不影响模型原本学到的海量知识。</li>
+</ul>

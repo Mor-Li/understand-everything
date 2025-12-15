@@ -1,0 +1,169 @@
+<h1>easyeditor/models/serac/serac_main.py</h1>
+<p>这份代码确实初看会觉得有点乱，特别是里面保留了大量<strong>被注释掉的代码</strong>（以 <code>#</code> 开头的），这会严重干扰视线。</p>
+<p>简单来说，这个文件定义了<strong>执行器（Executor）</strong>，它的作用是：<strong>“拿到一个编辑请求（比如把‘埃菲尔铁塔在巴黎’改成‘埃菲尔铁塔在柏林’），准备好数据，然后调用核心算法（SERAC）来生成一个新的模型。”</strong></p>
+<p>为了让你看懂，我为你列了一个<strong>学习任务清单 (To-Do List)</strong>，我们按照这个顺序一步步拆解。</p>
+<hr />
+<h3>📋 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>清理视野</strong>：识别并忽略那些“僵尸代码”（被注释掉的大段代码）。</li>
+<li><strong>搞懂角色</strong>：理解 <code>SeracRewriteExecutor</code> 类是干嘛的。</li>
+<li><strong>初始化阶段</strong>：看懂 <code>init_model</code> 如何加载 SERAC 的外挂模型。</li>
+<li><strong>核心执行阶段</strong>：看懂 <code>apply_to_model</code> 如何处理文本数据并执行编辑。</li>
+<li><strong>多模态版本</strong>：快速扫一眼 <code>SeracMultimodalRewriteExecutor</code>（处理图片的版本）。</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 1: 清理视野 (忽略注释)</h4>
+<p>首先，请在心里把代码中所有大段的灰色注释（<code># ...</code>）删掉。
+你会发现 <code>apply_to_model</code> 函数里，有一大半代码是废弃的（看起来是从 MEND 算法那里复制过来没删干净的逻辑）。
+<strong>核心逻辑其实非常短。</strong></p>
+<h4>Task 2: 搞懂角色 (Class Definition)</h4>
+<p>代码定义了一个类 <code>SeracRewriteExecutor</code>。
+*   <strong>它的定位</strong>：它不是算法本身（算法逻辑在 <code>...trainer</code> 里的 <code>SERAC</code>），它是一个<strong>接口</strong>。
+*   <strong>它的工作</strong>：连接用户输入的 <code>request</code> 和底层的 <code>SERAC</code> 算法。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">SeracRewriteExecutor</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">is_init</span> <span class="o">=</span> <span class="kc">False</span>  <span class="c1"># 标记是否已经初始化过</span>
+</code></pre></div>
+
+<h4>Task 3: 初始化阶段 (<code>init_model</code>)</h4>
+<p>当我们要开始修改模型时，首先要加载 SERAC 需要的组件。SERAC 的原理是不改动原大模型参数，而是外挂一个小模型（Scope Classifier 和 Counterfactual Model）来修正错误。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">init_model</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model</span><span class="p">,</span> <span class="n">tok</span><span class="p">,</span> <span class="n">params</span><span class="p">:</span> <span class="n">SERACHparams</span><span class="p">):</span>
+    <span class="c1"># 1. 检查是否有预训练的 SERAC 权重文件 (archive)</span>
+    <span class="k">assert</span> <span class="n">params</span><span class="o">.</span><span class="n">archive</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">or</span> <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s1">&#39;Training weights Needed....&#39;</span><span class="p">)</span>
+
+    <span class="c1"># 2. 绑定大模型和分词器</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">model</span> <span class="o">=</span> <span class="n">model</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span> <span class="o">=</span> <span class="n">tok</span>
+
+    <span class="c1"># 3. 设置分词器的 padding（补零）方式，GPT类模型通常要在左边补零</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">set_padding</span><span class="p">():</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">pad_token_id</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">eos_token_id</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">padding_side</span> <span class="o">=</span> <span class="s1">&#39;left&#39;</span>
+    <span class="n">set_padding</span><span class="p">()</span>
+
+    <span class="c1"># 4. 【关键】初始化 SERAC 核心算法模块</span>
+    <span class="c1"># deepcopy 是为了防止修改配置影响外部</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">alg</span> <span class="o">=</span> <span class="n">SERAC</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">,</span> <span class="n">deepcopy</span><span class="p">(</span><span class="n">params</span><span class="p">),</span> <span class="k">lambda</span><span class="p">:</span> <span class="n">deepcopy</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">))</span>
+
+    <span class="c1"># 5. 加载训练好的 SERAC 权重 (Classifier 和 Replacement Model)</span>
+    <span class="n">d</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">params</span><span class="o">.</span><span class="n">archive</span><span class="p">,</span> <span class="n">map_location</span><span class="o">=</span><span class="s1">&#39;cpu&#39;</span><span class="p">)</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">alg</span><span class="o">.</span><span class="n">load_state_dict</span><span class="p">(</span><span class="n">d</span><span class="p">[</span><span class="s2">&quot;model&quot;</span><span class="p">],</span> <span class="kc">False</span><span class="p">)</span>
+
+    <span class="c1"># 6. 把组件搬运到 GPU 上</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">alg</span><span class="o">.</span><span class="n">replacement</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="sa">f</span><span class="s1">&#39;cuda:</span><span class="si">{</span><span class="n">params</span><span class="o">.</span><span class="n">device</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">))</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">alg</span><span class="o">.</span><span class="n">classifier</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="sa">f</span><span class="s1">&#39;cuda:</span><span class="si">{</span><span class="n">params</span><span class="o">.</span><span class="n">device</span><span class="si">}</span><span class="s1">&#39;</span><span class="p">))</span>
+
+    <span class="bp">self</span><span class="o">.</span><span class="n">is_init</span> <span class="o">=</span> <span class="kc">True</span>
+</code></pre></div>
+
+<p><strong>总结</strong>：这一步就是把外挂装备（SERAC 权重）穿到模型身上。</p>
+<h4>Task 4: 核心执行阶段 (<code>apply_to_model</code>)</h4>
+<p>这是最复杂的部分，但如果我们忽略注释，逻辑就很清晰：<strong>处理输入 -&gt; 扔给算法 -&gt; 返回新模型</strong>。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">apply_to_model</span><span class="p">(</span>
+    <span class="bp">self</span><span class="p">,</span>
+    <span class="n">model</span><span class="p">:</span> <span class="n">AutoModelForCausalLM</span><span class="p">,</span>
+    <span class="n">tok</span><span class="p">:</span> <span class="n">AutoTokenizer</span><span class="p">,</span>
+    <span class="n">requests</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">Dict</span><span class="p">],</span> <span class="c1"># 用户的编辑请求列表</span>
+    <span class="n">hparams</span><span class="p">:</span> <span class="n">SERACHparams</span><span class="p">,</span>
+    <span class="n">copy</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+    <span class="c1"># ... 其他参数忽略</span>
+<span class="p">):</span>
+    <span class="c1"># 1. 如果没初始化，先执行上面的 init_model</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_init</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">init_model</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">tok</span><span class="p">,</span> <span class="n">hparams</span><span class="p">)</span>
+
+    <span class="c1"># 2. 准备数据：构造输入(Prompt)和目标(Target)</span>
+    <span class="c1"># requests 里的例子：{&#39;prompt&#39;: &#39;谁是美国总统?&#39;, &#39;target_new&#39;: &#39;拜登&#39;}</span>
+
+    <span class="c1"># 提取目标文本</span>
+    <span class="n">targets</span> <span class="o">=</span> <span class="p">[</span>
+        <span class="p">(</span><span class="s2">&quot; &quot;</span> <span class="k">if</span> <span class="n">request</span><span class="p">[</span><span class="s2">&quot;target_new&quot;</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span> <span class="o">!=</span> <span class="s2">&quot; &quot;</span> <span class="k">else</span> <span class="s2">&quot;&quot;</span><span class="p">)</span>
+        <span class="o">+</span> <span class="n">request</span><span class="p">[</span><span class="s2">&quot;target_new&quot;</span><span class="p">]</span>
+        <span class="k">for</span> <span class="n">request</span> <span class="ow">in</span> <span class="n">requests</span>
+    <span class="p">]</span>
+    <span class="c1"># 拼接完整的句子：Prompt + Target</span>
+    <span class="n">sentences</span> <span class="o">=</span> <span class="p">[</span>
+        <span class="n">request</span><span class="p">[</span><span class="s2">&quot;prompt&quot;</span><span class="p">]</span> <span class="o">+</span> <span class="n">targets</span><span class="p">[</span><span class="n">i</span><span class="p">]</span>
+        <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">request</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">requests</span><span class="p">)</span>
+    <span class="p">]</span>
+
+    <span class="c1"># 3. Tokenize (把文本转成数字 ID)</span>
+    <span class="c1"># 处理完整的句子</span>
+    <span class="n">sent_tok</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">(</span><span class="n">sentences</span><span class="p">,</span> <span class="n">padding</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">return_tensors</span><span class="o">=</span><span class="s2">&quot;pt&quot;</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span>
+        <span class="sa">f</span><span class="s2">&quot;cuda:</span><span class="si">{</span><span class="n">hparams</span><span class="o">.</span><span class="n">device</span><span class="si">}</span><span class="s2">&quot;</span>
+    <span class="p">)</span>
+    <span class="c1"># 单独处理目标标签 (Label)</span>
+    <span class="n">label_tok</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">([</span><span class="n">request</span><span class="p">[</span><span class="s2">&quot;target_new&quot;</span><span class="p">]</span> <span class="k">for</span> <span class="n">request</span> <span class="ow">in</span> <span class="n">requests</span><span class="p">],</span>
+                                <span class="n">padding</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                                <span class="n">return_tensors</span><span class="o">=</span><span class="s2">&quot;pt&quot;</span>
+                                <span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;cuda:</span><span class="si">{</span><span class="n">hparams</span><span class="o">.</span><span class="n">device</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="c1"># 4. 构造传给算法的字典</span>
+    <span class="n">edit_inner</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span>
+        <span class="n">input_ids</span><span class="o">=</span><span class="n">sent_tok</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">],</span>        <span class="c1"># 句子的 token ID</span>
+        <span class="n">attention_mask</span><span class="o">=</span><span class="n">sent_tok</span><span class="p">[</span><span class="s2">&quot;attention_mask&quot;</span><span class="p">],</span> <span class="c1"># 掩码（区分哪里是字，哪里是补零）</span>
+        <span class="n">labels</span><span class="o">=</span><span class="n">label_tok</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">],</span>          <span class="c1"># 我们希望模型输出的目标</span>
+    <span class="p">)</span>
+    <span class="c1"># 条件输入（通常用于分类器判断是否需要编辑）</span>
+    <span class="n">cond</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">sent_tok</span><span class="p">[</span><span class="n">k</span><span class="p">]</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">,</span> <span class="s2">&quot;attention_mask&quot;</span><span class="p">]}</span>
+
+    <span class="c1"># 5. 【核心】调用 SERAC 算法进行编辑</span>
+    <span class="c1"># self.alg.edit 内部会把这个样本存入缓存，或者更新外挂模型</span>
+    <span class="n">new_model</span><span class="p">,</span> <span class="n">model_info</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">alg</span><span class="o">.</span><span class="n">edit</span><span class="p">(</span><span class="n">edit_inner</span><span class="p">,</span> <span class="n">cond</span><span class="p">)</span>
+
+    <span class="c1"># (中间略过一大段被注释掉的代码，那些是 MEND 算法改权重用的，SERAC 不直接改大模型权重)</span>
+
+    <span class="c1"># 6. 如果需要保持原始权重，做一些缓存清理（不太重要）</span>
+    <span class="k">if</span> <span class="n">keep_original_weight</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">alg</span><span class="o">.</span><span class="n">cache_labels</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">alg</span><span class="o">.</span><span class="n">cache_labels</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">:]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">alg</span><span class="o">.</span><span class="n">cache_inputs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">alg</span><span class="o">.</span><span class="n">cache_inputs</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">:]</span>
+
+    <span class="c1"># 7. 返回编辑后的模型对象</span>
+    <span class="k">return</span> <span class="n">new_model</span><span class="p">,</span> <span class="p">{}</span>
+</code></pre></div>
+
+<p><strong>总结</strong>：
+1.  把人类读得懂的 <code>request</code> 变成机器读得懂的 <code>input_ids</code>。
+2.  调用 <code>self.alg.edit()</code>。SERAC 的特点是它通常<strong>不直接修改</strong> <code>model</code> 的参数，而是返回一个包装好的 <code>new_model</code>。这个 <code>new_model</code> 在推理时会先判断“这个问题是不是我们要改的？”，如果是，就用外挂小模型回答；如果不是，就用原大模型回答。</p>
+<h4>Task 5: 多模态版本 (<code>SeracMultimodalRewriteExecutor</code>)</h4>
+<p>这个类继承了上面的类，逻辑几乎一样，只是处理的数据多了<strong>图片</strong>。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">SeracMultimodalRewriteExecutor</span><span class="p">(</span><span class="n">SeracRewriteExecutor</span><span class="p">):</span>
+    <span class="c1"># ... init_model 几乎一样，只是用了 SERAC_MULTI 类 ...</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">apply_to_model</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">...</span> <span class="n">request</span> <span class="o">...</span><span class="p">):</span>
+        <span class="c1"># ... 初始化 ...</span>
+
+        <span class="c1"># 1. 准备数据</span>
+        <span class="n">src</span> <span class="o">=</span> <span class="p">[</span><span class="n">request</span><span class="p">[</span><span class="s2">&quot;prompt&quot;</span><span class="p">]]</span>
+        <span class="n">trg</span> <span class="o">=</span> <span class="p">[(</span><span class="s2">&quot; &quot;</span> <span class="k">if</span> <span class="n">request</span><span class="p">[</span><span class="s2">&quot;target&quot;</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span> <span class="o">!=</span> <span class="s2">&quot; &quot;</span> <span class="k">else</span> <span class="s2">&quot;&quot;</span><span class="p">)</span> <span class="o">+</span> <span class="n">request</span><span class="p">[</span><span class="s2">&quot;target&quot;</span><span class="p">]]</span>
+
+        <span class="c1"># 2. 处理图片：把图片堆叠成 Tensor</span>
+        <span class="n">image</span> <span class="o">=</span> <span class="p">[</span><span class="n">request</span><span class="p">[</span><span class="s2">&quot;image&quot;</span><span class="p">]]</span>
+        <span class="n">image</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">image</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+
+        <span class="c1"># 3. 拼接文本</span>
+        <span class="n">text_input</span> <span class="o">=</span> <span class="p">[</span><span class="n">s</span> <span class="o">+</span> <span class="n">t</span> <span class="k">for</span> <span class="n">s</span><span class="p">,</span> <span class="n">t</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">src</span><span class="p">,</span> <span class="n">trg</span><span class="p">)]</span>
+
+        <span class="c1"># ... 计算长度等 ...</span>
+
+        <span class="c1"># 4. 构造输入字典，多了 &#39;image&#39; 字段</span>
+        <span class="n">edit_inner</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span>
+            <span class="n">image</span><span class="o">=</span><span class="n">image</span><span class="p">,</span>
+            <span class="n">text_input</span><span class="o">=</span><span class="n">text_input</span><span class="p">,</span>
+            <span class="n">labels</span><span class="o">=</span><span class="n">labels</span><span class="p">,</span>
+            <span class="n">prompts_len</span><span class="o">=</span><span class="n">prompts_len</span>
+        <span class="p">)</span>
+
+        <span class="c1"># 5. 调用算法</span>
+        <span class="n">new_model</span><span class="p">,</span> <span class="n">model_info</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">alg</span><span class="o">.</span><span class="n">edit</span><span class="p">(</span><span class="n">edit_inner</span><span class="p">,)</span>
+
+        <span class="k">return</span> <span class="n">new_model</span><span class="p">,</span> <span class="p">{}</span>
+</code></pre></div>
+
+<h3>总结全文观点</h3>
+<p>这个文件本身没有提出新的“观点”，它是一个<strong>工程实现文件</strong>。它表达的逻辑是：
+1.  SERAC 算法需要预先训练好的权重（Archive）。
+2.  编辑过程就是把用户的 Prompt 和 Target 编码，然后喂给 SERAC 算法模块。
+3.  SERAC 会返回一个新的模型对象（<code>new_model</code>），这个对象内部封装了路由机制（Router/Classifier），决定何时使用编辑后的知识。</p>
+<p><strong>最核心的一句话：</strong> 这是一个<strong>数据预处理和调度中心</strong>，它负责把原始数据喂给 SERAC 算法，并拿回编辑好的模型。</p>

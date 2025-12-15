@@ -1,0 +1,69 @@
+<h1>easyeditor/util/generate.py</h1>
+<p>这份代码确实包含了很多深度学习（尤其是大语言模型）底层的推理逻辑，乍一看全是张量（Tensor）操作，很难懂。</p>
+<p>别担心，我们把这段代码想象成<strong>“如何让一个AI模型开口说话，并且还能跟旧模型对比”</strong>的过程。</p>
+<p>我为你列了一个 <strong>5步走的 Task List（任务清单）</strong>，带你从宏观到微观，一步步拆解它的逻辑：</p>
+<hr />
+<h3>📝 Task 1: 搞清楚这个文件的核心目的</h3>
+<p><strong>任务目标</strong>：知道这俩函数是干嘛的。</p>
+<ul>
+<li><strong><code>generate_interactive</code></strong>: 这是一个<strong>聊天窗口</strong>。它的作用是启动一个程序，让你能不断输入问题，然后它会展示经过修改的模型（Argument Model）和原版模型（Baseline Model）分别是怎么回答的。</li>
+<li><strong><code>generate_fast</code></strong>: 这是<strong>发动机</strong>。它是真正执行“生成文字”这个动作的函数。之所以叫 <code>fast</code>，是因为它手动实现了一遍生成过程，利用了缓存机制来加速。</li>
+</ul>
+<hr />
+<h3>📝 Task 2: 理解“聊天”流程 (<code>generate_interactive</code>)</h3>
+<p><strong>任务目标</strong>：看懂主循环是如何工作的。</p>
+<p>这一步的代码逻辑非常直观：
+1.  <strong>准备工具</strong>：如果有需要，初始化 <code>LogitLens</code>（这是一个透视镜工具，用来观察模型内部每一层在想什么，非必须）。
+2.  <strong>死循环 (<code>while True</code>)</strong>：
+    *   <strong>步骤 A</strong>: <code>input("Enter a prompt: ")</code> -&gt; 等待你输入一句话。
+    *   <strong>步骤 B</strong>: 调用 <code>generate_fast</code> 让<strong>新模型</strong>生成回答，并打印出来。
+    *   <strong>步骤 C</strong>: 如果你提供了<strong>旧模型</strong> (<code>compare_against</code>)，也调用 <code>generate_fast</code> 让它回答，并打印出来。（方便你对比模型修改前后的效果）。
+    *   <strong>步骤 D</strong>: 如果开了透视镜 (<code>LogitLens</code>)，打印模型内部的分析数据。</p>
+<p><strong>总结</strong>：这就是个控制台交互界面，核心工作都外包给了 <code>generate_fast</code>。</p>
+<hr />
+<h3>📝 Task 3: 启动发动机前的准备 (<code>generate_fast</code> 前半部分)</h3>
+<p><strong>任务目标</strong>：把人类语言变成机器能懂的数字。</p>
+<p>进入 <code>generate_fast</code> 函数：
+1.  <strong>复制输入 (<code>Unroll prompts</code>)</strong>: 如果你想让同一个问题生成 3 个不同的回答，这里会把你的问题复制 3 份。
+2.  <strong>分词 (<code>tok(...)</code>)</strong>: 把你的文本（例如 "Hello"）转换成数字 ID（例如 <code>[15496]</code>）。
+3.  <strong>偷懒模式 (<code>vanilla_generation</code>)</strong>: 代码里有个 <code>if vanilla_generation:</code>。如果设为 True，它就直接调用 HuggingFace 自带的 <code>model.generate()</code>，完全不走后面的复杂逻辑。
+4.  <strong>准备缓存 (<code>past_key_values</code>)</strong>:
+    *   这是大模型加速的关键。模型每生成一个字，不需要回头重新读一遍全文，只需要读新生成的那个字，之前的记忆存在 <code>past_key_values</code> 里。初始设为 <code>None</code>。</p>
+<hr />
+<h3>📝 Task 4: 核心生成循环 (<code>generate_fast</code> 的 <code>while</code> 循环)</h3>
+<p><strong>任务目标</strong>：理解模型是如何<strong>一个字一个字</strong>往外蹦的。</p>
+<p>这是全文件最难懂的部分，逻辑如下：
+1.  <strong>循环条件</strong>: <code>while input_ids.size(1) &lt; max_out_len</code>: 只要生成的长度还没超过限制，就一直循环。
+2.  <strong>模型预测 (<code>model(...)</code>)</strong>:
+    *   把当前的输入喂给模型。
+    *   <strong>关键点</strong>: <code>use_cache=True</code>。告诉模型：“把这次算的记忆存起来，下次接着用”。
+3.  <strong>选词逻辑 (Sampling)</strong>:
+    *   模型输出的是 <code>logits</code>（它是词表中每一个词的概率分数）。
+    *   <strong>Softmax</strong>: 把分数变成概率百分比。
+    *   <strong>Top-K (<code>torch.topk</code>)</strong>: 为了防止模型胡言乱语，只保留概率最高的 K 个词（默认 5 个）。
+    *   <strong>抽奖 (<code>torch.multinomial</code>)</strong>: 从这 5 个候选词里，随机抽 1 个作为下一个字。
+4.  <strong>填空逻辑</strong>:
+    *   代码里有一堆关于 <code>attention_mask</code> 和 <code>cur_context</code> 的操作。
+    *   简单说：它在计算<strong>“我刚才生成的这个新字，应该填在句子的哪个位置”</strong>。
+    *   它会把新生成的字追加到 <code>input_ids</code>（输入的数字序列）末尾。</p>
+<hr />
+<h3>📝 Task 5: 翻译回人类语言 (<code>generate_fast</code> 收尾)</h3>
+<p><strong>任务目标</strong>：把数字变回文字，并打扫卫生。</p>
+<p>循环结束后：
+1.  <strong>解码 (<code>tok.decode</code>)</strong>: 把一长串数字 ID（包括原来的问题和新生成的回答）变回字符串。
+2.  <strong>清洗数据</strong>:
+    *   <code>unicodedata.normalize</code>: 统一字符编码格式。
+    *   <code>.replace("\n\n", " ")</code>: 把连续换行变成空格。
+    *   <code>.replace("&lt;|endoftext|&gt;", "")</code>: 把模型生成的“结束符”删掉，不然看着很丑。
+3.  <strong>交卷</strong>: <code>return txt</code> 返回最终生成的文本列表。</p>
+<hr />
+<h3>总结一下</h3>
+<p>这个文件的逻辑其实就是：
+1.  <strong><code>generate_interactive</code></strong>: 一个不断问你“请输入”的死循环。
+2.  <strong><code>generate_fast</code></strong>:
+    *   先把字变数字。
+    *   利用缓存机制（KV Cache），一个词接一个词地预测。
+    *   从概率最高的几个词里抽一个。
+    *   把数字变回字，清理干净后返回。</p>
+<p><strong>为什么它看起来这么复杂？</strong>
+主要是因为它<strong>手动实现</strong>了 PyTorch 的生成循环（为了控制细节和利用缓存加速），而不是直接调用现成的库函数，所以涉及了很多张量维度的操作。</p>

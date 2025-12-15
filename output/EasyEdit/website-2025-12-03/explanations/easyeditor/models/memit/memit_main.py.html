@@ -1,0 +1,145 @@
+<h1>easyeditor/models/memit/memit_main.py</h1>
+<p>这份代码实现了 <strong>MEMIT (Mass-Editing Memory in a Transformer)</strong> 算法。简单来说，它的目的是<strong>批量修改大模型中的知识</strong>（比如把“埃菲尔铁塔在巴黎”改成“埃菲尔铁塔在罗马”），而且要改得自然、不破坏模型原有的其他能力。</p>
+<p>你可以把这个过程想象成给模型做一场“精密脑科手术”。</p>
+<p>为了让你看懂，我把你原本觉得复杂的代码逻辑拆解成了一个 <strong>“手术流程 To-Do List”</strong>。</p>
+<hr />
+<h3>📋 MEMIT 算法执行清单 (Task To-Do List)</h3>
+<h4><strong>第一阶段：术前准备 (准备数据)</strong></h4>
+<ol>
+<li><strong>整理请求</strong>：把用户想要修改的知识点（比如 "Subject: 埃菲尔铁塔", "Target: 罗马"）整理好，并加上一些上下文前缀（Prompt），让模型更容易理解语境。</li>
+<li><strong>锁定手术区域</strong>：确定要修改模型的哪些层（Layers）。通常是模型中间偏后的几层 MLP 层。</li>
+</ol>
+<h4><strong>第二阶段：确定目标 (计算 $z$)</strong></h4>
+<ol>
+<li><strong>计算最终目标向量 ($z$)</strong>：<ul>
+<li>我们希望模型在看到“埃菲尔铁塔”时，最后一层输出的向量能代表“罗马”。</li>
+<li>这一步是算出：为了输出“罗马”，模型<strong>最后一层</strong>的神经元激活值应该是多少。</li>
+</ul>
+</li>
+</ol>
+<h4><strong>第三阶段：分层手术 (核心循环)</strong></h4>
+<p><em>MEMIT 的核心特点是把修改任务分摊到多个层去完成，而不是只改一层。</em></p>
+<ol>
+<li><strong>遍历每一层 (Loop Layers)</strong>：从选定的第一层开始，一直到最后一层。<ul>
+<li><strong>Task 4.1：计算当前层的输入 ($k$)</strong>：<ul>
+<li>当输入是“埃菲尔铁塔”时，当前这一层接收到的<strong>输入信号</strong>是什么？这个输入信号被称为 Key ($k$)。</li>
+</ul>
+</li>
+<li><strong>Task 4.2：计算还有多少误差 (Residual)</strong>：<ul>
+<li>看看当前模型输出和我们在<strong>第二阶段</strong>算出的最终目标 ($z$) 还有多大差距。</li>
+<li>这个差距就是这一层需要努力去修正的“残差”。</li>
+</ul>
+</li>
+<li><strong>Task 4.3：获取“背景知识”统计 (Covariance)</strong>：<ul>
+<li>为了不把模型改傻（比如改了埃菲尔铁塔，结果忘了长城在哪），我们需要知道这一层平时处理普通文本时的参数分布（协方差矩阵）。这是为了由最小二乘法来约束修改幅度。</li>
+</ul>
+</li>
+<li><strong>Task 4.4：计算手术方案 (Update Matrix)</strong>：<ul>
+<li>利用数学公式（闭式解），结合 <strong>输入($k$)</strong>、<strong>误差(Residual)</strong> 和 <strong>背景统计(Covariance)</strong>，计算出这一层的权重矩阵 $W$ 应该加上多少 ($\Delta W$)。</li>
+</ul>
+</li>
+<li><strong>Task 4.5：临时缝合 (Temporary Update)</strong>：<ul>
+<li>把算出来的 $\Delta W$ 暂时加到模型上。</li>
+<li><strong>为什么要临时加？</strong> 因为下一层的计算依赖于上一层的输出。如果上一层改了，传给下一层的信号就变了，所以必须实时更新模型状态。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<h4><strong>第四阶段：正式缝合 (应用修改)</strong></h4>
+<ol>
+<li><strong>永久应用修改</strong>：把所有层计算出来的权重变化量 ($\Delta W$) 正式应用到原模型上。</li>
+</ol>
+<hr />
+<h3>🔍 代码对应解析 (Step-by-Step)</h3>
+<p>现在我们拿着上面的清单，去对应代码里的函数：</p>
+<h4>1. 入口：<code>apply_memit_to_model</code></h4>
+<p>这是手术的主刀医生。
+*   它调用 <code>execute_memit</code> 来制定手术方案。
+*   拿到方案（<code>deltas</code>）后，执行 <code>w[...] += upd_matrix.float()</code>，真正修改模型的权重。</p>
+<h4>2. 核心逻辑：<code>execute_memit</code></h4>
+<p>这是最复杂的函数，它对应了上面的 <strong>第二、三阶段</strong>。</p>
+<ul>
+<li>
+<p><strong>对应 To-Do 1 (整理请求):</strong>
+    <code>python
+    # 代码 78-94 行
+    if request["target_new"][0] != " ": ...
+    requests[i]['prompt'] = ...</code>
+    这里在处理字符串格式，确保 Tokenizer 能正确处理。</p>
+</li>
+<li>
+<p><strong>对应 To-Do 2 (锁定区域):</strong>
+    <code>python
+    # 代码 97-102 行
+    weights = { ... hparams.layers ... }</code>
+    获取要修改的层的原始权重。</p>
+</li>
+<li>
+<p><strong>对应 To-Do 3 (计算最终目标 $z$):</strong>
+    <code>python
+    # 代码 107-156 行
+    cur_z = compute_z(..., z_layer, ...)
+    zs = torch.stack(z_list, dim=1)</code>
+    <code>compute_z</code> 函数算出：为了输出新知识，最后一层的向量 $z$ 必须长什么样。</p>
+</li>
+<li>
+<p><strong>对应 To-Do 4 (分层手术循环):</strong>
+    <code>python
+    # 代码 159 行
+    for i, layer in enumerate(hparams.layers):</code>
+    开始遍历每一层。</p>
+<ul>
+<li>
+<p><strong>Task 4.1 (计算输入 $k$):</strong>
+    <code>python
+    # 代码 163 行
+    layer_ks = compute_ks(..., layer, ...).T</code>
+    <code>compute_ks</code> 算出当前层接收到的输入信号。</p>
+</li>
+<li>
+<p><strong>Task 4.2 (计算误差 Residual):</strong>
+    <code>python
+    # 代码 167-179 行
+    cur_zs = get_module_input_output_at_words(...) # 当前实际输出
+    targets = zs - cur_zs # 目标 - 当前 = 误差</code>
+    算出还需要修正多少。</p>
+</li>
+<li>
+<p><strong>Task 4.3 (获取背景统计 Covariance):</strong>
+    <code>python
+    # 代码 187-198 行
+    cov = get_cov(...)</code>
+    <code>get_cov</code> 读取预先计算好的大规模文本统计信息（防止修改导致模型崩坏）。</p>
+</li>
+<li>
+<p><strong>Task 4.4 (计算手术方案):</strong>
+    <code>python
+    # 代码 207-213 行
+    # 这是一个解线性方程组的过程 (Ridge Regression / Least Squares)
+    adj_k = torch.linalg.solve(hparams.mom2_update_weight * cov.double() + layer_ks @ layer_ks.T, layer_ks)
+    resid = targets / (len(hparams.layers) - i) # 把误差平摊到剩下的层
+    upd_matrix = resid @ adj_k.T</code>
+    这一段数学公式是 MEMIT 的灵魂。它计算出 <code>upd_matrix</code>（即 $\Delta W$）。</p>
+</li>
+<li>
+<p><strong>Task 4.5 (临时缝合):</strong>
+    <code>python
+    # 代码 222-227 行
+    weights[weight_name][...] = weights_copy[weight_name] + upd_matrix.float()</code>
+    在循环内更新权重，确保下一层循环计算时，用到的是更新过的模型状态。</p>
+</li>
+</ul>
+</li>
+</ul>
+<h4>3. 辅助功能：<code>get_cov</code></h4>
+<ul>
+<li>这是一个缓存工具。因为计算协方差矩阵（Covariance Matrix）需要跑很多数据，很慢，所以它会把结果存成文件，下次直接读取。</li>
+</ul>
+<h3>总结</h3>
+<p>这段代码其实就在做一件事：
+<strong>解一个数学方程，找到一组新的权重参数。</strong></p>
+<p>这组新参数要满足两个条件：
+1.  <strong>记住新知识</strong>：对于特定的输入（埃菲尔铁塔），输出特定的目标（罗马）。
+2.  <strong>不忘旧知识</strong>：对于其他所有输入（背景统计 Covariance），输出尽可能保持不变。</p>
+<p>MEMIT 把这个求解过程拆解到了多个层中逐步完成，比只改一层更稳定。</p>

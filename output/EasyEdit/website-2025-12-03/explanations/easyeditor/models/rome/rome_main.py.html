@@ -1,0 +1,83 @@
+<h1>easyeditor/models/rome/rome_main.py</h1>
+<p>这份代码确实涉及比较底层的深度学习模型操作，也就是所谓的“模型编辑”（Model Editing）。它的核心目的是：<strong>不动模型的大部分参数，只精准修改某一层的一小部分权重，从而让模型“记住”一个新的知识（比如把“埃菲尔铁塔在巴黎”改成“埃菲尔铁塔在罗马”），同时不破坏模型原有的能力。</strong></p>
+<p>这个算法叫 <strong>ROME</strong> (Rank-One Model Editing)。</p>
+<p>为了让你看懂，我把阅读这份代码拆解成一个 <strong>“6步走的 Task List”</strong>。你按照这个顺序，就能把代码逻辑串起来。</p>
+<hr />
+<h3>🗺️ ROME 代码阅读 Task List</h3>
+<h4>✅ Task 1: 搞清楚我们在做什么手术 (输入是什么？)</h4>
+<p><strong>目标：</strong> 理解 <code>apply_rome_to_model</code> 函数的输入参数。
+*   <strong>概念：</strong> 这就像给病人（模型）做微创手术。你需要：
+    1.  <strong>病人</strong> (<code>model</code>, <code>tok</code>): 你要修改的大语言模型和分词器。
+    2.  <strong>手术方案</strong> (<code>request</code>): 一个字典，包含 <code>prompt</code> (提示词), <code>subject</code> (主语), <code>target_new</code> (新目标)。
+        *   <em>例子：</em> <code>prompt</code>: "{} is located in", <code>subject</code>: "Eiffel Tower", <code>target_new</code>: "Rome".
+    3.  <strong>手术器械参数</strong> (<code>hparams</code>): 指定改哪一层、改多大劲儿等超参数。</p>
+<h4>✅ Task 2: 核心计算逻辑 —— 寻找“修改量” (execute_rome)</h4>
+<p><strong>目标：</strong> 理解 <code>execute_rome</code> 函数。这是整个文件的<strong>核心大脑</strong>。
+*   <strong>代码逻辑：</strong> 这个函数并不真正永久修改模型，它的任务是<strong>计算出权重应该怎么改</strong>。
+    1.  <strong>格式化输入：</strong> 代码开头处理 <code>request</code>，确保 prompt 里有占位符 <code>{}</code>，并且新目标词前面加空格（分词需要）。
+    2.  <strong>锁定目标层：</strong> 代码里 <code>hparams.layers</code> 指定了我们要改模型的第几层（通常是 MLP 层）。
+    3.  <strong>循环计算 (最重要)：</strong>
+        *   它遍历指定的每一层。
+        *   <strong>计算 $u$ (Left Vector):</strong> <code>compute_u(...)</code>。你可以把它理解为<strong>“定位向量”</strong>。它告诉模型：当看到“埃菲尔铁塔”这个概念时，哪里的神经元被激活了？我们要改的就是这里。
+        *   <strong>计算 $v$ (Right Vector):</strong> <code>compute_v(...)</code>。你可以把它理解为<strong>“新值向量”</strong>。它告诉模型：在这个位置，原本输出的是“巴黎”，现在我要你强行输出“罗马”。
+        *   <em>(注：<code>compute_u</code> 和 <code>compute_v</code> 是外部引用的复杂数学计算，本文件只负责调用)</em>。</p>
+<h4>✅ Task 3: 算出权重的“增量” (Delta)</h4>
+<p><strong>目标：</strong> 理解 <code>upd_matrix</code> 是怎么来的。
+*   <strong>数学原理：</strong> ROME 是 Rank-One（一阶）更新。公式是 $\Delta W = u \cdot v^T$。
+*   <strong>代码对应：</strong>
+    <code>python
+    # 把 u 和 v 做外积（矩阵乘法），得到一个矩阵
+    upd_matrix = left_vector.unsqueeze(1) @ right_vector.unsqueeze(0)</code>
+*   <strong>形状调整：</strong> <code>upd_matrix_match_shape</code> 函数。
+    *   因为不同的模型（如 GPT-2 vs GPT-J）权重的存储方式不一样（有的转置了，有的没转置），这个函数确保算出来的补丁形状能贴合原来的权重矩阵。</p>
+<h4>✅ Task 4: 临时试穿与复原</h4>
+<p><strong>目标：</strong> 理解 <code>execute_rome</code> 结尾部分的 <code>weights_copy</code>。
+*   <strong>逻辑：</strong>
+    1.  在 <code>execute_rome</code> 内部，它先把算出来的 <code>upd_matrix</code> 加到了模型权重上（<code>weights[weight_name][...] += upd_matrix</code>），这是为了在计算下一层时（如果有多层）能基于更新后的状态。
+    2.  <strong>但是！</strong> 函数最后有一个 <code>Restore state</code> 部分：
+        <code>python
+        for k, v in weights.items():
+            v[...] = weights_copy[k]</code>
+    3.  <strong>为什么？</strong> 因为 <code>execute_rome</code> 的职责只是<strong>计算</strong>出 <code>deltas</code>（变化量），它承诺函数执行前后模型状态不变（Invariant）。真正的修改交给外层函数。</p>
+<h4>✅ Task 5: 真正动刀 —— 永久修改权重 (回到 apply_rome_to_model)</h4>
+<p><strong>目标：</strong> 理解 <code>apply_rome_to_model</code> 的后半部分。
+*   <strong>逻辑：</strong>
+    1.  拿到 <code>execute_rome</code> 返回的 <code>deltas</code> (就是那个 $u$ 和 $v$)。
+    2.  <strong>永久写入：</strong>
+        <code>python
+        with torch.no_grad():
+            for w_name, (delta_u, delta_v) in deltas.items():
+                # 重新计算矩阵
+                upd_matrix = delta_u.unsqueeze(1) @ delta_v.unsqueeze(0)
+                # 获取模型原本的参数
+                w = nethook.get_parameter(model, w_name)
+                # ...形状调整...
+                # 【关键】把增量加到原权重上
+                w[...] += upd_matrix</code>
+    3.  至此，手术完成。模型现在的参数里已经包含了“埃菲尔铁塔在罗马”的信息。</p>
+<h4>✅ Task 6: 术后康复 —— 上下文模板 (get_context_templates)</h4>
+<p><strong>目标：</strong> 理解为什么最后有一个 <code>get_context_templates</code> 函数。
+*   <strong>问题：</strong> 如果我们只教模型“埃菲尔铁塔在罗马”，它可能只死记硬背这一句话。如果用户问“因为埃菲尔铁塔在罗马，所以...”，模型可能就懵了。
+*   <strong>解决：</strong> 我们需要让这个修改在不同的语境下都生效。
+*   <strong>代码逻辑：</strong>
+    *   这个函数生成一堆随机的前缀（比如 "The...", "Because...", "I think..."）。
+    *   这些模板会被传给 <code>compute_v</code>，用来计算一个更鲁棒（泛化性更强）的 $v$ 向量。意思就是：“不管前面说了啥，只要提到埃菲尔铁塔，你都得给我输出罗马”。</p>
+<hr />
+<h3>总结一下流程</h3>
+<ol>
+<li><strong>准备：</strong> 用户给一句提示和新知识。</li>
+<li><strong>计算 (Execute)：</strong><ul>
+<li>找到要改的那一层。</li>
+<li>用 <code>compute_u</code> 找到<strong>改哪里</strong>。</li>
+<li>用 <code>get_context_templates</code> 生成多种语境。</li>
+<li>用 <code>compute_v</code> 结合语境找到<strong>改成什么</strong>。</li>
+<li>算出更新矩阵 $\Delta W$。</li>
+</ul>
+</li>
+<li><strong>应用 (Apply)：</strong><ul>
+<li>把 $\Delta W$ 加到模型原始权重 $W$ 上：$W_{new} = W_{old} + \Delta W$。</li>
+</ul>
+</li>
+<li><strong>完成：</strong> 返回修改后的模型。</li>
+</ol>
+<p>现在你再回头看代码，重点关注 <code>execute_rome</code> 里的循环和 <code>apply_rome_to_model</code> 里的 <code>w[...] += upd_matrix</code>，应该就清晰多了。</p>

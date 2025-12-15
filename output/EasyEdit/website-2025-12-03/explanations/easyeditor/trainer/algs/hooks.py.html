@@ -1,0 +1,95 @@
+<h1>easyeditor/trainer/algs/hooks.py</h1>
+<p>这段代码确实比较底层，它属于 PyTorch 的 <strong>Hook（钩子）机制</strong>。如果不熟悉 PyTorch 的底层运行原理，看这段代码就像看天书。</p>
+<p>简单来说，这段代码的目的是：<strong>在模型运行的过程中，偷偷把某些层的“输入数据”和“反向传播的梯度”截获并保存下来，为了后面修改模型参数做准备。</strong></p>
+<p>为了让你彻底搞懂，我为你制定了一个 <strong>5步走的 Task List（任务清单）</strong>。我们一步步把这段代码拆解开。</p>
+<hr />
+<h3>📋 任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1：理解核心概念——什么是“Hook (钩子)”？</strong></li>
+<li><strong>Task 2：前向传播——偷看并保存“输入” (<code>linear_forward_hook</code>)</strong></li>
+<li><strong>Task 3：反向传播——偷看并保存“梯度” (<code>linear_backward_hook</code>)</strong></li>
+<li><strong>Task 4：组装——把钩子挂到模型上 (<code>hook_model</code>)</strong></li>
+<li><strong>Task 5：总结——为什么要这么做？(大局观)</strong></li>
+</ol>
+<hr />
+<h3>💡 Task 1：理解核心概念——什么是“Hook (钩子)”？</h3>
+<p>想象一下，模型像是一个复杂的<strong>流水线工厂</strong>。
+*   数据从一头进去，经过层层加工（Forward），从另一头出来。
+*   如果产品有瑕疵，质检员会从出口往回走，告诉每一层哪里做错了（Backward）。</p>
+<p><strong>Hook (钩子)</strong> 就像是一个<strong>监听器</strong>或者<strong>监控探头</strong>。
+我们把它安装在流水线的某一个特定的机器（层/Module）上。当数据流过这台机器时，钩子就会自动触发，执行我们定义好的代码。</p>
+<p><strong>这段代码就是在定义：当数据流过时，我们要干什么坏事（截获数据）。</strong></p>
+<hr />
+<h3>👁️ Task 2：前向传播——偷看并保存“输入”</h3>
+<p>我们先看 <code>linear_forward_hook</code> 这个函数。它的任务是在模型<strong>正向计算</strong>（Forward）时执行。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">linear_forward_hook</span><span class="p">(</span><span class="n">mod</span><span class="p">,</span> <span class="n">activations</span><span class="p">,</span> <span class="n">output</span><span class="p">):</span>
+    <span class="c1"># activations 就是进入这一层的输入数据 (x)</span>
+    <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">activations</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span>
+
+    <span class="c1"># 重点在这里：</span>
+    <span class="c1"># 它把输入数据 (activations[0]) 拿出来，脱离计算图 (detach)，</span>
+    <span class="c1"># 然后强行“粘贴”到了这一层的权重对象 (mod.weight) 上，取名为 __x__</span>
+    <span class="n">mod</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">__x__</span> <span class="o">=</span> <span class="n">activations</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span>
+</code></pre></div>
+
+<ul>
+<li><strong>目的</strong>：我想知道，当模型处理这句话时，进入这一层的<strong>输入 $x$</strong> 具体是多少？</li>
+<li><strong>操作</strong>：把输入 $x$ 存下来，记作 <code>__x__</code>。</li>
+<li><strong>比喻</strong>：面粉进入面包机之前，我偷偷抓了一把面粉样本，贴在面包机侧面，留着待会儿分析。</li>
+</ul>
+<hr />
+<h3>🔙 Task 3：反向传播——偷看并保存“梯度”</h3>
+<p>接下来看 <code>linear_backward_hook</code>。它的任务是在模型<strong>反向传播</strong>（Backward，计算误差）时执行。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">linear_backward_hook</span><span class="p">(</span><span class="n">mod</span><span class="p">,</span> <span class="n">grad_in</span><span class="p">,</span> <span class="n">grad_out</span><span class="p">):</span>
+    <span class="c1"># 如果这一层没有权重参数，就不管了</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">mod</span><span class="p">,</span> <span class="s2">&quot;weight&quot;</span><span class="p">):</span>
+        <span class="k">return</span>
+
+    <span class="c1"># 检查刚才 Task 2 里有没有成功保存输入 __x__</span>
+    <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">mod</span><span class="o">.</span><span class="n">weight</span><span class="p">,</span> <span class="s2">&quot;__x__&quot;</span><span class="p">):</span>
+        <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">grad_out</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span>
+
+        <span class="c1"># 重点在这里：</span>
+        <span class="c1"># grad_out[0] 是从后面传回来的“误差信号” (梯度)</span>
+        <span class="c1"># 它把这个梯度保存到了权重对象上，取名为 __delta__</span>
+        <span class="n">mod</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">__delta__</span> <span class="o">=</span> <span class="n">grad_out</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">mod</span><span class="si">}</span><span class="s2"> has no __x__&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>目的</strong>：我想知道，为了减少最终的预测错误，这一层的输出应该怎么调整？这个信号就是梯度（在这里通常代表 $\delta$）。</li>
+<li><strong>操作</strong>：把传回来的梯度 $\delta$ 存下来，记作 <code>__delta__</code>。</li>
+<li><strong>比喻</strong>：质检员从后面跑过来说：“面包烤焦了！”。我把这个“烤焦了”的反馈信息，也贴在面包机侧面。</li>
+</ul>
+<hr />
+<h3>🔧 Task 4：组装——把钩子挂到模型上</h3>
+<p>定义好了上面两个“监听动作”，我们需要把它们安装到具体的模型层上。这就是 <code>hook_model</code> 的作用。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">hook_model</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">pnames</span><span class="p">):</span>
+    <span class="n">handles</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="c1"># 遍历我们想要监听的每一层 (pnames 是层的名字列表)</span>
+    <span class="k">for</span> <span class="n">m</span> <span class="ow">in</span> <span class="p">[</span><span class="n">parent_module</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">pname</span><span class="p">)</span> <span class="k">for</span> <span class="n">pname</span> <span class="ow">in</span> <span class="n">pnames</span><span class="p">]:</span>
+
+        <span class="c1"># 1. 安装反向传播监听器 (Task 3)</span>
+        <span class="n">handles</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">register_full_backward_hook</span><span class="p">(</span><span class="n">linear_backward_hook</span><span class="p">))</span>
+
+        <span class="c1"># 2. 安装正向传播监听器 (Task 2)</span>
+        <span class="n">handles</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">register_forward_hook</span><span class="p">(</span><span class="n">linear_forward_hook</span><span class="p">))</span>
+
+    <span class="c1"># 把这些安装句柄存起来，方便以后拆除</span>
+    <span class="n">model</span><span class="o">.</span><span class="n">handles</span> <span class="o">=</span> <span class="n">handles</span>
+</code></pre></div>
+
+<ul>
+<li><strong>操作</strong>：你给它一个名单 <code>pnames</code>（比如 <code>['第3层', '第5层']</code>），它就跑去把这两个监听器安装到对应的层上。</li>
+</ul>
+<hr />
+<h3>🎯 Task 5：总结——为什么要这么做？(大局观)</h3>
+<p>你可能会问：<em>PyTorch 自己不是会自动计算梯度更新权重吗？为什么要手动存 <code>__x__</code> 和 <code>__delta__</code>？</em></p>
+<p>这通常用于 <strong>Model Editing（模型编辑）</strong> 算法（如 MEND, ROME 等）。</p>
+<p>在这些算法中，我们不想用标准的 SGD/Adam 优化器来慢悠悠地训练模型。我们想通过数学公式，<strong>直接计算出</strong>权重 $W$ 应该变成什么样，才能让模型瞬间记住一个新知识（比如“埃菲尔铁塔在罗马” -&gt; 改成 “在巴黎”）。</p>
+<p>要计算这个“修改量”，根据数学推导（链式法则），通常需要两个核心要素：
+1.  <strong>当前的输入是什么？</strong> ($\rightarrow$ <code>__x__</code>，由 Task 2 获取)
+2.  <strong>当前的误差方向是什么？</strong> ($\rightarrow$ <code>__delta__</code>，由 Task 3 获取)</p>
+<p><strong>全篇观点的总结：</strong>
+这个文件的作用就是<strong>“采集原材料”</strong>。它通过 Hook 机制，在不破坏模型原有结构的情况下，把特定层的<strong>输入</strong>和<strong>梯度</strong>偷偷保存到 <code>weight</code> 属性上，供后续的算法直接读取并计算出“权重的修改方案”。</p>
