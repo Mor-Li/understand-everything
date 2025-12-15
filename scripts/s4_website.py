@@ -798,6 +798,7 @@ def main():
     parser.add_argument("repo_path", help="Git 仓库路径")
     parser.add_argument("--subdir", default="", help="要分析的子目录（默认为空，分析整个仓库）")
     parser.add_argument("--explain", help="explain 输出目录（默认：output/<repo_name>/explain）")
+    parser.add_argument("--suffix", "-s", help="输出目录后缀（覆盖默认的日期后缀，如 'early', 'mid', 'current'）")
     parser.add_argument("--output", "-o", help="网站输出目录（默认：output/<repo_name>/website）")
 
     args = parser.parse_args()
@@ -806,11 +807,17 @@ def main():
     subdir = Path(args.subdir) if args.subdir else Path(".")
     repo_name = repo_path.name
 
-    # 默认路径
+    # 默认路径：使用 suffix 或 日期
     if args.explain is None:
-        args.explain = get_output_path(args.repo_path, args.subdir, "explain")
+        if args.suffix:
+            args.explain = f"output/{repo_name}/explain-{args.suffix}"
+        else:
+            args.explain = get_output_path(args.repo_path, args.subdir, "explain")
     if args.output is None:
-        args.output = get_output_path(args.repo_path, args.subdir, "website")
+        if args.suffix:
+            args.output = f"output/{repo_name}/website-{args.suffix}"
+        else:
+            args.output = get_output_path(args.repo_path, args.subdir, "website")
 
     explain_base = Path(args.explain)
     output_dir = Path(args.output)

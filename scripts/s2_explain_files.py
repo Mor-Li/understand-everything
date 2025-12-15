@@ -102,11 +102,18 @@ def get_top_files(repo_path: str, subdir: str, top_n: int | None = None) -> list
     for commit in repo.iter_commits():
         try:
             if commit.parents:
+                # 普通 commit：对比 parent
                 diffs = commit.parents[0].diff(commit)
                 for diff in diffs:
                     file_path = diff.a_path or diff.b_path
                     if file_path:
-                        # 如果指定了 subdir，只统计该目录下的文件
+                        if filter_prefix is None or file_path.startswith(filter_prefix):
+                            file_change_count[file_path] += 1
+            else:
+                # 初始 commit：所有文件都算作新增
+                for item in commit.tree.traverse():
+                    if item.type == 'blob':  # 只统计文件，不统计目录
+                        file_path = item.path
                         if filter_prefix is None or file_path.startswith(filter_prefix):
                             file_change_count[file_path] += 1
         except Exception:
@@ -285,17 +292,22 @@ async def main_async():
     parser.add_argument("--top", type=int, help="解释 top N 个文件（与 --percent 互斥）")
     parser.add_argument("--percent", type=int, help="解释前 N%% 的文件（按修改次数排序，与 --top 互斥）")
     parser.add_argument("--output", "-o", help="输出目录（默认：output/<repo_name>/explain-<date>）")
+    parser.add_argument("--suffix", "-s", help="输出目录后缀（覆盖默认的日期后缀，如 'early', 'mid', 'current'）")
     parser.add_argument("--force", action="store_true", help="强制重新生成")
     parser.add_argument("--model", "-m", default="gemini-3-pro-preview", help="使用的模型")
     parser.add_argument("--workers", "-w", type=int, default=16, help="最大并发数（默认：16）")
 
     args = parser.parse_args()
 
-    # 默认输出路径：output/<repo_name>/explain-<date>
+    # 默认输出路径：output/<repo_name>/explain-<date> 或 explain-<suffix>
     if args.output is None:
-        # 使用仓库名作为 subdir 参数传给 get_output_path
         repo_name = Path(args.repo_path).name
-        args.output = get_output_path(args.repo_path, repo_name, "explain")
+        if args.suffix:
+            # 使用自定义后缀（如 early, mid, current）
+            args.output = f"output/{repo_name}/explain-{args.suffix}"
+        else:
+            # 使用仓库名作为 subdir 参数传给 get_output_path
+            args.output = get_output_path(args.repo_path, repo_name, "explain")
 
     # 检查参数
     if args.top is None and args.percent is None:

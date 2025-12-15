@@ -432,17 +432,22 @@ async def main_async():
     parser.add_argument("repo_path", help="Git 仓库路径")
     parser.add_argument("--subdir", default="", help="要分析的子目录（默认为空，分析整个仓库）")
     parser.add_argument("--output", "-o", help="输出目录（默认：output/<repo_name>/explain）")
+    parser.add_argument("--suffix", "-s", help="输出目录后缀（覆盖默认的日期后缀，如 'early', 'mid', 'current'）")
     parser.add_argument("--force", action="store_true", help="强制重新生成")
     parser.add_argument("--model", "-m", default="gemini-3-pro-preview", help="使用的模型")
     parser.add_argument("--workers", "-w", type=int, default=8, help="最大并发数（默认：8）")
 
     args = parser.parse_args()
 
-    # 默认输出路径：output/<repo_name>/explain-<date>
+    # 默认输出路径：output/<repo_name>/explain-<date> 或 explain-<suffix>
     if args.output is None:
-        # 使用仓库名作为 subdir 参数传给 get_output_path
         repo_name = Path(args.repo_path).name
-        args.output = get_output_path(args.repo_path, repo_name, "explain")
+        if args.suffix:
+            # 使用自定义后缀（如 early, mid, current）
+            args.output = f"output/{repo_name}/explain-{args.suffix}"
+        else:
+            # 使用仓库名作为 subdir 参数传给 get_output_path
+            args.output = get_output_path(args.repo_path, repo_name, "explain")
 
     explain_base = Path(args.output)
 
