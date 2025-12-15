@@ -30,10 +30,12 @@ A toolchain for deeply understanding code repositories. It analyzes Git history,
 
 ```
 understand-everything/
-├── scripts/              # 3 core scripts (named by execution order)
-│   ├── s1_explain_files.py        # AI interprets code files
-│   ├── s2_generate_readme.py      # Generate hierarchical READMEs
-│   └── s3_website.py              # Generate interactive website
+├── scripts/              # Core scripts (named by execution order)
+│   ├── s0_find_snapshots.py       # Find curriculum learning snapshots
+│   ├── s1_curriculum_pipeline.py  # Curriculum learning pipeline
+│   ├── s2_explain_files.py        # AI interprets code files
+│   ├── s3_generate_readme.py      # Generate hierarchical READMEs
+│   └── s4_website.py              # Generate interactive website
 ├── utils/               # Utility scripts
 │   ├── s0_add_timestamps.py       # Add timestamps
 │   ├── s1_repo_heatmap_tree.py    # Generate repo structure heatmap
@@ -72,13 +74,13 @@ Assuming you want to analyze `repo/your-project`:
 
 ```bash
 # Step 1: AI interprets files (generates explanations)
-python scripts/s1_explain_files.py repo/your-project --workers 8 --percent 100
+python scripts/s2_explain_files.py repo/your-project --workers 8 --percent 100
 
 # Step 2: Generate hierarchical READMEs (bottom-up summarization)
-python scripts/s2_generate_readme.py repo/your-project
+python scripts/s3_generate_readme.py repo/your-project
 
 # Step 3: Generate interactive website (final output)
-python scripts/s3_website.py repo/your-project
+python scripts/s4_website.py repo/your-project
 ```
 
 **Optional utility scripts**:
@@ -102,7 +104,7 @@ python -m http.server 8000
 
 ## Core Scripts
 
-### S1 - AI Code Interpretation
+### S2 - AI Code Interpretation
 
 **Function**: Use Gemini 3 Pro Preview to generate easy-to-understand explanations for each file
 
@@ -115,21 +117,21 @@ python -m http.server 8000
 
 **Usage**:
 ```bash
-python scripts/s1_explain_files.py <repo_path> [options]
+python scripts/s2_explain_files.py <repo_path> [options]
 
 # Interpret all files with 8 workers
-python scripts/s1_explain_files.py repo/your-project --workers 8 --percent 100
+python scripts/s2_explain_files.py repo/your-project --workers 8 --percent 100
 
 # Interpret top 50% of files
-python scripts/s1_explain_files.py repo/your-project --percent 50
+python scripts/s2_explain_files.py repo/your-project --percent 50
 
 # Force regenerate
-python scripts/s1_explain_files.py repo/your-project --percent 100 --force
+python scripts/s2_explain_files.py repo/your-project --percent 100 --force
 ```
 
 **Output**: `output/<repo_name>/explain-<date>/*.md`
 
-### S2 - Generate Hierarchical READMEs
+### S3 - Generate Hierarchical READMEs
 
 **Function**: Recursively generate summary READMEs for each folder (bottom-up)
 
@@ -141,18 +143,18 @@ python scripts/s1_explain_files.py repo/your-project --percent 100 --force
 
 **Usage**:
 ```bash
-python scripts/s2_generate_readme.py <repo_path> [options]
+python scripts/s3_generate_readme.py <repo_path> [options]
 
 # Example
-python scripts/s2_generate_readme.py repo/your-project
+python scripts/s3_generate_readme.py repo/your-project
 
 # Force regenerate
-python scripts/s2_generate_readme.py repo/your-project --force
+python scripts/s3_generate_readme.py repo/your-project --force
 ```
 
 **Output**: Generates `README.md` in each folder of the interpretation directory
 
-### S3 - Generate Interactive Website
+### S4 - Generate Interactive Website
 
 **Function**: Generate Read the Docs style static website
 
@@ -167,10 +169,10 @@ python scripts/s2_generate_readme.py repo/your-project --force
 
 **Usage**:
 ```bash
-python scripts/s3_website.py <repo_path> [options]
+python scripts/s4_website.py <repo_path> [options]
 
 # Example
-python scripts/s3_website.py repo/your-project
+python scripts/s4_website.py repo/your-project
 ```
 
 **Output**:
