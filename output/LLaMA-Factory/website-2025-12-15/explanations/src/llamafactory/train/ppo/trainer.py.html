@@ -1,0 +1,69 @@
+<h1>src/llamafactory/train/ppo/trainer.py</h1>
+<p>这份代码是 <strong>LlamaFactory</strong> 中用于 <strong>PPO (Proximal Policy Optimization)</strong> 训练的核心文件。</p>
+<p>简单来说，这是 <strong>RLHF (Reinforcement Learning from Human Feedback，基于人类反馈的强化学习)</strong> 的最后一步。</p>
+<p>想象你要训练一个学生（你的模型），你不仅让他背书（SFT，监督微调），现在还要让他<strong>根据老师的打分来调整自己的回答</strong>。</p>
+<p>我把这份代码的逻辑拆解成一个 <strong>“特训班 Todo List”</strong>，每一步对应代码中的一个关键环节：</p>
+<h3>📋 PPO 特训班任务清单</h3>
+<h4>Task 1: 搭建教室与准备教具 (初始化)</h4>
+<p><strong>对应代码：</strong> <code>__init__</code> 方法
+*   <strong>做什么</strong>：
+    *   设置训练参数（<code>PPOConfig</code>）：比如一次学多少、学多快（学习率）。
+    *   准备三个关键角色：
+        1.  <strong>学生模型 (<code>model</code>)</strong>：我们要训练的那个 AI。
+        2.  <strong>参考模型 (<code>ref_model</code>)</strong>：这是学生原来的样子。用来对比，防止学生为了拿高分“走火入魔”，变得完全不像原来的自己（防止 KL 散度过大）。
+        3.  <strong>打分老师 (<code>reward_model</code>)</strong>：专门用来给学生的回答打分的模型。
+    *   准备优化器（<code>optimizer</code>）：决定如何更新学生的大脑参数。</p>
+<h4>Task 2: 制定课程表 (主循环)</h4>
+<p><strong>对应代码：</strong> <code>ppo_train</code> 方法
+*   <strong>做什么</strong>：
+    *   这是一个大的 <code>for</code> 循环，控制训练的步数（<code>max_steps</code>）。
+    *   它不像普通的训练那样直接丢数据算 Loss，而是分成了三个阶段：<strong>做题 -&gt; 判分 -&gt; 学习</strong>。</p>
+<hr />
+<p><strong>👇 以下是每一轮训练（Step）内部的具体流程：</strong></p>
+<h4>Task 3: 学生做题 (采样/Rollout)</h4>
+<p><strong>对应代码：</strong> <code>ppo_train</code> 循环内部 -&gt; 调用 <code>self.get_inputs</code>
+*   <strong>情景</strong>：老师给出一批题目（<code>queries</code>，即 prompt）。
+*   <strong>动作</strong>：
+    *   把模型切换到评估模式 (<code>self.model.eval()</code>)。
+    *   让学生模型根据题目，现场生成回答（<code>responses</code>）。
+    *   <strong>代码细节</strong>：<code>get_inputs</code> 函数会处理 padding（填充），确保生成的回答格式正确。
+*   <strong>目的</strong>：收集一批“题目 + 学生的回答”作为素材。</p>
+<h4>Task 4: 老师判卷 (计算奖励)</h4>
+<p><strong>对应代码：</strong> <code>ppo_train</code> 循环内部 -&gt; 调用 <code>self.get_rewards</code>
+*   <strong>情景</strong>：学生做完题了，现在由“打分老师”来看。
+*   <strong>动作</strong>：
+    *   把“题目 + 回答”丢给 <code>reward_model</code>。
+    *   <code>reward_model</code> 会给出一个分数（scalar score），比如 5.0 分、-2.0 分。
+    *   <strong>代码细节</strong>：如果是 LoRA 微调，代码里还有个 <code>replace_model</code> 的骚操作，临时把模型切换成奖励模型来算分。
+*   <strong>目的</strong>：告诉模型，刚才生成的那些回答，哪些是好的，哪些是坏的。</p>
+<h4>Task 5: 学生根据分数修正大脑 (PPO 更新)</h4>
+<p><strong>对应代码：</strong> <code>ppo_train</code> 循环内部 -&gt; 调用 <code>self.step</code> (这是父类 <code>PPOTrainer</code> 的方法，但依赖本文件中的 <code>batched_forward_pass</code>)
+*   <strong>情景</strong>：学生拿着考卷和分数，开始反思。
+*   <strong>动作</strong>：
+    *   <strong>计算优势 (Advantage)</strong>：对比“实际得分”和“预期得分”。
+    *   <strong>计算概率 (<code>batched_forward_pass</code>)</strong>：重新计算刚才生成那些词的概率。
+    *   <strong>更新参数</strong>：
+        *   如果某个回答得分高，就增加生成这些词的概率。
+        *   如果得分低，就降低概率。
+        *   同时，要保证不要改得太离谱（由 <code>ref_model</code> 限制）。
+*   <strong>代码细节</strong>：<code>batched_forward_pass</code> 专门用来高效地进行前向传播，计算 Logits 和 Values，支持大显存优化（DeepSpeed/FSDP）。</p>
+<h4>Task 6: 记录成长日记 (日志与保存)</h4>
+<p><strong>对应代码：</strong> <code>ppo_train</code> 尾部 -&gt; <code>log_stats</code>, <code>save_model</code>
+*   <strong>动作</strong>：
+    *   把这一轮的平均分（Reward）、损失（Loss）打印出来。
+    *   如果到了保存点（<code>save_steps</code>），就把当前训练好的学生模型存到硬盘上。
+    *   <strong>代码细节</strong>：<code>save_model</code> 方法里专门处理了 DeepSpeed 和 FSDP 的分布式保存逻辑，防止存出来的模型是坏的。</p>
+<hr />
+<h3>总结一下流程图</h3>
+<ol>
+<li><strong>Input</strong>: 一堆 Prompt (问题)。</li>
+<li><strong>Generate</strong>: 模型生成 Answer (回答)。</li>
+<li><strong>Reward</strong>: 奖励模型给 (问题+回答) 打分。</li>
+<li><strong>Update</strong>:<ul>
+<li>分高 -&gt; 鼓励模型下次还这么答。</li>
+<li>分低 -&gt; 惩罚模型。</li>
+<li><em>约束</em> -&gt; 不能偏离原始模型太远。</li>
+</ul>
+</li>
+</ol>
+<p>这个文件就是把上面这套流程用代码串联起来的“总指挥”。</p>

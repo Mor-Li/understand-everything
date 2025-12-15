@@ -1,0 +1,95 @@
+<h1>src/llmtuner/tuner/ppo/utils.py</h1>
+<p>这段代码确实比较晦涩，因为它涉及到了 <strong>RLHF（人类反馈强化学习）</strong> 训练中非常底层的工程优化细节，主要是为了<strong>省显存</strong>和<strong>保证数值稳定性</strong>。</p>
+<p>不用担心，我们把它拆解成一个 <strong>“PPO训练准备清单” (To-Do List)</strong>。想象你是一个正在指挥大模型训练的工程师，你需要完成以下几个任务才能让训练跑起来。</p>
+<hr />
+<h3>📋 任务清单：PPO 训练底层优化指南</h3>
+<h4>✅ Task 1: 理解背景 —— 我们为什么要“省钱”？</h4>
+<p><strong>背景知识：</strong>
+在 PPO 训练中，我们需要两个模型：
+1.  <strong>Actor（演员/策略模型）：</strong> 负责说话（生成文本）。
+2.  <strong>Critic（评论家/奖励模型）：</strong> 负责打分（判断说得好不好）。</p>
+<p><strong>痛点：</strong>
+如果加载两个完整的 7B 或 70B 模型，显存直接爆炸。
+<strong>解决方案：</strong>
+我们只加载<strong>一个</strong>基础模型，然后通过 <strong>LoRA（低秩适配器）</strong> 技术，给这个模型挂上两个不同的“挂件”。
+*   挂件 A：负责生成（Default）。
+*   挂件 B：负责打分（Reward）。</p>
+<p>这段代码的核心目的之一，就是<strong>在同一个模型躯壳里，快速切换这两个挂件</strong>。</p>
+<hr />
+<h4>✅ Task 2: 执行“变脸”手术 —— 解读 <code>replace_model</code> 函数</h4>
+<p>这个函数的任务是：<strong>把当前模型从“生成模式”切换到“打分模式”，或者切回来。</strong></p>
+<p><strong>步骤拆解：</strong></p>
+<ol>
+<li>
+<p><strong>检查目标 (Target)</strong>：</p>
+<ul>
+<li>你是要切换成 <code>default</code> (生成/策略) 还是 <code>reward</code> (打分/奖励)？</li>
+</ul>
+</li>
+<li>
+<p><strong>备份旧脑子 (如果需要)</strong>：</p>
+<ul>
+<li><code>if target == "reward":</code></li>
+<li>如果我们正准备切到“奖励模式”，说明现在内存里装的是“生成模式”的头（Value Head）。先把这个“生成头”的权重存起来（<code>setattr</code>），免得一会儿覆盖了找不到了。</li>
+</ul>
+</li>
+<li>
+<p><strong>切换 LoRA 挂件 (核心动作)</strong>：</p>
+<ul>
+<li><code>model.pretrained_model.set_adapter(target)</code></li>
+<li>这是告诉底层模型：“嘿，把刚才负责生成的 LoRA 拔掉，插上负责打分的 LoRA。”（或者反过来）。</li>
+</ul>
+</li>
+<li>
+<p><strong>换头手术 (Value Head)</strong>：</p>
+<ul>
+<li><code>model.v_head.load_state_dict(...)</code></li>
+<li>模型除了 LoRA 主干，还有一个“头”（<code>v_head</code>，用来输出分数的层）。</li>
+<li>这里直接把 <code>v_head</code> 的权重参数，替换成目标模式（<code>target</code>）对应的权重。</li>
+<li><strong>大白话：</strong> 身体还是那个身体，但是把“打分器”的参数换成了对应功能的参数。</li>
+</ul>
+</li>
+</ol>
+<p><strong>总结：</strong> 这个函数就是一个<strong>“一键换装”</strong>按钮。</p>
+<hr />
+<h4>✅ Task 3: 搞定“精度”地雷 —— 解读 <code>cast_layernorm_dtype</code> 函数</h4>
+<p>这个函数的任务是：<strong>处理 LayerNorm 层的数值精度，防止训练崩溃。</strong></p>
+<p><strong>背景知识：</strong>
+*   <strong>FP16 (半精度)</strong>：运算快，省显存，但不够精确。
+*   <strong>FP32 (单精度)</strong>：运算慢，占显存，但很精确，不容易溢出。
+*   <strong>LayerNorm (层归一化)</strong>：模型里非常敏感的一层。如果用 FP16 跑 LayerNorm，有时候数值会溢出（变成 NaN），导致训练失败。</p>
+<p><strong>步骤拆解：</strong></p>
+<ol>
+<li>
+<p><strong>寻找敏感部位</strong>：</p>
+<ul>
+<li><code>for name, param in model.named_parameters():</code></li>
+<li>遍历模型全身，找到所有名字里带 <code>LayerNorm</code> 的层。</li>
+</ul>
+</li>
+<li>
+<p><strong>分支 A：准备阶段 (备份并降级)</strong>：</p>
+<ul>
+<li><strong>场景</strong>：<code>layer_norm_params</code> 是空的 (<code>None</code>)。</li>
+<li><strong>动作 1 (备份)</strong>：<code>layer_norm_state_dict[name] = param.data.detach().clone()</code>。把当前的 LayerNorm 权重（通常是 FP32）完整备份一份存到字典里。</li>
+<li><strong>动作 2 (降级)</strong>：<code>param.data = param.data.to(torch.float16)</code>。为了配合某些计算（或者为了强行省显存），把模型里的 LayerNorm 变成了 FP16。</li>
+<li><strong>目的</strong>：先把高精度的存好，然后把模型转成低精度去跑某些流程。</li>
+</ul>
+</li>
+<li>
+<p><strong>分支 B：恢复阶段 (回滚)</strong>：</p>
+<ul>
+<li><strong>场景</strong>：<code>layer_norm_params</code> 是有值的（就是刚才备份的那个字典）。</li>
+<li><strong>动作</strong>：<code>param.data = layer_norm_params[name]</code>。</li>
+<li><strong>目的</strong>：计算完之后，赶紧把 LayerNorm 恢复成高精度的 FP32，保证后续更新参数时的稳定性。</li>
+</ul>
+</li>
+</ol>
+<p><strong>总结：</strong> 这个函数就像是一个<strong>“防爆盾”</strong>。在进行危险操作前，先把精密的零件（LayerNorm FP32）保护起来，换个耐造但粗糙的（FP16）上去顶一下，完事了再换回来。</p>
+<hr />
+<h3>🚀 最终总结</h3>
+<p>这段代码主要解决了 PPO 训练中的两个“穷人”问题（资源受限）：</p>
+<ol>
+<li><strong><code>replace_model</code></strong>：为了省显存，<strong>用一套参数空间，轮流扮演 Actor 和 Critic</strong>。它负责在两者之间来回倒腾参数。</li>
+<li><strong><code>cast_layernorm_dtype</code></strong>：为了在混合精度训练时不炸膛，<strong>对敏感的 LayerNorm 层进行精度的备份与转换</strong>。</li>
+</ol>

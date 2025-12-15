@@ -1,0 +1,133 @@
+<h1>tests/loftq_init.py</h1>
+<p>完全没问题。这段代码涉及到了大模型微调中比较前沿的一个概念：<strong>LoftQ (LoRA-Fine-Tuning-aware Quantization)</strong>。</p>
+<p>如果不理解背景，这段代码确实像天书。为了让你看懂，我先把核心概念用大白话解释一下，然后再给你列一个 Task List（任务清单），最后逐行对应代码讲解。</p>
+<h3>核心概念：什么是 LoftQ？</h3>
+<p>想象你有一张<strong>高清原图</strong>（原始大模型权重 $W$）。
+你想把它存成<strong>马赛克图</strong>（量化后的权重 $Q$）以节省显存，然后通过画一些<strong>修正补丁</strong>（LoRA 适配器 $A$ 和 $B$）来恢复细节。</p>
+<ul>
+<li><strong>普通 QLoRA：</strong> 直接把原图变马赛克，补丁是空白的（从零开始训练）。这导致一开始模型效果很差，因为马赛克丢失了太多信息。</li>
+<li><strong>LoftQ（这个脚本做的）：</strong> 在把原图变马赛克的同时，<strong>计算出一套初始补丁</strong>。<ul>
+<li>公式：$W \approx Q + A \times B$</li>
+<li>意思是：<strong>原模型 $\approx$ 量化模型 + LoRA参数</strong>。</li>
+<li>这样你还没开始训练，模型的效果就已经很接近原版了，因为 LoRA 补丁填补了量化带来的误差。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task List：代码逻辑的任务清单</h3>
+<p>这个脚本的任务就是<strong>“拆解”</strong>。它把一个完整的模型，拆成“低精度基座”和“初始LoRA补丁”两部分并保存下来。</p>
+<p>以下是代码执行的 <strong>Todo List</strong>：</p>
+<ol>
+<li><strong>[准备阶段]</strong> 加载原始的高精度大模型（比如 Llama-2-7b）。</li>
+<li><strong>[配置阶段]</strong> 设定“切分规则”：<ul>
+<li>LoftQ 配置：我要压缩到几 bit（比如 4bit）？</li>
+<li>LoRA 配置：我要在哪里加补丁（比如 q_proj, v_proj）？</li>
+</ul>
+</li>
+<li><strong>[核心计算]</strong> 执行 LoftQ 算法（最关键的一步）：<ul>
+<li>把原权重分解为 <code>量化权重</code> + <code>LoRA权重</code>。</li>
+<li>此时内存里的模型已经被替换成了 PEFT 格式。</li>
+</ul>
+</li>
+<li><strong>[保存任务 A]</strong> 把计算好的 <strong>LoRA 权重（补丁）</strong> 单独保存到 <code>adapters</code> 文件夹。</li>
+<li><strong>[清洗任务]</strong> 把模型身上的“外壳”剥掉（Unwrap）：<ul>
+<li>因为 PEFT 库为了训练方便，给模型套了很多层 wrapper。为了保存成通用的 HuggingFace 格式，我们需要把这些 wrapper 去掉，只留下量化后的权重。</li>
+</ul>
+</li>
+<li><strong>[保存任务 B]</strong> 把 <strong>量化后的基座模型</strong> 保存到输出目录。</li>
+</ol>
+<hr />
+<h3>详细步骤讲解（中英对照）</h3>
+<p>现在我们对照着代码，一步步看它是怎么完成上面这个 List 的。</p>
+<h4>第一步：加载模型 (Load Model)</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 对应代码：</span>
+<span class="n">tokenizer</span> <span class="o">=</span> <span class="n">AutoTokenizer</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">model_name_or_path</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+<span class="n">model</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">model_name_or_path</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：这就是把那个几 GB 或几十 GB 的原始模型读进内存。</li>
+</ul>
+<h4>第二步：配置 LoftQ 和 LoRA (Configuration)</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 对应代码：</span>
+<span class="n">loftq_config</span> <span class="o">=</span> <span class="n">LoftQConfig</span><span class="p">(</span><span class="n">loftq_bits</span><span class="o">=</span><span class="n">loftq_bits</span><span class="p">,</span> <span class="n">loftq_iter</span><span class="o">=</span><span class="n">loftq_iter</span><span class="p">)</span>
+<span class="n">lora_config</span> <span class="o">=</span> <span class="n">LoraConfig</span><span class="p">(</span>
+    <span class="o">...</span><span class="p">,</span>
+    <span class="n">init_lora_weights</span><span class="o">=</span><span class="s2">&quot;loftq&quot;</span><span class="p">,</span>  <span class="c1"># &lt;--- 重点！告诉程序我要用 LoftQ 初始化</span>
+    <span class="n">loftq_config</span><span class="o">=</span><span class="n">loftq_config</span><span class="p">,</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：<ul>
+<li><code>loftq_bits=4</code>：告诉它我要把模型压到 4bit。</li>
+<li><code>init_lora_weights="loftq"</code>：这是开关。如果设为 False，就是普通的 LoRA；设为 <code>"loftq"</code>，它就会在后台自动计算如何把原权重拆解成“量化权重+LoRA”。</li>
+</ul>
+</li>
+</ul>
+<h4>第三步：执行拆解 (Init LoftQ Model)</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 对应代码：</span>
+<span class="n">lora_model</span> <span class="o">=</span> <span class="n">get_peft_model</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">lora_config</span><span class="p">)</span>
+<span class="n">base_model</span><span class="p">:</span> <span class="s2">&quot;PreTrainedModel&quot;</span> <span class="o">=</span> <span class="n">lora_model</span><span class="o">.</span><span class="n">get_base_model</span><span class="p">()</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：<ul>
+<li><code>get_peft_model</code> 这一行运行后，原本的 <code>model</code> 变身了。它内部的线性层（Linear Layer）被替换成了量化层，并且附带了计算好的 LoRA 权重。</li>
+<li>这一步最耗时，因为它在做数学运算（SVD分解等）来最小化量化误差。</li>
+</ul>
+</li>
+</ul>
+<h4>第四步：保存 LoRA 补丁 (Save Adapters)</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 对应代码：</span>
+<span class="c1"># 修改配置路径，方便以后加载</span>
+<span class="nb">setattr</span><span class="p">(</span><span class="n">lora_model</span><span class="o">.</span><span class="n">base_model</span><span class="o">.</span><span class="n">peft_config</span><span class="p">[</span><span class="s2">&quot;default&quot;</span><span class="p">],</span> <span class="s2">&quot;base_model_name_or_path&quot;</span><span class="p">,</span> <span class="n">save_dir</span><span class="p">)</span>
+<span class="nb">setattr</span><span class="p">(</span><span class="n">lora_model</span><span class="o">.</span><span class="n">base_model</span><span class="o">.</span><span class="n">peft_config</span><span class="p">[</span><span class="s2">&quot;default&quot;</span><span class="p">],</span> <span class="s2">&quot;init_lora_weights&quot;</span><span class="p">,</span> <span class="kc">True</span><span class="p">)</span>
+
+<span class="c1"># 保存 adapter</span>
+<span class="n">lora_model</span><span class="o">.</span><span class="n">save_pretrained</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">save_dir</span><span class="p">,</span> <span class="s2">&quot;adapters&quot;</span><span class="p">),</span> <span class="n">safe_serialization</span><span class="o">=</span><span class="n">save_safetensors</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：这里把计算出的 $A$ 和 $B$ 矩阵（补丁）存到了硬盘上。以后你微调的时候，就是在这个基础上继续训练。</li>
+</ul>
+<h4>第五步：剥壳清洗 (Unwrap Model)</h4>
+<p>这是你可能最看不懂的部分：<code>class Shell</code> 和 <code>unwrap_model</code> 函数。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 对应代码：</span>
+<span class="n">unwrap_model</span><span class="p">(</span><span class="n">base_model</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>为什么要这样做？</strong><ul>
+<li><code>get_peft_model</code> 把原本简单的 <code>Linear</code> 层变成了一个复杂的 <code>Linear4bit</code> 或者是套在 LoRA 里的层。</li>
+<li>如果我们直接保存 <code>base_model</code>，可能会保存下来一堆 PEFT 库特有的结构，导致以后如果不加载 PEFT 库就打不开这个模型。</li>
+<li><code>unwrap_model</code> 函数的作用是：<strong>暴力拆解</strong>。它遍历模型，找到那些被修改过的层，把里面的权重（weight）和偏置（bias）拿出来，塞到一个简单的 <code>Shell</code>（壳子）里。</li>
+<li><code>Shell</code> 是一个最简单的 PyTorch 模块，只存参数，不干别的。这样保存下来的模型结构就干净了。</li>
+</ul>
+</li>
+</ul>
+<h4>第六步：保存量化基座 (Save Base Model)</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 对应代码：</span>
+<span class="n">base_model</span><span class="o">.</span><span class="n">save_pretrained</span><span class="p">(</span><span class="n">save_dir</span><span class="p">,</span> <span class="n">safe_serialization</span><span class="o">=</span><span class="n">save_safetensors</span><span class="p">)</span>
+<span class="n">tokenizer</span><span class="o">.</span><span class="n">save_pretrained</span><span class="p">(</span><span class="n">save_dir</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：把清洗后的、已经是量化数值的基座模型保存下来。</li>
+</ul>
+<hr />
+<h3>总结：跑完这个脚本你会得到什么？</h3>
+<p>假设你的输出目录是 <code>output_dir</code>，跑完后你会得到：</p>
+<ol>
+<li><strong><code>output_dir/</code> (基座模型)</strong>：<ul>
+<li>这是一个看起来像普通 HuggingFace 的模型，但它的权重已经是量化过的（或者是为了适应 LoftQ 处理过的）。</li>
+</ul>
+</li>
+<li><strong><code>output_dir/adapters/</code> (LoRA 权重)</strong>：<ul>
+<li>这里面存的是 <code>adapter_model.bin</code>。</li>
+<li>这些参数不是随机初始化的，而是经过 LoftQ 精心计算的。</li>
+</ul>
+</li>
+</ol>
+<p><strong>下一步做什么？</strong>
+你会拿着这两个文件夹去进行后续的<strong>微调（Fine-tuning）</strong>。加载时，先加载基座，再加载 adapters，起步点比从零开始高很多，训练收敛更快，效果更好。</p>

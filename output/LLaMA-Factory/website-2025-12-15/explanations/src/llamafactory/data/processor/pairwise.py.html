@@ -1,0 +1,93 @@
+<h1>src/llamafactory/data/processor/pairwise.py</h1>
+<p>这份代码文件 <code>pairwise.py</code> 的核心作用是：<strong>为“偏好学习”（如 DPO、Reward Modeling）准备数据。</strong></p>
+<p>在训练大模型时，我们有时不仅仅给它看“什么是对的”，还要给它看“<strong>哪个更好</strong>”。这需要成对的数据：一个提示词（Prompt），对应两个回答，一个是“胜出（Chosen）”的，一个是“落败（Rejected）”的。</p>
+<p>为了让你更容易理解，我把你当作一个<strong>数据加工流水线的主管</strong>，这份代码就是你的<strong>操作手册</strong>。我们将任务拆解为一个 To-Do List，一步步带你看它是怎么工作的。</p>
+<hr />
+<h3>📋 任务清单：从原始文本到模型能吃的“成对数据”</h3>
+<h4>Task 1: 检查原材料 (数据清洗)</h4>
+<p><strong>对应代码位置：</strong> <code>preprocess_dataset</code> 方法中的 <code>for</code> 循环开头。</p>
+<ul>
+<li><strong>要做什么：</strong> 也就是遍历你的原始数据集。</li>
+<li><strong>代码逻辑：</strong><ul>
+<li>它会检查每一条数据。</li>
+<li><code>if len(examples["_prompt"][i]) % 2 != 1</code>: 检查对话历史是否符合逻辑（通常是一问一答）。</li>
+<li><code>or len(examples["_response"][i]) &lt; 2</code>: <strong>关键点！</strong> 它检查是否有<strong>两个</strong>回答。因为是“成对（Pairwise）”训练，必须至少有一个“好的回答”和一个“坏的回答”。</li>
+<li>如果数据不合格，直接 <code>continue</code>（扔掉），并打印警告。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 区分“好”与“坏” (分类)</h4>
+<p><strong>对应代码位置：</strong> <code>_encode_data_example</code> 方法被调用时。</p>
+<ul>
+<li><strong>要做什么：</strong> 把原始数据里的两个回答拆开处理。</li>
+<li><strong>代码逻辑：</strong><ul>
+<li>代码默认 <code>response[0]</code> 是 <strong>Chosen（好的/胜出的）</strong>。</li>
+<li>代码默认 <code>response[1]</code> 是 <strong>Rejected（坏的/被拒绝的）</strong>。</li>
+<li>它会分别把 Prompt + Chosen 和 Prompt + Rejected 组合成两条独立的线去处理。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 翻译成数字 (Tokenization)</h4>
+<p><strong>对应代码位置：</strong> <code>_encode_data_example</code> 中的 <code>self.template.encode_oneturn</code>。</p>
+<ul>
+<li><strong>要做什么：</strong> 计算机不认识中文或英文，只认识数字。我们需要把文本转成 Token IDs。</li>
+<li><strong>代码逻辑：</strong><ul>
+<li><strong>处理 Chosen 路径：</strong> 把 <code>Prompt + Chosen Response</code> 扔给分词器，得到 <code>prompt_ids</code> 和 <code>chosen_ids</code>。</li>
+<li><strong>处理 Rejected 路径：</strong> 把 <code>Prompt + Rejected Response</code> 扔给分词器，得到 <code>rejected_ids</code>（这里不需要重新算 prompt_ids，因为是一样的）。</li>
+<li><em>注：如果有图片、视频等多模态内容，也会在这里被处理成占位符。</em></li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 裁剪长度 (截断)</h4>
+<p><strong>对应代码位置：</strong> <code>_encode_data_example</code> 中的 <code>infer_seqlen</code> 和切片操作 <code>[:source_len]</code>。</p>
+<ul>
+<li><strong>要做什么：</strong> 模型输入的长度有限制（比如 4096 或 8192），太长了吃不下，必须切一刀。</li>
+<li><strong>代码逻辑：</strong><ul>
+<li>它计算 Prompt 有多长，两个回答中最长的那个有多长。</li>
+<li>如果总长度超标，它会优先保留 Prompt，然后把回答（Chosen 和 Rejected）截断到最大允许长度。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 5: 制作“考卷”与“答案” (构建 Input 和 Label)</h4>
+<p><strong>对应代码位置：</strong> <code>_encode_data_example</code> 的最后部分。</p>
+<ul>
+<li><strong>要做什么：</strong> 这是最关键的一步。模型训练需要 <code>input_ids</code>（输入什么）和 <code>labels</code>（预测什么）。</li>
+<li><strong>核心逻辑（非常重要）：</strong><ul>
+<li><strong>Input IDs (输入):</strong> 就是 <code>Prompt + Response</code> 的数字序列。</li>
+<li><strong>Labels (标签):</strong> 我们只希望模型学习“怎么回答”，而不希望它学习“怎么提问”。</li>
+<li><strong>IGNORE_INDEX:</strong> 这是一个特殊的数字（通常是 -100）。</li>
+<li><strong>操作：</strong><ul>
+<li>把 Prompt 部分的 Label 全部设为 <code>IGNORE_INDEX</code>（意思是：这部分考试不计分，不用管）。</li>
+<li>把 Response 部分的 Label 设为真实的 Token ID（意思是：这部分要学会，算 Loss）。</li>
+</ul>
+</li>
+<li><strong>最终产出四样东西：</strong><ol>
+<li><code>chosen_input_ids</code>: 提示词 + 好回答</li>
+<li><code>chosen_labels</code>: (-100, -100...) + 好回答</li>
+<li><code>rejected_input_ids</code>: 提示词 + 坏回答</li>
+<li><code>rejected_labels</code>: (-100, -100...) + 坏回答</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<h4>Task 6: 打包发货 (Batching)</h4>
+<p><strong>对应代码位置：</strong> <code>preprocess_dataset</code> 的最后部分。</p>
+<ul>
+<li><strong>要做什么：</strong> 把处理好的一条条数据放到一个大字典里，准备喂给 GPU。</li>
+<li><strong>代码逻辑：</strong><ul>
+<li>将上面生成的 <code>chosen_input_ids</code>, <code>rejected_input_ids</code> 等等，分别 append 到 <code>model_inputs</code> 列表中。</li>
+<li>同时生成 <code>attention_mask</code>（告诉模型哪些是字，哪些是补全的空白）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码在干嘛？</h3>
+<p>简单来说，这段代码就是一个<strong>“比较级数据厨师”</strong>：</p>
+<ol>
+<li>拿来一堆素材（用户提问 + 两个回答）。</li>
+<li>把素材切分成两盘菜：<strong>A套餐（好回答）</strong> 和 <strong>B套餐（坏回答）</strong>。</li>
+<li>把菜切碎（Tokenization）。</li>
+<li>把盘子边缘擦干净（Masking，把 Prompt 部分遮住不计算损失）。</li>
+<li>最后打包送给模型，让模型学习：<strong>“A套餐比B套餐好吃，下次要学着做A套餐”</strong>。</li>
+</ol>

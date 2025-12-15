@@ -1,0 +1,139 @@
+<h1>tests/data/test_collator.py</h1>
+<p>这份代码确实容易让人劝退，因为它不是“业务逻辑”，而是<strong>测试代码（Unit Test）</strong>。它的作用是用来“检查”LlamaFactory里的一个核心组件——<strong>Data Collator（数据整理器）</strong>是否工作正常。</p>
+<p>为了让你读懂，我们把它想象成一个<strong>“打包员培训考核”</strong>。</p>
+<p><strong>核心概念：什么是 Data Collator？</strong>
+在大模型训练中，数据是一条一条进来的（比如一句话、一张图），长短不一。但是模型（GPU）喜欢整齐划一的矩阵。Data Collator 就是那个<strong>打包员</strong>，把长短不一的数据凑成整齐的一批（Batch），该补零的补零，该遮蔽的遮蔽。</p>
+<p>下面是一个学习任务清单（To-Do List），我们分三步走，一步步拆解这个文件。</p>
+<hr />
+<h3>✅ 任务一：搞懂基础文本打包 (test_base_collator)</h3>
+<p><strong>目标</strong>：理解最简单的文本是如何被处理成模型能吃的 Tensor（张量）的。</p>
+<p><strong>代码对应部分</strong>：<code>def test_base_collator():</code></p>
+<p><strong>步骤讲解</strong>：</p>
+<ol>
+<li>
+<p><strong>设置场景</strong>：</p>
+<ul>
+<li>代码加载了一个微小的模型 <code>TINY_LLAMA3</code> 和对应的分词器（Tokenizer）。</li>
+<li>初始化了一个 <code>MultiModalDataCollatorForSeq2Seq</code>（虽然名字带多模态，但这里先测纯文本）。</li>
+<li><strong>关键参数</strong>：<code>pad_to_multiple_of=8</code>。意思是打包后的长度必须是8的倍数（为了GPU计算效率）。</li>
+</ul>
+</li>
+<li>
+<p><strong>准备“烂”数据 (<code>features</code>)</strong>：</p>
+<ul>
+<li>这里模拟了两条数据：<ul>
+<li>第一条长：<code>[0, 1, 2, 3, 4, 5]</code> (长度6)</li>
+<li>第二条短：<code>[6, 7]</code> (长度2)</li>
+</ul>
+</li>
+<li>注意 <code>labels</code> 里的 <code>q</code> (即 <code>IGNORE_INDEX</code>)，这意味着这些位置不算 loss（通常是提问部分，模型不需要预测）。</li>
+</ul>
+</li>
+<li>
+<p><strong>打包员干活 (<code>data_collator(features)</code>)</strong>：</p>
+<ul>
+<li>调用 collator 把这两条数据合并。</li>
+</ul>
+</li>
+<li>
+<p><strong>检查作业 (<code>expected_input</code>)</strong>：</p>
+<ul>
+<li><strong>Input IDs (输入)</strong>：<ul>
+<li>第一条长度是6，为了凑8的倍数，补了2个 <code>p</code> (pad token)。变成了 <code>[..., 5, p, p]</code>。</li>
+<li>第二条长度是2，为了跟第一条对齐（并凑8的倍数），补了6个 <code>p</code>。</li>
+</ul>
+</li>
+<li><strong>Attention Mask (注意力掩码)</strong>：<ul>
+<li>告诉模型：是 <code>1</code> 的地方是真的字，是 <code>0</code> 的地方是填充的，别看。</li>
+</ul>
+</li>
+<li><strong>Labels (标签)</strong>：<ul>
+<li>填充的地方全是 <code>q</code> (-100)，计算梯度时会忽略。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<p><strong>结论</strong>：这个测试保证了打包员能把长短不一的句子，通过填充（Padding）变成整齐的方块。</p>
+<hr />
+<h3>✅ 任务二：搞懂多模态（图片+文字）打包 (test_multimodal_collator)</h3>
+<p><strong>目标</strong>：理解当数据里混入了图片时，打包员怎么处理。</p>
+<p><strong>代码对应部分</strong>：<code>def test_multimodal_collator():</code></p>
+<p><strong>步骤讲解</strong>：</p>
+<ol>
+<li>
+<p><strong>切换高难度模型</strong>：</p>
+<ul>
+<li>这次用了 <code>Qwen2-VL</code>（千问视觉模型），这是一个能看图的模型。</li>
+<li>代码里还造了一个 <code>fake_image</code>（假图片，纯白色的），用来模拟图片输入。</li>
+</ul>
+</li>
+<li>
+<p><strong>特殊符号</strong>：</p>
+<ul>
+<li>注意变量 <code>s</code> (<code>&lt;|vision_start|&gt;</code>), <code>e</code> (<code>&lt;|vision_end|&gt;</code>), <code>m</code> (<code>&lt;|image_pad|&gt;</code>)。</li>
+<li>模型看不懂像素，它需要把图片变成一堆特殊的 token 塞进文本里。</li>
+</ul>
+</li>
+<li>
+<p><strong>打包员干活</strong>：</p>
+<ul>
+<li>输入是 <code>[0, 1, 2, 3]</code>。</li>
+<li>但在预期结果 <code>expected_input</code> 中，你会发现 <code>input_ids</code> 变长了！</li>
+<li><strong>变化</strong>：它在文本后面自动拼上了图片的占位符：<code>s</code> (开始) + 4个 <code>m</code> (图片占位) + <code>e</code> (结束)。</li>
+<li><em>注：这里是模拟测试，真实的图片占位符会有成百上千个，这里为了测试只用了几个。</em></li>
+</ul>
+</li>
+<li>
+<p><strong>复杂的 3D 位置编码 (<code>position_ids</code>)</strong>：</p>
+<ul>
+<li>普通的文本是 0, 1, 2, 3... 线性排列。</li>
+<li>图片是二维的（高x宽），加上时间就是三维。Qwen2-VL 使用特殊的 <code>position_ids</code> 来告诉模型图片的空间关系。这里测试就是检查这些 ID 生成得对不对。</li>
+</ul>
+</li>
+</ol>
+<p><strong>结论</strong>：这个测试保证了当你输入“图片+文字”时，打包员能自动把图片转换成 Token 插进去，并且生成正确的空间坐标。</p>
+<hr />
+<h3>✅ 任务三：搞懂 4D 注意力掩码 (test_4d_attention_mask)</h3>
+<p><strong>目标</strong>：理解最高阶的“谁能看谁”的控制逻辑。</p>
+<p><strong>代码对应部分</strong>：<code>def test_4d_attention_mask():</code></p>
+<p><strong>背景知识</strong>：
+*   <strong>Attention Mask</strong>：决定了序列中的 Token A 能不能“看见” Token B。
+*   <strong>4D Mask</strong>：通常用于复杂的拼接数据（Packing）。比如把三句不相关的话拼成一条长数据训练，必须保证第一句话不能“看见”第二句话，否则就作弊了。</p>
+<p><strong>步骤讲解</strong>：</p>
+<ol>
+<li>
+<p><strong>输入数据 (<code>attention_mask_with_indices</code>)</strong>：</p>
+<ul>
+<li>看这个数组：<code>[1, 1, 2, 2, 2, 0]</code></li>
+<li>意思是：前两个字属于“句子1”，中间三个字属于“句子2”，最后一个是填充（0）。</li>
+</ul>
+</li>
+<li>
+<p><strong>生成 Mask</strong>：</p>
+<ul>
+<li><code>o</code> (0.0) 代表<strong>可见</strong>。</li>
+<li><code>x</code> (min) 代表<strong>不可见</strong>（被遮蔽）。</li>
+</ul>
+</li>
+<li>
+<p><strong>解读矩阵 (<code>attention_mask_expected</code>)</strong>：</p>
+<ul>
+<li>这是一个 6x6 的矩阵（看第一块）。</li>
+<li><strong>左上角 2x2 是 <code>o</code></strong>：说明索引为1的两个字可以互相看（句子1内部可见）。</li>
+<li><strong>中间 3x3 是 <code>o</code></strong>：说明索引为2的三个字可以互相看（句子2内部可见）。</li>
+<li><strong>右上角和左下角是 <code>x</code></strong>：说明句子1看不到句子2，句子2也看不到句子1。这就是<strong>防止串味</strong>。</li>
+<li>此外，它还包含<strong>Causal Mask（因果掩码）</strong>的逻辑：即第1个字能看第1个，但第1个字不能看第2个（如果是生成任务）。</li>
+</ul>
+</li>
+</ol>
+<p><strong>结论</strong>：这个测试是数学层面的检查，确保模型在处理拼接数据时，注意力机制（眼睛）不会乱瞟。</p>
+<hr />
+<h3>总结 (Takeaway)</h3>
+<p>如果你要看懂这个文件，只需要记住这三句话：</p>
+<ol>
+<li><strong>Base Test</strong>：检查能不能把长短不一的句子<strong>填补</strong>整齐。</li>
+<li><strong>Multimodal Test</strong>：检查能不能把<strong>图片</strong>变成 Token 塞进句子里。</li>
+<li><strong>Mask Test</strong>：检查能不能控制模型<strong>不偷看</strong>不该看的数据。</li>
+</ol>
+<p>这个文件就是为了保证 LlamaFactory 在处理数据时不出 bug。</p>

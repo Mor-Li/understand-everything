@@ -1,0 +1,103 @@
+<h1>src/llmtuner/train/sft/metric.py</h1>
+<p>这份代码文件的核心作用就像是<strong>一位“阅卷老师”</strong>。</p>
+<p>在训练大模型（SFT，有监督微调）时，模型会生成一些答案，我们需要知道它回答得好不好。这个文件就是用来<strong>给模型生成的答案打分</strong>的。</p>
+<p>为了让你更容易理解，我把它拆解成一个<strong>“阅卷流程 To-Do List”</strong>，每一步对应代码里的一个动作：</p>
+<h3>阅卷流程 To-Do List</h3>
+<ol>
+<li><strong>准备工具箱</strong> (引入依赖)</li>
+<li><strong>接收考卷</strong> (获取模型预测值和标准答案)</li>
+<li><strong>清理涂改痕迹</strong> (处理特殊标记)</li>
+<li><strong>翻译天书</strong> (将数字编号转回文字)</li>
+<li><strong>逐题批改</strong> (循环处理每一条数据)<ul>
+<li>5.1 <strong>切分词语</strong> (中文分词)</li>
+<li>5.2 <strong>计算 ROUGE 分数</strong> (查全率/内容覆盖度)</li>
+<li>5.3 <strong>计算 BLEU 分数</strong> (准确率/翻译流畅度)</li>
+</ul>
+</li>
+<li><strong>计算平均分</strong> (输出最终成绩)</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>1. 准备工具箱 (Imports)</h4>
+<p>代码最开头的一堆 <code>import</code>。
+*   <strong>观点</strong>：要批改中文作业，得有懂中文的工具。
+*   <strong>解释</strong>：代码引入了 <code>jieba</code>（用来把中文句子切成词）、<code>nltk</code>（算 BLEU 分）、<code>rouge_chinese</code>（算 ROUGE 分）。如果没有这些库，阅卷老师就“罢工”了。</p>
+<h4>2. 接收考卷 (<code>__call__</code> 函数入口)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="fm">__call__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">eval_preds</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">,</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">]]])</span> <span class="o">-&gt;</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]:</span>
+    <span class="n">preds</span><span class="p">,</span> <span class="n">labels</span> <span class="o">=</span> <span class="n">eval_preds</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：拿到模型写的答案（<code>preds</code>）和标准答案（<code>labels</code>）。</li>
+<li><strong>解释</strong>：这里的输入全是<strong>数字</strong>（Token IDs），因为计算机只认识数字，不认识汉字。</li>
+</ul>
+<h4>3. 清理涂改痕迹 (处理 IGNORE_INDEX)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">preds</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">preds</span> <span class="o">!=</span> <span class="n">IGNORE_INDEX</span><span class="p">,</span> <span class="n">preds</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">pad_token_id</span><span class="p">)</span>
+<span class="n">labels</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">labels</span> <span class="o">!=</span> <span class="n">IGNORE_INDEX</span><span class="p">,</span> <span class="n">labels</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">pad_token_id</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：训练时有些不需要关注的地方被标记为 <code>-100</code> (即 <code>IGNORE_INDEX</code>)，如果不处理，转换成文字时会报错。</li>
+<li><strong>解释</strong>：这步把那些“忽略标记”替换成“填充标记”（Pad Token），相当于把试卷上的墨团擦干净，变成空白，防止后面翻译出错。</li>
+</ul>
+<h4>4. 翻译天书 (Batch Decode)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">decoded_preds</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">batch_decode</span><span class="p">(</span><span class="n">preds</span><span class="p">,</span> <span class="n">skip_special_tokens</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">decoded_labels</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">batch_decode</span><span class="p">(</span><span class="n">labels</span><span class="p">,</span> <span class="n">skip_special_tokens</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：把数字还原成人类能读懂的文字。</li>
+<li><strong>解释</strong>：<ul>
+<li>比如 <code>[101, 234, 567]</code> -&gt; 变成 <code>"今天天气不错"</code>。</li>
+<li><code>skip_special_tokens=True</code> 意思是去掉那些 <code>&lt;s&gt;</code>, <code>&lt;pad&gt;</code> 等计算机专用的符号，只留内容。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 逐题批改 (Loop &amp; Jieba)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">for</span> <span class="n">pred</span><span class="p">,</span> <span class="n">label</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">decoded_preds</span><span class="p">,</span> <span class="n">decoded_labels</span><span class="p">):</span>
+    <span class="n">hypothesis</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">jieba</span><span class="o">.</span><span class="n">cut</span><span class="p">(</span><span class="n">pred</span><span class="p">))</span>
+    <span class="n">reference</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">jieba</span><span class="o">.</span><span class="n">cut</span><span class="p">(</span><span class="n">label</span><span class="p">))</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：中文不像英文有空格，必须先把句子切成词，才能对比相似度。</li>
+<li><strong>解释</strong>：<ul>
+<li>模型写的：<code>"我喜欢吃苹果"</code> -&gt; 切分后：<code>['我', '喜欢', '吃', '苹果']</code></li>
+<li>标准答案：<code>"我爱吃苹果"</code> -&gt; 切分后：<code>['我', '爱', '吃', '苹果']</code></li>
+<li>这一步用了 <code>jieba.cut</code>，这是中文NLP里最关键的一步。</li>
+</ul>
+</li>
+</ul>
+<h4>5.2 计算 ROUGE 分数</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">rouge</span> <span class="o">=</span> <span class="n">Rouge</span><span class="p">()</span>
+<span class="n">scores</span> <span class="o">=</span> <span class="n">rouge</span><span class="o">.</span><span class="n">get_scores</span><span class="p">(</span><span class="s2">&quot; &quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">hypothesis</span><span class="p">),</span> <span class="s2">&quot; &quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">reference</span><span class="p">))</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：看看模型写的答案里，包含了多少标准答案的关键词（侧重“召回率”）。</li>
+<li><strong>解释</strong>：<ul>
+<li><strong>Rouge-1</strong>: 单个词重合了多少？</li>
+<li><strong>Rouge-2</strong>: 连续两个词重合了多少？</li>
+<li><strong>Rouge-L</strong>: 最长的一串公共词有多长？</li>
+<li>如果句子是空的，就直接给 0 分。</li>
+</ul>
+</li>
+</ul>
+<h4>5.3 计算 BLEU 分数</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">bleu_score</span> <span class="o">=</span> <span class="n">sentence_bleu</span><span class="p">([</span><span class="nb">list</span><span class="p">(</span><span class="n">label</span><span class="p">)],</span> <span class="nb">list</span><span class="p">(</span><span class="n">pred</span><span class="p">),</span> <span class="n">smoothing_function</span><span class="o">=</span><span class="n">SmoothingFunction</span><span class="p">()</span><span class="o">.</span><span class="n">method3</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：看看模型写的句子有多像人话，是否准确（侧重“精确度”）。</li>
+<li><strong>解释</strong>：BLEU-4 原本是用来评价机器翻译好坏的，现在常用来评价大模型生成的文本是否通顺、准确。</li>
+</ul>
+<h4>6. 计算平均分 (Return Mean)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">return</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="nb">float</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="n">v</span><span class="p">))</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">score_dict</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：不能只看一道题的分数，要看全班（整个Batch）的平均分。</li>
+<li><strong>解释</strong>：代码把这一批次里所有句子的 ROUGE-1, ROUGE-2, ROUGE-L, BLEU-4 分数分别加起来求平均值，最后返回给训练器，告诉它：“你这一轮训练，考了多少分”。</li>
+</ul>
+<h3>总结</h3>
+<p>这个脚本就是一个<strong>“中文文本评分器”</strong>。它把模型输出的数字转成中文，切词，然后对比标准答案，算出 ROUGE 和 BLEU 分数，用来衡量模型训练的效果好坏。</p>

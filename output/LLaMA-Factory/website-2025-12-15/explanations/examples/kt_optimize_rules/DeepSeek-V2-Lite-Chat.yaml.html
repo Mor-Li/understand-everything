@@ -1,0 +1,126 @@
+<h1>examples/kt_optimize_rules/DeepSeek-V2-Lite-Chat.yaml</h1>
+<p>这个文件看起来像是一堆乱码，但其实它是一份<strong>“改装车指南”</strong>（或者说是<strong>“手术方案”</strong>）。</p>
+<p>这份文件的作用是告诉 <code>ktransformers</code> 这个软件：<strong>“当你在加载 DeepSeek-V2 这个模型时，请把原来慢吞吞或者太占显存的零件，替换成我指定的、更强更快的零件。”</strong></p>
+<p>为了让你彻底看懂，我把阅读这份文件拆解成一个 <strong>Task List（任务清单）</strong>，我们一步步来完成。</p>
+<hr />
+<h3>Task 1：理解基本逻辑（改装规则）</h3>
+<p>在看具体内容前，先搞懂两个关键词：
+*   <strong>Match（寻找目标）</strong>: 就像在说“找到原厂车里的那个旧轮胎”。
+*   <strong>Replace（替换方案）</strong>: 就像在说“把它换成赛车专用的高性能轮胎”。</p>
+<p>文件里的每一个横杠 <code>-</code> 开头的段落，就是一组“寻找 -&gt; 替换”的规则。</p>
+<hr />
+<h3>Task 2：逐条解析改装步骤</h3>
+<p>现在我们按照文件从上到下的顺序，看看它到底对模型做了什么手术。</p>
+<h4>步骤 1：优化位置编码 (RoPE)</h4>
+<div class="codehilite"><pre><span></span><code><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">match</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">class</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">...DeepseekV2YarnRotaryEmbedding</span><span class="w">  </span><span class="c1"># 原版的位置编码</span>
+<span class="w">  </span><span class="nt">replace</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">class</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">...YarnRotaryEmbedding</span><span class="w">            </span><span class="c1"># 优化后的版本</span>
+<span class="w">    </span><span class="nt">kwargs</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">generate_device</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;cuda&quot;</span><span class="w">                </span><span class="c1"># 在显卡(GPU)上运行</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：模型需要知道每个字的位置信息。这里把原版 DeepSeek 的位置计算模块，换成了 <code>ktransformers</code> 自己写的高效版本，并指定必须在 <strong>NVIDIA 显卡 (cuda)</strong> 上运行，以此来加速。</li>
+</ul>
+<h4>步骤 2：给大部分运算层“换引擎” (Linear Layers)</h4>
+<div class="codehilite"><pre><span></span><code><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">match</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;^model\\.layers\\.(?!.*self_attn\\.kv_b_proj).*$&quot;</span><span class="w"> </span><span class="c1"># 正则表达式：匹配绝大多数线性层</span>
+<span class="w">    </span><span class="nt">class</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">torch.nn.Linear</span>
+<span class="w">  </span><span class="nt">replace</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">class</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">...KTransformersLinear</span><span class="w">  </span><span class="c1"># 换成 ktransformers 的线性层</span>
+<span class="w">    </span><span class="nt">kwargs</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">generate_op</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;KLinearMarlin&quot;</span><span class="w"> </span><span class="c1"># 生成阶段使用 Marlin 算法（极速量化内核）</span>
+<span class="w">      </span><span class="nt">prefill_op</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;KLinearTorch&quot;</span><span class="w">   </span><span class="c1"># 预填充阶段使用 Torch</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：这是大手术。大模型里最多的就是线性层（Linear Layer）。</li>
+<li>这里说：除了个别特殊的层（<code>kv_b_proj</code>）以外，把所有的线性层都换掉。</li>
+<li><strong>重点</strong>：使用了 <strong>Marlin</strong>。Marlin 是目前最快的量化推理内核之一。这意味着模型在显卡上跑得飞快，而且用的是量化后的低精度数据（省显存、速度快）。</li>
+</ul>
+<h4>步骤 3：优化最后的输出层 (LM Head)</h4>
+<div class="codehilite"><pre><span></span><code><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">match</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;^lm_head&quot;</span>
+<span class="w">    </span><span class="nt">class</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">torch.nn.Linear</span>
+<span class="w">  </span><span class="nt">replace</span><span class="p">:</span>
+<span class="w">    </span><span class="l l-Scalar l-Scalar-Plain">...KTransformersLinear</span>
+<span class="w">    </span><span class="l l-Scalar l-Scalar-Plain">kwargs</span><span class="p p-Indicator">:</span>
+<span class="w">      </span><span class="nt">generate_op</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;KLinearMarlin&quot;</span><span class="w"> </span><span class="c1"># 同样使用 Marlin 加速</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：模型最后“吐字”的那一层（lm_head），也做同样的处理：换成支持 Marlin 加速的高性能层，放在显卡上跑。</li>
+</ul>
+<h4>步骤 4：处理“大脑”分配逻辑 (MoE Router)</h4>
+<div class="codehilite"><pre><span></span><code><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">match</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;^model\\.layers\\..*\\.mlp$&quot;</span>
+<span class="w">    </span><span class="nt">class</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">...DeepseekV2MoE</span>
+<span class="w">  </span><span class="nt">replace</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">class</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">...KDeepseekV2MoE</span>
+<span class="w">    </span><span class="nt">kwargs</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">generate_device</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;cuda&quot;</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：DeepSeek-V2 是一个 MoE（混合专家）模型。这一步是把“分配任务给哪个专家”的路由模块（Router），换成优化后的版本，并保留在显卡上。</li>
+</ul>
+<h4>步骤 5：<strong>核心魔法</strong> —— 专家层的 CPU 卸载 (The Experts)</h4>
+<p><strong>这是整个文件最关键的一步！</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">match</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;^model\\.layers\\..*\\.mlp\\.experts$&quot;</span><span class="w"> </span><span class="c1"># 匹配所有的“专家”模块</span>
+<span class="w">  </span><span class="nt">replace</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">class</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">...KTransformersExperts</span>
+<span class="w">    </span><span class="nt">kwargs</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">generate_device</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;cpu&quot;</span><span class="w">      </span><span class="c1"># 注意！生成阶段放在 CPU 上！</span>
+<span class="w">      </span><span class="nt">generate_op</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;KExpertsCPU&quot;</span><span class="w">  </span><span class="c1"># 使用 CPU 专用的计算内核</span>
+<span class="w">      </span><span class="nt">out_device</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;cuda&quot;</span><span class="w">          </span><span class="c1"># 算完结果扔回显卡</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：DeepSeek-V2 模型非常大，显存通常放不下。</li>
+<li><strong>观点</strong>：这里的策略是<strong>“空间换时间”</strong>的变种。因为 MoE 模型每次只激活一小部分专家，所以<strong>把庞大的专家权重数据全部放在内存（CPU RAM）里</strong>，而不是显存里。</li>
+<li><strong>流程</strong>：当模型需要计算时，CPU 快速计算专家部分，然后把结果传回 GPU。这使得<strong>单张显卡（甚至消费级显卡）也能运行巨大的 DeepSeek-V2 模型</strong>。</li>
+</ul>
+<h4>步骤 6：优化注意力机制 (Attention)</h4>
+<div class="codehilite"><pre><span></span><code><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">match</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;^model\\.layers\\..*\\.self_attn$&quot;</span>
+<span class="w">  </span><span class="nt">replace</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">class</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">...KDeepseekV2Attention</span><span class="w"> </span><span class="c1"># 针对 DeepSeek 优化的 MLA 注意力</span>
+<span class="w">    </span><span class="nt">kwargs</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">generate_device</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;cuda&quot;</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：DeepSeek-V2 使用了一种特殊的 MLA（Multi-Head Latent Attention）技术。这里用专门写好的 CUDA 内核替换原版，确保在显卡上最高效地处理上下文记忆。</li>
+</ul>
+<h4>步骤 7 &amp; 8：收尾工作 (Model &amp; Embeddings)</h4>
+<div class="codehilite"><pre><span></span><code><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">match</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;^model$&quot;</span>
+<span class="w">    </span><span class="l l-Scalar l-Scalar-Plain">...</span>
+<span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">match</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;^model.embed_tokens&quot;</span><span class="w"> </span><span class="c1"># 词表嵌入层</span>
+<span class="w">  </span><span class="nt">replace</span><span class="p">:</span>
+<span class="w">    </span><span class="l l-Scalar l-Scalar-Plain">...</span>
+<span class="w">    </span><span class="l l-Scalar l-Scalar-Plain">kwargs</span><span class="p p-Indicator">:</span>
+<span class="w">      </span><span class="nt">generate_device</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;cpu&quot;</span><span class="w">    </span><span class="c1"># 放在 CPU 上</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：<ul>
+<li>对整个模型类进行封装。</li>
+<li>把最开始的“查字典”环节（Embedding）也放到 CPU 上。因为词表很大，放显存里太浪费，且计算量极小，CPU 跑完全没问题。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 3：总结这份文件的核心观点</h3>
+<p>如果让你用一句话总结这份文件在干嘛，你可以这样理解：</p>
+<blockquote>
+<p><strong>这是一份“显存大瘦身”+“计算大提速”的配置单。</strong></p>
+</blockquote>
+<ol>
+<li><strong>它极度压榨性能</strong>：凡是计算密集的地方（Linear层、Attention层），全部强制使用最快的 GPU 内核（Marlin, CUDA）。</li>
+<li><strong>它让小卡跑大模型</strong>：凡是特别占显存但计算量相对分散的地方（MoE Experts 专家层、Embedding 词表），全部扔到 <strong>CPU 内存</strong>里去跑。</li>
+</ol>
+<p><strong>最终效果</strong>：你可能只需要一张 24G 显存的 4090 或者更低的配置，配合较大的电脑内存（比如 64G+ RAM），就能流畅运行原本需要 80G+ 显存才能跑起来的 DeepSeek-V2 模型。</p>

@@ -1,0 +1,101 @@
+<h1>src/llamafactory/v1/plugins/model_plugins/kernels/rms_norm/npu_rms_norm.py</h1>
+<p>没问题，这段代码乍一看确实涉及了很多 Python 的“黑魔法”（比如动态绑定方法），但它的核心逻辑其实非常简单：<strong>“偷梁换柱”</strong>。</p>
+<p>它的目的是：<strong>当你在华为昇腾芯片（NPU）上跑大模型时，把原本比较慢的通用计算模块，替换成华为专门优化过的极速模块。</strong></p>
+<p>为了让你彻底看懂，我把你当成这个代码的开发者，给你列一个 <strong>“开发任务清单 (Todo List)”</strong>，我们一步一步来完成这个功能。</p>
+<hr />
+<h3>任务清单 (Todo List)</h3>
+<ol>
+<li><strong>【准备工作】确认环境</strong>：确认我们是不是在华为 NPU 环境下，如果不是，啥也不用做。</li>
+<li><strong>【制造零件】写一个“加速版”的函数</strong>：写一个利用 NPU 硬件加速特性的新函数，用来替代旧的。</li>
+<li><strong>【定位目标】找到模型里需要替换的“旧零件”</strong>：在巨大的模型结构里，找到所有叫 "RMSNorm" 的层。</li>
+<li><strong>【执行手术】把“旧零件”换成“新零件”</strong>：把找到的旧层的运行逻辑（forward），强制改成我们写好的加速版函数。</li>
+</ol>
+<hr />
+<h3>任务逐步讲解</h3>
+<h4>任务 1：【准备工作】确认环境</h4>
+<p>代码里并没有专门写一个大函数做这个，而是穿插在逻辑里。
+*   <strong>代码体现</strong>：
+    <code>python
+    from .....accelerator.helper import DeviceType, is_torch_npu_available
+    # ...
+    if not is_torch_npu_available():
+        return model</code>
+*   <strong>解释</strong>：如果当前机器没装华为的 NPU 驱动（<code>is_torch_npu_available</code> 为 False），那这个优化就没法做，直接把原模型退回去，任务结束。</p>
+<h4>任务 2：【制造零件】写一个“加速版”的函数</h4>
+<p>我们需要定义一个函数，它能做和原来一样的事（RMSNorm 归一化），但速度更快。</p>
+<ul>
+<li><strong>代码体现</strong>：
+    ```python
+    def _npu_rms_forward(self, hidden_states):
+        # 引入华为专用的 PyTorch 库
+        import torch_npu<div class="codehilite"><pre><span></span><code><span class="c1"># 调用华为优化的底层算子 npu_rms_norm</span>
+<span class="c1"># [0] 是因为这个函数可能返回多个值，我们只需要第一个结果（处理后的张量）</span>
+<span class="k">return</span><span class="w"> </span><span class="n">torch_npu</span><span class="o">.</span><span class="n">npu_rms_norm</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">,</span><span class="w"> </span><span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="p">,</span><span class="w"> </span><span class="n">epsilon</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">variance_epsilon</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
+</code></pre></div>
+
+<p><code>``
+*   **解释**：
+*   这个函数就是我们的“秘密武器”。
+*   普通的 RMSNorm 是一步步算加减乘除，很慢。
+*</code>torch_npu.npu_rms_norm<code>是华为直接用 C++ 或汇编针对硬件写好的，飞快。
+*   **注意**：这个函数第一个参数是</code>self`，这意味着我们打算把它当成一个<strong>类的方法</strong>来用。</p>
+</li>
+</ul>
+<h4>任务 3：【定位目标】找到模型里需要替换的“旧零件”</h4>
+<p>现在我们有了武器，得找到靶子。大模型里有很多层（Layer），我们只关心做“RMSNorm”的那一层。</p>
+<ul>
+<li>
+<p><strong>代码体现</strong>：
+    ```python
+    # 正则表达式：忽略大小写，匹配名字里包含 "RMSNorm" 的东西
+    rms_norm_pattern = re.compile("RMSNorm", re.IGNORECASE)</p>
+<h1>遍历模型里所有的子模块</h1>
+<p>for name, module in model.named_modules():
+    # 检查这个模块的类名（class name）是不是包含 "RMSNorm"
+    if re.search(rms_norm_pattern, module.<strong>class</strong>.<strong>name</strong>):
+        # 找到了！就是它！
+        # ... (下一步就是替换)
+<code>``
+*   **解释**：
+*</code>model.named_modules()<code>会把模型拆解成一个个小积木。
+*   我们拿着正则放大镜</code>rms_norm_pattern<code>检查每一个积木的名字。只要名字里带</code>RMSNorm<code>（比如</code>LlamaRMSNorm`），就是我们的替换目标。</p>
+</li>
+</ul>
+<h4>任务 4：【执行手术】把“旧零件”换成“新零件”</h4>
+<p>这是最关键的一步，也就是所谓的 <strong>Monkey Patch（猴子补丁）</strong>。我们要把运行中的代码逻辑给改了。</p>
+<ul>
+<li>
+<p><strong>代码体现</strong>：
+    <code>python
+    # 把我们刚才写的加速函数 _npu_rms_forward，绑定到当前这个模块实例上
+    # types.MethodType 的作用是把一个独立函数变成一个对象的方法（这样函数里才能用 self）
+    module.forward = types.MethodType(cls.kernel, module)</code>
+    <em>注：<code>cls.kernel</code> 在类定义里指向了 <code>_npu_rms_forward</code>。</em></p>
+</li>
+<li>
+<p><strong>解释</strong>：</p>
+<ul>
+<li><code>module.forward</code> 是原本模型运行时调用的函数。</li>
+<li>这行代码直接把 <code>module.forward</code> 指向了我们写的 <code>_npu_rms_forward</code>。</li>
+<li><strong>效果</strong>：从此以后，当模型运行到这一层，想执行 <code>forward</code> 时，它以为自己在跑原来的代码，实际上跑的是我们注入的华为 NPU 加速代码。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码在讲什么？</h3>
+<p>这段代码定义了一个插件类 <code>NpuRMSNormKernel</code>。</p>
+<p><strong>它的核心观点是：</strong></p>
+<blockquote>
+<p>"如果你在用华为 NPU 跑模型，原本的 RMSNorm 层太慢了。我会自动扫描你的模型，找到所有的 RMSNorm 层，把它们的计算逻辑偷偷换成华为专用的 <code>torch_npu.npu_rms_norm</code>，从而让你的模型跑得更快，而你不需要修改模型本身的任何代码。"</p>
+</blockquote>
+<p><strong>结构图解：</strong></p>
+<ol>
+<li><strong>定义加速逻辑</strong> (<code>_npu_rms_forward</code>)：我是快枪手。</li>
+<li><strong>定义插件类</strong> (<code>NpuRMSNormKernel</code>)：我是工头。</li>
+<li><strong>应用逻辑</strong> (<code>apply</code> 方法)：<ul>
+<li>工头检查机器（是 NPU 吗？）。</li>
+<li>工头找目标（谁是 RMSNorm？）。</li>
+<li>工头下令替换（把快枪手装上去，替换掉原来的慢枪手）。</li>
+</ul>
+</li>
+</ol>

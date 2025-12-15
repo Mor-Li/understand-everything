@@ -1,0 +1,120 @@
+<h1>tests/llamafy_internlm2.py</h1>
+<p>这段代码就像是一个<strong>“整容医生”</strong>或者<strong>“易容大师”</strong>。</p>
+<p>它的核心目标只有一个：<strong>把 InternLM2（书生·浦语2）模型，“伪装”成 LLaMA2 模型的样子。</strong></p>
+<p>为什么要这么做？因为 LLaMA 的生态非常好，很多工具（比如推理框架、量化工具）都原生支持 LLaMA。如果把 InternLM2 的内部变量名改得跟 LLaMA 一模一样，就可以直接骗过这些工具，让它们以为自己在运行 LLaMA。</p>
+<p>下面我按照你要求的 <strong>Task Todo List</strong> 格式，把这个脚本的工作流程一步步拆解给你看：</p>
+<hr />
+<h3>📋 任务清单：InternLM2 -&gt; LLaMA2 改造计划</h3>
+<h4>Phase 1: 准备工作 (Setup)</h4>
+<ul>
+<li>[ ] <strong>Task 01: 创建手术室</strong><ul>
+<li>检查输出目录是否存在，如果不存在就创建（<code>os.makedirs</code>）。</li>
+</ul>
+</li>
+<li>[ ] <strong>Task 02: 读取原始“病例”（配置）</strong><ul>
+<li>从输入目录加载 <code>config.json</code>，了解 InternLM2 的参数（比如有多少个注意力头）。</li>
+</ul>
+</li>
+</ul>
+<h4>Phase 2: 权重搬运与改造 (Weight Conversion) —— <em>这是最核心、最累的一步</em></h4>
+<ul>
+<li>[ ] <strong>Task 03: 加载原始模型权重</strong><ul>
+<li>遍历输入文件夹，把所有分散的 <code>.bin</code> 权重文件加载到内存里，拼成一个完整的字典 (<code>internlm2_state_dict</code>)。</li>
+</ul>
+</li>
+<li>[ ] <strong>Task 04: 开始“整容”（重命名与张量切割）</strong><ul>
+<li>创建一个新的空字典 <code>llama2_state_dict</code>。</li>
+<li>遍历原始权重，根据规则进行修改（详见下文的“对照表”）：<ul>
+<li>[ ] <strong>改名</strong>：比如把 <code>output</code> 改叫 <code>lm_head</code>。</li>
+<li>[ ] <strong>切割手术</strong>：InternLM2 把 Q、K、V 三个矩阵拼在一起存叫 <code>wqkv</code>，但 LLaMA 习惯分开存。所以代码要把这个大矩阵切成三份：<code>q_proj</code>, <code>k_proj</code>, <code>v_proj</code>。</li>
+<li>[ ] <strong>对应</strong>：把其他的层（FFN、Norm层）的名字改成 LLaMA 对应的名字。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>[ ] <strong>Task 05: 缝合与分块保存 (Sharding &amp; Saving)</strong><ul>
+<li>因为模型可能很大，不能存成一个巨型文件。使用 <code>shard_checkpoint</code> 把改造好的权重切分成每块不超过 10GB 的小文件。</li>
+<li>把这些新文件保存到输出目录（可以是 <code>.bin</code> 也可以是 <code>.safetensors</code> 格式）。</li>
+<li>生成一个索引文件（index json），告诉程序哪个参数在哪个文件里。</li>
+</ul>
+</li>
+</ul>
+<h4>Phase 3: 修改身份证明 (Config Adaptation)</h4>
+<ul>
+<li>[ ] <strong>Task 06: 修改配置文件</strong><ul>
+<li>再次读取 <code>config.json</code>。</li>
+<li>把架构名从 <code>InternLM2</code> 改成 <code>LlamaForCausalLM</code>。</li>
+<li>删掉一些 InternLM 独有但 LLaMA 不需要/不认识的参数（如 <code>auto_map</code>, <code>bias</code> 等）。</li>
+<li>保存新的 <code>config.json</code> 到输出目录。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🔍 关键步骤深度解析</h3>
+<p>为了让你彻底看懂，我把 <strong>Task 04</strong> 中的“整容对照表”单独列出来，这是代码里 <code>if...elif...else</code> 那一大段的逻辑：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: left;">原始部位 (InternLM2)</th>
+<th style="text-align: left;">改造后部位 (LLaMA2)</th>
+<th style="text-align: left;">动作 (Action)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;"><code>output</code></td>
+<td style="text-align: left;"><code>lm_head</code></td>
+<td style="text-align: left;">纯改名</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>tok_embeddings</code></td>
+<td style="text-align: left;"><code>embed_tokens</code></td>
+<td style="text-align: left;">纯改名</td>
+</tr>
+<tr>
+<td style="text-align: left;"><strong><code>attention.wqkv</code></strong></td>
+<td style="text-align: left;"><strong><code>self_attn.q_proj</code></strong><br><strong><code>self_attn.k_proj</code></strong><br><strong><code>self_attn.v_proj</code></strong></td>
+<td style="text-align: left;"><strong>大手术</strong>：原版是三合一的，代码里计算了 Q 和 KV 的比例，用切片操作 <code>value[:q_size]</code> 等把它切开了。</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>attention.wo</code></td>
+<td style="text-align: left;"><code>self_attn.o_proj</code></td>
+<td style="text-align: left;">纯改名</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>attention_norm</code></td>
+<td style="text-align: left;"><code>input_layernorm</code></td>
+<td style="text-align: left;">纯改名</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>ffn_norm</code></td>
+<td style="text-align: left;"><code>post_attention_layernorm</code></td>
+<td style="text-align: left;">纯改名</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>feed_forward.w1</code></td>
+<td style="text-align: left;"><code>mlp.gate_proj</code></td>
+<td style="text-align: left;">纯改名</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>feed_forward.w2</code></td>
+<td style="text-align: left;"><code>mlp.down_proj</code></td>
+<td style="text-align: left;">纯改名</td>
+</tr>
+<tr>
+<td style="text-align: left;"><code>feed_forward.w3</code></td>
+<td style="text-align: left;"><code>mlp.up_proj</code></td>
+<td style="text-align: left;">纯改名</td>
+</tr>
+</tbody>
+</table>
+<h3>⚠️ 重要警告</h3>
+<p>代码开头有一个很显眼的注释：</p>
+<blockquote>
+<p><strong>Warning: We have found that the converted model cannot infer correctly. It will be fixed later.</strong>
+（警告：我们发现转换后的模型无法正确推理。稍后修复。）</p>
+</blockquote>
+<p><strong>这意味着：</strong>
+虽然这个脚本逻辑上是在把 InternLM2 变成 LLaMA2 格式，但目前（写这段代码时）可能还有 bug，或者因为 InternLM2 的某些数学实现细节（比如 RoPE 旋转位置编码的细节）和 LLaMA 不完全兼容，导致“整容”虽然成功了，但“脑子”不好使了，输出可能是乱码。</p>
+<h3>总结</h3>
+<p>这个脚本就是一个<strong>格式转换器</strong>。它不训练模型，只是把模型权重的<strong>名字</strong>和<strong>存储形状</strong>修改一下，试图让 InternLM2 能跑在只支持 LLaMA 的软件里。</p>

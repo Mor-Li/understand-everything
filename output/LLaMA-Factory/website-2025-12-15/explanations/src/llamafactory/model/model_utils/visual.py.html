@@ -1,0 +1,51 @@
+<h1>src/llamafactory/model/model_utils/visual.py</h1>
+<p>这份代码文件 <code>src/llamafactory/model/model_utils/visual.py</code> 的核心作用是<strong>“多模态模型（VLM）的大管家”</strong>。</p>
+<p>在 LlamaFactory 中，为了支持各种各样的“视觉-语言”模型（比如 LLaVA, Qwen-VL, Yi-VL 等），需要一个统一的地方来管理这些模型的结构差异。因为不同的模型，给自己的“眼睛”（视觉编码器）和“连接层”（投影层）起的名字都不一样。</p>
+<p>为了让你更容易理解，我把这个文件的功能拆解成一个<strong>“大模型训练前的准备任务清单（Task List）”</strong>。想象一下，LlamaFactory 是一个总指挥，在开始训练前，它需要照着这个清单一步步执行：</p>
+<hr />
+<h3>📋 任务清单：如何管理一个多模态模型？</h3>
+<h4>Task 1: 定义什么是“组合模型” (Standardize the Structure)</h4>
+<p><strong>代码对应：</strong> <code>class CompositeModel</code> (第 40 行)
+*   <strong>背景：</strong> 多模态模型通常由三部分组成：
+    1.  <strong>眼睛</strong>（Vision Tower）：看图的。
+    2.  <strong>翻译官</strong>（Projector）：把图片特征翻译成语言模型能懂的向量。
+    3.  <strong>大脑</strong>（Language Model）：负责思考和生成的 LLM。
+*   <strong>任务：</strong> 创建一个标准模板（Dataclass），用来记录每个模型中这三个部分分别叫什么变量名。比如有的模型管眼睛叫 <code>vision_tower</code>，有的叫 <code>visual_model</code>。这个类就是为了统一称呼。</p>
+<h4>Task 2: 建立模型“户口本” (Register Models)</h4>
+<p><strong>代码对应：</strong> <code>_register_composite_model</code> 函数 (第 58 行) 和文件底部的所有调用 (第 206 行起)
+*   <strong>背景：</strong> 既然定义了标准，就需要把市面上各种模型的信息录入进去。
+*   <strong>任务：</strong> 这是一个巨大的注册表。
+    *   <strong>LLaVA 说：</strong> “我的眼睛叫 <code>vision_tower</code>，翻译官叫 <code>multi_modal_projector</code>。” -&gt; 登记！
+    *   <strong>Qwen2-VL 说：</strong> “我的眼睛叫 <code>visual.blocks</code>，翻译官叫 <code>visual.merger</code>。” -&gt; 登记！
+    *   <strong>MiniCPM 说：</strong> “我的翻译官叫 <code>resampler</code>。” -&gt; 登记！
+*   <strong>目的：</strong> 以后 LlamaFactory 只要看到模型名字（如 <code>qwen2_vl</code>），查一下这个表，就知道去哪里找它的“眼睛”和“大脑”。</p>
+<h4>Task 3: 处理“刺头”模型 (Handle Special Cases)</h4>
+<p><strong>代码对应：</strong> <code>LlavaMultiModalProjectorForYiVL</code> 类 (第 84 行) 和 <code>configure_visual_model</code> (第 149 行)
+*   <strong>背景：</strong> 大部分模型都很听话，符合 HuggingFace 的标准。但是 <strong>Yi-VL</strong> 这个模型比较特殊，或者官方库支持得不够好。
+*   <strong>任务：</strong>
+    *   <strong>手动修补：</strong> 代码里专门为 Yi-VL 手写了一个 <code>Projector</code> 类（投影层），因为它原本的实现可能缺少某些配置或为了兼容性。
+    *   <strong>打补丁：</strong> <code>configure_visual_model</code> 函数会在加载模型前检查，如果是 Yi-VL，就强行把它的投影层替换成这里手写的版本。</p>
+<h4>Task 4: 确保数据类型安全 (Type Safety Check)</h4>
+<p><strong>代码对应：</strong> <code>autocast_projector_dtype</code> (第 130 行)
+*   <strong>背景：</strong> 在训练时，我们经常用半精度（float16/bf16）来省显存。但是有些模型的“翻译官”（Projector）如果不小心用了全精度（float32）或者量化后的类型，计算时会报错或性能下降。
+*   <strong>任务：</strong> 这是一个“挂钩子”（Hook）的操作。它告诉模型：“不管你本来是什么类型，当你跑完‘翻译官’这一层输出结果时，必须把数据类型转换成和主模型一致（比如 float16）”，防止训练崩溃。</p>
+<h4>Task 5: 决定冻结哪些部分 (Freeze Modules)</h4>
+<p><strong>代码对应：</strong> <code>get_forbidden_modules</code> (第 160 行)
+*   <strong>背景：</strong> 微调多模态模型时，我们通常不会把所有参数都训练一遍。
+    *   有时候只训练“翻译官”（Projector），冻结“眼睛”和“大脑”。
+    *   有时候训练“大脑”，冻结“眼睛”。
+*   <strong>任务：</strong> 根据用户的配置（<code>finetuning_args</code>），列出一个<strong>“禁止训练名单”</strong>。
+    *   如果用户说 <code>freeze_vision_tower=True</code>，这个函数就去查 Task 2 的户口本，找到视觉模块的名字（比如 <code>vision_tower</code>），把它加到禁止名单里。</p>
+<h4>Task 6: 为 LoRA 划定范围 (Setup LoRA Targets)</h4>
+<p><strong>代码对应：</strong> <code>patch_target_modules</code> (第 184 行)
+*   <strong>背景：</strong> LoRA 是一种高效微调技术。我们需要告诉程序把 LoRA 模块插到哪些层上。
+*   <strong>任务：</strong>
+    1.  拿到用户想微调的层名称列表。
+    2.  <strong>过滤：</strong> 检查这些层是不是在 Task 5 的“禁止名单”里？如果在（比如该层属于被冻结的视觉塔），那就把它剔除。
+    3.  <strong>避坑：</strong> 检查这些层是不是在 <code>lora_conflict_keys</code> 里（这是在注册表里定义的，有些层加了 LoRA 会出错），如果是，也剔除。
+    4.  返回最终安全的、可训练的模块列表。</p>
+<hr />
+<h3>总结</h3>
+<p>你看不懂是因为这个文件<strong>全是“后勤工作”</strong>，没有具体的算法逻辑。</p>
+<p><strong>一句话概括：</strong>
+这个文件是一个<strong>配置中心</strong>，它记录了不同多模态模型的<strong>组件名称映射关系</strong>，并负责在训练开始前，根据这些信息来<strong>冻结不需要训练的层</strong>、<strong>修正特殊的模型结构</strong>以及<strong>确保数据类型正确</strong>。</p>

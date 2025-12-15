@@ -1,0 +1,87 @@
+<h1>tests/llamafy_baichuan2.py</h1>
+<p>这份代码的核心目的非常简单：<strong>“把百川2（Baichuan2）模型伪装成 LLaMA2 模型”</strong>。</p>
+<p>为什么要这么做？因为 LLaMA 是目前开源社区生态最丰富的模型，很多工具（比如量化工具、推理加速引擎 vLLM、llama.cpp 等）对 LLaMA 的支持最好。把百川的格式转换成 LLaMA 格式，就能直接蹭上这些现成的工具了。</p>
+<p>为了让你更容易理解，我把你当作这个脚本的执行者，给你列一份 <strong>Task Todo List（任务清单）</strong>，我们一步步来完成这个“整容手术”。</p>
+<hr />
+<h3>📋 任务清单 (Task Todo List)</h3>
+<ol>
+<li><strong>准备手术室</strong>：创建存放新模型的文件夹。</li>
+<li><strong>收集旧零件</strong>：把百川模型原本分散的权重文件（.bin）全部加载到内存里。</li>
+<li><strong>核心手术（权重整形）</strong>：<ul>
+<li><em>关键点 A</em>：把百川“打包”在一起的参数切分开（拆解 <code>W_pack</code>）。</li>
+<li><em>关键点 B</em>：对输出层的参数做个标准化处理（处理 <code>lm_head</code>）。</li>
+</ul>
+</li>
+<li><strong>重新打包</strong>：把修改好的参数按 LLaMA 的规则切分并保存（存为 .bin 或 .safetensors）。</li>
+<li><strong>修改身份证</strong>：修改配置文件（<code>config.json</code>），把名字从 "Baichuan" 改成 "Llama"。</li>
+</ol>
+<hr />
+<h3>🧐 逐步详解 (Step-by-Step Guide)</h3>
+<p>下面我结合代码，给你详细讲讲每一步都在干啥。</p>
+<h4>Task 1: 准备手术室</h4>
+<p><strong>代码位置：</strong> <code>llamafy_baichuan2</code> 函数开头</p>
+<div class="codehilite"><pre><span></span><code><span class="n">os</span><span class="o">.</span><span class="n">makedirs</span><span class="p">(</span><span class="n">output_dir</span><span class="p">,</span> <span class="n">exist_ok</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+这就好比你在硬盘上新建一个文件夹，用来放“整容”后的模型。如果文件夹已经存在，为了防止覆盖重要数据，它会报错停止。</p>
+<h4>Task 2: 收集旧零件 (加载权重)</h4>
+<p><strong>代码位置：</strong> <code>save_weight</code> 函数的第一部分</p>
+<div class="codehilite"><pre><span></span><code><span class="n">baichuan2_state_dict</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="n">OrderedDict</span><span class="p">()</span>
+<span class="k">for</span> <span class="n">filepath</span> <span class="ow">in</span> <span class="n">tqdm</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">listdir</span><span class="p">(</span><span class="n">input_dir</span><span class="p">),</span> <span class="n">desc</span><span class="o">=</span><span class="s2">&quot;Load weights&quot;</span><span class="p">):</span>
+    <span class="c1"># ... 遍历读取所有的 .bin 文件 ...</span>
+    <span class="n">shard_weight</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="n">baichuan2_state_dict</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">shard_weight</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+大模型通常太大，被切分成了很多小文件（比如 <code>pytorch_model-00001-of-00003.bin</code>）。这一步就是把这些碎片全部读进来，拼成一个完整的字典 <code>baichuan2_state_dict</code>，里面装着模型所有的参数。</p>
+<h4>Task 3: 核心手术 (这是最难懂的部分)</h4>
+<p><strong>代码位置：</strong> <code>save_weight</code> 函数的中间循环</p>
+<p><strong>手术 A：拆解三明治 (<code>W_pack</code>)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="s2">&quot;W_pack&quot;</span> <span class="ow">in</span> <span class="n">key</span><span class="p">:</span>
+    <span class="n">proj_size</span> <span class="o">=</span> <span class="n">value</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span> <span class="o">//</span> <span class="mi">3</span>
+    <span class="n">llama2_state_dict</span><span class="p">[</span><span class="n">key</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s2">&quot;W_pack&quot;</span><span class="p">,</span> <span class="s2">&quot;q_proj&quot;</span><span class="p">)]</span> <span class="o">=</span> <span class="n">value</span><span class="p">[:</span><span class="n">proj_size</span><span class="p">,</span> <span class="p">:]</span>
+    <span class="n">llama2_state_dict</span><span class="p">[</span><span class="n">key</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s2">&quot;W_pack&quot;</span><span class="p">,</span> <span class="s2">&quot;k_proj&quot;</span><span class="p">)]</span> <span class="o">=</span> <span class="n">value</span><span class="p">[</span><span class="n">proj_size</span> <span class="p">:</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">proj_size</span><span class="p">,</span> <span class="p">:]</span>
+    <span class="n">llama2_state_dict</span><span class="p">[</span><span class="n">key</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s2">&quot;W_pack&quot;</span><span class="p">,</span> <span class="s2">&quot;v_proj&quot;</span><span class="p">)]</span> <span class="o">=</span> <span class="n">value</span><span class="p">[</span><span class="mi">2</span> <span class="o">*</span> <span class="n">proj_size</span> <span class="p">:,</span> <span class="p">:]</span>
+</code></pre></div>
+
+<p><strong>观点解读：</strong>
+*   <strong>百川的做法</strong>：为了省事，百川把注意力机制里的 Q（Query）、K（Key）、V（Value）三个矩阵拼在了一起，起名叫 <code>W_pack</code>。
+*   <strong>LLaMA的要求</strong>：LLaMA 架构要求这三个矩阵必须分开，分别叫 <code>q_proj</code>, <code>k_proj</code>, <code>v_proj</code>。
+*   <strong>操作</strong>：代码把 <code>W_pack</code> 均分成三份，分别改名。就像把一个“三明治”拆成“面包”、“火腿”和“生菜”分开放。</p>
+<p><strong>手术 B：头部整形 (<code>lm_head</code>)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">elif</span> <span class="s2">&quot;lm_head&quot;</span> <span class="ow">in</span> <span class="n">key</span><span class="p">:</span>
+    <span class="n">llama2_state_dict</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">normalize</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>观点解读：</strong>
+*   这是百川2的一个特殊设计。它的输出层（<code>lm_head</code>）在训练时做过归一化（Normalize）。
+*   为了让转换后的模型能正常工作，这里必须手动对这个权重做一次 <code>normalize</code> 操作。如果不做这一步，模型输出的概率分布就会乱套，开始胡言乱语。</p>
+<h4>Task 4: 重新打包 (保存权重)</h4>
+<p><strong>代码位置：</strong> <code>save_weight</code> 函数的后半部分</p>
+<div class="codehilite"><pre><span></span><code><span class="n">shards</span><span class="p">,</span> <span class="n">index</span> <span class="o">=</span> <span class="n">shard_checkpoint</span><span class="p">(</span><span class="n">llama2_state_dict</span><span class="p">,</span> <span class="n">max_shard_size</span><span class="o">=</span><span class="n">shard_size</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+<span class="k">for</span> <span class="n">shard_file</span><span class="p">,</span> <span class="n">shard</span> <span class="ow">in</span> <span class="n">tqdm</span><span class="p">(</span><span class="n">shards</span><span class="o">.</span><span class="n">items</span><span class="p">(),</span> <span class="n">desc</span><span class="o">=</span><span class="s2">&quot;Save weights&quot;</span><span class="p">):</span>
+    <span class="c1"># ... 保存文件 ...</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+手术做完了，现在要把内存里巨大的模型存回硬盘。
+*   <code>shard_checkpoint</code>：这个函数负责把巨大的参数切分成每块最大 10GB（由 <code>shard_size</code> 参数决定）的小文件。
+*   支持保存为 <code>.safetensors</code> 格式（加载更快更安全）或者传统的 <code>.bin</code> 格式。
+*   还会生成一个索引文件（index.json），告诉程序哪个参数在哪个文件里。</p>
+<h4>Task 5: 修改身份证 (修改 Config)</h4>
+<p><strong>代码位置：</strong> <code>save_config</code> 函数</p>
+<div class="codehilite"><pre><span></span><code><span class="n">llama2_config_dict</span><span class="p">[</span><span class="s2">&quot;architectures&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;LlamaForCausalLM&quot;</span><span class="p">]</span>
+<span class="n">llama2_config_dict</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">&quot;auto_map&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+<span class="n">llama2_config_dict</span><span class="p">[</span><span class="s2">&quot;model_type&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;llama&quot;</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+模型只有权重是不够的，还需要一个说明书（config.json）。
+*   <strong>改名</strong>：把架构名从百川改成 <code>LlamaForCausalLM</code>，把模型类型改成 <code>llama</code>。
+*   <strong>删掉私货</strong>：删掉百川特有的 <code>auto_map</code>（这是 HuggingFace 用来加载自定义模型代码的）。
+*   <strong>目的</strong>：这一步做完后，当你用 <code>transformers</code> 库加载这个模型时，系统会惊呼：“哦！这是一只 LLaMA！”然后调用标准的 LLaMA 代码来运行它，而不是去调用百川的自定义代码。</p>
+<h3>总结</h3>
+<p>这段代码就是一个<strong>“格式转换器”</strong>。</p>
+<p>它不改变模型原本的知识（除了 <code>lm_head</code> 做了必要的数学变换），只是把数据的<strong>存储结构</strong>和<strong>命名方式</strong>从“百川流派”改成了“LLaMA流派”，方便你使用 LLaMA 生态里的各种工具。</p>

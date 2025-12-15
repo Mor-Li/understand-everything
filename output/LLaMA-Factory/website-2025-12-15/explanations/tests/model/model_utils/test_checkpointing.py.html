@@ -1,0 +1,64 @@
+<h1>tests/model/model_utils/test_checkpointing.py</h1>
+<p>这段代码其实是一个 <strong>测试文件</strong>（Test Suite），它的作用不是“训练模型”，而是“检查 LlamaFactory 的各种开关有没有按预期工作”。</p>
+<p>你可以把它想象成是一个<strong>质检员的清单</strong>。当开发者修改了 LlamaFactory 的核心代码后，运行这个文件，确保没有把重要的功能（比如省显存的功能、防报错的功能）给搞坏。</p>
+<p>为了让你听懂，我把这个文件的逻辑拆解成一个 <strong>“模型训练前的体检 List”</strong>。我们将分 5 个步骤（Task）来逐步解读。</p>
+<hr />
+<h3>📋 任务清单：模型训练前的“体检”流程</h3>
+<h4>✅ Task 1: 准备体检环境 (Setup)</h4>
+<p><strong>代码对应部分：</strong> 开头的变量定义 (<code>TINY_LLAMA3</code>, <code>TRAIN_ARGS</code>)
+<strong>解读：</strong>
+在开始检查之前，我们需要弄一个“小白鼠”模型。
+*   <strong><code>TINY_LLAMA3</code></strong>: 这里选了一个非常小的 Llama-3 模型（Tiny 版），因为测试只需要验证逻辑，不需要真的跑大模型，这样速度快。
+*   <strong><code>TRAIN_ARGS</code></strong>: 这是模拟用户输入的训练参数。比如：
+    *   <code>fp16: True</code>（开启半精度，省显存）
+    *   <code>finetuning_type: "lora"</code>（使用 LoRA 微调）
+    *   <code>stage: "sft"</code>（有监督微调阶段）</p>
+<p><strong>观点：</strong> 测试必须在受控的、轻量级的环境中进行。</p>
+<hr />
+<h4>✅ Task 2: 检查“省显存模式”是否生效 (Gradient Checkpointing)</h4>
+<p><strong>代码对应部分：</strong> <code>test_vanilla_checkpointing</code>
+<strong>背景知识：</strong>
+训练大模型时显存很容易爆。有一个技术叫 <strong>“梯度检查点” (Gradient Checkpointing)</strong>，它的原理是“用时间换空间”（不存中间激活值，反向传播时重算），能大幅降低显存占用。</p>
+<p><strong>代码在干啥：</strong>
+1.  <strong>加载模型</strong>：分别尝试“开启”和“关闭”梯度检查点功能。
+2.  <strong>遍历检查</strong>：它会遍历模型里所有支持该功能的层。
+3.  <strong>断言 (Assert)</strong>：
+    *   如果我设了 <code>disable=True</code>（禁用），那模型里这个功能必须是关的。
+    *   如果我设了 <code>disable=False</code>（启用），那模型里这个功能必须是开的。</p>
+<p><strong>观点：</strong> 确保用户想省显存的时候，程序真的把这个开关打开了。</p>
+<hr />
+<h4>✅ Task 3: 检查“加速外挂”是否挂上了 (Unsloth)</h4>
+<p><strong>代码对应部分：</strong> <code>test_unsloth_gradient_checkpointing</code>
+<strong>背景知识：</strong>
+<strong>Unsloth</strong> 是现在非常火的一个库，能极大地加速 Llama 等模型的训练并进一步降低显存。LlamaFactory 集成了它。</p>
+<p><strong>代码在干啥：</strong>
+1.  <strong>加载模型</strong>：参数里开启 <code>use_unsloth_gc=True</code>。
+2.  <strong>检查身份</strong>：它去查看模型层的检查点函数名字。
+3.  <strong>断言</strong>：确认这个函数的名字是 <code>UnslothGradientCheckpointing</code>。</p>
+<p><strong>观点：</strong> 确保当用户想用 Unsloth 加速时，底层调用的确实是 Unsloth 的代码，而不是 PyTorch 原生的慢代码。</p>
+<hr />
+<h4>✅ Task 4: 检查“防爆破”机制 1 (LayerNorm Upcast)</h4>
+<p><strong>代码对应部分：</strong> <code>test_upcast_layernorm</code>
+<strong>背景知识：</strong>
+我们在 Task 1 里开启了 <code>fp16</code>（半精度）。FP16 虽然快，但数值范围小，容易溢出（变成 NaN）。
+<strong>LayerNorm（层归一化）</strong> 对数值精度很敏感。如果用 FP16 跑 LayerNorm，模型很容易训练崩溃。所以通常的做法是：<strong>虽然整体用 FP16，但 LayerNorm 这一层强制用 FP32（全精度）。</strong></p>
+<p><strong>代码在干啥：</strong>
+1.  <strong>加载模型</strong>：开启 <code>upcast_layernorm=True</code>。
+2.  <strong>遍历参数</strong>：找到所有名字里带 "norm" 的参数。
+3.  <strong>断言</strong>：检查这些参数的数据类型（dtype）是不是 <code>float32</code>。</p>
+<p><strong>观点：</strong> 混合精度训练时，关键部位必须保持高精度，否则训练会失败。</p>
+<hr />
+<h4>✅ Task 5: 检查“防爆破”机制 2 (LM Head Output)</h4>
+<p><strong>代码对应部分：</strong> <code>test_upcast_lmhead_output</code>
+<strong>背景知识：</strong>
+和上面一样，模型的最后一层（LM Head，负责输出下一个词概率的层）计算量大且涉及指数运算（Softmax），用 FP16 很容易算出一堆 0 或者无穷大。为了稳定，输出结果通常要转回 FP32。</p>
+<p><strong>代码在干啥：</strong>
+1.  <strong>加载模型</strong>：开启 <code>upcast_lmhead_output=True</code>。
+2.  <strong>模拟输入</strong>：造一个假的输入数据（FP16 格式）。
+3.  <strong>运行一次</strong>：让模型跑一下最后一层 <code>model.get_output_embeddings()(inputs)</code>。
+4.  <strong>断言</strong>：检查跑出来的结果（Outputs）是不是变成了 <code>float32</code>。</p>
+<p><strong>观点：</strong> 即使输入是低精度的，关键的输出结果必须强制转回高精度以计算 Loss。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件的核心观点只有一句话：
+<strong>“在模型开始训练前，必须确保 显存优化（Checkpointing）、加速工具（Unsloth）和 数值稳定性保护（Upcast） 这三个关键配置已经正确地应用到了模型架构上。”</strong></p>

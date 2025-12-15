@@ -1,0 +1,107 @@
+<h1>examples/kt_optimize_rules/DeepSeek-V3-Chat-amx.yaml</h1>
+<p>这份文件确实充满了技术术语，如果你不熟悉大模型底层架构，看懂它就像在看天书。</p>
+<p>简单来说，这份 <code>.yaml</code> 文件是一份<strong>“改装清单”</strong>。</p>
+<p><strong>背景：</strong> 你有一辆原厂车（DeepSeek-V3 模型），但它的引擎太大（参数量巨大），你的车库（显卡显存）塞不下，或者跑得不够快。
+<strong>目的：</strong> 使用 <code>ktransformers</code> 这个工具，把原厂车的某些零件拆下来，换成“高性能”或者“省空间”的改装件。</p>
+<p>为了让你彻底理解，我为你列了一个 <strong>5步走的 Task List（任务清单）</strong>，我们一步步来拆解这份文件：</p>
+<hr />
+<h3>✅ Task 1: 理解核心逻辑 —— "Match" 和 "Replace"</h3>
+<p><strong>任务目标：</strong> 看懂文件的基本语法结构。</p>
+<ul>
+<li><strong>原文逻辑：</strong> 文件里全是成对出现的 <code>match</code> 和 <code>replace</code>。<ul>
+<li><strong>Match (匹配)：</strong> 告诉程序，“请找到模型里原来的这个零件（比如原来的线性层）”。</li>
+<li><strong>Replace (替换)：</strong> 告诉程序，“把它扔了，换成我指定的这个新零件（比如 ktransformers 优化过的层）”。</li>
+</ul>
+</li>
+<li><strong>kwargs (参数)：</strong> 这是给新零件的说明书。比如告诉它在这个设备上运行（<code>cuda</code> 代表显卡，<code>cpu</code> 代表处理器）。</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 解决最大的难题 —— MoE 专家模型的“分家” (最关键的一步)</h3>
+<p><strong>任务目标：</strong> 理解文件中关于 <code>experts</code>（专家）的部分，这是DeepSeek-V3能跑起来的核心。</p>
+<p>DeepSeek-V3 是一个混合专家模型（MoE），它的参数量非常大（几千亿），普通显卡根本装不下。</p>
+<ul>
+<li><strong>对应代码段：</strong>
+    ```yaml<ul>
+<li>match:
+    name: "^model\.layers\..*\.mlp\.experts$" # 找到原来的专家层
+  replace:
+    class: ktransformers.operators.experts.KTransformersExperts
+    kwargs:
+      prefill_device: "cuda"    # 预处理（看提示词时）用显卡
+      generate_device: "cpu"    # 生成（写回复时）用 CPU ！！！
+      backend: "AMXInt8"        # 使用 Intel CPU 的 AMX 加速指令集
+```</li>
+</ul>
+</li>
+<li><strong>解读：</strong>
+    这是这份文件名为 <code>...-amx.yaml</code> 的原因。它把模型<strong>最大、最占内存</strong>的“专家权重”部分，强制放在了 <strong>CPU 内存</strong>里（<code>generate_device: "cpu"</code>），而不是显卡里。
+    并且，它使用了 <code>AMXInt8</code>，这是 Intel 高端 CPU 特有的加速指令，为了让 CPU 跑模型也能稍微快一点。<ul>
+<li><strong>一句话总结：</strong> 显卡放不下，所以把大块头扔给 CPU 去算。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 压榨显卡性能 —— 线性层优化</h3>
+<p><strong>任务目标：</strong> 理解那些标有 <code>Linear</code> 的部分。</p>
+<p>除了专家部分，模型还有很多普通的矩阵计算（线性层）。这些通常还是放在显卡上算比较快。</p>
+<ul>
+<li><strong>对应代码段：</strong>
+    ```yaml<ul>
+<li>match:
+    class: torch.nn.Linear # 找到普通的线性层
+  replace:
+    class: ktransformers.operators.linear.KTransformersLinear
+    kwargs:
+      generate_op: "KLinearMarlin" # 使用 Marlin 算子
+      generate_device: "cuda"      # 放在显卡上
+```</li>
+</ul>
+</li>
+<li><strong>解读：</strong>
+    把普通的 PyTorch 线性层，换成了 <code>KTransformersLinear</code>。
+    关键在于 <code>KLinearMarlin</code>。Marlin 是一种非常高效的 GPU 计算内核（Kernel），专门用来加速量化后的模型计算。<ul>
+<li><strong>一句话总结：</strong> 能塞进显卡的小零件，全部换成高性能版本（Marlin），让显卡跑得飞快。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 优化“大脑” —— 注意力机制与位置编码</h3>
+<p><strong>任务目标：</strong> 理解 <code>Attention</code> 和 <code>RotaryEmbedding</code>。</p>
+<p>DeepSeek-V3 使用了特殊的注意力机制（MLA），原版实现可能比较慢或占显存。</p>
+<ul>
+<li><strong>对应代码段：</strong><ul>
+<li><code>DeepseekV3RotaryEmbedding</code> -&gt; 替换为 <code>YarnRotaryEmbeddingV3</code></li>
+<li><code>self_attn</code> -&gt; 替换为 <code>KDeepseekV2Attention</code></li>
+</ul>
+</li>
+<li><strong>解读：</strong>
+    这里是用 <code>ktransformers</code> 专门为 DeepSeek 写的高效算子，替换了原版的算子。
+    <code>kwargs</code> 里写着 <code>generate_device: "cuda"</code>，说明这些核心计算依然在显卡上进行，保证速度。</li>
+</ul>
+<hr />
+<h3>✅ Task 5: 杂项配置 —— 输入与总控</h3>
+<p><strong>任务目标：</strong> 扫清剩下的边角料。</p>
+<ul>
+<li><strong>Gate (门控) / MoEGate：</strong><ul>
+<li>MoE 模型需要一个“门”来决定把任务派发给哪个专家。这里把原来的门换成了 <code>KMoEGate</code>，放在显卡上 (<code>cuda:0</code>) 快速决策。</li>
+</ul>
+</li>
+<li><strong>Embed_tokens (词嵌入)：</strong><ul>
+<li><code>match: "^model.embed_tokens"</code> -&gt; <code>replace: "default"</code> (CPU)。</li>
+<li>把文本转成数字的第一步，放在 CPU 上做，为了省一点点显存。</li>
+</ul>
+</li>
+<li><strong>Model (总模型)：</strong><ul>
+<li><code>KDeepseekV2Model</code>。这是整个模型的包装壳，用来协调上面所有的零件。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📝 最终总结 (Executive Summary)</h3>
+<p>看完这个 List，你应该能明白这份文件的<strong>战术意图</strong>了：</p>
+<p>这是一个<strong>“CPU/GPU 混合推理”</strong>的方案，专门针对 <strong>Intel 支持 AMX 指令集的 CPU</strong> 优化的。</p>
+<ol>
+<li><strong>显卡 (GPU) 负责：</strong> 负责“门控”、“注意力机制”和“普通计算”，这些需要高带宽、低延迟，且显存占用相对较小。</li>
+<li><strong>处理器 (CPU) 负责：</strong> 负责扛起“专家模块 (Experts)”这个重担。因为这部分数据量太大（几百 GB），显卡装不下，只能放在系统内存里，利用 CPU 的 AMX 加速来计算。</li>
+</ol>
+<p><strong>如果你运行这个配置：</strong> 你会发现显存占用被控制住了（因为大头在内存里），但 CPU 负载会很高，且回复速度会比纯显卡慢，但至少能让你在有限的显卡上跑起这个巨型模型。</p>

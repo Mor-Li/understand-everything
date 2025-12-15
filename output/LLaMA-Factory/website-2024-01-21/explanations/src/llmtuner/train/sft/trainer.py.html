@@ -1,0 +1,115 @@
+<h1>src/llmtuner/train/sft/trainer.py</h1>
+<p>完全理解你的感受。这段代码涉及了深度学习框架（PyTorch）、Transformers 库的底层逻辑以及大模型（LLM）微调时的特殊处理，直接看确实像天书。</p>
+<p>你可以把这个文件看作是<strong>“给大模型改作业的特级教师”</strong>。普通的 <code>Seq2SeqTrainer</code> 是通用教师，而这个 <code>CustomSeq2SeqTrainer</code> 是专门为了大模型微调（SFT）定制的。</p>
+<p>为了让你读懂，我制定了一个<strong>三阶段的学习任务清单（Todo List）</strong>。我们一步步通关：</p>
+<hr />
+<h3>阶段一：搞清楚身份（基础设定）</h3>
+<p><strong>Task 1：理解这个类的定义</strong></p>
+<blockquote>
+<p>代码位置：<code>class CustomSeq2SeqTrainer(Seq2SeqTrainer):</code></p>
+</blockquote>
+<ul>
+<li><strong>它的角色</strong>：它是 <code>Seq2SeqTrainer</code> 的儿子（继承）。<code>Seq2SeqTrainer</code> 是 HuggingFace 库里用来训练“序列到序列”模型（比如翻译、对话）的标准工具。</li>
+<li><strong>它的目的</strong>：虽然父亲很强，但在计算生成指标（比如 BLEU、ROUGE，即机器生成的文本像不像人话）时，父亲的做法对大模型来说不够细腻。所以儿子主要重写了“预测（Prediction）”和“保存结果”的逻辑。</li>
+</ul>
+<hr />
+<h3>阶段二：核心逻辑——怎么让模型做题？（重难点）</h3>
+<p>这是代码中最难懂的部分，主要集中在 <code>prediction_step</code> 函数。想象一下，模型在做“完形填空”或者“问答题”。</p>
+<p><strong>Task 2：处理输入数据的长度对齐</strong></p>
+<blockquote>
+<p>代码位置：<code>prediction_step</code> 函数开头部分</p>
+</blockquote>
+<ul>
+<li><strong>背景</strong>：大模型训练时，数据是成批（Batch）进来的。因为每句话长短不一，必须把短的补齐（Padding）成一样长才能运算。</li>
+<li><strong>动作</strong>：<ul>
+<li><code>if self.args.predict_with_generate:</code>：如果开启了“生成模式”（不仅仅是算 loss，还要让模型真的写出字来）。</li>
+<li><code>assert ... "left"</code>：强制要求<strong>左侧补齐</strong>。为什么？因为大模型是预测下一个字，如果补齐符（Pad）在右边，模型生成时会先看到一堆无意义的 Pad，就乱了。</li>
+<li><strong>对齐逻辑</strong>：<ul>
+<li>如果 <code>prompt</code>（问题）比 <code>label</code>（答案）长，就把答案强行补长，跟问题一样长。</li>
+<li>如果 <code>label</code>（答案）比 <code>prompt</code>（问题）长，为了兼容性（比如 Llama2 fp16），这里选择把答案截断，只保留跟问题一样长的部分（这通常是为了避免显存报错或维度不匹配）。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<p><strong>Task 3：让模型生成答案</strong></p>
+<blockquote>
+<p>代码位置：<code>super().prediction_step(...)</code></p>
+</blockquote>
+<ul>
+<li><strong>动作</strong>：调用“父亲”的方法。</li>
+<li><strong>结果</strong>：得到 <code>loss</code>（误差）、<code>generated_tokens</code>（模型写出来的 token 数字序列）。</li>
+<li><strong>关键点</strong>：这里的 <code>generated_tokens</code> 通常包含了 <strong>[问题 + 模型生成的答案]</strong>。</li>
+</ul>
+<p><strong>Task 4：去头去尾（最关键的一步）</strong></p>
+<blockquote>
+<p>代码位置：<code>generated_tokens[:, :prompt_len] = self.tokenizer.pad_token_id</code></p>
+</blockquote>
+<ul>
+<li><strong>痛点</strong>：我们在评估模型好坏时，只想看它<strong>回答</strong>得怎么样，不想看它把<strong>问题</strong>复读一遍。</li>
+<li><strong>动作</strong>：<ul>
+<li>代码里的 <code>[:prompt_len]</code> 就是指“问题部分的长度”。</li>
+<li>这行代码的意思是：<strong>把生成结果里“问题”的那部分，全部涂改成“空白符”（pad_token_id）。</strong></li>
+<li><strong>目的</strong>：这样在计算分数时，只计算“答案”部分的准确率，排除“问题”部分的干扰。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>阶段三：收尾工作——把数字变成人话</h3>
+<p>模型吐出来的都是数字（Token IDs），我们需要把它变成人能看懂的字并存下来。</p>
+<p><strong>Task 5：处理“忽略符”</strong></p>
+<blockquote>
+<p>代码位置：<code>save_predictions</code> 函数中的 <code>np.where</code></p>
+</blockquote>
+<ul>
+<li><strong>背景</strong>：在训练中，为了不计算某些部分的 Loss，我们会把 label 标记为 <code>-100</code> (代码里的 <code>IGNORE_INDEX</code>)。</li>
+<li><strong>动作</strong>：<ul>
+<li>如果 ID 是 <code>-100</code>，就把它替换成普通的 <code>pad_token_id</code>。</li>
+<li>如果不替换，转换成文字时程序会报错。</li>
+</ul>
+</li>
+</ul>
+<p><strong>Task 6：修正填充位置（一个奇怪的补丁）</strong></p>
+<blockquote>
+<p>代码位置：<code>for i in range(len(preds)): ... np.concatenate</code></p>
+</blockquote>
+<ul>
+<li><strong>动作</strong>：这是一个特殊的处理循环。它检查生成的预测结果，如果 Padding（空白）夹在中间或者位置不对，它尝试把非空白内容移到前面，把空白移到最后。</li>
+<li><strong>目的</strong>：确保解码出来的句子是连贯的，不会被空白符打断。</li>
+</ul>
+<p><strong>Task 7：解码并保存</strong></p>
+<blockquote>
+<p>代码位置：<code>batch_decode</code> 和 <code>writer.write</code></p>
+</blockquote>
+<ul>
+<li><strong>动作</strong>：<ul>
+<li><code>batch_decode</code>：查字典，把数字（如 <code>[392, 211]</code>）变回文字（如 <code>["你好"]</code>）。</li>
+<li><code>json.dumps</code>：把“标准答案（label）”和“模型预测（predict）”打包成 JSON 格式。</li>
+<li>写入 <code>generated_predictions.jsonl</code> 文件。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个文件到底干了啥？</h3>
+<p>如果不用代码，用人话总结这个文件的工作流：</p>
+<ol>
+<li><strong>准备考试</strong>：我是个特级教师，我要给大模型考试。</li>
+<li><strong>发卷子（Prediction Step）</strong>：<ul>
+<li>为了防止作弊和出错，我强制要求试卷左对齐。</li>
+<li>如果题目太长或答案太长，我先剪裁一下纸张大小，让它们能放进机器里。</li>
+</ul>
+</li>
+<li><strong>做题与批改</strong>：<ul>
+<li>让模型做题。</li>
+<li>模型交卷时，往往把“题目+答案”一起写下来了。</li>
+<li><strong>我拿涂改液，把“题目”部分涂掉，只留下“答案”。</strong>（这是最核心的修改）</li>
+</ul>
+</li>
+<li><strong>公布成绩（Save Predictions）</strong>：<ul>
+<li>把模型写的数字编号翻译成中文/英文。</li>
+<li>把其中代表“不用管”的乱码清理干净。</li>
+<li>把“标准答案”和“模型回答”整理成一个 Excel 表（JSONL文件）存到硬盘上，方便人类查看。</li>
+</ul>
+</li>
+</ol>
+<p>现在，你再回头看代码，关注 <code>prediction_step</code> 里的 <code>generated_tokens[:, :prompt_len] = ...</code>，是不是就明白它在干什么了？</p>

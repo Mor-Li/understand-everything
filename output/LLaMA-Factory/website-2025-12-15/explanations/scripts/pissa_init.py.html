@@ -1,0 +1,125 @@
+<h1>scripts/pissa_init.py</h1>
+<p>没问题，这个脚本涉及到了大模型微调中比较前沿的一个概念叫 <strong>PiSSA</strong>。如果直接看代码容易晕，我们把它想象成一个<strong>“做手术”</strong>的过程。</p>
+<p>简单来说，这个脚本的作用是：<strong>把一个完整的大模型，拆分成“瘦身后的主模型”和“PiSSA插件”两部分，以便后续训练效果更好。</strong></p>
+<p>我为你列了一个 <strong>Task To-Do List</strong>，我们将按照这个清单，一步步拆解这段代码在干什么。</p>
+<h3>📋 Task To-Do List (代码执行清单)</h3>
+<ol>
+<li><strong>[准备阶段]</strong> 引入工具包与设置参数</li>
+<li><strong>[加载病人]</strong> 读取原始的大模型（Base Model）</li>
+<li><strong>[制定方案]</strong> 配置 LoRA/PiSSA 参数（决定怎么切分模型）</li>
+<li><strong>[执行手术]</strong> 运行 PiSSA 初始化（核心数学变换）</li>
+<li><strong>[保存结果 A]</strong> 保存被切分出来的“插件”（Adapter/LoRA weights）</li>
+<li><strong>[保存结果 B]</strong> 保存被切分后的“主模型”（Modified Base Model）</li>
+<li><strong>[输出指南]</strong> 告诉用户接下来怎么用这两个文件</li>
+</ol>
+<hr />
+<h3>逐步讲解 (Step-by-Step)</h3>
+<h4>Task 1: [准备阶段] 引入工具包与设置参数</h4>
+<p>代码开头的一堆 import 和 <code>quantize_pissa</code> 函数定义。</p>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>python
+    import fire
+    from peft import LoraConfig, TaskType, get_peft_model
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    # ...
+    def quantize_pissa(model_name_or_path, output_dir, ...):</code></li>
+<li><strong>解释：</strong>
+    这里定义了一个命令行工具。用户运行这个脚本时，需要提供两个核心信息：<ul>
+<li><code>model_name_or_path</code>: 原始模型在哪？</li>
+<li><code>output_dir</code>: 处理好的新模型存哪？</li>
+<li>其他参数（如 <code>lora_rank</code>, <code>pissa_iter</code>）都是控制“手术”精度的参数。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: [加载病人] 读取原始的大模型</h4>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>python
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, ...)
+    model = AutoModelForCausalLM.from_pretrained(model_name_or_path, ...)</code></li>
+<li><strong>解释：</strong>
+    这里把完整的、原始的（比如 Llama-3-8B）模型加载到内存里。此时它还是一个完整的整体。</li>
+</ul>
+<h4>Task 3: [制定方案] 配置 LoRA/PiSSA 参数</h4>
+<p>这是最关键的一步，决定了如何把模型拆开。</p>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>python
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=lora_rank,
+        target_modules=lora_target,
+        # 重点在这里：
+        init_lora_weights="pissa" if pissa_iter == -1 else f"pissa_niter_{pissa_iter}",
+    )</code></li>
+<li><strong>解释：</strong>
+    这里创建了一个配置单。最重要的是 <code>init_lora_weights="pissa..."</code>。<ul>
+<li><strong>普通 LoRA</strong>：是随机初始化一个外挂插件，主模型不动。</li>
+<li><strong>PiSSA</strong>：它使用一种数学方法（SVD，奇异值分解），计算出模型里<strong>最重要</strong>的特征参数。它打算把这些最重要的参数提取出来做成插件，把剩下的留给主模型。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: [执行手术] 运行 PiSSA 初始化</h4>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>python
+    # Init PiSSA model
+    peft_model = get_peft_model(model, lora_config)</code></li>
+<li><strong>解释：</strong>
+    当 <code>get_peft_model</code> 运行时，因为配置了 PiSSA，它会在内存中执行“手术”：<ol>
+<li>找到模型权重的核心特征（主成分）。</li>
+<li>把核心特征<strong>提取</strong>出来，变成 LoRA 适配器（Adapter）。</li>
+<li><strong>修改主模型</strong>：从原模型中减去这些提取出来的特征（这一步是 PiSSA 和普通 LoRA 最大的区别，普通 LoRA 不改主模型）。
+此时，内存里的 <code>peft_model</code> 包含了<strong>修改后的主模型</strong> + <strong>提取出的 Adapter</strong>。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 5: [保存结果 A] 保存被切分出来的“插件”</h4>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>python
+    pissa_dir = os.path.join(output_dir, "pissa_init")
+    # ...
+    setattr(peft_model.peft_config["default"], "init_lora_weights", True) 
+    peft_model.save_pretrained(pissa_dir, safe_serialization=save_safetensors)</code></li>
+<li><strong>解释：</strong>
+    把提取出来的核心参数（PiSSA Adapter）单独保存到一个叫 <code>pissa_init</code> 的文件夹里。这部分以后用来微调，收敛速度会非常快。</li>
+</ul>
+<h4>Task 6: [保存结果 B] 保存被切分后的“主模型”</h4>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>python
+    base_model: PreTrainedModel = peft_model.unload() # 卸载adapter，只留主模型
+    base_model.save_pretrained(output_dir, safe_serialization=save_safetensors)
+    tokenizer.save_pretrained(output_dir)</code></li>
+<li><strong>解释：</strong>
+    <strong>这一步非常重要！</strong> 因为 Task 4 里的手术修改了主模型的权重（Residual Model），所以必须把这个“残差模型”保存下来。<ul>
+<li>如果不保存这个，下次你用原始模型加载 PiSSA 插件，数学上就对不上了（会重复计算或者缺失参数）。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 7: [输出指南] 告诉用户接下来怎么用</h4>
+<ul>
+<li><strong>代码片段：</strong>
+    <code>python
+    print("- Fine-tune this model with:")
+    print(f"model_name_or_path: {output_dir}") # 用新保存的主模型
+    print(f"adapter_name_or_path: {pissa_dir}") # 用新保存的插件
+    print("pissa_init: false") # 以后训练不需要再初始化了
+    print("pissa_convert: true")</code></li>
+<li><strong>解释：</strong>
+    脚本最后打印了一段话，告诉你后续训练（Fine-tune）的时候：<ul>
+<li><strong>主模型</strong>：请加载刚才保存的 <code>output_dir</code>（不是原始模型了！）。</li>
+<li><strong>Adapter</strong>：请加载 <code>pissa_init</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这到底是在干啥？</h3>
+<p>你可以把这个脚本理解为一个<strong>“预处理转换器”</strong>。</p>
+<ul>
+<li><strong>普通 LoRA</strong>：像是给书本贴便利贴（书本内容不变，便利贴是空的，从头开始写）。</li>
+<li><strong>PiSSA</strong>：像是把书本里最重要的几页撕下来（主模型变了），放到一个笔记本里（Adapter），然后我们在笔记本上修改。</li>
+</ul>
+<p><strong>这个脚本就是负责“撕书”和“装订笔记本”的过程。</strong> 运行完这个脚本后，你得到了一个残缺的书（新的 Base Model）和一个写满精华的笔记本（PiSSA Adapter），然后你就可以基于这两个东西开始高效训练了。</p>

@@ -1,0 +1,82 @@
+<h1>src/llmtuner/train/dpo/collator.py</h1>
+<p>这段代码确实看起来有点绕，因为它处理的是<strong>DPO（Direct Preference Optimization，直接偏好优化）</strong>训练中非常具体的数据整理工作。</p>
+<p>简单来说，这个脚本是一个<strong>“数据打包员”（Collator）</strong>。它的工作是在把数据送入显卡（GPU）训练之前，把参差不齐的文本数据整理成整齐的方块（Tensor），并告诉模型：“你要学习哪一部分，忽略哪一部分”。</p>
+<p>为了让你能看懂，我列了一个<strong>“从原料到成品”的 4 步任务清单 (To-Do List)</strong>，我们一步步来拆解。</p>
+<hr />
+<h3>📋 任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>【原料准备】</strong>：理解 DPO 训练需要什么样的“成对”数据。</li>
+<li><strong>【拆分与拼接】</strong>：把“成对”的数据拆开，变成“一长串”输入。</li>
+<li><strong>【统一长度】</strong>：因为句子长短不一，需要填充（Padding）成一样长。</li>
+<li><strong>【划重点】</strong>：制作标签（Labels），告诉模型只计算“回答”部分的损失，忽略“提问”部分。</li>
+</ol>
+<hr />
+<h3>逐步讲解</h3>
+<h4>1. 【原料准备】理解输入数据</h4>
+<p>在 DPO 训练中，每一条数据都是一个“比较级”。
+*   <strong>Prompt</strong>: 提示词（问题）。
+*   <strong>Chosen</strong>: 被选中的回答（好的回答）。
+*   <strong>Rejected</strong>: 被拒绝的回答（坏的回答）。</p>
+<p>代码里的 <code>features</code> 就是一堆这样的字典。</p>
+<h4>2. 【拆分与拼接】(对应 <code>__call__</code> 方法的前半部分)</h4>
+<p>模型一次只能读入一串 token，它不懂什么是“好”什么是“坏”，它只看序列。所以我们需要把数据转换格式。</p>
+<p><strong>代码逻辑：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">concatenated_features</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;chosen_ids&quot;</span><span class="p">,</span> <span class="s2">&quot;rejected_ids&quot;</span><span class="p">):</span> <span class="c1"># 先处理好的，再处理坏的</span>
+    <span class="k">for</span> <span class="n">feature</span> <span class="ow">in</span> <span class="n">features</span><span class="p">:</span>
+        <span class="c1"># ...</span>
+        <span class="c1"># 拼接： 输入 = 问题 + 回答</span>
+        <span class="s2">&quot;input_ids&quot;</span><span class="p">:</span> <span class="n">feature</span><span class="p">[</span><span class="s2">&quot;prompt_ids&quot;</span><span class="p">]</span> <span class="o">+</span> <span class="n">feature</span><span class="p">[</span><span class="n">key</span><span class="p">]</span>
+</code></pre></div>
+
+<p><strong>发生了什么？</strong>
+假设你的 Batch Size 是 2（你有 2 个问题）。
+这个循环会生成 <strong>4</strong> 条数据（2 * N）：
+1.  问题1 + <strong>好</strong>回答
+2.  问题2 + <strong>好</strong>回答
+3.  问题1 + <strong>坏</strong>回答
+4.  问题2 + <strong>坏</strong>回答</p>
+<p><strong>重点</strong>：它把“好数据”全放在前面，把“坏数据”全放在后面。这对后续 DPO 算法计算 Loss 很重要。</p>
+<h4>3. 【统一长度】(对应 <code>self.tokenizer.pad</code>)</h4>
+<p>现在的 4 条数据长短不一。GPU 运算需要矩阵（Matrix），也就是整齐的矩形。</p>
+<p><strong>代码逻辑：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">batch</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">pad</span><span class="p">(</span>
+    <span class="n">concatenated_features</span><span class="p">,</span>
+    <span class="c1"># ...</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p><strong>发生了什么？</strong>
+比如最长的句子是 100 个词，最短的是 50 个。
+这个函数会在短句子的旁边补上“空白符”（Padding Token），让大家全都变成 100 的长度。</p>
+<h4>4. 【划重点】制作标签 (对应 <code>_pad_labels</code> 方法)</h4>
+<p>这是最难懂但也最重要的一步。
+在训练大模型时，我们<strong>不希望</strong>模型去学习“如何复读问题”，我们只希望它学习“如何生成回答”。</p>
+<p>所以，计算 Loss（误差）的时候，我们要把“问题部分”和“补全的空白部分”给<strong>遮住（Mask）</strong>，只保留“回答部分”。</p>
+<p><strong>代码逻辑 (<code>_pad_labels</code>):</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 创建一个全是 -100 的张量（-100 在 PyTorch 里代表“忽略，不计算Loss”）</span>
+<span class="n">padded_tensor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">label_pad_token_id</span> <span class="o">*</span> <span class="n">torch</span><span class="o">.</span><span class="n">ones_like</span><span class="p">(</span><span class="n">feature</span><span class="p">)</span>
+
+<span class="c1"># 找到回答(Answer)的起始和结束位置</span>
+<span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">padding_side</span> <span class="o">==</span> <span class="s2">&quot;left&quot;</span><span class="p">:</span>
+    <span class="n">start</span><span class="p">,</span> <span class="n">end</span> <span class="o">=</span> <span class="n">feature</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span> <span class="o">-</span> <span class="n">answer_len</span><span class="p">,</span> <span class="n">feature</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="n">start</span><span class="p">,</span> <span class="n">end</span> <span class="o">=</span> <span class="n">prompt_len</span><span class="p">,</span> <span class="n">prompt_len</span> <span class="o">+</span> <span class="n">answer_len</span>
+
+<span class="c1"># 只把“回答”部分的真实 Token 填进去，其他地方保持 -100</span>
+<span class="n">padded_tensor</span><span class="p">[</span><span class="n">start</span><span class="p">:</span><span class="n">end</span><span class="p">]</span> <span class="o">=</span> <span class="n">feature</span><span class="p">[</span><span class="n">start</span><span class="p">:</span><span class="n">end</span><span class="p">]</span>
+</code></pre></div>
+
+<p><strong>图解：</strong>
+假设一句话是：<code>[PAD] [PAD] [问题:你好] [回答:你好呀]</code>
+*   <strong>Input IDs</strong>: <code>[0, 0, 101, 202]</code> (模型看到的输入)
+*   <strong>Labels</strong>: <code>[-100, -100, -100, 202]</code> (模型计算 Loss 的目标)</p>
+<p>这里 <code>_pad_labels</code> 就是在做这件事：它利用之前记录的 <code>prompt_len</code> (问题长度) 和 <code>answer_len</code> (回答长度)，精确地计算出哪一段是“回答”，把这段保留，其他全设为 -100。</p>
+<h3>总结</h3>
+<p>这个文件的作用就是把原始的 <strong>(问题, 好回答, 坏回答)</strong> 数据，变成模型训练时需要的张量：</p>
+<ol>
+<li><strong>Input IDs</strong>: <code>[问题+好回答, 问题+坏回答]</code> (并补齐长度)</li>
+<li><strong>Labels</strong>: <code>[忽略问题+好回答, 忽略问题+坏回答]</code> (问题部分设为 -100)</li>
+<li><strong>Attention Mask</strong>: 告诉模型哪些是真实内容，哪些是补齐的空白。</li>
+</ol>
+<p>你看懂了吗？核心就是<strong>拼接数据</strong>然后<strong>制作只针对回答进行学习的标签</strong>。</p>

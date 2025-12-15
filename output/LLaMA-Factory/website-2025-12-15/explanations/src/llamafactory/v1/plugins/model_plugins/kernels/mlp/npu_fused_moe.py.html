@@ -1,0 +1,58 @@
+<h1>src/llamafactory/v1/plugins/model_plugins/kernels/mlp/npu_fused_moe.py</h1>
+<p>这份代码确实涉及了很多底层硬件加速（NPU）和深度学习模型架构（MoE）的概念，乍一看很复杂。</p>
+<p>简单来说，这个文件的作用是：<strong>给 LlamaFactory 加上一个“加速挂”，专门用于在华为昇腾（NPU）芯片上加速“混合专家模型”（MoE）的运行。</strong></p>
+<p>为了让你看懂，我们可以把这个代码要做的事情想象成<strong>“处理一家快递分拣中心（MoE模型）的包裹（数据）”</strong>。</p>
+<p>我为你列了一个 <strong>Task Todo List</strong>，按照代码的逻辑顺序，一步步拆解它在干什么：</p>
+<h3>📋 Task Todo List：MoE 模型加速流水线</h3>
+<h4>✅ Task 1: 准备超级工具 (定义基础算子)</h4>
+<p>在处理包裹之前，我们需要一种比普通计算器更快的工具。
+*   <strong>代码对应：</strong> <code>class GmmFunction</code> 和 <code>class HybridGmmFunction</code>
+*   <strong>这是啥？</strong> 这是自定义的数学运算函数。
+*   <strong>通俗解释：</strong>
+    *   普通的矩阵乘法是一次算一个。
+    *   这里的 <code>Gmm</code> (Grouped Matrix Multiplication) 是<strong>分组矩阵乘法</strong>。
+    *   <strong>场景：</strong> 不同的包裹要发往不同的城市（不同的专家 Expert）。以前要写个循环一个城市一个城市算，现在有了这个工具，可以把所有城市的包裹打包，<strong>一次性</strong>算完。
+    *   它还顺便定义了 <code>backward</code>（反向传播），也就是如果算错了（训练时），怎么把误差传回去修正。</p>
+<h4>✅ Task 2: 设计标准工作流程 (定义通用 MoE 逻辑)</h4>
+<p>有了工具，我们要规定包裹怎么流转。
+*   <strong>代码对应：</strong> <code>class NpuMoeFused</code> -&gt; <code>npu_moe_experts_forward</code>
+*   <strong>步骤拆解：</strong>
+    1.  <strong>分拣 (Permute):</strong> <code>npu_moe_token_permute</code>。把乱序进来的包裹，按照它们要去哪个城市（Expert），重新排队。去北京的站一排，去上海的站一排。
+    2.  <strong>统计 (Histc):</strong> 也就是代码里的 <code>tokens_per_expert</code>。数一下去北京的有多少个，去上海的有多少个。
+    3.  <strong>计算 (Compute):</strong> <code>GmmFunction.apply</code>。调用 Task 1 里的超级工具，一次性处理完所有排好队的包裹（进行神经网络的层运算）。
+    4.  <strong>还原 (Unpermute):</strong> <code>npu_moe_token_unpermute</code>。包裹处理完了，要按照最开始进来的顺序发还给用户，不能乱序。</p>
+<h4>✅ Task 3: 设计特殊客户流程 (针对 Qwen3 模型的逻辑)</h4>
+<p>有些大客户（比如 Qwen3 模型）的包裹结构比较特殊，标准流程处理不了，得单独开个窗口。
+*   <strong>代码对应：</strong> <code>class Qwen3NpuMoeFused</code>
+*   <strong>区别：</strong> Qwen3 的 MoE 结构可能在权重形状或门控逻辑上有点不同。
+*   <strong>步骤：</strong>
+    *   它手动把数据切片 (<code>torch.split</code>)。
+    *   分别计算 Gate（门控）、Up（升维）、Down（降维）三个投影层。
+    *   使用 <code>HybridGmmFunction</code> 来处理这些切分好的数据列表。
+    *   最后同样要把数据还原 (<code>unpermute</code>) 回去。</p>
+<h4>✅ Task 4: 建立花名册 (配置映射表)</h4>
+<p>我们需要一个列表，记下来哪些模型可以用这个加速方案。
+*   <strong>代码对应：</strong> <code>kernel_moe_mapping</code>
+*   <strong>内容：</strong>
+    *   如果是 <code>Qwen3VLMoeForConditionalGeneration</code> 模型，就用 Task 2 的标准流程。
+    *   如果是 <code>Qwen3MoeForCausalLM</code> 模型，就用 Task 3 的特殊流程。</p>
+<h4>✅ Task 5: 执行替换 (应用补丁)</h4>
+<p>这是最后一步，也就是代码真正“干活”的地方。
+*   <strong>代码对应：</strong> <code>class NpuMoEFusedMoEKernel</code> -&gt; <code>apply</code> 方法
+*   <strong>执行逻辑：</strong>
+    1.  <strong>检查环境：</strong> 看看是不是在用 NPU (<code>is_torch_npu_available</code>)。如果不是，直接收工，啥也不干。
+    2.  <strong>检查模型：</strong> 看看当前跑的模型是不是 Task 4 花名册里的模型。
+    3.  <strong>偷天换日 (Monkey Patching)：</strong>
+        *   遍历模型里的所有层。
+        *   如果发现某一层的名字在花名册里（比如 <code>Qwen3MoeSparseMoeBlock</code>）。
+        *   <strong>关键动作：</strong> <code>module.forward = types.MethodType(new_forward_func, module)</code>。
+        *   <strong>意思就是：</strong> 告诉 Python，“以后运行这一层的时候，别用原来那个慢吞吞的函数了，用我刚才写的这个超级加速版函数（Task 2 或 Task 3）”。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件的核心故事是：</p>
+<ol>
+<li><strong>造轮子</strong>：利用华为 NPU 的底层能力，造了一个能批量处理分组数据的算子 (<code>GmmFunction</code>)。</li>
+<li><strong>定流程</strong>：用这个算子重写了 MoE 模型最耗时的部分（排序 -&gt; 计算 -&gt; 还原）。</li>
+<li><strong>做替换</strong>：程序启动时，自动把模型里原本慢的函数，替换成这些快的函数。</li>
+</ol>
+<p>你看懂了吗？它其实就是一个<strong>针对特定硬件的性能优化补丁包</strong>。</p>

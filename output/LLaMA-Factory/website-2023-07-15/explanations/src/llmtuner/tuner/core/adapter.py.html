@@ -1,0 +1,92 @@
+<h1>src/llmtuner/tuner/core/adapter.py</h1>
+<p>这份代码的核心功能是<strong>“为大模型穿装备”</strong>。</p>
+<p>简单来说，当你想要微调（训练）一个大模型时，你不能直接拿原始模型就开练，你需要根据你的微调方式（全量微调、冻结微调、还是LoRA微调）来对模型进行“初始化”和“改造”。</p>
+<p>这个函数 <code>init_adapter</code> 就是那个<strong>改造车间的主管</strong>。</p>
+<p>为了让你听懂，我把这个函数的执行逻辑拆解成一个 <strong>“待办清单 (To-Do List)”</strong>。代码运行的时候，就是在按顺序执行这个清单上的任务。</p>
+<hr />
+<h3>🛠️ 任务清单：初始化模型适配器 (Init Adapter)</h3>
+<h4>✅ 任务 1：安全检查 (Safety Check)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>if finetuning_args.finetuning_type == "none" and is_trainable:</code></li>
+<li><strong>主管说</strong>：“如果你想训练（<code>is_trainable</code> 是真的），但你又告诉我微调类型是 'none'（啥都不干），那你是在逗我吗？”</li>
+<li><strong>动作</strong>：如果发现这种矛盾，直接报错（抛出 ValueError）。</li>
+</ul>
+<hr />
+<h4>✅ 任务 2：处理“全量微调” (Full Fine-tuning)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>if finetuning_args.finetuning_type == "full":</code></li>
+<li><strong>场景</strong>：你是土豪，显存巨大，要把模型所有参数都重新算一遍。</li>
+<li><strong>主管说</strong>：“好，既然要全量练，为了保证计算精度和稳定性，把整个模型的数据格式转成 <code>float32</code>。”</li>
+<li><strong>动作</strong>：<code>model = model.float()</code>。</li>
+</ul>
+<hr />
+<h4>✅ 任务 3：处理“冻结微调” (Freeze Fine-tuning)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>if finetuning_args.finetuning_type == "freeze":</code></li>
+<li><strong>场景</strong>：你想省点力气，把模型大部分锁住不动，只练其中的几层。</li>
+<li><strong>主管说</strong>：“收到。我会遍历模型所有的参数：”<ol>
+<li><strong>上锁</strong>：如果这个参数的名字不在你想练的名单里（<code>trainable_layers</code>），我就把它锁死（<code>requires_grad_(False)</code>），不让它更新。</li>
+<li><strong>解锁</strong>：如果这个参数是你要练的，我就把它转成 <code>float32</code> 准备计算。</li>
+<li><strong>加载旧进度</strong>：如果你给了我一个存档路径（<code>checkpoint_dir</code>），我会把之前的训练参数加载进来。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h4>✅ 任务 4：处理“LoRA微调” (LoRA Fine-tuning) —— <strong>这是最重要的一步</strong></h4>
+<ul>
+<li><strong>代码位置</strong>：<code>if finetuning_args.finetuning_type == "lora":</code></li>
+<li><strong>场景</strong>：目前最主流的微调方式。不改动原模型，而是在旁边挂一个“外挂包”来训练。</li>
+</ul>
+<p>这里逻辑比较复杂，主管把它分成了三个子步骤：</p>
+<ul>
+<li>
+<p><strong>4.1 检查存档 (Check Checkpoints)</strong></p>
+<ul>
+<li>如果你提供了存档路径（<code>checkpoint_dir</code>），主管会检查里面有没有 LoRA 的权重文件。如果没有，说明你指错路了，报错。</li>
+</ul>
+</li>
+<li>
+<p><strong>4.2 合并旧外挂 (Merge Old Adapters)</strong></p>
+<ul>
+<li><strong>逻辑</strong>：假设你之前已经练过好几次 LoRA 了（比如 v1, v2）。</li>
+<li><strong>主管说</strong>：“为了继续往下练，或者为了推理速度快，我先把之前的 LoRA 外挂直接<strong>融合</strong>进主模型里去（<code>merge_and_unload</code>）。”</li>
+<li>这就好比：你之前给车贴了个贴纸，现在为了贴新贴纸，先把旧贴纸的图案直接喷漆喷到车身上，让它变成车的一部分。</li>
+</ul>
+</li>
+<li>
+<p><strong>4.3 决定是“继续练”还是“重新练”</strong></p>
+<ul>
+<li><strong>情况 A：继续练 (Resume)</strong><ul>
+<li>如果你有存档，主管会加载最新的那个 LoRA 权重，并告诉模型：“在这个基础上继续算”。</li>
+</ul>
+</li>
+<li><strong>情况 B：从头练 (New Training)</strong><ul>
+<li><strong>代码</strong>：<code>if is_trainable and latest_checkpoint is None:</code></li>
+<li><strong>主管说</strong>：“没发现旧存档，看来是要重新开始。给我拿一张新的‘白纸’来。”</li>
+<li><strong>动作</strong>：创建一个新的 LoRA 配置 (<code>LoraConfig</code>)，设置好秩（Rank）、Alpha值、Dropout等参数，然后用 <code>get_peft_model</code> 把这个新的外挂挂到模型上。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h4>✅ 任务 5：最终确认 (Final Report)</h4>
+<ul>
+<li><strong>代码位置</strong>：最后几行</li>
+<li><strong>主管说</strong>：“如果刚才加载了任何存档，我现在记录一下日志，告诉用户我加载了哪些文件。”</li>
+<li><strong>动作</strong>：打印 Log 信息。</li>
+<li><strong>结束</strong>：把处理好的 <code>model</code> 交还给你。</li>
+</ul>
+<hr />
+<h3>总结一下</h3>
+<p>这段代码就像是<strong>赛车进站维修</strong>：</p>
+<ol>
+<li><strong>Full</strong>：把整辆车拆了重新组装（全量微调）。</li>
+<li><strong>Freeze</strong>：把车身焊死，只允许换轮胎和方向盘（冻结微调）。</li>
+<li><strong>LoRA</strong>：<ul>
+<li>如果有旧的改装件，先把旧改装件焊死在车上（Merge）。</li>
+<li>如果是新比赛，就给车加装一个新的外挂涡轮（Init LoRA），只训练这个涡轮，不动车身。</li>
+</ul>
+</li>
+</ol>
+<p>现在再回头看代码，是不是清晰一点了？</p>

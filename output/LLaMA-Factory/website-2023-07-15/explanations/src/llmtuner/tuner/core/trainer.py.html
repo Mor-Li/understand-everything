@@ -1,0 +1,81 @@
+<h1>src/llmtuner/tuner/core/trainer.py</h1>
+<p>这段代码确实涉及很多底层逻辑，如果没接触过 HuggingFace 的 <code>Trainer</code> 或者大模型微调（PEFT/LoRA），看起来会很晕。</p>
+<p>你可以把这个 <code>PeftTrainer</code> 类想象成一个<strong>“大模型装修工”</strong>。普通的 <code>Seq2SeqTrainer</code> 是一个通用的装修工，而这个类是专门为了<strong>省钱装修（参数高效微调/PEFT）</strong>而定制的。</p>
+<p>为了让你看懂，我把它拆解成一份<strong>“装修工的工作清单 (To-Do List)”</strong>，我们一步步来看它是怎么工作的。</p>
+<hr />
+<h3>📋 装修工 (PeftTrainer) 的任务清单</h3>
+<h4>Task 1: 报到与准备 (Initialization)</h4>
+<p><strong>对应代码：</strong> <code>__init__</code> 和 <code>_remove_log</code></p>
+<ul>
+<li><strong>我是谁？</strong> 我继承自 <code>Seq2SeqTrainer</code>（HuggingFace 的标准训练器）。这意味着原本训练器能干的事（比如安排训练进度、记录日志）我都能干。</li>
+<li><strong>我要干啥？</strong> 我在入职（初始化）的时候，除了拿标准的工具包（<code>kwargs</code>），我还专门拿了一份<strong>“微调施工图纸”</strong> (<code>finetuning_args</code>)。</li>
+<li><strong>清理现场：</strong> 在开工前，我会检查一下输出目录里有没有旧的日志文件（<code>trainer_log.jsonl</code>）。如果有，我就把它删了，免得记混了（<code>_remove_log</code>）。</li>
+</ul>
+<h4>Task 2: 收工存档 (Saving Model)</h4>
+<p><strong>对应代码：</strong> <code>_save</code> <strong>（这是最核心的部分）</strong></p>
+<p>普通的装修工收工时，是把整栋房子（整个模型）都打包存起来。但我这个“省钱装修工”不一样，我得看情况存东西。</p>
+<ul>
+<li>
+<p><strong>步骤 2.1：剥洋葱</strong></p>
+<ul>
+<li>代码：<code>model = unwrap_model(self.model)</code></li>
+<li>解释：先把模型外面包裹的并行计算、加速的外壳剥掉，拿到最核心的模型本体。</li>
+</ul>
+</li>
+<li>
+<p><strong>步骤 2.2：检查有没有“奖励探头” (Value Head)</strong></p>
+<ul>
+<li>代码：<code>if hasattr(model, "pretrained_model"): ...</code></li>
+<li>解释：如果是做 RLHF（像 ChatGPT 那样的人类反馈强化学习），模型上会多长一个“脑袋”（Value Head）。如果发现了它，我得把它单独存到一个叫 <code>value_head.bin</code> 的文件里。</li>
+</ul>
+</li>
+<li>
+<p><strong>步骤 2.3：根据装修类型存档 (关键！)</strong></p>
+<ul>
+<li><strong>情况 A：如果是 LoRA (贴壁纸模式)</strong><ul>
+<li>代码：<code>if self.finetuning_args.finetuning_type == "lora": ...</code></li>
+<li>解释：LoRA 只是在原模型上挂了一些小参数（相当于只贴了壁纸）。<strong>我只保存这些“壁纸”（Adapter）</strong>，不保存原来的房子（底座模型）。这样存下来的文件很小。</li>
+</ul>
+</li>
+<li><strong>情况 B：如果是全量微调/冻结微调 (拆墙重装模式)</strong><ul>
+<li>代码：<code>else: ...</code></li>
+<li>解释：这种情况下，模型大改了。我必须把<strong>整个大模型</strong>的所有参数都存下来。同时为了兼容性，我会临时开启 <code>use_cache</code> 配置，存完再关掉。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>步骤 2.4：保存说明书</strong></p>
+<ul>
+<li>解释：最后，我会把这次训练的参数配置写到 json 文件里，方便你下次查阅。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 恢复最佳状态 (Loading Best Model)</h4>
+<p><strong>对应代码：</strong> <code>_load_best_model</code></p>
+<p>训练过程中，我们会评估哪个时间点的模型效果最好。训练结束后，我需要把那个“最佳状态”找回来。</p>
+<ul>
+<li><strong>步骤 3.1：根据装修类型回档</strong><ul>
+<li><strong>情况 A：如果是 LoRA</strong><ul>
+<li>代码：<code>backbone_model.load_adapter(...)</code></li>
+<li>解释：我找到那个最佳时间点的存档，把那时候的“壁纸”（Adapter）重新贴回到模型上。</li>
+<li>如果有“奖励探头”（Value Head），我也要把那个探头的参数读回来。</li>
+</ul>
+</li>
+<li><strong>情况 B：如果是全量微调</strong><ul>
+<li>代码：<code>load_trainable_params(...)</code></li>
+<li>解释：直接把那个最佳时间点的所有参数覆盖回来。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结一下文中的核心观点</h3>
+<p>这段代码其实只解决了<strong>一个核心痛点</strong>：</p>
+<p><strong>HuggingFace 原生的 <code>Trainer</code> 不知道什么是 LoRA。</strong></p>
+<p>如果你用原生 Trainer 去存 LoRA 模型，它可能会傻乎乎地把整个几十 GB 的大模型都存下来，或者存错东西。</p>
+<p>这个 <code>PeftTrainer</code> 重写了 <code>_save</code> 和 <code>_load_best_model</code>，就是为了告诉程序：</p>
+<blockquote>
+<p>"嘿，如果我们在做 LoRA 微调，<strong>只存那几百 MB 的增量参数</strong>就好，别把底座模型也存了；但在加载的时候，记得要把这几百 MB 的参数<strong>挂载</strong>回底座模型上。"</p>
+</blockquote>

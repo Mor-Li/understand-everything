@@ -1,0 +1,127 @@
+<h1>src/llamafactory/train/mca/workflow.py</h1>
+<p>这份代码文件 <code>workflow.py</code> 位于 <code>src/llamafactory/train/mca/</code> 目录下，它的核心作用是<strong>作为一座“桥梁”</strong>。</p>
+<p>它连接了 <strong>LLaMA-Factory</strong>（易用的微调框架）和 <strong>Megatron-Core (MCA)</strong>（NVIDIA 开发的高性能、大规模分布式训练框架）。</p>
+<p>简单来说，这个文件的目的是：<strong>让 LLaMA-Factory 能够调用 Megatron-Core 的底层能力来进行预训练（PT）、指令微调（SFT）和偏好优化（DPO）。</strong></p>
+<p>为了让你看懂，我把它拆解成一个<strong>“任务清单 (To-Do List)”</strong>，然后逐个任务给你讲解代码在干什么。</p>
+<hr />
+<h3>📋 任务清单 (Task To-Do List)</h3>
+<p>想象你是一个负责训练大模型的项目经理，要运行这个脚本，你需要按顺序完成以下任务：</p>
+<ol>
+<li><strong>[环境检查]</strong>：确认安装了高性能引擎（mcore_adapter）。</li>
+<li><strong>[工具准备]</strong>：准备好分词器（Tokenizer）和数据处理模板。</li>
+<li><strong>[数据预处理]</strong>：<ul>
+<li>加载数据集。</li>
+<li><strong>关键动作</strong>：对数据长度做特殊处理（错位切割）。</li>
+<li><strong>关键动作</strong>：对输入数据做“左移/右移”操作（为了预测下一个token）。</li>
+</ul>
+</li>
+<li><strong>[模型加载]</strong>：检查模型是否支持，并加载 Megatron 版本的模型结构。</li>
+<li><strong>[选择训练模式]</strong>：<ul>
+<li><strong>任务 A (run_pt)</strong>：跑预训练（Pre-Training）。</li>
+<li><strong>任务 B (run_sft)</strong>：跑指令微调（Supervised Fine-Tuning），含多模态特殊处理。</li>
+<li><strong>任务 C (run_dpo)</strong>：跑偏好优化（DPO），需要加载参考模型。</li>
+</ul>
+</li>
+<li><strong>[开始训练]</strong>：启动训练器，保存模型，画损失函数图。</li>
+</ol>
+<hr />
+<h3>🚀 逐步详细讲解</h3>
+<p>下面我按照上面的清单，结合代码给你讲讲它具体是怎么实现的。</p>
+<h4>1. 环境检查 (Check Environment)</h4>
+<p>代码开头有一段检查：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="ow">not</span> <span class="n">is_mcore_adapter_available</span><span class="p">():</span>
+    <span class="k">raise</span> <span class="ne">ImportError</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>含义</strong>：因为这是专门针对 Megatron-Core 的流程，如果你的环境里没装 <code>mcore-adapter</code> 这个包，程序直接报错退出。这是为了防止你用错误的配置跑代码。</li>
+</ul>
+<h4>2. 工具准备 (Prepare Tools)</h4>
+<p>在每个 <code>run_xxx</code> 函数的开头，都有类似的代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">tokenizer_module</span> <span class="o">=</span> <span class="n">load_tokenizer</span><span class="p">(</span><span class="n">model_args</span><span class="p">)</span>
+<span class="n">tokenizer</span> <span class="o">=</span> <span class="n">tokenizer_module</span><span class="p">[</span><span class="s2">&quot;tokenizer&quot;</span><span class="p">]</span>
+<span class="n">template</span> <span class="o">=</span> <span class="n">get_template_and_fix_tokenizer</span><span class="p">(</span><span class="n">tokenizer</span><span class="p">,</span> <span class="n">data_args</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>含义</strong>：加载分词器（把文字变成数字的工具）和对话模板（比如 User/Assistant 的格式）。这是所有训练的基础。</li>
+</ul>
+<h4>3. 数据预处理 (Data Pre-processing) - <strong>核心难点</strong></h4>
+<p>这里有两个非常细节的处理逻辑，是这段代码的精华：</p>
+<p><strong>A. 长度的小把戏 (<code>cutoff_len</code>)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">data_args</span><span class="o">.</span><span class="n">cutoff_len</span> <span class="o">+=</span> <span class="mi">1</span>
+<span class="n">dataset_module</span> <span class="o">=</span> <span class="n">get_dataset</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="n">data_args</span><span class="o">.</span><span class="n">cutoff_len</span> <span class="o">-=</span> <span class="mi">1</span>
+</code></pre></div>
+
+<ul>
+<li><strong>为什么？</strong> 训练大模型是“预测下一个字”。如果你想要训练长度为 1024 的序列，你实际需要 1025 个 token。前 1024 个做输入，后 1024 个（从第2个开始到第1025个）做答案。</li>
+<li><strong>操作</strong>：所以代码先偷偷把截断长度 +1，加载完数据后，再把参数改回来。</li>
+</ul>
+<p><strong>B. 数据的错位处理 (<code>_data_collator_wrapper</code>)</strong>
+代码定义了一个 <code>_data_collator_wrapper</code> 函数：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">feature</span><span class="p">[</span><span class="s2">&quot;labels&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">feature</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">][</span><span class="mi">1</span><span class="p">:]</span>  <span class="c1"># 标签是输入的后一位</span>
+<span class="n">feature</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">feature</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">][:</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="c1"># 输入去掉最后一位</span>
+</code></pre></div>
+
+<ul>
+<li><strong>含义</strong>：这是标准的 Causal Language Modeling（因果语言模型）处理。<ul>
+<li><strong>输入</strong>：<code>A B C D</code></li>
+<li><strong>标签</strong>：<code>B C D E</code></li>
+<li>Megatron-Core 可能需要我们在送入模型前手动做好这个切分，而普通的 HuggingFace 模型有时是在模型内部做的。这里显式地处理了数据的“错位”。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 模型加载 (Load Model)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">_check_model_support</span><span class="p">(</span><span class="n">model_args</span><span class="p">)</span>
+<span class="n">model</span> <span class="o">=</span> <span class="n">AutoModel</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">training_args</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>含义</strong>：<ol>
+<li>先检查你的模型（比如 Llama3, Qwen2）是否在 MCA 的支持列表里。不支持就报错。</li>
+<li>使用 <code>mcore_adapter.models.AutoModel</code> 加载模型。注意，这里用的不是 transformers 的 AutoModel，而是适配了 Megatron 分布式并行的版本。</li>
+</ol>
+</li>
+</ul>
+<h4>5. 选择训练模式 (Training Modes)</h4>
+<p>文件里定义了三个主要函数，对应三种训练阶段：</p>
+<p><strong>任务 A: <code>run_pt</code> (预训练)</strong>
+*   <strong>特点</strong>：最简单。
+*   <strong>流程</strong>：加载数据 -&gt; 包装数据整理器（Collator） -&gt; 启动 <code>McaTrainer</code> -&gt; 训练并保存。</p>
+<p><strong>任务 B: <code>run_sft</code> (指令微调)</strong>
+*   <strong>特点</strong>：处理问答数据，且包含多模态（视觉）模型的特殊逻辑。
+*   <strong>多模态冻结逻辑</strong>：
+    <code>python
+    if getattr(model.config, "hf_model_type", None) in ["qwen2_vl", "qwen2_5_vl"]:
+        # ... 冻结 vision_tower (看图的眼睛)
+        # ... 冻结 projector (连接眼睛和大脑的神经)
+        # ... 冻结 language_model (大脑)</code>
+    这段代码专门针对 Qwen2-VL 系列模型。在微调时，用户可能只想训练其中的一部分（比如只练语言模型，不练视觉部分），这里根据参数把不需要训练的层锁住（<code>requires_grad_(False)</code>）。</p>
+<p><strong>任务 C: <code>run_dpo</code> (偏好优化)</strong>
+*   <strong>特点</strong>：需要两个模型（当前模型 + 参考模型）。
+*   <strong>逻辑</strong>：
+    <code>python
+    if finetuning_args.use_ref_model:
+        # 复制一个模型作为 referee (裁判/参考)
+        ref_model = AutoModel.from_config(ref_config)</code>
+    DPO 算法需要对比“新模型生成的概率”和“老模型生成的概率”，所以这里加载了一个 <code>ref_model</code>。
+*   <strong>训练器</strong>：使用的是 <code>McaDPOTrainer</code>，专门用于处理 DPO 的损失函数。</p>
+<h4>6. 开始训练与收尾 (Train &amp; Plot)</h4>
+<p>在每个函数的最后：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">trainer</span><span class="o">.</span><span class="n">train</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="n">trainer</span><span class="o">.</span><span class="n">save_model</span><span class="p">()</span>
+<span class="n">plot_loss</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>含义</strong>：<ol>
+<li><strong>Train</strong>：开始在这个高性能分布式框架上跑训练。</li>
+<li><strong>Save</strong>：保存训练好的权重。</li>
+<li><strong>Plot</strong>：如果是在主进程（process_zero），画出 Loss 曲线图，让你直观看到模型有没有变聪明。</li>
+</ol>
+</li>
+</ul>
+<h3>总结</h3>
+<p><strong>一句话概括：</strong>
+这个文件是 LLaMA-Factory 的<strong>“Megatron-Core 插件”</strong>。它负责把数据切好（错位处理）、把模型加载好（适配分布式）、并根据你是要预训练、微调还是DPO，选择正确的流程启动高性能训练。</p>

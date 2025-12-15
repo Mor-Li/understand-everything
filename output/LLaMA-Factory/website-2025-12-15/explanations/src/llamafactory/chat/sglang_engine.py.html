@@ -1,0 +1,68 @@
+<h1>src/llamafactory/chat/sglang_engine.py</h1>
+<p>这份代码确实包含了很多底层细节，如果直接看容易晕。简单来说，这个文件的作用是 <strong>让 LlamaFactory 能够使用 SGLang 这个高性能推理引擎来跑大模型</strong>。</p>
+<p>你可以把 LlamaFactory 想象成一个“总指挥”，而 SGLang 是一个“高性能计算器”。这个文件就是连接两者的“翻译官”兼“操作员”。</p>
+<p>为了让你看懂，我把这个文件的逻辑拆解成一个 <strong>Task Todo List（任务清单）</strong>。想象你就是这个程序，你需要按顺序完成以下任务：</p>
+<h3>任务清单 (Task Todo List)</h3>
+<h4>✅ Task 1: 启动后台服务 (初始化阶段)</h4>
+<p><strong>代码位置：</strong> <code>__init__</code> 方法
+<strong>核心逻辑：</strong>
+传统的代码是直接在 Python 里加载模型跑，但 SGLang 比较特殊，它喜欢把自己作为一个 <strong>HTTP 服务器</strong> 跑起来。
+1.  <strong>准备启动命令</strong>：程序会拼凑一串命令行指令，比如 <code>python3 -m sglang.launch_server --model-path ...</code>。
+    *   它会配置模型路径、显存占用、多卡并行 (TP size) 等参数。
+    *   <em>代码对应：</em> <code>launch_cmd = [...]</code> 那一段。
+2.  <strong>启动子进程</strong>：使用 Python 的 <code>subprocess</code> 在后台悄悄运行这个命令。
+    *   <em>代码对应：</em> <code>launch_server_cmd(launch_cmd)</code>。
+3.  <strong>等待就绪</strong>：程序不能马上往下走，必须不断 Ping 这个服务器（<code>http://localhost:端口</code>），直到它回答“我准备好了”。
+    *   <em>代码对应：</em> <code>wait_for_server(self.base_url...)</code>。</p>
+<blockquote>
+<p><strong>通俗解释：</strong> 就像你要开一家餐厅（推理服务），你得先去后厨把炉灶点着（启动 Server），等厨师说“火生好了”（Wait for server），你才能开始接客（处理请求）。</p>
+</blockquote>
+<h4>✅ Task 2: 接收并处理用户的输入 (预处理阶段)</h4>
+<p><strong>代码位置：</strong> <code>_generate</code> 方法的前半部分
+<strong>核心逻辑：</strong>
+用户发来的是“你好”这样的文字，或者包含图片。SGLang 看不懂这些，它只认数字（Token IDs）。
+1.  <strong>处理多模态</strong>：如果输入里有图片、视频，需要把它们转换成占位符（比如 <code>&lt;image&gt;</code>）。
+2.  <strong>应用模板</strong>：给用户的文字加上对话模板（比如 <code>&lt;|user|&gt;你好&lt;|assistant|&gt;</code>）。
+3.  <strong>转成数字</strong>：使用 Tokenizer 把处理后的文本变成一串数字 ID (<code>prompt_ids</code>)。
+    *   <em>代码对应：</em> <code>self.template.encode_oneturn(...)</code>。</p>
+<blockquote>
+<p><strong>通俗解释：</strong> 客人点菜说“我要那个红色的鱼”，服务员（你）得把它翻译成后厨听得懂的代码“A03号菜，微辣”。</p>
+</blockquote>
+<h4>✅ Task 3: 组装参数并发送请求 (核心交互阶段)</h4>
+<p><strong>代码位置：</strong> <code>_generate</code> 方法的中间部分
+<strong>核心逻辑：</strong>
+现在有了输入的数字 ID，还需要告诉 SGLang 怎么生成（温度是多少？要生成多长？）。
+1.  <strong>打包参数</strong>：把 <code>temperature</code>, <code>top_p</code>, <code>max_new_tokens</code> 等参数打包成一个字典 <code>sampling_params</code>。
+2.  <strong>发送 HTTP 请求</strong>：这是最关键的一步。程序不再自己算模型了，而是用 <code>requests.post</code> 发送一个 JSON 包给 Task 1 启动的那个本地服务器。
+    *   <em>代码对应：</em> <code>requests.post(f"{self.base_url}/generate", ...)</code>。</p>
+<blockquote>
+<p><strong>通俗解释：</strong> 服务员（你）把写好的点菜单通过传菜口（HTTP POST）递给后厨（SGLang Server），然后站在那里等菜出来。</p>
+</blockquote>
+<h4>✅ Task 4: 接收并流式输出结果 (响应阶段)</h4>
+<p><strong>代码位置：</strong> <code>_generate</code> 中的 <code>stream_request</code> 和 <code>stream_chat</code>
+<strong>核心逻辑：</strong>
+SGLang 生成字是一点一点吐出来的（Streaming）。
+1.  <strong>监听数据流</strong>：通过 <code>response.iter_lines()</code> 监听服务器返回的数据。
+2.  <strong>逐步解析</strong>：每次收到一点数据（chunk），就解析成 JSON，提取出新生成的文字。
+3.  <strong>Yield 出去</strong>：把生成的字通过 <code>yield</code> 返还给 LlamaFactory 的上层界面，这样用户就能看到字一个个蹦出来。</p>
+<blockquote>
+<p><strong>通俗解释：</strong> 后厨每做好一道菜（生成一个片段），你就赶紧端给客人，而不是等满汉全席都做好了才端上去。</p>
+</blockquote>
+<h4>✅ Task 5: 打扫卫生 (清理阶段)</h4>
+<p><strong>代码位置：</strong> <code>_cleanup_server</code> 和 <code>atexit</code>
+<strong>核心逻辑：</strong>
+当程序结束或者报错时，不能把那个后台的 SGLang 服务器留在那里占显存。
+1.  <strong>注册退出函数</strong>：在启动时就告诉系统，如果我挂了，一定要运行清理函数。
+    *   <em>代码对应：</em> <code>atexit.register(self._cleanup_server)</code>。
+2.  <strong>杀掉进程</strong>：找到刚才启动的那个子进程，把它强制关闭。</p>
+<blockquote>
+<p><strong>通俗解释：</strong> 餐厅打烊了，必须要把后厨的火关掉，把厨师赶回家，不能让他们空耗煤气（显存）。</p>
+</blockquote>
+<hr />
+<h3>总结</h3>
+<p>这个脚本其实就是一个 <strong>Client（客户端）</strong>。
+*   它不负责具体的矩阵乘法运算。
+*   它负责 <strong>启动</strong> 一个 Server。
+*   它负责把数据 <strong>发给</strong> 那个 Server。
+*   它负责把结果 <strong>拿回来</strong>。</p>
+<p>之所以这么麻烦，是因为 SGLang 作为一个独立的推理引擎，性能非常强（吞吐量高），但它设计上就是作为一个独立服务运行的。LlamaFactory 通过这种方式“借用”了它的能力。</p>

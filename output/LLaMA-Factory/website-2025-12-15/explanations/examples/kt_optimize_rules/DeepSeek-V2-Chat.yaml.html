@@ -1,0 +1,86 @@
+<h1>examples/kt_optimize_rules/DeepSeek-V2-Chat.yaml</h1>
+<p>这份文件其实是一份 <strong>“改装说明书”</strong>。</p>
+<p>你可以把 DeepSeek-V2 模型想象成一辆原厂出产的<strong>赛车</strong>。虽然它能跑，但可能太重了（显存占用大）或者在某些跑道上不够快。</p>
+<p>这个 <code>.yaml</code> 文件的作用，就是告诉 <code>ktransformers</code> 这个软件：<strong>“把这辆车的哪些原厂零件拆下来，换成我们特制的、更强或者更省油的改装零件。”</strong></p>
+<p>为了让你听懂，我把这个文件拆解成一个 <strong>“改装任务清单 (Todo List)”</strong>，我们一步一步来看它是怎么“动手术”的。</p>
+<hr />
+<h3>核心逻辑：Match（找零件）与 Replace（换零件）</h3>
+<p>在开始清单之前，你只需要记住这个文件的唯一逻辑：
+*   <strong>Match (匹配):</strong> 找到原模型里的某个部件（比如发动机、轮胎）。
+*   <strong>Replace (替换):</strong> 把它换成 <code>ktransformers</code> 提供的特殊部件（比如省油发动机、防滑轮胎），并指定它是在 <strong>CPU</strong> 上跑还是在 <strong>GPU (CUDA)</strong> 上跑。</p>
+<hr />
+<h3>🛠️ 改装任务清单 (Task Todo List)</h3>
+<h4>Task 1: 升级“导航系统” (RoPE 位置编码)</h4>
+<ul>
+<li><strong>原文对应:</strong> 第 1 段 (<code>DeepseekV2YarnRotaryEmbedding</code>)</li>
+<li><strong>在做什么:</strong> 模型需要知道每个字的位置（位置编码）。</li>
+<li><strong>改装动作:</strong> 把原厂的位置编码器，换成 <code>ktransformers</code> 优化过的版本。</li>
+<li><strong>硬件安排:</strong> 无论是“预热”（Prefill）还是“生成”（Generate），都放在显卡 (<strong>CUDA</strong>) 上算，因为这部分计算量小，显卡算得快。</li>
+</ul>
+<h4>Task 2: 强化“肌肉组织” (线性层 Linear Layers)</h4>
+<ul>
+<li><strong>原文对应:</strong> 第 2 段 (<code>torch.nn.Linear</code>)</li>
+<li><strong>在做什么:</strong> 这是模型里数量最多的普通计算层（除去特殊的注意力层）。</li>
+<li><strong>改装动作:</strong> 只要名字匹配正则表达式（即普通的线性层），就换成 <code>KTransformersLinear</code>。</li>
+<li><strong>硬件安排:</strong><ul>
+<li>全部放在显卡 (<strong>CUDA</strong>) 上。</li>
+<li><strong>重点:</strong> 生成阶段使用 <code>KLinearMarlin</code>。这是一个经过<strong>量化</strong>（压缩）优化的算子，速度极快，专门用来加速生成的。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 处理“输出口” (LM Head)</h4>
+<ul>
+<li><strong>原文对应:</strong> 第 3 段 (<code>lm_head</code>)</li>
+<li><strong>在做什么:</strong> 这是模型最后吐出单词的那一层。</li>
+<li><strong>改装动作:</strong> 同样换成优化过的线性层。</li>
+<li><strong>硬件安排:</strong> 放在显卡 (<strong>CUDA</strong>) 上，确保最后输出不卡顿。</li>
+</ul>
+<h4>Task 4: ⭐ 核心手术：改造“专家大脑” (MoE 混合专家)</h4>
+<ul>
+<li><strong>原文对应:</strong> 第 4、5 段 (<code>DeepseekV2MoE</code> 和 <code>mlp.experts</code>)</li>
+<li><strong>这是整个文件最关键的地方！</strong></li>
+<li><strong>背景:</strong> DeepSeek-V2 是一个 MoE 模型，它有几百个“专家”（Experts），体积非常大，普通显卡根本装不下。</li>
+<li><strong>改装动作 (分两步):</strong><ol>
+<li><strong>外壳:</strong> 把 MoE 的管理层换成 <code>KDeepseekV2MoE</code>。</li>
+<li><strong>专家本人:</strong> 把具体的专家网络 (<code>experts</code>) 换成 <code>KTransformersExperts</code>。</li>
+</ol>
+</li>
+<li><strong>硬件安排 (精髓所在):</strong><ul>
+<li><strong>Prefill (阅读提示词时):</strong> 用 <strong>CUDA (显卡)</strong>。因为这时候是一次性处理很多字，显卡并行能力强。</li>
+<li><strong>Generate (一个字一个字蹦时):</strong> 用 <strong>CPU</strong> (<code>generate_device: "cpu"</code>)！</li>
+<li><strong>Out Device:</strong> 算完的结果再扔回 <strong>CUDA</strong>。</li>
+</ul>
+</li>
+<li><strong>为什么这么做？</strong> 这就是所谓的“CPU/GPU 异构计算”。因为专家模型太大了，显存放不下，所以在生成时，把庞大的专家数据放在内存里，用 CPU 跑。虽然比纯显卡慢，但能让你在消费级显卡上跑起来这个巨无霸模型。</li>
+</ul>
+<h4>Task 5: 优化“注意力机制” (Self Attention)</h4>
+<ul>
+<li><strong>原文对应:</strong> 第 6 段 (<code>self_attn</code>)</li>
+<li><strong>在做什么:</strong> 这是模型理解上下文（比如“苹果”是指水果还是手机）的关键部分。DeepSeek 使用了 MLA 技术。</li>
+<li><strong>改装动作:</strong> 换成 <code>KDeepseekV2Attention</code>。</li>
+<li><strong>硬件安排:</strong> 全程在显卡 (<strong>CUDA</strong>) 上，保证核心思考速度。</li>
+</ul>
+<h4>Task 6: 整体架构调整 (Model)</h4>
+<ul>
+<li><strong>原文对应:</strong> 第 7 段 (<code>^model$</code>)</li>
+<li><strong>在做什么:</strong> 模型的整体容器。</li>
+<li><strong>改装动作:</strong> 换成 <code>KDeepseekV2Model</code>。</li>
+<li><strong>细节:</strong> 设置了一个阈值参数，用于控制层级预填充的策略（这里设为0，主要涉及内存管理）。</li>
+</ul>
+<h4>Task 7: 这里的“入口”最省钱 (Embed Tokens)</h4>
+<ul>
+<li><strong>原文对应:</strong> 最后一段 (<code>embed_tokens</code>)</li>
+<li><strong>在做什么:</strong> 把你输入的文字转换成数字向量的第一层。</li>
+<li><strong>改装动作:</strong> 标记为 <code>default</code>（默认），但指定了设备。</li>
+<li><strong>硬件安排:</strong> 强制放在 <strong>CPU</strong> 上。</li>
+<li><strong>为什么？</strong> 这一层体积特别大（词表很大），但计算量极小。把它扔在内存（CPU）里，可以省下好几个 GB 的宝贵显存给核心计算用。</li>
+</ul>
+<hr />
+<h3>总结：这个文件到底想干嘛？</h3>
+<p>如果不用这个文件，直接加载 DeepSeek-V2，你需要大概 <strong>200GB+ 的显存</strong>（这是企业级配置）。</p>
+<p>用了这个文件（TodoList 执行完毕后），它达成了一个战术目标：</p>
+<ol>
+<li><strong>显存大瘦身:</strong> 把最占地方的“词表入口”(Task 7) 和“专家模块”(Task 4) 扔到了 <strong>CPU/内存</strong> 里。</li>
+<li><strong>速度保底:</strong> 把计算最密集的“注意力”(Task 5) 和“线性层”(Task 2) 留在 <strong>GPU/显卡</strong> 上，并用了加速算子 (<code>Marlin</code>)。</li>
+</ol>
+<p><strong>一句话总结：</strong> 这是一个<strong>“显存不够内存来凑”</strong>的优化方案，让你能用相对便宜的硬件跑起来 DeepSeek-V2 这个大模型。</p>

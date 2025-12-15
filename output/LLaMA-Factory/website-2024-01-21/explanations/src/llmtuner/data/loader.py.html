@@ -1,0 +1,132 @@
+<h1>src/llmtuner/data/loader.py</h1>
+<p>这份代码文件 <code>src/llmtuner/data/loader.py</code> 是整个大模型微调项目中的<strong>“数据大管家”</strong>。</p>
+<p>它的核心任务只有一件事情：<strong>把各种乱七八糟的原始数据（文本文件、网上的数据集），变成模型能看懂的数字格式（Tensor/Input IDs），并喂给模型去训练。</strong></p>
+<p>为了让你听懂，我把这个过程拆解成一个 <strong>“数据加工流水线”</strong> 的 <strong>Todo List</strong>。</p>
+<hr />
+<h3>📋 数据加工流水线 (Task Todo List)</h3>
+<p>想象你是一个大厨（Loader），你要准备炒菜（训练模型）。你的工作清单如下：</p>
+<ol>
+<li><strong>[准备工具]</strong>: 拿好菜谱（Template）和切菜刀（Tokenizer）。</li>
+<li><strong>[检查库存]</strong>: 看看冰箱里有没有切好洗好的半成品菜（Cache）。如果有，直接拿去炒，跳过后面步骤。</li>
+<li><strong>[采购原料]</strong>: 如果没库存，就去各个渠道买菜（加载原始数据集）。<ul>
+<li>渠道包括：HuggingFace Hub、ModelScope、本地文件夹、Python脚本。</li>
+</ul>
+</li>
+<li><strong>[清洗归类]</strong>: 把买来的菜洗干净，统一放在标准盘子里（Align Dataset）。<ul>
+<li>不管原来叫“问题”还是“指令”，统一重命名为标准格式。</li>
+</ul>
+</li>
+<li><strong>[混合装盘]</strong>: 如果买了胡萝卜和牛肉，要把它们混在一起（Merge Dataset）。<ul>
+<li>是直接堆在一起（Concat），还是按比例穿插着放（Interleave）？</li>
+</ul>
+</li>
+<li><strong>[切菜加工]</strong>: 把文本切成模型能吃的 Token（Pre-process）。<ul>
+<li>这是最耗时的一步，把文字转成数字 ID。</li>
+</ul>
+</li>
+<li><strong>[留样存档]</strong>: 把切好的菜存一份到冰箱（Save Cache），下次直接用。</li>
+<li><strong>[上菜]</strong>: 把最终的数据端给训练程序。</li>
+</ol>
+<hr />
+<h3>🧐 逐步代码解读</h3>
+<p>现在我们对照上面的 Todo List，一步步看代码里是怎么实现的。</p>
+<h4>第一步：准备工具与检查库存</h4>
+<p>对应函数：<code>get_dataset</code> (代码的入口)</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">get_dataset</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="c1"># 1. 准备工具：获取对话模板(template)并修正分词器(tokenizer)</span>
+    <span class="n">template</span> <span class="o">=</span> <span class="n">get_template_and_fix_tokenizer</span><span class="p">(</span><span class="n">data_args</span><span class="o">.</span><span class="n">template</span><span class="p">,</span> <span class="n">tokenizer</span><span class="p">)</span>
+
+    <span class="c1"># ... (中间省略了一些检查)</span>
+
+    <span class="c1"># 2. 检查库存：如果指定了缓存路径(cache_path)且文件存在</span>
+    <span class="k">if</span> <span class="n">data_args</span><span class="o">.</span><span class="n">cache_path</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="n">data_args</span><span class="o">.</span><span class="n">cache_path</span><span class="p">):</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span><span class="s2">&quot;Loading dataset from disk...&quot;</span><span class="p">)</span>
+            <span class="n">dataset</span> <span class="o">=</span> <span class="n">load_from_disk</span><span class="p">(</span><span class="n">data_args</span><span class="o">.</span><span class="n">cache_path</span><span class="p">)</span> <span class="c1"># 直接加载，收工！</span>
+            <span class="k">return</span> <span class="n">dataset</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：数据处理很慢，为了不每次重新跑，代码优先检查有没有“半成品”（Cache）。</li>
+</ul>
+<h4>第二步 &amp; 第三步：采购原料 &amp; 清洗归类</h4>
+<p>对应函数：<code>load_single_dataset</code> (被 <code>get_dataset</code> 循环调用)</p>
+<p>这是代码中最长的一部分，因为它要处理各种来源的数据。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">load_single_dataset</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="c1"># 判断数据来源：是从网上(hf_hub/ms_hub)下，还是本地文件(file/script)</span>
+    <span class="k">if</span> <span class="n">dataset_attr</span><span class="o">.</span><span class="n">load_from</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;hf_hub&quot;</span><span class="p">,</span> <span class="s2">&quot;ms_hub&quot;</span><span class="p">]:</span>
+        <span class="c1"># ... 设置路径 ...</span>
+    <span class="k">elif</span> <span class="n">dataset_attr</span><span class="o">.</span><span class="n">load_from</span> <span class="o">==</span> <span class="s2">&quot;file&quot;</span><span class="p">:</span>
+        <span class="c1"># ... 扫描本地文件夹，检查文件格式(json, csv等) ...</span>
+        <span class="c1"># 还会做一个 checksum 校验，防止文件坏了或被篡改</span>
+        <span class="n">checksum</span><span class="p">(</span><span class="n">data_files</span><span class="p">,</span> <span class="n">dataset_attr</span><span class="o">.</span><span class="n">dataset_sha1</span><span class="p">)</span>
+
+    <span class="c1"># 真正的加载动作</span>
+    <span class="k">if</span> <span class="n">dataset_attr</span><span class="o">.</span><span class="n">load_from</span> <span class="o">==</span> <span class="s2">&quot;ms_hub&quot;</span><span class="p">:</span>
+        <span class="c1"># 如果是阿里的 ModelScope 社区</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">modelscope</span><span class="w"> </span><span class="kn">import</span> <span class="n">MsDataset</span>
+        <span class="n">dataset</span> <span class="o">=</span> <span class="n">MsDataset</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">to_hf_dataset</span><span class="p">()</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="c1"># 默认使用 HuggingFace 的 load_dataset</span>
+        <span class="n">dataset</span> <span class="o">=</span> <span class="n">load_dataset</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+    <span class="c1"># 4. 清洗归类：align_dataset</span>
+    <span class="c1"># 原始数据列名千奇百怪（比如有的叫&quot;content&quot;, 有的叫&quot;text&quot;）</span>
+    <span class="c1"># align_dataset 负责把它们统一映射成标准列名（prompt, response 等）</span>
+    <span class="k">return</span> <span class="n">align_dataset</span><span class="p">(</span><span class="n">dataset</span><span class="p">,</span> <span class="n">dataset_attr</span><span class="p">,</span> <span class="n">data_args</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：兼容性很重要。无论用户的数据是 CSV、JSON 还是网上的，代码都要能读，并且读进来后要“对齐”（Align）成统一格式。</li>
+</ul>
+<h4>第四步：混合装盘</h4>
+<p>对应函数：<code>merge_dataset</code></p>
+<p>如果你在配置里写了要用 3 个数据集训练，这一步负责把它们合体。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">merge_dataset</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">all_datasets</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">all_datasets</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="c1"># 只有一个就直接返回</span>
+
+    <span class="c1"># 策略 A：Concat (拼接)</span>
+    <span class="c1"># 就像把三本书叠在一起，学完一本学下一本</span>
+    <span class="k">elif</span> <span class="n">data_args</span><span class="o">.</span><span class="n">mix_strategy</span> <span class="o">==</span> <span class="s2">&quot;concat&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">concatenate_datasets</span><span class="p">(</span><span class="n">all_datasets</span><span class="p">)</span>
+
+    <span class="c1"># 策略 B：Interleave (穿插)</span>
+    <span class="c1"># 就像洗扑克牌，按概率把不同来源的数据混在一起喂给模型</span>
+    <span class="k">elif</span> <span class="n">data_args</span><span class="o">.</span><span class="n">mix_strategy</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">&quot;interleave&quot;</span><span class="p">):</span>
+        <span class="k">return</span> <span class="n">interleave_datasets</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<h4>第五步：切菜加工 (最关键的一步)</h4>
+<p>回到函数：<code>get_dataset</code> 的后半部分</p>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># ... 在 get_dataset 函数底部 ...</span>
+
+    <span class="k">with</span> <span class="n">training_args</span><span class="o">.</span><span class="n">main_process_first</span><span class="p">(</span><span class="n">desc</span><span class="o">=</span><span class="s2">&quot;pre-process dataset&quot;</span><span class="p">):</span>
+        <span class="c1"># 获取预处理函数 (preprocess_func)</span>
+        <span class="c1"># 这个函数负责把 &quot;你好&quot; 变成 [101, 872, 912...] 这种数字</span>
+        <span class="n">preprocess_func</span><span class="p">,</span> <span class="n">print_function</span> <span class="o">=</span> <span class="n">get_preprocess_and_print_func</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+
+        <span class="c1"># 真正干活：dataset.map</span>
+        <span class="c1"># batched=True 表示批量处理，速度快</span>
+        <span class="c1"># remove_columns 表示处理完把原始文本删掉，只留数字，节省内存</span>
+        <span class="n">dataset</span> <span class="o">=</span> <span class="n">dataset</span><span class="o">.</span><span class="n">map</span><span class="p">(</span><span class="n">preprocess_func</span><span class="p">,</span> <span class="n">batched</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">remove_columns</span><span class="o">=</span><span class="n">column_names</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+</code></pre></div>
+
+<h4>第六步：留样存档 &amp; 上菜</h4>
+<div class="codehilite"><pre><span></span><code>        <span class="c1"># 如果设置了缓存路径，把处理好的数据存硬盘，下次直接跳到第一步</span>
+        <span class="k">if</span> <span class="n">data_args</span><span class="o">.</span><span class="n">cache_path</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="n">data_args</span><span class="o">.</span><span class="n">cache_path</span><span class="p">):</span>
+            <span class="k">if</span> <span class="n">training_args</span><span class="o">.</span><span class="n">should_save</span><span class="p">:</span>
+                <span class="n">dataset</span><span class="o">.</span><span class="n">save_to_disk</span><span class="p">(</span><span class="n">data_args</span><span class="o">.</span><span class="n">cache_path</span><span class="p">)</span>
+
+        <span class="c1"># 打印一条样本看看对不对 (Sanity Check)</span>
+        <span class="k">if</span> <span class="n">training_args</span><span class="o">.</span><span class="n">should_log</span><span class="p">:</span>
+            <span class="n">print_function</span><span class="p">(</span><span class="nb">next</span><span class="p">(</span><span class="nb">iter</span><span class="p">(</span><span class="n">dataset</span><span class="p">)))</span>
+
+        <span class="k">return</span> <span class="n">dataset</span> <span class="c1"># 上菜！</span>
+</code></pre></div>
+
+<hr />
+<h3>总结</h3>
+<p>这个文件的核心逻辑就是：
+<strong>Load (加载)</strong> -&gt; <strong>Align (对齐格式)</strong> -&gt; <strong>Merge (合并)</strong> -&gt; <strong>Preprocess (分词转数字)</strong> -&gt; <strong>Cache (缓存)</strong>。</p>
+<p>它帮你屏蔽了底层处理 CSV、JSON、ModelScope、HuggingFace 等不同数据源的复杂性，让你只需要关心“我要用哪些数据”和“怎么混合它们”。</p>

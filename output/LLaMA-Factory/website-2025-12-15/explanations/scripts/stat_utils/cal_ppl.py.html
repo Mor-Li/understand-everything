@@ -1,0 +1,79 @@
+<h1>scripts/stat_utils/cal_ppl.py</h1>
+<p>这份代码的核心目的只有一个：<strong>给大模型“考试”，算出它的“困惑度”（Perplexity, 简称 PPL）。</strong></p>
+<p><strong>什么是困惑度 (PPL)？</strong>
+简单理解：你给模型一段话，看它能不能猜中下一个字是什么。
+*   如果模型猜得很准，它就不“困惑”，PPL 分数越<strong>低</strong>越好（说明模型聪明）。
+*   如果模型乱猜，它就很“困惑”，PPL 分数就高（说明模型还没学好）。</p>
+<p>为了让你看懂，我把这段代码拆解成一个 <strong>“给模型安排一场考试”</strong> 的任务清单（To-Do List），我们一步步来完成它。</p>
+<hr />
+<h3>📋 任务清单：计算模型困惑度 (Calculate PPL)</h3>
+<h4>✅ Task 1: 准备考试大纲（读取配置）</h4>
+<p><strong>代码位置：</strong> <code>calculate_ppl</code> 函数开头，<code>get_train_args(...)</code>
+<strong>解释：</strong>
+首先要确定考什么、谁来考。代码从命令行读取参数，比如：
+*   <code>model_name_or_path</code>: 考哪个模型？（比如 Llama-3）。
+*   <code>dataset</code>: 考哪套卷子？（比如 alpaca 数据集）。
+*   <code>stage</code>: 考什么题型？（<code>pt</code>=填空题，<code>sft</code>=问答题，<code>rm</code>=选择题）。
+*   <code>batch_size</code>: 一次批改几份卷子？</p>
+<h4>✅ Task 2: 请出“翻译官”和“考生”（加载 Tokenizer 和 Model）</h4>
+<p><strong>代码位置：</strong> <code>load_tokenizer(...)</code> 和 <code>load_model(...)</code>
+<strong>解释：</strong>
+*   <strong>Tokenizer (翻译官):</strong> 模型看不懂中文英文，只认识数字。我们需要 Tokenizer 把文字转换成数字 ID。
+*   <strong>Model (考生):</strong> 加载大模型的权重。注意这里 <code>is_trainable=False</code>，意思是我们只测试它，不训练它（不修改它的脑子）。</p>
+<h4>✅ Task 3: 打印并分发试卷（加载和处理数据）</h4>
+<p><strong>代码位置：</strong> <code>get_dataset(...)</code> 和 <code>DataLoader(...)</code>
+<strong>解释：</strong>
+*   <strong>Dataset:</strong> 把原始文本读进来，用上面的翻译官转换成数字。
+*   <strong>Template:</strong> 给题目加上格式（比如加上 "User:" 和 "Assistant:" 这种对话标签）。
+*   <strong>DataLoader:</strong> 把成千上万条数据打包成一捆一捆（Batch），方便批量测试。</p>
+<h4>✅ Task 4: 制定阅卷规则（选择 DataCollator）</h4>
+<p><strong>代码位置：</strong> <code>if stage == "pt": ... elif stage == "sft": ...</code>
+<strong>解释：</strong>
+不同的考试阶段，数据整理方式不一样：
+*   <strong>PT (Pre-training):</strong> 纯文本续写，不需要特殊对齐。
+*   <strong>SFT (Supervised Fine-tuning):</strong> 指令微调，需要把问题和答案对齐，还要把不够长的地方补齐（Padding）。
+*   <strong>RM (Reward Modeling):</strong> 奖励模型，通常涉及两个答案的对比（代码里专门写了个 <code>PairwiseDataCollatorWithPadding</code> 类来处理这种成对的数据）。</p>
+<h4>✅ Task 5: 开始闭卷考试（推理循环）</h4>
+<p><strong>代码位置：</strong> <code>with torch.no_grad():</code> 下方的 <code>for batch in tqdm(...)</code>
+<strong>解释：</strong>
+*   <code>torch.no_grad()</code>: 告诉电脑“别记笔记，别算梯度”，因为我们只是测试，这样省显存、跑得快。
+*   <code>model(**batch)</code>: 把这一捆试卷扔给模型，让模型输出它的预测结果（<code>outputs</code>）。</p>
+<h4>✅ Task 6: 核心步骤——老师打分（计算 PPL 数学逻辑）</h4>
+<p><strong>这是全篇最难懂的地方，代码在循环内部：</strong></p>
+<ol>
+<li>
+<p><strong>错位对比 (Shift):</strong>
+    <code>python
+    shift_logits = outputs["logits"][..., :-1, :] # 模型预测的（去掉最后一个，因为没得猜了）
+    shift_labels = batch["labels"][..., 1:]       # 标准答案（去掉第一个，因为它是已知的）</code>
+    <em>原理：</em> 比如句子是“我爱中国”。
+    模型输入“我”，预测“爱”；输入“爱”，预测“中”...
+    所以我们要拿模型的<strong>第1个预测</strong>去跟<strong>第2个字</strong>（标准答案）比。这就叫错位。</p>
+</li>
+<li>
+<p><strong>计算损失 (CrossEntropyLoss):</strong>
+    <code>python
+    token_logps = criterion(flatten_logits, flatten_labels)</code>
+    算出模型预测的字和标准答案之间的差距（Loss）。</p>
+</li>
+<li>
+<p><strong>算出困惑度 (Exp):</strong>
+    <code>python
+    sentence_logps = ...
+    total_ppl += sentence_logps.exp().sum().item()</code>
+    代码计算出这句话的平均 Log Probability（对数概率），然后做一个指数运算 <code>exp()</code>。</p>
+<ul>
+<li><strong>数学关系：</strong> Loss 越小 -&gt; 概率越大 -&gt; <code>exp(Loss)</code> (即 PPL) 越小。</li>
+<li><strong>PPL = 1</strong>：完美预测（完全不困惑）。</li>
+<li><strong>PPL 很大</strong>：完全在瞎猜。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 7: 公布排名并存档（保存结果）</h4>
+<p><strong>代码位置：</strong> 最后几行 <code>json.dump</code> 和 <code>print</code>
+<strong>解释：</strong>
+*   把每一条数据的 PPL 值存到一个 JSON 文件里（<code>ppl.json</code>）。
+*   计算所有数据的平均 PPL，打印在屏幕上：<code>Average perplexity is ...</code>。</p>
+<hr />
+<h3>总结</h3>
+<p>这个脚本就是一个<strong>自动阅卷机</strong>。它不教模型新知识，只是把一堆题目扔给模型，看模型能不能准确预测下一个字，最后算出一个分数（PPL）来衡量模型的语言能力水平。</p>

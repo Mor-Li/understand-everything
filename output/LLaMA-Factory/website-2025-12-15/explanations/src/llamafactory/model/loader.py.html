@@ -1,0 +1,118 @@
+<h1>src/llamafactory/model/loader.py</h1>
+<p>这份代码文件 <code>src/llamafactory/model/loader.py</code> 是 LlamaFactory 框架中非常核心的一个<strong>“后勤总管”</strong>。</p>
+<p>它的主要职责是：<strong>根据用户的配置，把模型（Model）、分词器（Tokenizer）和配置（Config）从硬盘或网络上加载到内存中，并组装成一个可以开始训练或推理的成品。</strong></p>
+<p>为了让你听懂，我把这个过程想象成<strong>“组装一台赛车”</strong>。我们列一个 <strong>Task To-Do List</strong>，然后一步步对应代码里的操作。</p>
+<hr />
+<h3>📋 组装模型的 To-Do List</h3>
+<ol>
+<li><strong>准备通行证</strong>：准备下载模型所需的身份验证和路径信息。</li>
+<li><strong>招聘翻译官（Load Tokenizer）</strong>：加载分词器，负责把人类语言变成机器能懂的数字。</li>
+<li><strong>阅读图纸（Load Config）</strong>：读取模型的配置文件，看看我们要造什么车。</li>
+<li><strong>根据图纸修改设计</strong>：在造车前，根据需求微调图纸（比如扩大油箱/上下文长度）。</li>
+<li><strong>核心引擎组装（Load Model）</strong>：<ul>
+<li><em>分支 A</em>：如果是特殊引擎（Unsloth/KTransformers），走快速通道加载。</li>
+<li><em>分支 B</em>：如果是普通引擎，去仓库搬运（HuggingFace AutoModel）。</li>
+<li><em>分支 C</em>：如果是多模态（看图/听声音），加载对应的特殊组件。</li>
+</ul>
+</li>
+<li><strong>引擎改装（Patch Model）</strong>：对加载好的引擎做针对性修复或调整。</li>
+<li><strong>加装外挂（Init Adapter）</strong>：这是微调的关键，给模型挂上 LoRA 适配器。</li>
+<li><strong>加装裁判（Value Head - 可选）</strong>：如果是做 RLHF（强化学习），需要加装一个打分器。</li>
+<li><strong>最终质检</strong>：冻结不需要训练的部件，打印参数量，准备由“训练师”接管。</li>
+</ol>
+<hr />
+<h3>逐步讲解代码逻辑</h3>
+<h4>1. 准备通行证 (<code>_get_init_kwargs</code>)</h4>
+<p>在代码开头有个小函数 <code>_get_init_kwargs</code>。
+*   <strong>动作</strong>：它把用户的 <code>model_args</code>（模型参数）转化成 HuggingFace 库能识别的字典。
+*   <strong>目的</strong>：比如 <code>trust_remote_code=True</code>（允许运行远程代码），<code>token</code>（HuggingFace 的密码），<code>cache_dir</code>（模型下载存哪）。这相当于进仓库前的安检。</p>
+<h4>2. 招聘翻译官 (<code>load_tokenizer</code>)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>def load_tokenizer(...)</code></li>
+<li><strong>动作</strong>：<ul>
+<li>尝试用 <code>AutoTokenizer.from_pretrained</code> 加载分词器。</li>
+<li>这里有个 <code>try...except</code>：它先试着加载“快速分词器”（Fast Tokenizer），如果失败了，就退而求其次加载“慢速分词器”。</li>
+<li><code>patch_tokenizer</code>：给分词器打补丁（比如有些模型没定义 padding token，这里会强制加上）。</li>
+<li><strong>多模态支持</strong>：如果模型不仅读文字，还看图（如 LLaVA），它还会加载 <code>AutoProcessor</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>3. &amp; 4. 阅读并修改图纸 (<code>load_config</code>)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>def load_config(...)</code> 和 <code>load_model</code> 的前几行。</li>
+<li><strong>动作</strong>：<ul>
+<li><code>AutoConfig.from_pretrained</code>：把模型的 <code>config.json</code> 读进来。</li>
+<li><code>patch_config</code>：<strong>关键步骤</strong>。比如你想把 Llama-3 的上下文窗口从 8k 扩展到 32k，或者改变 RoPE 的缩放比例，都是在这里修改配置对象的。</li>
+<li><code>apply_liger_kernel</code>：如果开启了 Liger Kernel（一种加速优化的内核），在这里修改配置以适配。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 核心引擎组装 (<code>load_model</code> 的核心部分)</h4>
+<p>这是最复杂的函数 <code>def load_model(...)</code>，它决定了模型怎么被加载进显存。</p>
+<ul>
+<li>
+<p><strong>特殊通道（加速库）</strong>：</p>
+<ul>
+<li><code>if model_args.use_kt:</code> 如果你用了 <strong>KTransformers</strong>，走这条路。</li>
+<li><code>elif model_args.use_unsloth:</code> 如果你用了 <strong>Unsloth</strong>（一个非常流行的微调加速库），走这条路。它会直接加载优化过的模型，省显存又快。</li>
+</ul>
+</li>
+<li>
+<p><strong>标准通道（HuggingFace）</strong>：</p>
+<ul>
+<li>如果没用加速库，代码会根据配置判断模型类型：<ul>
+<li><code>AutoModelForCausalLM</code>：最常见的文本生成模型（如 Llama, Qwen）。</li>
+<li><code>AutoModelForVision2Seq</code>：视觉语言模型。</li>
+<li><code>AutoModelForSeq2SeqLM</code>：翻译模型（如 T5）。</li>
+</ul>
+</li>
+<li><strong>从头训练 vs 预训练</strong>：<ul>
+<li><code>train_from_scratch</code>: 如果是 True，只用配置创建一个空壳模型（随机初始化权重）。</li>
+<li>否则，从硬盘/网络加载真实的权重文件（<code>.safetensors</code> 或 <code>.bin</code>）。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>6. 引擎改装 (<code>patch_model</code>)</h4>
+<ul>
+<li><strong>动作</strong>：模型加载完后，可能还不够完美。</li>
+<li><code>patch_model(model, ...)</code>：这里会处理一些特定模型的 bug 或者需求。比如：<ul>
+<li>确保 Embedding 层的大小和分词器大小一致。</li>
+<li>设置正确的梯度检查点（Gradient Checkpointing）以节省显存。</li>
+</ul>
+</li>
+</ul>
+<h4>7. 加装外挂 (<code>init_adapter</code>)</h4>
+<ul>
+<li><strong>这是微调的核心！</strong></li>
+<li><strong>动作</strong>：调用 <code>init_adapter</code>。</li>
+<li><strong>解释</strong>：如果你做的是 <strong>LoRA</strong> 或 <strong>QLoRA</strong> 微调，原本的大模型会被冻结，代码会在这里往模型里插入小型的“适配器（Adapter）”模块。之后的训练只更新这些小模块。</li>
+</ul>
+<h4>8. 加装裁判 (<code>add_valuehead</code>)</h4>
+<ul>
+<li><strong>场景</strong>：如果你在做 <strong>RLHF</strong>（PPO 算法），模型不仅要生成文本，还需要一个“价值头（Value Head）”来给生成的文本打分。</li>
+<li><strong>动作</strong>：<ul>
+<li><code>AutoModelForCausalLMWithValueHead.from_pretrained(model)</code>：把刚才的模型包装一下，多加一个输出层用来打分。</li>
+<li>加载 Value Head 的权重（如果有的话）。</li>
+</ul>
+</li>
+</ul>
+<h4>9. 最终质检 (函数末尾)</h4>
+<ul>
+<li><strong>冻结权重</strong>：<ul>
+<li><code>if not is_trainable:</code> 如果你只是来做推理（聊天）的，把模型设为 <code>eval()</code> 模式，并把所有参数锁住不让更新。</li>
+<li>如果是训练模式，确保数据类型（dtype）正确（比如 float16 或 bfloat16）。</li>
+</ul>
+</li>
+<li><strong>打印报表</strong>：<ul>
+<li><code>count_parameters(model)</code>：计算一下参数量。</li>
+<li><code>logger.info(...)</code>：并在屏幕上告诉你：“所有参数 xx 亿，其中可训练参数 xx 万”（让你确认 LoRA 只有很少的参数是可训练的）。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件的作用就是<strong>“承上启下”</strong>：
+*   <strong>上</strong>接用户的命令行参数（我要跑什么模型，用什么微调方法）。
+*   <strong>下</strong>接 PyTorch 的训练循环（给训练器一个准备好的 <code>model</code> 对象）。</p>
+<p>你看不懂是因为它把所有可能的加载情况（Unsloth, 多模态, RLHF, 全量微调, LoRA）都写在了一个函数里。但只要按着<strong>“加载配置 -&gt; 加载底座 -&gt; 加载适配器 -&gt; 准备开跑”</strong>这个逻辑看，就清晰多了。</p>

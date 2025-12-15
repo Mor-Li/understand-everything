@@ -1,0 +1,93 @@
+<h1>src/llamafactory/train/kto/trainer.py</h1>
+<p>这份代码确实包含了很多细节，涉及到大模型训练中比较前沿的 <strong>KTO (Kahneman-Tversky Optimization)</strong> 算法。简单来说，KTO 是一种类似 DPO（直接偏好优化）的算法，但它不需要“成对”的数据（即不需要“A比B好”这种严格的对比），只需要告诉模型“这个回答是好的（Chosen）”或者“这个回答是坏的（Rejected）”。</p>
+<p>为了让你看懂，我把你（作为一个开发者）如果要写出这个文件，需要完成的 <strong>5个核心 Task</strong> 列出来。我们将从“准备工作”一直讲到“计算分数”。</p>
+<hr />
+<h3>📋 Task List: 逐步构建 KTO 训练器</h3>
+<h4>Task 1: 搞定“初始化” (Setup &amp; Init)</h4>
+<p><strong>目标</strong>：在开始训练前，把模型、参考模型（Ref Model）和超参数准备好。</p>
+<ul>
+<li><strong>代码位置</strong>：<code>__init__</code> 方法。</li>
+<li><strong>你需要做什么</strong>：<ol>
+<li><strong>加载模型</strong>：你需要一个正在训练的 <code>model</code> 和一个作为对照组的 <code>ref_model</code>（参考模型）。参考模型通常是训练前的原始模型，用来防止新模型“忘本”（跑偏太远）。</li>
+<li><strong>设置参数</strong>：KTO 算法有几个关键参数：<ul>
+<li><code>beta</code>：控制模型偏离参考模型的程度。</li>
+<li><code>desirable_weight</code> / <code>undesirable_weight</code>：好样本和坏样本的权重（KTO 特有）。</li>
+</ul>
+</li>
+<li><strong>禁用 Dropout</strong>：为了计算准确的概率，通常在对齐训练（Alignment）中会关掉 Dropout (<code>disable_dropout_in_model</code>)。</li>
+<li><strong>处理 DeepSpeed</strong>：如果用了 DeepSpeed 分布式训练，需要特殊处理参考模型的加载方式。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 2: 定义“模型如何看数据” (Forward Pass)</h4>
+<p><strong>目标</strong>：告诉训练器，给一堆数据，怎么算出模型输出的概率（Log Probabilities）。</p>
+<ul>
+<li><strong>代码位置</strong>：<code>forward</code> 和 <code>concatenated_forward</code> 方法。</li>
+<li><strong>你需要做什么</strong>：<ol>
+<li><strong>普通前向传播 (<code>forward</code>)</strong>：<ul>
+<li>输入：<code>input_ids</code> (文本), <code>pixel_values</code> (如果是多模态/图片)。</li>
+<li>输出：<code>logits</code> (原始分数) -&gt; <code>logps</code> (对数概率)。</li>
+<li><em>解释</em>：这里就是让模型读题，然后算出它生成每个 token 的概率是多少。</li>
+</ul>
+</li>
+<li><strong>区分好坏样本 (<code>concatenated_forward</code>)</strong>：<ul>
+<li>KTO 的数据比较特殊，一个 Batch 里混杂着“好数据”和“坏数据”。</li>
+<li>你需要用 <code>batch["kto_tags"]</code> 这个标签把它们分开。</li>
+<li><code>True</code> 的是 <strong>Chosen</strong> (好)，<code>False</code> 的是 <strong>Rejected</strong> (坏)。</li>
+<li><strong>关键点</strong>：你需要分别算出好样本的概率 (<code>chosen_logps</code>) 和坏样本的概率 (<code>rejected_logps</code>)。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>Task 3: 设立“参考基准” (Reference Log Probs)</h4>
+<p><strong>目标</strong>：计算“如果我不训练，原始模型会怎么回答这个问题？”</p>
+<ul>
+<li><strong>代码位置</strong>：<code>compute_reference_log_probs</code> 方法。</li>
+<li><strong>你需要做什么</strong>：<ol>
+<li>把同样的数据喂给 <code>self.ref_model</code>（那个冻结的、不更新的参考模型）。</li>
+<li>算出参考模型的 <code>reference_chosen_logps</code> 和 <code>reference_rejected_logps</code>。</li>
+<li><strong>为什么？</strong> KTO/DPO 的核心思想是：<strong>奖励 = 现模型的概率 / 参考模型的概率</strong>。如果现模型对好答案的概率比参考模型高，奖励就高。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 4: 计算“损失函数” (Loss Calculation)</h4>
+<p><strong>目标</strong>：这是核心！根据概率算出 Loss，告诉模型怎么改参数。</p>
+<ul>
+<li><strong>代码位置</strong>：<code>get_batch_loss_metrics</code> 方法。</li>
+<li><strong>你需要做什么</strong>：<ol>
+<li><strong>收集所有概率</strong>：拿到 Task 2 算出的（当前模型概率）和 Task 3 算出的（参考模型概率）。</li>
+<li><strong>调用公式</strong>：<code>self.kto_loss(...)</code>（这是从父类 <code>KTOTrainer</code> 继承的数学公式）。<ul>
+<li>它会计算：对于好样本，尽量提高概率；对于坏样本，尽量降低概率。</li>
+</ul>
+</li>
+<li><strong>混合 SFT Loss (可选)</strong>：<ul>
+<li>代码里有一段 <code>if self.ftx_gamma &gt; 1e-6:</code>。</li>
+<li>这是为了防止模型为了讨好人类偏好而开始“胡言乱语”。加上一点 SFT（标准监督微调）的 Loss，让模型保持语言通顺。</li>
+</ul>
+</li>
+<li><strong>计算指标 (Metrics)</strong>：顺便算一下 <code>rewards/chosen</code>（好样本得多少分）和 <code>rewards/rejected</code>（坏样本得多少分），方便画图看。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 5: 记账与汇报 (Logging)</h4>
+<p><strong>目标</strong>：训练过程中，把分散在各个显卡上的指标收集起来，打印到日志里。</p>
+<ul>
+<li><strong>代码位置</strong>：<code>log</code> 方法。</li>
+<li><strong>你需要做什么</strong>：<ol>
+<li><strong>分布式收集</strong>：因为训练通常是多卡并行的，每张卡只算了一部分数据。你需要用 <code>self.accelerator.reduce</code> 把所有卡上的指标（比如 Loss 和 Reward 的总和）加起来。</li>
+<li><strong>计算平均值</strong>：总和 / 样本数量 = 平均值。</li>
+<li><strong>计算 Margin</strong>：<code>rewards/margins = chosen - rejected</code>。这个值越大，说明模型越能区分好坏，训练效果越好。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码在干嘛？</h3>
+<p>这段代码就是 <strong>LlamaFactory</strong> 为了适配 <strong>KTO 算法</strong> 专门写的一个“教练”。</p>
+<ol>
+<li><strong>初始化</strong>时，它请来了“现任模型”和“前任模型（参考）”。</li>
+<li><strong>训练</strong>时，它把数据喂给两个模型，看它们对“好回答”和“坏回答”分别给多大的概率。</li>
+<li>它通过 <strong>Loss</strong> 惩罚现任模型：如果现任模型给“坏回答”的概率太高，或者给“好回答”的概率比“前任”还低，就狠狠地罚它（更新参数）。</li>
+<li>最后，它负责把训练过程中的分数（Reward）<strong>记录</strong>下来，让你看到模型是不是变聪明了。</li>
+</ol>
+<p><strong>你需要重点关注的只有 <code>get_batch_loss_metrics</code> 这个函数，它是整个流程的指挥中心。</strong></p>

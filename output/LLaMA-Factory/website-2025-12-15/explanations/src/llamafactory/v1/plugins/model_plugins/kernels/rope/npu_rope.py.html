@@ -1,0 +1,118 @@
+<h1>src/llamafactory/v1/plugins/model_plugins/kernels/rope/npu_rope.py</h1>
+<p>没问题。这段代码确实比较硬核，因为它涉及到<strong>底层硬件加速（NPU）</strong>和<strong>动态修改代码逻辑（Monkey Patching）</strong>。</p>
+<p>简单来说，这个文件的作用是：<strong>如果你用的是华为昇腾（NPU）显卡，这段代码会把原来模型里算得慢的“位置编码”函数，悄悄替换成华为专门优化的“极速版”函数。</strong></p>
+<p>为了让你彻底搞懂，我制定了一个 <strong>5步走的 Task List</strong>，我们一步步来拆解。</p>
+<hr />
+<h3>📋 学习任务清单 (Task List)</h3>
+<ul>
+<li><strong>Task 1：搞懂背景</strong> —— 为什么要写这个文件？（NPU 是什么？RoPE 是什么？）</li>
+<li><strong>Task 2：核心魔法 1</strong> —— 看懂普通加速函数 <code>_apply_rotary_pos_emb</code>。</li>
+<li><strong>Task 3：核心魔法 2</strong> —— 看懂多模态加速函数 <code>_apply_multimodal...</code> (针对 Qwen2-VL)。</li>
+<li><strong>Task 4：实施手段</strong> —— 搞懂 <code>apply</code> 方法是如何“偷梁换柱”的（Monkey Patching）。</li>
+<li><strong>Task 5：总结全貌</strong> —— 串联整个流程。</li>
+</ul>
+<hr />
+<h3>🚀 Task 1：搞懂背景</h3>
+<p><strong>1. NPU 是什么？</strong>
+通常我们跑 AI 用的是 NVIDIA 的 GPU（CUDA）。但这个文件是专门给 <strong>华为昇腾芯片（Ascend NPU）</strong> 用的。华为有一套自己的库叫 <code>torch_npu</code>。</p>
+<p><strong>2. RoPE 是什么？</strong>
+RoPE (Rotary Positional Embeddings) 是现在 Llama、Qwen 等大模型都在用的一种技术，用来告诉模型“哪个词在前，哪个词在后”。
+*   <strong>问题：</strong> 原始的 PyTorch 实现 RoPE 涉及很多切片、乘法、加法操作，在 NPU 上跑得不够快。
+*   <strong>解决：</strong> 华为 NPU 底层提供了一个专门的指令 <code>npu_rotary_mul</code>，一次指令就能算完，速度飞快。</p>
+<p><strong>结论：</strong> 这个文件的目的就是<strong>为了用上这个专用指令</strong>。</p>
+<hr />
+<h3>⚡ Task 2：核心魔法 1 —— 普通加速函数</h3>
+<p>我们看代码中的第一个函数：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">_apply_rotary_pos_emb</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">,</span> <span class="n">position_ids</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">unsqueeze_dim</span><span class="o">=</span><span class="mi">1</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Applies Rotary Position Embedding to the query and key tensors.&quot;&quot;&quot;</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">torch_npu</span>  <span class="c1"># 1. 引入华为的 NPU 库</span>
+
+    <span class="c1"># 2. 调整 cos 和 sin 的形状，方便计算</span>
+    <span class="n">cos</span> <span class="o">=</span> <span class="n">cos</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="n">unsqueeze_dim</span><span class="p">)</span>
+    <span class="n">sin</span> <span class="o">=</span> <span class="n">sin</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="n">unsqueeze_dim</span><span class="p">)</span>
+
+    <span class="c1"># 3. 【关键】直接调用 NPU 的专用算子进行计算</span>
+    <span class="c1"># 原来的 PyTorch 写法可能要写 5-6 行数学公式，这里一行搞定</span>
+    <span class="n">q_embed</span> <span class="o">=</span> <span class="n">torch_npu</span><span class="o">.</span><span class="n">npu_rotary_mul</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">)</span>
+    <span class="n">k_embed</span> <span class="o">=</span> <span class="n">torch_npu</span><span class="o">.</span><span class="n">npu_rotary_mul</span><span class="p">(</span><span class="n">k</span><span class="p">,</span> <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="n">q_embed</span><span class="p">,</span> <span class="n">k_embed</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+这就好比切土豆丝。
+*   <strong>原来（PyTorch）：</strong> 你拿菜刀一刀一刀切（通用计算）。
+*   <strong>现在（NPU）：</strong> 你把土豆扔进全自动切丝机（<code>npu_rotary_mul</code>），瞬间切好。</p>
+<hr />
+<h3>🖼️ Task 3：核心魔法 2 —— 多模态加速函数</h3>
+<p>针对 <strong>Qwen2-VL</strong> 这种既能看图又能读文字的模型，它的位置编码比较特殊（它是 3D 的，叫 M-RoPE）。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">_apply_multimodal_rotary_pos_emb_qwen25_vl</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">,</span> <span class="n">mrope_section</span><span class="p">,</span> <span class="n">unsqueeze_dim</span><span class="o">=</span><span class="mi">1</span><span class="p">):</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">torch_npu</span>
+
+    <span class="c1"># ... (省略中间的数据拼接过程) ...</span>
+    <span class="c1"># 这里主要是为了把 Qwen2-VL 特殊的 cos/sin 格式，</span>
+    <span class="c1"># 拼凑成 NPU 算子能看懂的格式。</span>
+
+    <span class="c1"># 最后依然是调用那个极速算子</span>
+    <span class="n">q_embed</span> <span class="o">=</span> <span class="n">torch_npu</span><span class="o">.</span><span class="n">npu_rotary_mul</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">)</span>
+    <span class="n">k_embed</span> <span class="o">=</span> <span class="n">torch_npu</span><span class="o">.</span><span class="n">npu_rotary_mul</span><span class="p">(</span><span class="n">k</span><span class="p">,</span> <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">q_embed</span><span class="p">,</span> <span class="n">k_embed</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+Qwen2-VL 的土豆形状比较怪（多模态数据），不能直接塞进切丝机。这个函数的作用是<strong>先把怪土豆修整成普通土豆的样子</strong>，然后再扔进切丝机（<code>npu_rotary_mul</code>）。</p>
+<hr />
+<h3>🕵️ Task 4：实施手段 —— “偷梁换柱” (Monkey Patching)</h3>
+<p>有了上面那两个“极速函数”，怎么让模型去用它们呢？模型原本的代码里写的是 <code>import torch</code> 然后自己算的呀。</p>
+<p>这时候就需要 <code>NpuRoPEKernel</code> 类里的 <code>apply</code> 方法了。这是一种<strong>黑客技巧</strong>。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">NpuRoPEKernel</span><span class="p">(</span><span class="n">MetaRoPEKernel</span><span class="p">):</span>
+    <span class="c1"># ... 设置类型和设备 ...</span>
+    <span class="n">kernel</span> <span class="o">=</span> <span class="n">_apply_rotary_pos_emb</span>  <span class="c1"># 指定我们要用上面的哪个函数</span>
+
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">apply</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">model</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+        <span class="c1"># 如果没装 NPU 环境，直接退出</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">is_torch_npu_available</span><span class="p">():</span>
+            <span class="k">return</span> <span class="n">model</span>
+
+        <span class="n">_modules</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+        <span class="c1"># 1. 遍历模型里所有的组件</span>
+        <span class="k">for</span> <span class="n">module</span> <span class="ow">in</span> <span class="n">model</span><span class="o">.</span><span class="n">modules</span><span class="p">():</span>
+            <span class="c1"># 2. 找到名字里带 &quot;Attention&quot; 的组件（因为RoPE只在注意力层用）</span>
+            <span class="k">if</span> <span class="s2">&quot;Attention&quot;</span> <span class="ow">in</span> <span class="n">module</span><span class="o">.</span><span class="vm">__class__</span><span class="o">.</span><span class="vm">__name__</span><span class="p">:</span>
+                <span class="c1"># 3. 找到这个组件是在哪个文件里定义的</span>
+                <span class="n">module_name</span> <span class="o">=</span> <span class="n">module</span><span class="o">.</span><span class="vm">__class__</span><span class="o">.</span><span class="vm">__module__</span>
+
+                <span class="c1"># ... (跳过重复处理) ...</span>
+
+                <span class="k">try</span><span class="p">:</span>
+                    <span class="c1"># 4. 找到那个定义文件 (target_module)</span>
+                    <span class="n">target_module</span> <span class="o">=</span> <span class="n">sys</span><span class="o">.</span><span class="n">modules</span><span class="p">[</span><span class="n">module_name</span><span class="p">]</span>
+
+                    <span class="c1"># 5. 检查那个文件里有没有叫 &quot;apply_rotary_pos_emb&quot; 的函数</span>
+                    <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">target_module</span><span class="p">,</span> <span class="s2">&quot;apply_rotary_pos_emb&quot;</span><span class="p">):</span>
+                        <span class="c1"># 6. 【核心操作】把那个文件里的函数，强行替换成我们的 cls.kernel (也就是 _apply_rotary_pos_emb)</span>
+                        <span class="nb">setattr</span><span class="p">(</span><span class="n">target_module</span><span class="p">,</span> <span class="s2">&quot;apply_rotary_pos_emb&quot;</span><span class="p">,</span> <span class="bp">cls</span><span class="o">.</span><span class="n">kernel</span><span class="p">)</span>
+                        <span class="n">_modules</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">module_name</span><span class="p">)</span>
+                <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
+                    <span class="k">pass</span>
+        <span class="k">return</span> <span class="n">model</span>
+</code></pre></div>
+
+<p><strong>通俗解释：</strong>
+这就好比你去餐厅（Model）吃饭。
+1.  本来厨师（Attention Module）做菜时，切土豆是手切的（原版函数）。
+2.  这个 <code>apply</code> 方法就像是餐厅经理。
+3.  经理走进厨房，找到所有负责切菜的厨师。
+4.  经理对厨师说：“从现在开始，<strong>当你脑子里想执行‘切土豆’这个动作时，必须使用我给你的这台‘自动切丝机’，不许再手切了。</strong>”
+5.  这就是 <code>setattr(..., "apply_rotary_pos_emb", cls.kernel)</code> 的含义——<strong>运行时替换函数</strong>。</p>
+<hr />
+<h3>📝 Task 5：总结全貌</h3>
+<p>现在你再看整个文件，逻辑就很清晰了：</p>
+<ol>
+<li><strong>定义工具：</strong> 定义了两个函数 <code>_apply_rotary_pos_emb</code> 和 <code>_apply_multimodal...</code>，它们利用 <code>import torch_npu</code> 调用华为芯片底层的加速指令。</li>
+<li><strong>定义插件：</strong> 定义了 <code>NpuRoPEKernel</code> 类。</li>
+<li><strong>执行替换：</strong> 当 LlamaFactory 启动训练时，会调用这个类的 <code>apply</code> 方法。它会扫描你的模型，找到所有做 Attention 的地方，把原本慢吞吞的 Python 算位置编码的逻辑，强行替换成上面的 NPU 加速逻辑。</li>
+</ol>
+<p><strong>一句话总结：</strong>
+这是一个<strong>外挂</strong>，专门给用华为 NPU 显卡的人用的。它通过<strong>动态修改代码</strong>的方式，让模型在计算位置编码时调用<strong>硬件专用指令</strong>，从而跑得更快。</p>

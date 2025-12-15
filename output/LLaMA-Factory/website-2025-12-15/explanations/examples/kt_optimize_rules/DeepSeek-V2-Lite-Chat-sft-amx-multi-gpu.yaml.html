@@ -1,0 +1,111 @@
+<h1>examples/kt_optimize_rules/DeepSeek-V2-Lite-Chat-sft-amx-multi-gpu.yaml</h1>
+<p>这份文件实际上是一个 <strong>“装修施工图”</strong> 或者说是 <strong>“交通指挥图”</strong>。</p>
+<p>它的作用是告诉 <code>ktransformers</code>（一个优化大模型推理的工具），当运行 DeepSeek-V2 这个模型时，应该把模型的<strong>哪一部分</strong>放到<strong>哪个硬件</strong>（CPU 还是显卡）上去运行，以及使用什么样的<strong>加速技术</strong>。</p>
+<p>为了让你看懂，我们将这个理解过程拆解为一个 <strong>Todo List</strong>，你只需要跟着我完成这 5 个任务，就能完全明白了。</p>
+<hr />
+<h3>✅ Task 1：理解核心逻辑 —— “查找与替换” (Match &amp; Replace)</h3>
+<p>首先，不要被代码吓到。整个文件其实就在重复做一件事：<strong>“找到谁，把它变成什么样”。</strong></p>
+<ul>
+<li><strong>Match (匹配):</strong> 就像在文档里按 <code>Ctrl+F</code>。它通过名字（<code>name</code>）或类型（<code>class</code>）找到模型里的特定零件（比如第几层、注意力模块、运算层）。</li>
+<li><strong>Replace (替换):</strong> 找到零件后，给它下达指令：<ul>
+<li><code>device</code>: 你去 1 号显卡还是 2 号显卡，或者是 CPU？</li>
+<li><code>class</code>: 把原厂的普通零件，换成我们特制的“涡轮增压”零件（优化过的算子）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 2：看懂硬件分配策略 —— “分家产”</h3>
+<p>这个文件最核心的意图是<strong>多显卡 + CPU 协同工作</strong>。你需要搞清楚它把模型切成了哪几块。</p>
+<p>请注意文件里反复出现的两个正则表达（由符号组成的规则）：
+1.  <strong><code>(0|[1-9])</code></strong>: 代表模型的 <strong>第 0 层到第 9 层</strong>（前 10 层）。
+    *   文件里给它们分配的是：<code>cuda:0</code> (<strong>第 1 张显卡</strong>)。
+2.  <strong><code>([12][0-9])</code></strong>: 代表模型的 <strong>第 10 层到第 29 层</strong>（后 20 层）。
+    *   文件里给它们分配的是：<code>cuda:1</code> (<strong>第 2 张显卡</strong>)。</p>
+<p><strong>💡 观点总结：</strong> 这是一个双显卡配置，显卡 0 负责前 1/3，显卡 1 负责后 2/3。</p>
+<hr />
+<h3>✅ Task 3：逐个击破 —— 模型的各个部位去哪了？</h3>
+<p>现在我们按照模型数据流动的顺序，一步步看每个部位的安排：</p>
+<h4>1. 入口大门 (Embeddings)</h4>
+<div class="codehilite"><pre><span></span><code><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">match: name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;^model.embed_tokens&quot;</span>
+<span class="w">  </span><span class="nt">replace: ... kwargs: generate_device</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;cpu&quot;</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong> 模型的词表（字典）非常大，占显存。</li>
+<li><strong>去向：</strong> <strong>CPU</strong>。为了省显卡显存，把这一步扔给内存做。</li>
+</ul>
+<h4>2. 核心计算层 (Layers) - 普通运算</h4>
+<ul>
+<li><strong>解读：</strong> 也就是 <code>torch.nn.Linear</code> 部分。</li>
+<li><strong>去向：</strong><ul>
+<li>前 10 层去 <strong>显卡 0</strong>。</li>
+<li>后 20 层去 <strong>显卡 1</strong>。</li>
+<li><strong>优化：</strong> 换成了 <code>KTransformersLinear</code>，这是专门加速的运算核。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 核心计算层 (Layers) - MoE 专家系统 (最关键的部分！)</h4>
+<p>DeepSeek-V2 是 MoE 模型（混合专家模型），这部分计算量最大。</p>
+<div class="codehilite"><pre><span></span><code><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">match</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">...experts$</span>
+<span class="w">  </span><span class="nt">replace</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">kwargs</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">generate_device</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;cpu&quot;</span><span class="w">  </span><span class="l l-Scalar l-Scalar-Plain">&lt;-- 注意这里！</span>
+<span class="w">      </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;AMXInt8&quot;</span><span class="w">      </span><span class="l l-Scalar l-Scalar-Plain">&lt;-- 英特尔 CPU 加速指令集</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong> 这里的配置非常特殊。虽然这层属于显卡 0 或 1 管理，但在<strong>生成文字（Generate）</strong>的时候，繁重的计算被<strong>外包给了 CPU</strong>。</li>
+<li><strong>为什么要这样？</strong> 因为 MoE 模型参数巨大，显存装不下。这里利用了 Intel CPU 的 <code>AMX</code> 加速指令（一种专门跑 AI 的 CPU 功能）来帮显卡分担压力。</li>
+<li><strong>观点：</strong> 这是一个 <strong>“显卡负责管理和路由，CPU 负责苦力计算”</strong> 的混合模式。</li>
+</ul>
+<h4>4. 注意力机制 (Attention)</h4>
+<div class="codehilite"><pre><span></span><code><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">match</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">...self_attn$</span>
+<span class="w">  </span><span class="nt">replace</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">... KDeepseekV2Attention</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong> 这是模型“思考”上下文的地方。</li>
+<li><strong>去向：</strong> 严格按照 Task 2 的分家策略，前 10 层在显卡 0，后 20 层在显卡 1。使用了专门针对 DeepSeek 优化的 Attention 算子。</li>
+</ul>
+<h4>5. 出口大门 (LM Head)</h4>
+<div class="codehilite"><pre><span></span><code><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">match: name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;^lm_head&quot;</span>
+<span class="w">  </span><span class="nt">replace: ... generate_device</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;cuda:1&quot;</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong> 最后输出结果的地方。</li>
+<li><strong>去向：</strong> <strong>显卡 1</strong>。因为数据流到了最后，肯定在最后一张卡上。</li>
+</ul>
+<hr />
+<h3>✅ Task 4：理解数据怎么“过河” (Transfer Map)</h3>
+<p>既然用了两张显卡，数据怎么从卡 0 跑到 卡 1？</p>
+<div class="codehilite"><pre><span></span><code><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">match: name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;^model$&quot;</span>
+<span class="w">  </span><span class="nt">replace</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">kwargs</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">transfer_map</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">10</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;cuda:1&quot;</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong> 这里定义了一个“传送门”。</li>
+<li><strong>含义：</strong> 当计算完 <strong>第 10 层</strong> 的时候，把数据从当前设备（显卡 0）搬运到 <strong><code>cuda:1</code> (显卡 1)</strong> 继续跑。</li>
+</ul>
+<hr />
+<h3>✅ Task 5：总结全篇观点 (Executive Summary)</h3>
+<p>读完这个文件，我们脑海里应该浮现出这样一个工作流：</p>
+<ol>
+<li><strong>开始：</strong> 用户输入文字，<strong>CPU</strong> 处理成数字（Embeddings）。</li>
+<li><strong>第一阶段：</strong> 数据进入 <strong>显卡 0</strong>。<ul>
+<li>显卡 0 处理前 10 层的注意力机制。</li>
+<li>但是遇到最重的 MoE 专家计算时，显卡 0 把任务扔回给 <strong>CPU (利用 AMX 加速)</strong> 算，算完再拿回来。</li>
+</ul>
+</li>
+<li><strong>中转：</strong> 算完第 10 层，数据被传送到 <strong>显卡 1</strong>。</li>
+<li><strong>第二阶段：</strong> 数据在 <strong>显卡 1</strong> 上跑剩下的 20 层。<ul>
+<li>同样，遇到 MoE 重计算，显卡 1 也扔给 <strong>CPU</strong> 算。</li>
+</ul>
+</li>
+<li><strong>结束：</strong> <strong>显卡 1</strong> 完成最后一步，输出结果。</li>
+</ol>
+<p><strong>一句话总结：</strong>
+这是一个<strong>为 Intel 高级 CPU（支持 AMX）和双显卡环境设计</strong>的配置，它极度节省显存（把最占显存的专家参数放在内存里用 CPU 跑），让显存不大的双卡机器也能跑得动 DeepSeek-V2 这种大模型。</p>

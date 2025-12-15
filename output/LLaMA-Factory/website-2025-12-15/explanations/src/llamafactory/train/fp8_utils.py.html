@@ -1,0 +1,81 @@
+<h1>src/llamafactory/train/fp8_utils.py</h1>
+<p>这份代码确实涉及了很多底层配置，看起来很枯燥。别担心，我们换个角度来看。</p>
+<p>你可以把这份代码想象成是一个 <strong>“FP8 训练模式的装修工头”</strong>。它的任务是在大模型开始训练之前，把训练环境、模型结构都调整好，以便能用 <strong>FP8（8位浮点数，一种通过降低精度来大幅节省显存并加速的技术）</strong> 跑起来。</p>
+<p>为了让你听懂，我把这个工头的工作拆解成一个 <strong>Task To-Do List（任务清单）</strong>，我们一步步来看它是怎么完成的。</p>
+<hr />
+<h3>📋 工头的 Task To-Do List</h3>
+<ol>
+<li><strong>Task 1: 确认需求（你要不要装修？）</strong><ul>
+<li>检查用户是否真的开启了 FP8 训练开关。</li>
+</ul>
+</li>
+<li><strong>Task 2: 贴告示（设置环境变量）</strong><ul>
+<li>告诉系统和底层库（Accelerate）：“我们要开始用 FP8 了，大家做好准备。”</li>
+</ul>
+</li>
+<li><strong>Task 3: 制定施工图纸（核心逻辑）</strong><ul>
+<li>决定用哪家公司的工具（Backend）。</li>
+<li><strong>关键点</strong>：决定模型里<strong>哪些层</strong>可以被压缩成 FP8，哪些层必须保持原样（过滤器）。</li>
+</ul>
+</li>
+<li><strong>Task 4: 完工验收（状态检查）</strong><ul>
+<li>最后检查一遍，FP8 模式到底有没有成功开启。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>逐步讲解（对应代码逻辑）</h3>
+<h4>Task 1: 确认需求</h4>
+<p><strong>代码位置</strong>：所有函数的开头 <code>if not model_args.fp8: return</code></p>
+<ul>
+<li><strong>讲人话</strong>：如果用户在命令行里没写 <code>--fp8</code>，那这代码啥也不干，直接下班。</li>
+</ul>
+<h4>Task 2: 贴告示（设置环境变量）</h4>
+<p><strong>代码位置</strong>：<code>configure_fp8_environment</code> 函数</p>
+<ul>
+<li><strong>讲人话</strong>：<ul>
+<li>代码里有一句 <code>os.environ["ACCELERATE_MIXED_PRECISION"] = "fp8"</code>。</li>
+<li>这就像是在工地上竖个大牌子，告诉 HuggingFace Accelerate（负责加速训练的库）：“全员注意，接下来的混合精度模式是 FP8，不是以前的 FP16 或 BF16 了。”</li>
+<li>它还会设置 <code>FP8_BACKEND</code>，指定是用 <code>torchao</code> 还是别的工具来处理这个技术。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 制定施工图纸（这是最难懂的部分）</h4>
+<p><strong>代码位置</strong>：<code>create_fp8_kwargs</code> 函数</p>
+<p>这个函数是核心，它生成了一份“食谱”（Recipe），告诉训练器具体怎么操作。</p>
+<p><strong>3.1 选工具 (Backend)</strong>
+*   代码默认使用 <code>torchao</code>（PyTorch 的一个架构优化库）。它配置了 <code>Float8LinearConfig</code>，使用 "rowwise"（行级）缩放。
+*   <strong>观点</strong>：这是一种具体的数学处理策略，能让 FP8 这种低精度的计算更稳定，不容易算崩。</p>
+<p><strong>3.2 筛选器 (The Filter) —— 重点！</strong>
+代码里定义了一个 <code>module_filter_func</code>。你可以把它想象成夜店的<strong>保安</strong>，它决定了模型的每一层能不能进入“FP8 俱乐部”。</p>
+<ul>
+<li><strong>保安规则 1：敏感部位不许进</strong><ul>
+<li>代码：<code>skip_layers = ["embed", "lm_head", "output", "classifier"]</code></li>
+<li><strong>解释</strong>：模型的“输入层”（Embedding）和“输出层”（Head/Classifier）非常敏感，稍微降低一点精度，整个模型就变傻了。所以这部分必须保持高精度，<strong>不转 FP8</strong>。</li>
+</ul>
+</li>
+<li><strong>保安规则 2：只接待 Linear 层</strong><ul>
+<li>代码：检查 <code>hasattr(module, "weight")</code> 且形状是二维的。</li>
+<li><strong>解释</strong>：FP8 主要加速矩阵乘法（Linear 层），其他的复杂层（比如 LayerNorm）转了也没啥好处，甚至会报错，所以<strong>不转</strong>。</li>
+</ul>
+</li>
+<li><strong>保安规则 3：身材必须是 16 的倍数（硬性指标）</strong><ul>
+<li>代码：<code>if in_features % 16 != 0 or out_features % 16 != 0: return False</code></li>
+<li><strong>解释</strong>：这是硬件（GPU）的要求。FP8 的计算核心（Kernel）通常要求数据的长宽必须能被 16 整除，就像搭积木，如果尺寸不对齐，积木就塞不进那个加速通道里。</li>
+<li><strong>观点</strong>：如果某一层维数是 4095（不能被16整除），工头会说：“这层不行，强行转 FP8 会报错，保持原样吧。”</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 完工验收</h4>
+<p><strong>代码位置</strong>：<code>verify_fp8_status</code> 函数</p>
+<ul>
+<li><strong>讲人话</strong>：<ul>
+<li>所有准备工作做完后，代码会去问 <code>accelerator</code>：“嘿，你现在显示的状态是 <code>fp8_enabled</code> 吗？”</li>
+<li>如果是 <code>True</code>，打印“FP8 训练已开启，用的是 xxx 后端”。</li>
+<li>如果是 <code>False</code>，打印警告：“老板（用户）要求了 FP8，但系统显示没开启，可能哪里出问题了。”</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这文件主要在讲：
+<strong>“为了安全且高效地跑 FP8，我们要把环境变量设好，并且要非常小心地挑选模型里的层。对于那些太敏感的（如Embedding）或者尺寸不合规（不能被16整除）的层，我们要把它们剔除，只对符合条件的 Linear 层进行 FP8 压缩。”</strong></p>

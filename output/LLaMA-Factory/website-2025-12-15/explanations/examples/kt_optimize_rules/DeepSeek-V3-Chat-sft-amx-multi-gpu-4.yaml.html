@@ -1,0 +1,61 @@
+<h1>examples/kt_optimize_rules/DeepSeek-V3-Chat-sft-amx-multi-gpu-4.yaml</h1>
+<p>这份文件其实是一个 <strong>“施工图纸”</strong> 或者 <strong>“调度指令”</strong>。</p>
+<p>它的背景是：你想运行 DeepSeek-V3 这样巨大的模型，但单个显卡显存不够，或者你想利用 CPU 来加速/省显存。你需要用 <code>ktransformers</code> 这个工具，指挥 4 张显卡（GPU）和 CPU 协同工作。</p>
+<p>这个 YAML 文件的作用就是告诉程序：<strong>模型的哪一部分放在哪张卡上，哪一部分扔给 CPU 算。</strong></p>
+<p>为了让你听懂，我把这个配置文件的逻辑拆解成一个 <strong>“项目经理的 To-Do List”</strong>，我们一步步来看：</p>
+<hr />
+<h3>📋 项目经理的调度清单 (To-Do List)</h3>
+<h4>Task 1: 准备工作 (处理词表)</h4>
+<ul>
+<li><strong>目标</strong>：处理模型的“字典”（Embedding 层）。</li>
+<li><strong>指令</strong>：<code>model.embed_tokens</code> -&gt; 放 <strong>CPU</strong>。</li>
+<li><strong>白话</strong>：最开始把文字转成数字的那一步，不占宝贵的显卡资源，直接在 CPU 上做。</li>
+</ul>
+<h4>Task 2: 划分地盘 (切分模型层数)</h4>
+<p>这是文件最核心的逻辑。DeepSeek-V3 模型像千层饼一样，一共有 61 层（Layer 0 到 Layer 60）。文件把它们切成了 4 段，分给 4 张显卡接力跑（这叫流水线并行）：
+*   <strong>分工</strong>：
+    *   <strong>GPU 0</strong>: 负责第 <strong>0 ~ 14</strong> 层。
+    *   <strong>GPU 1</strong>: 负责第 <strong>15 ~ 29</strong> 层。
+    *   <strong>GPU 2</strong>: 负责第 <strong>30 ~ 44</strong> 层。
+    *   <strong>GPU 3</strong>: 负责第 <strong>45 ~ 60</strong> 层。</p>
+<h4>Task 3: 改造零件 (替换算子)</h4>
+<p>为了跑得快，不能用原本慢吞吞的计算方式，要换成 <code>ktransformers</code> 特制的“加速零件”。
+*   <strong>位置编码 (Rotary Embedding)</strong>：换成 <code>YarnRotaryEmbeddingV3</code>。
+*   <strong>线性层 (Linear Layers)</strong>：换成 <code>KTransformersLinear</code>。
+*   <strong>注意力机制 (Self-Attention)</strong>：换成 <code>KDeepseekV2Attention</code>。
+*   <strong>MoE 门控 (Gate)</strong>：换成 <code>KMoEGate</code>。
+*   <strong>白话</strong>：这些都是常规操作，就是告诉每一张显卡：“在你负责的层数里，用这些优化过的工具来算，别用原生的。”</p>
+<h4>Task 4: 处理最占内存的大胖子 (MoE Experts) 🔥<strong>重点</strong></h4>
+<p>DeepSeek-V3 是 MoE（混合专家）模型，它的“专家参数”非常巨大，显存根本塞不下。
+*   <strong>指令</strong>：<code>KSFTExpertsCPU</code>，后端使用 <code>AMXInt8</code>。
+*   <strong>策略</strong>：
+    *   <strong>Prefill (阅读提问时)</strong>：为了快，尽量用 <strong>GPU</strong> 硬算。
+    *   <strong>Generate (生成回答时)</strong>：显卡显存不够了，把计算任务扔给 <strong>CPU</strong> 去跑。
+    *   <strong>优化</strong>：使用了 <code>AMXInt8</code>，这是英特尔 CPU 的一种加速指令集。
+*   <strong>白话</strong>：这是这个配置文件的精髓。它在说：“计算量最大的那部分（Experts），生成的时候全扔给 CPU 去算，利用 CPU 的大内存和 AMX 加速，别把显卡撑爆了。”</p>
+<h4>Task 5: 建立交通指挥 (Transfer Map)</h4>
+<p>因为模型分在了 4 张卡上，数据需要“接力”。
+*   <strong>指令</strong>：<code>model</code> -&gt; <code>transfer_map</code>。
+*   <strong>规则</strong>：
+    *   算完第 14 层 -&gt; 把数据传给 <strong>GPU 1</strong>。
+    *   算完第 29 层 -&gt; 把数据传给 <strong>GPU 2</strong>。
+    *   算完第 44 层 -&gt; 把数据传给 <strong>GPU 3</strong>。
+*   <strong>白话</strong>：就像接力赛跑，规定好谁跑哪一棒，跑完把接力棒扔给谁。</p>
+<h4>Task 6: 收尾工作 (输出层)</h4>
+<ul>
+<li><strong>目标</strong>：最后把数字转回文字（LM Head）和标准化（Norm）。</li>
+<li><strong>指令</strong>：<code>lm_head</code> 和 <code>model.norm</code> -&gt; 放 <strong>GPU 3</strong>。</li>
+<li><strong>白话</strong>：最后一张显卡（GPU 3）跑完最后一层后，顺便把最终结果算出来。</li>
+</ul>
+<hr />
+<h3>💡 总结：这个文件到底干了啥？</h3>
+<p><strong>一句话总结</strong>：
+这是一个<strong>“4卡 GPU + CPU 混合推理”</strong>的方案。</p>
+<p><strong>它的运行流程是这样的</strong>：
+1.  <strong>CPU</strong> 处理输入的字。
+2.  <strong>GPU 0</strong> 算前 15 层（如果不含 MoE 大参数，它自己算；遇到大参数，扔给 CPU 算完再拿回来）。
+3.  数据传给 <strong>GPU 1</strong>，算中间 15 层（同上，大参数扔给 CPU）。
+4.  数据传给 <strong>GPU 2</strong>，算后面 15 层。
+5.  数据传给 <strong>GPU 3</strong>，算最后 16 层，并输出结果。</p>
+<p><strong>为什么要这么做？</strong>
+为了在有限的显存下（比如你没有 8 张 H100），通过压榨 CPU 的内存和算力（AMX），强行跑起来 DeepSeek-V3 这种超级大模型。</p>

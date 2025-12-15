@@ -1,0 +1,82 @@
+<h1>src/llmtuner/train/ppo/trainer.py</h1>
+<p>这份代码确实比较硬核，因为它涉及到了 <strong>RLHF（基于人类反馈的强化学习）</strong> 中最复杂的 <strong>PPO（Proximal Policy Optimization）</strong> 算法的工程实现。</p>
+<p>你可以把这个文件 <code>trainer.py</code> 看作是一个 <strong>“AI 班主任”</strong>。它的工作是指挥模型（学生）做题、找老师打分、然后根据分数调整学习策略。</p>
+<p>为了让你听懂，我把这个文件的逻辑拆解成一个 <strong>“PPO 训练任务清单 (Todo List)”</strong>。代码里的每一部分其实就是在执行这个清单上的某一步。</p>
+<hr />
+<h3>📋 PPO 训练任务清单</h3>
+<ol>
+<li><strong>准备工作 (<code>__init__</code>)</strong>：把学生（模型）、打分老师（奖励模型 Reward Model）和教材（数据）准备好。</li>
+<li><strong>开始循环 (<code>ppo_train</code>)</strong>：这是主流程，指挥下面几个步骤不断循环。</li>
+<li><strong>任务 A：模拟考试 (<code>get_inputs</code>)</strong>：让模型根据问题（Query）写出答案（Response）。</li>
+<li><strong>任务 B：老师打分 (<code>get_rewards</code>)</strong>：拿着答案去问奖励模型，这题得几分？</li>
+<li><strong>任务 C：复习总结 (<code>batched_forward_pass</code>)</strong>：回顾刚才的考试，计算概率和误差。</li>
+<li><strong>任务 D：更新大脑 (<code>step</code>)</strong>：根据分数和概率，正式修改模型的参数（让它下次考更好）。</li>
+<li><strong>收尾工作 (<code>save_model</code>)</strong>：保存训练进度。</li>
+</ol>
+<hr />
+<h3>逐步讲解（中英对照）</h3>
+<h4>1. 准备工作 (<code>__init__</code>)</h4>
+<p><strong>代码位置</strong>：<code>class CustomPPOTrainer</code> 的 <code>__init__</code> 方法。
+<strong>讲人话</strong>：
+这是类的初始化。它主要做了两件事：
+*   <strong>加载配置</strong>：读入训练参数。
+*   <strong>准备奖励模型 (Reward Model)</strong>：代码里有一段逻辑判断 <code>reward_model_type</code>。
+    *   如果是 <code>full</code>：加载一个完整的打分模型。
+    *   如果是 <code>lora</code>：后面会通过切换 LoRA 权重来复用同一个模型进行打分。
+    *   如果是 <code>api</code>：后面会发网络请求去打分。</p>
+<h4>2. 主循环 (<code>ppo_train</code>)</h4>
+<p><strong>代码位置</strong>：<code>def ppo_train(self, ...)</code>
+<strong>讲人话</strong>：
+这是整个训练的“总指挥部”。
+*   它计算了总共要训练多少步 (<code>max_steps</code>)。
+*   进入一个巨大的 <code>for</code> 循环：
+    1.  <strong>切换模式</strong>：先切到 <code>eval</code> 模式（因为生成文本时不需要算梯度）。
+    2.  <strong>生成数据</strong>：调用 <code>self.get_inputs</code> 让模型根据 prompt 生成回答。
+    3.  <strong>计算奖励</strong>：调用 <code>self.get_rewards</code> 给回答打分。
+    4.  <strong>切换模式</strong>：切回 <code>train</code> 模式（准备更新参数）。
+    5.  <strong>执行更新</strong>：调用 <code>self.step</code> (这是父类 <code>PPOTrainer</code> 的方法) 来更新模型参数。
+    6.  <strong>记录日志</strong>：把 Loss 和 Reward 打印出来。</p>
+<h4>3. 任务 A：模拟考试 (<code>get_inputs</code>)</h4>
+<p><strong>代码位置</strong>：<code>def get_inputs(self, batch)</code>
+<strong>讲人话</strong>：
+这一步是<strong>“采样 (Rollout)”</strong>。
+*   <strong>输入</strong>：一堆问题（Queries）。
+*   <strong>动作</strong>：调用 <code>unwrapped_model.generate</code>。这就像让学生在考场上根据题目写作文。
+*   <strong>细节</strong>：代码里处理了 <code>padding</code>（填充）。因为生成的时候通常需要把 padding 放在左边，生成完了解析的时候要把 padding 去掉，提取出纯净的“问题”和“回答”。</p>
+<h4>4. 任务 B：老师打分 (<code>get_rewards</code>)</h4>
+<p><strong>代码位置</strong>：<code>def get_rewards(self, ...)</code>
+<strong>讲人话</strong>：
+学生写完了，现在要打分。
+*   代码里有三个分支：
+    1.  <strong>API 模式</strong>：把文本发给服务器，服务器返回分数（比如用 GPT-4 打分）。
+    2.  <strong>LoRA 模式</strong>：<code>replace_model(..., target="reward")</code>。这很有趣，它把模型的“大脑”暂时换成“打分模式”（加载奖励模型的 LoRA 权重），算完分后再换回来。
+    3.  <strong>Full 模式</strong>：直接丢给独立的 <code>self.reward_model</code> 跑一遍，取最后一个 token 的输出作为分数。</p>
+<h4>5. 任务 C：复习总结 (<code>batched_forward_pass</code>)</h4>
+<p><strong>代码位置</strong>：<code>def batched_forward_pass(self, ...)</code>
+<strong>讲人话</strong>：
+这一步是 PPO 算法中数学计算最密集的地方。
+为了更新参数，模型需要重新“看”一遍刚才自己写的答案，并计算：
+*   <strong>Logprobs</strong>：当时写这个词的概率是多少？
+*   <strong>Values</strong>：当时模型觉得自己能得多少分？
+*   <strong>Masks</strong>：哪些是真实的字，哪些是填充的空格（不能把空格算进误差里）。</p>
+<p><em>注意：代码里专门处理了 <code>chatglm</code> 模型的维度转置问题，还处理了 <code>padding</code> 带来的 mask 偏移问题，这是为了防止模型学习到错误的填充符。</em></p>
+<h4>6. 任务 D：更新大脑 (在 <code>ppo_train</code> 中调用 <code>self.step</code>)</h4>
+<p>虽然 <code>step</code> 函数没在这个文件里重写（它继承自 <code>trl.PPOTrainer</code>），但它是逻辑的核心。
+<strong>讲人话</strong>：
+结合 <strong>任务 B 的分数</strong> 和 <strong>任务 C 的概率</strong>，计算 Loss，然后反向传播更新参数。
+*   如果分数高，就鼓励模型下次还这么写（增加概率）。
+*   如果分数低，就惩罚模型（降低概率）。</p>
+<h4>7. 收尾工作 (<code>save_model</code>)</h4>
+<p><strong>代码位置</strong>：<code>def save_model(self, ...)</code>
+<strong>讲人话</strong>：
+保存模型权重。
+*   特别之处：如果你用了 DeepSpeed（一种分布式训练加速工具），保存逻辑会比较麻烦，这里做了一些兼容性处理，确保能存下完整的权重。</p>
+<hr />
+<h3>总结：这段代码到底在干嘛？</h3>
+<p>这段代码是 <strong>LLaMA-Factory</strong>（或其他类似框架）中用于 <strong>PPO 训练</strong> 的核心引擎。</p>
+<p>它继承了 HuggingFace 的 <code>TRL</code> 库，但做了很多<strong>“本地化适配”</strong>：
+1.  <strong>适配了不同的奖励模型加载方式</strong>（特别是 LoRA 权重的动态切换，这很省显存）。
+2.  <strong>修正了 padding 和 masking 的逻辑</strong>（这是 PPO 训练最容易崩的地方，也就是 <code>batched_forward_pass</code> 里那一堆复杂的索引操作）。
+3.  <strong>整合了自定义的日志和回调</strong>。</p>
+<p><strong>如果你不需要修改算法细节，你只需要知道：</strong>
+它就是一个<strong>循环</strong>：<code>生成回答</code> -&gt; <code>打分</code> -&gt; <code>算概率</code> -&gt; <code>更新参数</code>。</p>

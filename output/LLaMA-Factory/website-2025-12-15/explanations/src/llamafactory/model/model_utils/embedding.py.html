@@ -1,0 +1,95 @@
+<h1>src/llamafactory/model/model_utils/embedding.py</h1>
+<p>这份代码的核心作用只有一个：<strong>给大模型“扩容”，并给新加入的词（Token）赋予一个合理的初始状态。</strong></p>
+<p>想象一下，你有一本字典（模型），现在你要往里面加几个新词（比如 <code>&lt;think&gt;</code> 这种特殊符号）。你不能只加个空白页，你得在页面上先随便写点什么，或者根据含义写点什么，这样模型在后续学习时上手更快。</p>
+<p>下面我按照你的要求，分为 <strong>核心任务清单 (Todo List)</strong> 和 <strong>逐步讲解</strong> 两部分。</p>
+<hr />
+<h3>📋 核心任务清单 (Task Todo List)</h3>
+<p>如果要把“给模型加新词”这件事变成一个工作流，代码里的逻辑是这样的：</p>
+<ol>
+<li><strong>检查现状</strong>：看看分词器（Tokenizer）里的词是不是比模型（Model）里的词多？（如果多，说明需要扩容）。</li>
+<li><strong>准备环境</strong>：因为大模型可能跑在多张显卡上（DeepSpeed Zero3），先把分散的参数“聚拢”起来，方便修改。</li>
+<li><strong>物理扩容</strong>：把模型的“词向量表”（Embedding Matrix）的行数增加，腾出位置给新词。</li>
+<li><strong>决定策略</strong>：怎么填补这些新位置？<ul>
+<li><em>策略 A（简单粗暴）</em>：算一下老词的平均值，加点随机噪音填进去。</li>
+<li><em>策略 B（更有文化）</em>：根据新词的“文字描述”来填。比如新词是 <code>&lt;think&gt;</code>，描述是 "reasoning"，那就拿 "reasoning" 的向量填进去。</li>
+</ul>
+</li>
+<li><strong>执行填充</strong>：按照选定的策略，把数值填入新腾出的位置。</li>
+<li><strong>收尾</strong>：更新模型的配置参数，告诉它“你现在词表变大了”。</li>
+</ol>
+<hr />
+<h3>🧐 逐步讲解 (Step-by-Step)</h3>
+<p>我们把代码拆解开，对应上面的任务清单，一步步看它是怎么实现的。</p>
+<h4>第一步：总指挥 —— <code>resize_embedding_layer</code></h4>
+<p>这是代码的入口函数（最下面那个）。</p>
+<ul>
+<li><strong>它的任务</strong>：协调整个扩容过程。</li>
+<li><strong>关键逻辑</strong>：<ol>
+<li><strong>多卡同步</strong>：<code>if is_deepspeed_zero3_enabled(): ...</code><ul>
+<li>这部分是为了处理多显卡训练的复杂情况。简单理解就是：先把分散在各张卡上的权重拿回来，改成单机模式修改，改完再放回去。</li>
+</ul>
+</li>
+<li><strong>判断是否需要扩容</strong>：
+    <code>python
+    if len(tokenizer) &gt; current_embedding_size:</code><ul>
+<li>如果分词器里的词（比如 32005 个）比模型权重的行数（比如 32000 行）多，说明多了 5 个新词，需要干活了。</li>
+</ul>
+</li>
+<li><strong>物理扩容</strong>：
+    <code>python
+    model.resize_token_embeddings(len(tokenizer), pad_to_multiple_of=64)</code><ul>
+<li>这是 PyTorch/Transformers 自带的方法，直接把矩阵拉长。</li>
+</ul>
+</li>
+<li><strong>调用初始化逻辑</strong>：<ul>
+<li>扩容后，新多出来的几行全是随机数（或者0）。这时候它调用了 <code>_initialize_embeddings</code> 去给这些新行填值。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>第二步：分发员 —— <code>_initialize_embeddings</code></h4>
+<p>这个函数是一个“路由”，它根据你配置的方法，决定用哪种方式填值。</p>
+<ul>
+<li><strong>它的任务</strong>：看配置，选算法。</li>
+<li><strong>逻辑</strong>：<ul>
+<li>如果你选了 <code>desc_init</code> (描述初始化) 且提供了描述：调用 <code>_description_based_initialization</code>。</li>
+<li>否则（或者默认情况）：调用 <code>_noisy_mean_initialization</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>第三步：执行者 A (简单版) —— <code>_noisy_mean_initialization</code></h4>
+<p>这是默认的初始化方法。</p>
+<ul>
+<li><strong>理念</strong>：新来的词，我不知道它是啥意思。但我知道它大概率和“以前所有的词的平均水平”差不多。为了不让它太死板，我再加一点点随机波动（噪音）。</li>
+<li><strong>代码解读</strong>：<ol>
+<li><code>avg_weight = ...mean(...)</code>: 算出老词向量的平均值。</li>
+<li><code>noise_weight.normal_(...)</code>: 生成符合高斯分布的噪音。</li>
+<li><code>embed_weight[-num_new_tokens:] = avg_weight + noise_weight</code>:<ul>
+<li><strong>新词向量 = 平均值 + 噪音</strong>。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>第三步：执行者 B (进阶版) —— <code>_description_based_initialization</code></h4>
+<p>这是一个更聪明的初始化方法。</p>
+<ul>
+<li><strong>理念</strong>：如果新加的词是 <code>&lt;|image|&gt;</code>，与其瞎猜，不如告诉我它的含义是 "picture"。我就去模型里找 "picture" 的向量，拿来作为 <code>&lt;|image|&gt;</code> 的初始值。这样模型一开始就大概知道这个新词是干嘛的。</li>
+<li><strong>代码解读</strong>：<ol>
+<li><strong>拿到描述</strong>：比如 <code>descriptions = {"&lt;think&gt;": "reasoning process"}</code>。</li>
+<li><strong>理解描述</strong>：把 "reasoning process" 扔给分词器，变成 ID。</li>
+<li><strong>获取基准</strong>：
+    <code>python
+    token_embeds = model.get_input_embeddings()(valid_token_ids)
+    base_embedding = token_embeds.mean(dim=0)</code><ul>
+<li>去模型现有的词表里，查出 "reasoning" 和 "process" 的向量，取平均值。</li>
+</ul>
+</li>
+<li><strong>填入</strong>：把这个算出来的向量，填给新词 <code>&lt;think&gt;</code>。</li>
+<li><strong>可选</strong>：也可以像上面那样，加一点点噪音 (<code>add_noise=True</code>)。</li>
+</ol>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件的作用就是：<strong>当你在微调模型想加入新 Token 时，它负责把模型的“脑容量”扩充一下，并且用一种科学的方法（而不是瞎填）给这些新 Token 赋初值，让模型训练起来更稳定、收敛更快。</strong></p>

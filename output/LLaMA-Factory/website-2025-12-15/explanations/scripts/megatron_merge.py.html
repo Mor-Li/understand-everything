@@ -1,0 +1,115 @@
+<h1>scripts/megatron_merge.py</h1>
+<p>没问题，这个脚本看起来全是代码，但其实它的核心逻辑非常简单。我们可以把它想象成一个<strong>“翻译官”</strong>或者<strong>“格式转换器”</strong>。</p>
+<p>在在大模型领域，主要有两种模型格式：
+1.  <strong>Hugging Face (HF) 格式</strong>：最通用，大家都用它来下载、推理、微调。就像通用的 <code>.mp4</code> 视频格式。
+2.  <strong>Megatron (MCA) 格式</strong>：专门用于<strong>超大规模分布式训练</strong>。为了让几百张显卡一起跑，它把模型“切碎”了。就像专业的电影原始胶片素材，分成了很多卷。</p>
+<p><strong>这个脚本的作用就是：在这两种格式之间互相转换。</strong></p>
+<p>为了让你看懂，我列一个 <strong>“模型搬家 Task List”</strong>，我们一步步来看代码是如何完成这些任务的。</p>
+<hr />
+<h3>📋 Task List：模型转换任务清单</h3>
+<ol>
+<li><strong>🔍 侦查任务</strong>：看看输入的文件到底是哪种格式？</li>
+<li><strong>🔪 切分任务 (HF 转 Megatron)</strong>：如果是普通模型，为了大规模训练，需要把它按规则“切碎”。</li>
+<li><strong>🧩 拼图任务 (Megatron 转 HF)</strong>：如果是切碎的模型，为了方便使用，需要把它“拼回去”。</li>
+<li><strong>🎨 细节修饰</strong>：调整精度（bf16/fp16）和配置参数。</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>第一步：侦查任务 (判断方向)</h4>
+<p><strong>代码位置</strong>：<code>convert</code> 函数的核心逻辑</p>
+<p>当你运行这个脚本时，它首先要做的是判断你想干嘛。</p>
+<ul>
+<li><strong>代码解读</strong>：
+    <code>python
+    mca_config_path = os.path.join(checkpoint_path, "mca_config.json")
+    from_mca = os.path.exists(mca_config_path)</code></li>
+<li><strong>白话解释</strong>：
+    它去你看的文件夹里找有没有一个叫 <code>mca_config.json</code> 的身份证文件。<ul>
+<li><strong>如果有</strong> (<code>from_mca</code> 为 True)：说明这是 <strong>Megatron</strong> 格式（切碎的），你需要把它<strong>拼回去</strong>。</li>
+<li><strong>如果没有</strong>：说明这是 <strong>Hugging Face</strong> 格式（完整的），你需要把它<strong>切开</strong>用于训练。</li>
+</ul>
+</li>
+</ul>
+<h4>第二步：切分任务 (HF -&gt; Megatron)</h4>
+<p><strong>场景</strong>：你要开始用几百张卡做大规模预训练了。
+<strong>代码位置</strong>：<code>convert</code> 函数中的 <code>if not from_mca:</code> 分支</p>
+<ul>
+<li>
+<p><strong>代码解读</strong>：
+    ```python
+    dist_args = DistributingParallelArguments(
+        tensor_model_parallel_size=tensor_model_parallel_size, # TP: 横着切几刀
+        pipeline_model_parallel_size=pipeline_model_parallel_size, # PP: 竖着切几段
+        expert_model_parallel_size=expert_model_parallel_size, # EP: 专家怎么分
+        virtual_pipeline_model_parallel_size=virtual_pipeline_model_parallel_size,
+    )</p>
+<p>convert_checkpoint_to_mca(..., dist_args, ...)
+<code>``
+*   **白话解释**：
+既然要切，怎么切？
+*</code>tensor_model_parallel_size<code>(TP)：把每一层神经网络拆分给不同的显卡算。
+*</code>pipeline_model_parallel_size<code>(PP)：把模型的不同层（比如前10层给显卡A，后10层给显卡B）拆分。
+*   **动作**：调用</code>convert_checkpoint_to_mca`，把完整的 HF 模型按照你指定的“刀法”（参数），切成 Megatron 格式。</p>
+</li>
+</ul>
+<h4>第三步：拼图任务 (Megatron -&gt; HF)</h4>
+<p><strong>场景</strong>：训练完了，你想把模型发给朋友用，或者用 transformers 库加载。
+<strong>代码位置</strong>：<code>convert</code> 函数中的 <code>else:</code> 分支 和 <code>convert_mca_to_hf</code> 函数</p>
+<ul>
+<li>
+<p><strong>代码解读</strong>：
+    ```python
+    # 在 convert 函数里调用
+    convert_mca_to_hf(checkpoint_path, output_path, ...)</p>
+<h1>在 convert_mca_to_hf 函数内部</h1>
+<p>convert_checkpoint_to_hf(checkpoint_path, output_path, torch_dtype=torch_dtype)
+<code>``
+*   **白话解释**：
+这个过程叫“Merge”（合并）。它会自动识别那些分散在不同文件夹里的模型碎片（checkpoint），把它们的权重参数提取出来，拼凑成一个完整的权重文件（通常是</code>model.safetensors<code>或</code>pytorch_model.bin`），这样 Hugging Face 就能直接读取了。</p>
+</li>
+</ul>
+<h4>第四步：细节修饰 (精度与配置)</h4>
+<p><strong>场景</strong>：不管怎么转，都要确定的数据格式。
+<strong>代码位置</strong>：<code>convert_mca_to_hf</code> 函数开头</p>
+<ul>
+<li>
+<p><strong>代码解读</strong>：
+    ```python
+    if bf16 and fp16:
+        raise ValueError("bf16 and fp16 cannot be both True.") # 不能既要又要</p>
+<h1>设置数据类型</h1>
+<p>if bf16: torch_dtype = torch.bfloat16
+elif fp16: torch_dtype = torch.float16</p>
+<h1>如果需要，修改最大长度配置</h1>
+<p>if convert_model_max_length is not None:
+    config.model_max_length = convert_model_max_length
+    config.save_pretrained(output_path)
+<code>``
+*   **白话解释**：
+*   **精度**：你是要用</code>fp16<code>（普通半精度）还是</code>bf16<code>（脑图半精度，现在大模型常用的）？这里做个转换，确保保存出来的文件是你想要的精度。
+*   **Max Length**：有时候训练的时候改了上下文长度（比如扩充到了 32k），转换回 HF 格式时，需要顺便把说明书（</code>config.json`）里的长度参数也改了，不然加载时会报错。</p>
+</li>
+</ul>
+<h4>第五步：执行任务 (Fire)</h4>
+<p><strong>代码位置</strong>：<code>main</code> 函数</p>
+<ul>
+<li><strong>代码解读</strong>：
+    <code>python
+    def main():
+        fire.Fire(convert)</code></li>
+<li>
+<p><strong>白话解释</strong>：
+    <code>fire</code> 是一个 Python 库，它能把上面写的 <code>convert</code> 函数直接变成命令行工具。这样你就可以在终端里这样敲命令：</p>
+<p><code>python scripts/megatron_merge.py --checkpoint_path ./my_model --output_path ./new_model --bf16</code></p>
+</li>
+</ul>
+<hr />
+<h3>💡 总结</h3>
+<p>这个文件的核心逻辑就是：</p>
+<ol>
+<li><strong>用户给我一个路径</strong>。</li>
+<li><strong>我看一眼</strong>：是 Megatron 格式吗？</li>
+<li><strong>如果是</strong> $\rightarrow$ 把它<strong>合并</strong>成 Hugging Face 格式（方便人用）。</li>
+<li><strong>如果不是</strong> $\rightarrow$ 把它<strong>拆分</strong>成 Megatron 格式（方便机器训练用，根据 TP/PP 参数切分）。</li>
+</ol>
+<p>所以，虽然文件名叫 <code>megatron_merge.py</code>，但它其实是双向的：既能 Merge（合），也能 Split（分）。</p>

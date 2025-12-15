@@ -1,0 +1,118 @@
+<h1>scripts/vllm_infer.py</h1>
+<p>这份代码是一个用于 <strong>使用 vLLM 引擎进行模型推理（Inference）</strong> 的脚本。</p>
+<p>简单来说，它的作用是：<strong>加载一个大模型（可以是纯文本，也可以是看图/看视频的多模态模型），喂给它一批数据，让它快速生成回答，并将结果保存下来。</strong></p>
+<p>vLLM 是目前最流行、速度最快的大模型推理加速库之一。</p>
+<p>为了让你更容易理解，我把这个脚本的工作流程拆解成一个 <strong>“任务清单 (Todo List)”</strong>。想象一下，如果这个脚本是一个打工人，他的工作日志是这样的：</p>
+<h3>📋 脚本执行的 Task Todo List</h3>
+<ol>
+<li><strong>【准备阶段】接需求与核对参数</strong>：看看用户要用哪个模型？哪个数据集？生成参数（温度、长度）是多少？</li>
+<li><strong>【工具准备】加载分词器与模板</strong>：拿出翻译书（Tokenizer）和对话格式模板（Template），准备处理文本。</li>
+<li><strong>【启动引擎】初始化 vLLM</strong>：启动高性能推理引擎，配置好显卡加速策略。</li>
+<li><strong>【获取原料】加载数据</strong>：把需要测试的问题（Dataset）从硬盘里读出来。</li>
+<li><strong>【设定规则】配置采样参数</strong>：规定模型回答时的创造力（Temperature）、惩罚重复内容等规则。</li>
+<li><strong>【核心工作】批量推理 (Batch Inference)</strong>：<ul>
+<li><em>子任务 6.1</em>：把数据分成小批次（Batch）。</li>
+<li><em>子任务 6.2</em>：处理多模态内容（如果有图片、视频、音频，把它们格式化）。</li>
+<li><em>子任务 6.3</em>：让 vLLM 引擎开始生成回答。</li>
+<li><em>子任务 6.4</em>：收集结果。</li>
+</ul>
+</li>
+<li><strong>【收尾工作】保存结果</strong>：把所有的问题、标准答案、模型生成的回答写到一个文件里。</li>
+</ol>
+<hr />
+<h3>🧐 逐步详细讲解</h3>
+<p>下面我按照上面的清单，结合代码给你详细讲讲：</p>
+<h4>1. 【准备阶段】接需求与核对参数</h4>
+<p><strong>代码位置</strong>：<code>vllm_infer</code> 函数的开头部分。
+*   <strong>动作</strong>：脚本接收了一大堆参数，比如 <code>model_name_or_path</code>（模型在哪）、<code>dataset</code>（测什么题）、<code>batch_size</code>（一次做几道题）。
+*   <strong>逻辑</strong>：它会检查你的 GPU 数量够不够分（<code>pipeline_parallel_size</code>），并把所有参数整理好。</p>
+<h4>2. 【工具准备】加载分词器与模板</h4>
+<p><strong>代码位置</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">tokenizer_module</span> <span class="o">=</span> <span class="n">load_tokenizer</span><span class="p">(</span><span class="n">model_args</span><span class="p">)</span>
+<span class="n">template_obj</span> <span class="o">=</span> <span class="n">get_template_and_fix_tokenizer</span><span class="p">(</span><span class="n">tokenizer</span><span class="p">,</span> <span class="n">data_args</span><span class="p">)</span>
+<span class="n">template_obj</span><span class="o">.</span><span class="n">mm_plugin</span><span class="o">.</span><span class="n">expand_mm_tokens</span> <span class="o">=</span> <span class="kc">False</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：<ul>
+<li>加载 Tokenizer 是为了把人类文字变成数字（Token）。</li>
+<li>加载 Template 是为了给模型加 Prompt 格式（比如 <code>&lt;|im_start|&gt;user...</code>）。</li>
+<li><code>expand_mm_tokens = False</code>：这是一个小细节，告诉工具不要手动把 <code>&lt;image&gt;</code> 标签展开成一堆占位符，因为 vLLM 引擎自己会处理。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 【启动引擎】初始化 vLLM</h4>
+<p><strong>代码位置</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">engine_args</span> <span class="o">=</span> <span class="p">{</span> <span class="o">...</span> <span class="p">}</span>
+<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="o">**</span><span class="n">engine_args</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：这是脚本最关键的一步。它配置了 vLLM 引擎：<ul>
+<li><code>tensor_parallel_size</code>：如果你有多张卡，决定用几张卡并行计算。</li>
+<li><code>enable_lora</code>：如果你挂载了微调后的 LoRA 适配器，这里要开启。</li>
+<li><code>limit_mm_per_prompt</code>：限制每个问题里最多能放几张图或几个视频。</li>
+<li>最后 <code>llm = LLM(...)</code> 真正启动了引擎，模型加载进显存。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 【获取原料】加载数据</h4>
+<p><strong>代码位置</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">dataset_module</span> <span class="o">=</span> <span class="n">get_dataset</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="n">train_dataset</span> <span class="o">=</span> <span class="n">dataset_module</span><span class="p">[</span><span class="s2">&quot;train_dataset&quot;</span><span class="p">]</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：利用 LlamaFactory 的数据处理模块，把指定的数据集（如 <code>alpaca_en_demo</code>）读取进来，准备喂给模型。</li>
+</ul>
+<h4>5. 【设定规则】配置采样参数</h4>
+<p><strong>代码位置</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：告诉模型该怎么说话：<ul>
+<li><code>temperature</code>：高了胡说八道（有创造力），低了死板。</li>
+<li><code>stop_token_ids</code>：告诉模型遇到哪些词就闭嘴（停止生成）。</li>
+<li><code>max_tokens</code>：最多能说多少字。</li>
+</ul>
+</li>
+</ul>
+<h4>6. 【核心工作】批量推理 (Batch Inference)</h4>
+<p>这是代码里那个大的 <code>for</code> 循环：
+<code>for i in tqdm(range(0, len(train_dataset), batch_size), ...):</code></p>
+<p><strong>为什么要分批？</strong> 如果你有 10 万条数据，一次性全塞进去内存会爆，文件句柄也会不够用。所以要一小撮一小撮地做。</p>
+<ul>
+<li>
+<p><strong>子任务 6.1 &amp; 6.2：多模态数据处理</strong></p>
+<ul>
+<li>代码里有大量的 <code>if batch["images"]</code> / <code>elif batch["videos"]</code>。</li>
+<li><strong>图片</strong>：如果有图，调整图片大小 (<code>_regularize_images</code>)。</li>
+<li><strong>视频</strong>：如果有视频，这部分代码最复杂。<ul>
+<li>它会读取视频文件 (<code>av.open</code>)。</li>
+<li>提取关键帧、计算 FPS（帧率）、总帧数。</li>
+<li>特别是针对 <code>Qwen2-VL</code> 或 <code>GLM4V</code> 这种模型，它们需要非常具体的视频参数（如 <code>video_metadata_kwargs</code>），代码在这里专门做了适配。</li>
+</ul>
+</li>
+<li><strong>音频</strong>：如果有声音，处理采样率。</li>
+<li>最终打包成 <code>vllm_input_data</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>子任务 6.3：生成</strong>
+    <code>python
+    results = llm.generate(vllm_inputs, sampling_params, lora_request=lora_request)</code></p>
+<ul>
+<li><strong>解释</strong>：这就是“魔法”发生的时刻。调用 vLLM 的 <code>generate</code> 接口，传入整理好的数据，模型开始计算并返回结果。</li>
+</ul>
+</li>
+</ul>
+<h4>7. 【收尾工作】保存结果</h4>
+<p><strong>代码位置</strong>：最后面的 <code>with open(save_name, "w", ...)</code>。
+*   <strong>解释</strong>：循环结束后，把所有的：
+    *   <code>prompt</code> (原问题)
+    *   <code>predict</code> (模型生成的回答)
+    *   <code>label</code> (数据集里的标准答案，如果有的话)
+    *   打包成 JSON 格式，一行一行写入到 <code>generated_predictions.jsonl</code> 文件中。</p>
+<h3>总结</h3>
+<p>这个脚本就是一个<strong>高性能的流水线工人</strong>。它负责把你的数据（无论是字、图还是视频）清洗整理好，利用 vLLM 这个强力机器进行加工（推理），最后把产出的结果整整齐齐地打包存好。</p>

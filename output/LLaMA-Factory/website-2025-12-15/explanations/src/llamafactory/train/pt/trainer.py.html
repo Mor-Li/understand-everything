@@ -1,0 +1,69 @@
+<h1>src/llamafactory/train/pt/trainer.py</h1>
+<p>这份代码确实看起来有点“散”，因为它主要是在做一个<strong>“缝合”和“定制”</strong>的工作。</p>
+<p>你可以把这个文件理解为：<strong>LlamaFactory 觉得 HuggingFace 原生的 <code>Trainer</code>（训练器）不够用，或者有些默认行为不符合它的需求，所以它写了一个 <code>CustomTrainer</code>（自定义训练器）来覆盖和增强原有的功能。</strong></p>
+<p>为了让你看懂，我们可以把阅读这份代码想象成<strong>“组装一台定制赛车”</strong>的任务清单。我们按照这个 TODO List 一步步来看它到底改了什么。</p>
+<hr />
+<h3>📋 任务清单：理解 CustomTrainer 的组装过程</h3>
+<h4>✅ 任务 1：确立基础架构 (继承 Trainer)</h4>
+<p><strong>代码位置：</strong> <code>class CustomTrainer(Trainer):</code>
+*   <strong>解读：</strong> 这行代码告诉我们，这辆车不是从零造的，而是基于 HuggingFace 著名的 <code>Trainer</code> 改装的。所有的基础功能（比如怎么跑循环、怎么存盘）都直接沿用，我们只改我们需要的部分。</p>
+<h4>✅ 任务 2：启动前的检查与配置 (<code>__init__</code>)</h4>
+<p><strong>代码位置：</strong> <code>def __init__(...):</code>
+这是赛车启动前必须做的准备工作。代码里主要做了这几件事：</p>
+<ol>
+<li><strong>开启“省油模式” (FP8 环境)：</strong><ul>
+<li><code>configure_fp8_environment(model_args)</code></li>
+<li><strong>意思：</strong> 如果用户设置了 FP8（8位浮点数训练），这里会先配置好环境。这能大幅节省显存。</li>
+</ul>
+</li>
+<li><strong>兼容性调整 (版本补丁)：</strong><ul>
+<li><code>if is_transformers_version_greater_than("4.46"): ...</code></li>
+<li><strong>意思：</strong> HuggingFace 的库更新很快，这里是为了兼容新老版本的参数名（<code>processing_class</code> vs <code>tokenizer</code>），防止报错。</li>
+</ul>
+</li>
+<li><strong>防止计算错误 (Bug Fix)：</strong><ul>
+<li><code>self.model_accepts_loss_kwargs = False</code></li>
+<li><strong>意思：</strong> 这是一个技术性的补丁，注释里提到了是为了避免在“梯度累积”时计算 Loss 出错。</li>
+</ul>
+</li>
+<li><strong>安装“记录员” (Callback)：</strong><ul>
+<li><code>self.add_callback(SaveProcessorCallback(processor))</code></li>
+<li><strong>意思：</strong> 训练完模型后，我们需要把 Tokenizer（分词器）也存下来，否则模型没法用。这里挂载了一个回调函数，确保训练结束时自动保存分词器。</li>
+</ul>
+</li>
+<li><strong>安装“特殊引擎” (BAdam)：</strong><ul>
+<li><code>if finetuning_args.use_badam: ...</code></li>
+<li><strong>意思：</strong> 如果用户想用 BAdam（一种特殊的优化算法，比通常的 AdamW 更省显存），这里会魔改 <code>clip_grad_norm_</code> 函数并添加对应的回调，让训练器支持这种算法。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ 任务 3：更换“发动机” (Optimizer)</h4>
+<p><strong>代码位置：</strong> <code>def create_optimizer(self):</code>
+*   <strong>原版行为：</strong> 默认的 Trainer 通常只使用标准的 AdamW 优化器。
+*   <strong>这里改了啥：</strong>
+    *   <code>create_custom_optimizer(...)</code>
+    *   <strong>意思：</strong> LlamaFactory 支持很多花哨的优化技术（比如 LoRA+、Galore 等）。这里劫持了创建优化器的过程，把控制权交给 <code>create_custom_optimizer</code> 这个外部函数。意思是：“别用标配发动机了，给我换上 LlamaFactory 专用的发动机。”</p>
+<h4>✅ 任务 4：调整“变速箱” (Scheduler)</h4>
+<p><strong>代码位置：</strong> <code>def create_scheduler(self, ...):</code>
+*   <strong>原版行为：</strong> 控制学习率怎么随时间变化（预热、衰减）。
+*   <strong>这里改了啥：</strong>
+    *   <code>create_custom_scheduler(...)</code>
+    *   <strong>意思：</strong> 同样的，这里劫持了学习率调度器的创建过程。确保学习率的变化曲线符合 LlamaFactory 的特殊设置。</p>
+<h4>✅ 任务 5：定制“供油系统” (Sampler)</h4>
+<p><strong>代码位置：</strong> <code>def _get_train_sampler(self, ...):</code>
+*   <strong>原版行为：</strong> 训练数据通常是<strong>随机打乱</strong>（Shuffle）喂给模型的。
+*   <strong>这里改了啥：</strong>
+    *   <code>if self.finetuning_args.disable_shuffling: return SequentialSampler(...)</code>
+    *   <strong>意思：</strong> 有时候（比如做预训练 Pre-training 时），我们希望数据是<strong>按顺序</strong>喂进去的，不要打乱。如果用户开了 <code>disable_shuffling</code>，这里就强制使用顺序采样器。</p>
+<hr />
+<h3>💡 总结：这个文件到底在讲啥？</h3>
+<p><strong>一句话总结：</strong>
+这是一个<strong>中间层（Wrapper）</strong>，它把 HuggingFace 强大的 <code>Trainer</code> 和 LlamaFactory 复杂的参数配置（FP8、BAdam、LoRA优化器等）连接了起来。</p>
+<p><strong>如果把训练模型比作“炒菜”：</strong>
+*   <strong>HuggingFace Trainer</strong> 是全自动炒菜机。
+*   <strong>User (你)</strong> 想做一道非常特殊的“满汉全席”（FP8、BAdam 等特殊需求）。
+*   <strong>这个文件 (<code>trainer.py</code>)</strong> 就是修改了炒菜机的程序：
+    *   改了温控系统（Optimizer/Scheduler）。
+    *   改了投料顺序（Sampler）。
+    *   加了特殊的佐料处理逻辑（FP8/Callback）。</p>
+<p>现在再看代码，是不是觉得它只是在做一堆 <code>if...else</code> 的配置覆盖工作？</p>

@@ -1,0 +1,80 @@
+<h1>src/llamafactory/model/model_utils/checkpointing.py</h1>
+<p>这个文件看起来很复杂，是因为它涉及到了深度学习训练中最底层的<strong>显存优化（Memory Optimization）</strong>和<strong>数值稳定性（Numerical Stability）</strong>技巧。</p>
+<p>简单来说，这个文件的核心目的是：<strong>在训练大模型时，想尽办法省显存，同时保证模型别练崩了。</strong></p>
+<p>为了让你看懂，我把这个文件要做的事情拆解成一个 <strong>“大模型训练前的准备清单 (Task Todo List)”</strong>。我们像包工头一样，一步步看代码是怎么完成这些任务的。</p>
+<hr />
+<h3>任务清单 (Task Todo List)</h3>
+<h4>Task 1: 显存不够怎么办？开启“梯度检查点” (Gradient Checkpointing)</h4>
+<p><strong>背景：</strong> 训练大模型时，中间产生的临时数据（Activations）非常占显存。
+<strong>传统做法：</strong> 把所有中间数据都存着，等着反向传播用。结果：显存爆炸（OOM）。
+<strong>省钱做法（梯度检查点）：</strong> 中间数据我不存了，算完就扔。等反向传播需要用的时候，我再<strong>重新算一遍</strong>。虽然慢了一点点，但显存省了一大半。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>_gradient_checkpointing_enable</code> 函数。</li>
+<li><strong>动作：</strong> 这个函数会把模型原本的机制替换掉，强制开启这个省显存模式。</li>
+</ul>
+<h4>Task 2: 显存还是不够怎么办？用“Unsloth”的黑科技 (Offload to CPU)</h4>
+<p><strong>背景：</strong> 即使开了上面的功能，显存可能还是紧巴巴的。
+<strong>进阶做法：</strong> Unsloth 团队（一个专门做大模型优化的团队）想了个招：既然 GPU 显存贵，CPU 内存便宜，那我在存中间数据的时候，<strong>把数据暂时扔到 CPU 内存里去</strong>，等要用的时候再搬回 GPU。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>get_unsloth_gradient_checkpointing_func</code> 函数。</li>
+<li><strong>解读：</strong><ul>
+<li><code>forward</code> (前向传播): 把 <code>hidden_states</code> 搬运到 CPU (<code>.to("cpu")</code>)。</li>
+<li><code>backward</code> (反向传播): 把数据从 CPU 搬回 GPU (<code>.to("cuda")</code>)，然后重新计算。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 别做无用功，只对“能训练”的层动手 (Smart Checkpointing)</h4>
+<p><strong>背景：</strong> 有些层是冻结的（Frozen），不需要更新参数。如果对这些层也搞“重新计算”那一套，纯属浪费时间，而且可能会干扰某些特殊的优化器（比如 BAdam）。
+<strong>优化做法：</strong> 检查一下这一层是不是要训练（<code>requires_grad</code>）。如果要训练，我才搞检查点；如果不要训练，就按正常流程走。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>get_custom_gradient_checkpointing_func</code> 函数。</li>
+<li><strong>解读：</strong> 它是一个装饰器（Wrapper），在执行检查点之前，先判断 <code>if any(param.requires_grad ...)</code>。</li>
+</ul>
+<h4>Task 4: 防止数学计算溢出 (Upcasting to FP32)</h4>
+<p><strong>背景：</strong> 现在的模型为了快，通常用半精度（FP16 或 BF16）训练。但是，有些关键部位（比如 LayerNorm 层和最后的输出层）对精度非常敏感。如果用半精度，容易出现数值溢出（变成 NaN），导致训练失败。
+<strong>稳健做法：</strong> 无论整体用什么精度，强制把<strong>LayerNorm</strong>和<strong>最后的输出头 (LM Head)</strong> 转成全精度（FP32）来计算。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>prepare_model_for_training</code> 函数中的逻辑。</li>
+<li><strong>解读：</strong><ul>
+<li><code>if model_args.upcast_layernorm:</code> 找到所有 LayerNorm，转成 float32。</li>
+<li><code>if model_args.upcast_lmhead_output:</code> 给输出层挂一个钩子（Hook），强制输出 float32。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：代码执行流程图</h3>
+<p>当你调用 <code>prepare_model_for_training</code>（准备开始训练）时，代码是这样一步步执行的：</p>
+<ol>
+<li>
+<p><strong>准备阶段 (<code>prepare_model_for_training</code>)</strong>：</p>
+<ul>
+<li>👋 <strong>Task 4 执行</strong>：把 LayerNorm 变成 FP32，保证稳。</li>
+<li>👋 <strong>Task 4 执行</strong>：把输出层 (LM Head) 变成 FP32，保证稳。</li>
+</ul>
+</li>
+<li>
+<p><strong>开启省显存模式</strong>：</p>
+<ul>
+<li>检查用户是不是想用 FSDP2（一种分布式训练技术），如果是，调整一下设置。</li>
+<li>如果用户没禁用梯度检查点，调用 <code>_gradient_checkpointing_enable</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>配置省显存策略 (<code>_gradient_checkpointing_enable</code>)</strong>：</p>
+<ul>
+<li>❓ <strong>抉择</strong>：用户想用 Unsloth 的黑科技吗？<ul>
+<li><strong>是</strong> -&gt; 拿来 <strong>Task 2</strong> 的逻辑（存到 CPU）。</li>
+<li><strong>否</strong> -&gt; 用 PyTorch 自带的逻辑（存到 GPU）。</li>
+</ul>
+</li>
+<li>🛠 <strong>加工</strong>：不管选哪个，都套上 <strong>Task 3</strong> 的逻辑（只对训练层生效）。</li>
+<li>✅ <strong>激活</strong>：把这一套逻辑应用到模型上。</li>
+</ul>
+</li>
+</ol>
+<h3>这段代码的价值</h3>
+<p>如果你不用这段代码，直接用原生的 HuggingFace Transformers 训练：
+1.  显存很容易爆（OOM）。
+    2.  如果你开了 LoRA 或者冻结了部分层，原生的梯度检查点可能会浪费计算资源。
+3.  混合精度训练时，Loss 可能会突然变成 NaN（因为没做 FP32 强转）。</p>
+<p><strong>一句话总结：这是一个“大模型训练前的精细化改装车间”，目的是为了让你的显卡能跑得动更大的模型，而且跑得更稳。</strong></p>

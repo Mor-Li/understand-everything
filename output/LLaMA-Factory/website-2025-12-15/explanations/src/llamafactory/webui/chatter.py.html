@@ -1,0 +1,59 @@
+<h1>src/llamafactory/webui/chatter.py</h1>
+<p>这份代码文件 <code>src/llamafactory/webui/chatter.py</code> 是 <strong>LlamaFactory WebUI 界面背后的“聊天控制器”</strong>。</p>
+<p>简单来说，它的作用是<strong>连接网页界面（Gradio）和后台的 AI 模型</strong>。它负责处理用户的点击（加载模型）、输入（发消息）以及把模型的回复（流式输出）漂亮地展示在网页上。</p>
+<p>为了让你更容易理解，我把它想象成一个<strong>聊天机器人的“任务清单 (Todo List)”</strong>，按照用户操作的顺序一步步来讲。</p>
+<hr />
+<h3>📋 任务清单 (Task Todo)</h3>
+<p>如果这个程序是一个打工人的话，他的工作流程是这样的：</p>
+<ol>
+<li><strong>准备阶段 (Helpers)</strong>: 准备好处理文字格式的工具（比如怎么把“思考过程”折叠起来，怎么防止代码乱码）。</li>
+<li><strong>入职报到 (Init)</strong>: 初始化控制器，看看是不是演示模式（Demo Mode）。</li>
+<li><strong>接到任务：加载模型 (Load Model)</strong>: 用户选好模型点了“加载”，我要去硬盘读取模型文件，加载到显卡里。</li>
+<li><strong>接到任务：处理用户发言 (Append)</strong>: 用户发了一句话，我要把它加到聊天记录的小本本上。</li>
+<li><strong>接到任务：生成回复 (Stream)</strong>: 命令模型开始写作文，并把写出来的字一个一个实时推送到屏幕上（如果是深度思考模型，还要把思考过程藏在折叠框里）。</li>
+<li><strong>接到任务：卸载模型 (Unload Model)</strong>: 用户点了“卸载”，我要把模型踢出显存，释放资源。</li>
+</ol>
+<hr />
+<h3>🪜 一步一步详细解读</h3>
+<p>下面我们按照上面的清单，深入代码看看它是怎么干活的：</p>
+<h4>1. 准备阶段：文字美容师 (<code>_escape_html</code> 和 <code>_format_response</code>)</h4>
+<p>在代码的最上面有两个函数：
+*   <strong><code>_escape_html</code></strong>: 这是一个安全卫士。它把 <code>&lt;</code> 变成 <code>&amp;lt;</code>，防止用户输入的内容被浏览器误认为是 HTML 代码从而破坏页面布局。
+*   <strong><code>_format_response</code> (重点)</strong>: <strong>这是专门为 DeepSeek-R1 这种推理模型设计的</strong>。
+    *   如果模型输出了“思考过程”（Thought），它会把思考内容放在一个 <code>&lt;details&gt;</code> 折叠框里，把最终答案放在外面。
+    *   这样你在网页上看到的就是一个可以点击展开的“Thinking...”按钮，而不是满屏乱糟糟的思考步骤。</p>
+<h4>2. 类定义与初始化 (<code>WebChatModel</code> -&gt; <code>__init__</code>)</h4>
+<ul>
+<li>这个类继承自 <code>ChatModel</code>（后台的核心对话类）。</li>
+<li>它保存了一个 <code>manager</code>（用来获取网页上各个按钮/输入框的值）。</li>
+<li>如果系统环境变量里设置了 <code>DEMO_MODEL</code>，它会自动进入演示模式，直接加载预设的模型，不让用户瞎改配置。</li>
+</ul>
+<h4>3. 任务：加载模型 (<code>load_model</code>)</h4>
+<p>当你在网页点击“加载模型”时，这个函数被触发：
+*   <strong>收集情报</strong>: 它通过 <code>get("top.xxx")</code> 从网页界面上抓取你填写的配置：模型路径、微调方式（LoRA/Full）、量化位数（4bit/8bit）、计算后端（HuggingFace/vLLM）等。
+*   <strong>安全检查</strong>: 检查你是不是没选模型？路径对不对？是不是正在演示模式禁止加载？如果有问题，直接报错（<code>yield error</code>）。
+*   <strong>组装参数</strong>: 把上面收集到的零散配置，打包成一个字典 <code>args</code>。
+    *   <em>特技</em>: 如果你选了多个 LoRA 适配器，它会把路径拼起来。
+*   <strong>启动</strong>: 调用 <code>super().__init__(args)</code>，真正开始把庞大的模型文件读入显存。
+*   <strong>反馈</strong>: 告诉界面“加载成功”。</p>
+<h4>4. 任务：卸载模型 (<code>unload_model</code>)</h4>
+<p>当你在网页点击“卸载模型”时：
+*   <strong>清理</strong>: 把 <code>self.engine</code> 设为 <code>None</code>。
+*   <strong>打扫卫生</strong>: 调用 <code>torch_gc()</code>（Garbage Collection），强制清理显存，把显卡资源释放出来给别的程序用。</p>
+<h4>5. 任务：记录用户发言 (<code>append</code>)</h4>
+<p>当你输入问题并回车时：
+*   <strong>双份记录</strong>:
+    *   <code>chatbot</code>: 这是给<strong>网页显示</strong>用的列表（可能包含 HTML 转义）。
+    *   <code>messages</code>: 这是给<strong>模型后台</strong>用的原始数据列表（包含 <code>role: user</code>, <code>content: ...</code>）。
+*   它把你的话分别加到这两个列表里，然后清空输入框。</p>
+<h4>6. 任务：流式生成回复 (<code>stream</code>)</h4>
+<p>这是最核心、最复杂的部分。模型开始“吐字”了：
+*   <strong>临时设置</strong>: 使用 <code>update_attr</code> 临时开启或关闭“思考功能”（enable_thinking）。
+*   <strong>调用后台</strong>: <code>self.stream_chat(...)</code> 命令模型开始生成。它传入了历史记录、系统提示词（System Prompt）、工具（Tools）、图像/视频等多模态输入。
+*   <strong>实时循环</strong>:
+    *   模型每生成一点新内容，就进入一次循环。
+    *   <strong>工具调用判断</strong>: 检查模型是不是想调用函数（Function Calling）。如果是，生成 JSON 格式的工具调用指令。
+    *   <strong>普通对话</strong>: 如果是正常聊天，调用刚才提到的 <code>_format_response</code>，把内容排版好（处理思考标签）。
+*   <strong>推送到界面</strong>: 使用 <code>yield chatbot, output_messages</code>，让网页上的聊天气泡实时变长，产生“打字机”的效果。</p>
+<h3>总结</h3>
+<p>这个文件就是 <strong>LlamaFactory 网页版的“大管家”</strong>。它不负责具体的矩阵乘法（那是 PyTorch 和 Transformers 的事），它的工作是把网页上用户的点点点和打字，翻译成后台能听懂的指令，再把后台复杂的计算结果，翻译成网页上好看的聊天气泡。</p>

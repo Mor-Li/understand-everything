@@ -7,8 +7,10 @@
 **Transform any code repository into easy-to-understand interactive documentation through Git history and AI analysis.**
 
 [🌐 Project Website](https://mor-li.github.io/understand-everything/index.html) |
-[📖 verl Demo](https://mor-li.github.io/understand-everything/output/verl/website-2025-12-09/index.html) |
-[⚡ Megatron-LM Demo](https://mor-li.github.io/understand-everything/output/Megatron-LM/website-2025-12-09/index.html)
+[⚡ flash-linear-attention Demo](https://mor-li.github.io/understand-everything/output/flash-linear-attention/index.html) |
+[📖 verl Demo](https://mor-li.github.io/understand-everything/output/verl/index.html) |
+[🔥 Megatron-LM Demo](https://mor-li.github.io/understand-everything/output/Megatron-LM/index.html) |
+[🦙 LLaMA-Factory Demo](https://mor-li.github.io/understand-everything/output/LLaMA-Factory/index.html)
 
 English | [简体中文](assets/README_zh.md)
 
@@ -187,6 +189,8 @@ python scripts/s4_website.py repo/your-project
 Successfully analyzed open source projects:
 - **[verl](https://github.com/volcengine/verl)** (1100+ files) - ByteDance's large model reinforcement learning framework
 - **[Megatron-LM](https://github.com/NVIDIA/Megatron-LM)** (1330+ files) - NVIDIA's large-scale Transformer training framework
+- **[LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory)** (405 files) - One-stop LLM fine-tuning framework supporting 100+ models
+- **[flash-linear-attention](https://github.com/fla-org/flash-linear-attention)** (468 files) - Triton implementation of efficient linear attention mechanisms
 
 ## Tech Stack
 

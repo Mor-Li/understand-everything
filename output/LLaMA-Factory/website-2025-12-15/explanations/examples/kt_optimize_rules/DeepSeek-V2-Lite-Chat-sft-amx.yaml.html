@@ -1,0 +1,83 @@
+<h1>examples/kt_optimize_rules/DeepSeek-V2-Lite-Chat-sft-amx.yaml</h1>
+<p>这份文件其实是一份<strong>“装修/改装清单”</strong>。</p>
+<p>想象一下，你刚买了一套名为“DeepSeek-V2”的精装房（原版模型），但你想让它住起来更舒服、更省电，或者你的某些家具（显卡显存）放不下这么大的房子。</p>
+<p>于是，你写了这份 <code>yaml</code> 文件，告诉装修队（<code>ktransformers</code> 程序）：<strong>“看到原本的 A 部件，请把它拆掉，换成更高级的 B 部件，并且指定 B 部件是放在楼上（GPU）还是楼下（CPU）运行。”</strong></p>
+<p>这份配置的核心目的是：<strong>利用 CPU 的 AMX 指令集加速（Intel CPU 的一种加速功能）来运行模型中巨大的“混合专家（MoE）”部分，而把其他核心计算留在 GPU 上，实现“CPU+GPU”协同工作。</strong></p>
+<p>下面我为你列一个 <strong>Task To-Do List</strong>，一步步拆解这份文件在干什么：</p>
+<hr />
+<h3>🛠️ 任务清单：DeepSeek-V2 模型改装计划</h3>
+<h4>Task 1: 升级“定位系统” (RoPE)</h4>
+<ul>
+<li><strong>原文对应：</strong> 第 1 段 (<code>match: ...RotaryEmbedding</code>)</li>
+<li><strong>任务：</strong> 找到模型里的“旋转位置编码（RoPE）”模块。</li>
+<li><strong>动作：</strong> 替换成 <code>ktransformers</code> 特制的优化版本。</li>
+<li><strong>去哪儿运行？</strong> 全部扔给显卡 (<strong>CUDA</strong>)。</li>
+<li><strong>通俗解释：</strong> 这是模型用来理解文字顺序的零件，原版的太慢，换个专门优化过的，让显卡快速处理。</li>
+</ul>
+<h4>Task 2: 批量升级“普通运算单元” (Linear Layers)</h4>
+<ul>
+<li><strong>原文对应：</strong> 第 2 段 (<code>match: ...torch.nn.Linear</code>)</li>
+<li><strong>任务：</strong> 找到模型里所有的普通线性层（Linear），但<strong>排除</strong>掉注意力机制里的一部分特殊层（正则 <code>(?!.*self_attn...)</code> 排除的那些）。</li>
+<li><strong>动作：</strong> 替换成 <code>KTransformersLinear</code>（一种支持量化数据的内核）。</li>
+<li><strong>去哪儿运行？</strong> 无论是阅读提问（Prefill）还是生成回答（Generate），都用显卡 (<strong>CUDA</strong>)。</li>
+<li><strong>通俗解释：</strong> 这是模型里最常见的“神经元”连接。把它们全部换成高性能版本，跑在显卡上。</li>
+</ul>
+<h4>Task 3: 升级“嘴巴” (LM Head)</h4>
+<ul>
+<li><strong>原文对应：</strong> 第 3 段 (<code>match: ^lm_head</code>)</li>
+<li><strong>任务：</strong> 找到模型最后输出文字的那个层（LM Head）。</li>
+<li><strong>动作：</strong> 替换成 <code>KTransformersLinear</code>。</li>
+<li><strong>去哪儿运行？</strong> 显卡 (<strong>CUDA</strong>)。</li>
+<li><strong>通俗解释：</strong> 这是模型吐出下一个字的关口，同样换成高性能版，放在显卡上。</li>
+</ul>
+<h4>Task 4: 升级“专家调度员” (MoE Router)</h4>
+<ul>
+<li><strong>原文对应：</strong> 第 4 段 (<code>match: ...DeepseekV2MoE</code>)</li>
+<li><strong>任务：</strong> 找到 DeepSeek 模型特殊的“混合专家（MoE）”模块的主体。</li>
+<li><strong>动作：</strong> 替换成 <code>KDeepseekV2MoE</code>。</li>
+<li><strong>去哪儿运行？</strong> 显卡 (<strong>CUDA</strong>)。</li>
+<li><strong>通俗解释：</strong> DeepSeek 是个 MoE 模型，意味着它有很多“专家”。这个模块是“调度员”，负责决定把问题交给哪个专家。调度员需要反应快，所以放在显卡上。</li>
+</ul>
+<h4>Task 5: 【核心任务】把“专家团”搬到 CPU (The Experts)</h4>
+<ul>
+<li><strong>原文对应：</strong> 第 5 段 (<code>match: ...mlp.experts</code>)</li>
+<li><strong>任务：</strong> 找到那一大堆具体的“专家”层（Experts）。<strong>这是模型参数量最大、最占显存的部分。</strong></li>
+<li><strong>动作：</strong> 替换成 <code>KTransformersExperts</code>。</li>
+<li><strong>去哪儿运行？</strong><ul>
+<li><strong>CPU!</strong> (看 <code>prefill_device: "cpu"</code>, <code>generate_device: "cpu"</code>)</li>
+<li><strong>黑科技：</strong> <code>backend: "AMXInt8"</code>。这意味着使用 Intel CPU 的 AMX 加速指令，并且用 Int8（8位整数）格式来压缩计算。</li>
+</ul>
+</li>
+<li><strong>通俗解释：</strong> 显存不够放不下所有的专家，所以我们把最占地方的“专家团”全部赶到 CPU 上去跑。为了防止 CPU 太慢，我们开启了 AMX 加速和 Int8 量化。<strong>这是这个配置文件的灵魂所在。</strong></li>
+</ul>
+<h4>Task 6: 升级“注意力机制” (Attention/MLA)</h4>
+<ul>
+<li><strong>原文对应：</strong> 第 6 段 (<code>match: ...self_attn</code>)</li>
+<li><strong>任务：</strong> 找到模型的注意力层（Self Attention）。</li>
+<li><strong>动作：</strong> 替换成 <code>KDeepseekV2Attention</code>。</li>
+<li><strong>去哪儿运行？</strong> 显卡 (<strong>CUDA</strong>)。</li>
+<li><strong>通俗解释：</strong> DeepSeek V2 使用了一种叫 MLA 的特殊注意力机制。这里用专门优化的代码来替换原版，让它在显卡上跑得飞快。</li>
+</ul>
+<h4>Task 7: 调整“整体架构”与“门面” (Model &amp; Embeddings)</h4>
+<ul>
+<li><strong>原文对应：</strong> 最后两段 (<code>match: ^model$</code>, <code>match: ...embed_tokens</code>)</li>
+<li><strong>任务：</strong><ol>
+<li>调整整个模型的管理方式 (<code>KDeepseekV2Model</code>)。</li>
+<li>找到最开始的“文字入口”（Embeddings）。</li>
+</ol>
+</li>
+<li><strong>动作：</strong><ol>
+<li>设置层级预填充阈值为 0（技术细节，关乎调度策略）。</li>
+<li>把入口层 (<code>embed_tokens</code>) 放在 <strong>CPU</strong> 上。</li>
+</ol>
+</li>
+<li><strong>通俗解释：</strong> 这是一个收尾工作。把查字典（Embedding）这种不怎么费劲但占内存的工作扔给 CPU，省点显存给更重要的地方。</li>
+</ul>
+<hr />
+<h3>📝 总结：这个配置到底实现了什么？</h3>
+<p>如果你运行了这个配置，你的 DeepSeek-V2 模型会变成这样：</p>
+<ol>
+<li><strong>显卡（CUDA）负责：</strong> 所有的逻辑调度、注意力计算、普通的神经元连接。这些需要高带宽、低延迟。</li>
+<li><strong>处理器（CPU）负责：</strong> 所有的“专家库”（MoE Experts）和“查字典”（Embeddings）。这些占据了模型 80% 以上的体积。</li>
+<li><strong>最终效果：</strong> 你可以在一张显存不大的显卡上，配合一颗支持 AMX 的强力 CPU，跑起来原本需要巨量显存才能运行的 DeepSeek-V2 模型。</li>
+</ol>

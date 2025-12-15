@@ -1,0 +1,115 @@
+<h1>src/llamafactory/model/model_utils/moe.py</h1>
+<p>这份代码看起来确实很复杂，因为它涉及到<strong>深度学习框架（PyTorch）</strong>、<strong>分布式训练工具（DeepSpeed）</strong>以及<strong>各种大模型架构（DeepSeek, Qwen, Mixtral等）</strong>的底层细节。</p>
+<p>简单来说，这个文件的作用是：<strong>“为了让 LlamaFactory 能顺利训练各种‘混合专家（MoE）’模型，所做的各种杂活和补丁。”</strong></p>
+<p>为了让你听懂，我们把这个文件想象成一个<strong>“大模型训练的后勤管家”</strong>。它的任务清单（Todo List）如下。</p>
+<hr />
+<h3>📋 任务清单 (Task Todo List)</h3>
+<p>我们将代码拆解为三个主要任务，一步步来讲：</p>
+<h4>✅ Task 1: 保护“专家”不被暴力拆解 (针对 DeepSpeed ZeRO-3)</h4>
+<ul>
+<li><strong>背景知识</strong>：当你用多张显卡训练大模型时，通常会用一个叫 <strong>DeepSpeed ZeRO-3</strong> 的技术。它像切蛋糕一样，把模型切碎了分给不同的显卡，以节省显存。</li>
+<li><strong>问题</strong>：对于 <strong>MoE（混合专家模型）</strong> 来说，模型里有很多“专家（Experts）”层。如果 DeepSpeed 切得太碎，把原本应该在一起工作的“专家组”强行拆到了不同显卡上通信，训练速度会变得巨慢，甚至报错。</li>
+<li><strong>代码干了啥</strong>：<ul>
+<li>函数 <code>add_z3_leaf_module(model)</code> 就是在做这件事。</li>
+<li>它列出了一长串模型名字（DeepSeek, Mixtral, Qwen, Jamba...）。</li>
+<li>它指着这些模型的“专家层（MoeBlock）”告诉 DeepSpeed：<strong>“这是一个整体（Leaf Module），请不要把它内部再切碎了，要切就整块切。”</strong></li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 开启“负载均衡”监控 (配置训练参数)</h4>
+<ul>
+<li><strong>背景知识</strong>：MoE 模型有一个“路由器（Router）”，它负责决定把问题交给哪个专家处理。训练时，我们最怕路由器“偷懒”，把所有活儿都派给同一个专家，导致其他专家围观。这叫“负载不均衡”。</li>
+<li><strong>解决办法</strong>：我们需要给模型加一个<strong>“辅助损失（Aux Loss）”</strong>。如果分配不均，就罚分。</li>
+<li><strong>代码干了啥</strong>：<ul>
+<li>函数 <code>configure_moe(...)</code> 负责修改模型的配置。</li>
+<li>它检查模型类型，如果发现是 MoE 模型，就强制开启 <code>output_router_logits = True</code>（允许我们查看路由器的选择）。</li>
+<li>它把用户设置的 <code>moe_aux_loss_coef</code>（负载均衡惩罚系数）注入到模型配置里。这相当于告诉模型：“训练时记得算一下有没有偷懒，如果有，要罚分。”</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 手动实现特定模型的逻辑 (打补丁)</h4>
+<ul>
+<li><strong>背景知识</strong>：有时候新的模型（比如 Qwen3-Omni）刚出来，HuggingFace 的官方库 <code>transformers</code> 可能还没完全支持，或者支持得不够好。</li>
+<li><strong>代码干了啥</strong>：<ul>
+<li>代码最后那个很长的类 <code>Qwen3OmniMoeThinkerTextSparseMoeBlock</code> 就是在一个字一个字地手写这个模型的网络结构。</li>
+<li>它定义了：<ol>
+<li><strong>Gate (门控)</strong>：决定选哪个专家。</li>
+<li><strong>Forward (前向传播)</strong>：计算输入数据怎么流向专家，最后怎么把专家的结果加权合并起来。</li>
+</ol>
+</li>
+<li>这属于“临时工”或者“特定优化”代码，为了让这个特定的新模型能跑起来。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🔍 逐步代码对应讲解</h3>
+<p>现在你再回头看代码，就能对上号了：</p>
+<h4>第一部分：保护专家 (Task 1)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">add_z3_leaf_module</span><span class="p">(</span><span class="n">model</span><span class="p">:</span> <span class="s2">&quot;PreTrainedModel&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="c1"># ... 省略 ...</span>
+    <span class="k">if</span> <span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;mixtral&quot;</span><span class="p">:</span>
+        <span class="c1"># 告诉 DeepSpeed：Mixtral 的专家块是这个类，别乱切！</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">transformers.models.mixtral.modeling_mixtral</span><span class="w"> </span><span class="kn">import</span> <span class="n">MixtralSparseMoeBlock</span>
+        <span class="n">_set_z3_leaf_modules</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="p">[</span><span class="n">MixtralSparseMoeBlock</span><span class="p">])</span>
+
+    <span class="k">if</span> <span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;qwen2_moe&quot;</span><span class="p">:</span>
+        <span class="c1"># 告诉 DeepSpeed：Qwen2 MoE 的专家块是这个...</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">transformers.models.qwen2_moe.modeling_qwen2_moe</span><span class="w"> </span><span class="kn">import</span> <span class="n">Qwen2MoeSparseMoeBlock</span>
+        <span class="n">_set_z3_leaf_modules</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="p">[</span><span class="n">Qwen2MoeSparseMoeBlock</span><span class="p">])</span>
+    <span class="c1"># ... 下面全是各种模型的“点名保护” ...</span>
+</code></pre></div>
+
+<h4>第二部分：配置负载均衡 (Task 2)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">configure_moe</span><span class="p">(</span><span class="n">config</span><span class="p">:</span> <span class="s2">&quot;PretrainedConfig&quot;</span><span class="p">,</span> <span class="n">model_args</span><span class="p">:</span> <span class="s2">&quot;ModelArguments&quot;</span><span class="p">,</span> <span class="n">is_trainable</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="c1"># 如果不训练，就不管了</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">is_trainable</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">model_args</span><span class="o">.</span><span class="n">moe_aux_loss_coef</span><span class="p">:</span>
+        <span class="k">return</span>
+
+    <span class="c1"># 如果是以下这些模型...</span>
+    <span class="k">if</span> <span class="n">model_type</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;mixtral&quot;</span><span class="p">,</span> <span class="s2">&quot;qwen2_moe&quot;</span><span class="p">,</span> <span class="o">...</span><span class="p">]:</span>
+        <span class="c1"># 开启路由日志输出</span>
+        <span class="nb">setattr</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;output_router_logits&quot;</span><span class="p">,</span> <span class="kc">True</span><span class="p">)</span>
+
+    <span class="c1"># 设置辅助损失系数（惩罚偷懒的路由器）</span>
+    <span class="k">if</span> <span class="n">model_type</span> <span class="ow">in</span> <span class="p">[</span> <span class="o">...</span> <span class="p">]:</span>
+        <span class="nb">setattr</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;router_aux_loss_coef&quot;</span><span class="p">,</span> <span class="n">model_args</span><span class="o">.</span><span class="n">moe_aux_loss_coef</span><span class="p">)</span>
+    <span class="k">elif</span> <span class="n">model_type</span> <span class="o">==</span> <span class="s2">&quot;deepseek&quot;</span><span class="p">:</span>
+        <span class="c1"># DeepSeek 比较特立独行，它的参数名叫 aux_loss_alpha</span>
+        <span class="nb">setattr</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;aux_loss_alpha&quot;</span><span class="p">,</span> <span class="n">model_args</span><span class="o">.</span><span class="n">moe_aux_loss_coef</span><span class="p">)</span>
+</code></pre></div>
+
+<h4>第三部分：手写 Qwen3 Omni 的逻辑 (Task 3)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">Qwen3OmniMoeThinkerTextSparseMoeBlock</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+    <span class="c1"># 初始化：定义有多少个专家，每次选几个(top_k)</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">):</span>
+        <span class="c1"># ...</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">gate</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 路由器</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">experts</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">ModuleList</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 专家组</span>
+
+    <span class="c1"># 前向传播：数据怎么走</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_states</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+        <span class="c1"># 1. 路由器打分</span>
+        <span class="n">router_logits</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">gate</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span>
+        <span class="c1"># 2. 算出权重</span>
+        <span class="n">routing_weights</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="n">router_logits</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float</span><span class="p">)</span>
+        <span class="c1"># 3. 选出分数最高的 Top-K 个专家</span>
+        <span class="n">top_k_weights</span><span class="p">,</span> <span class="n">top_k_indices</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">topk</span><span class="p">(</span><span class="n">routing_weights</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">top_k</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+
+        <span class="c1"># ... 中间省略：归一化权重 ...</span>
+
+        <span class="c1"># 4. 让专家干活，并把结果加起来</span>
+        <span class="k">for</span> <span class="n">expert_idx</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">num_experts</span><span class="p">):</span>
+            <span class="c1"># 只有被选中的专家权重才不为0</span>
+            <span class="n">expert_layer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">experts</span><span class="p">[</span><span class="n">expert_idx</span><span class="p">]</span>
+            <span class="n">current_hidden_states</span> <span class="o">=</span> <span class="n">expert_layer</span><span class="p">(</span><span class="n">hidden_states</span><span class="p">)</span> <span class="o">*</span> <span class="n">expert_weights</span>
+            <span class="n">final_hidden_states</span> <span class="o">+=</span> <span class="n">current_hidden_states</span>
+
+        <span class="k">return</span> <span class="n">final_hidden_states</span><span class="p">,</span> <span class="n">router_logits</span>
+</code></pre></div>
+
+<h3>💡 总结</h3>
+<p>这个文件不是核心算法的创新，而是一个<strong>“适配器”</strong>。
+它确保了 LlamaFactory 在面对市面上五花八门的 MoE 模型（DeepSeek, Qwen, Mixtral 等）时，能够：
+1.  <strong>不被分布式训练切坏</strong> (Task 1)。
+2.  <strong>正确地计算训练损失</strong> (Task 2)。
+3.  <strong>支持最新的、官方还没完全搞定的模型结构</strong> (Task 3)。</p>

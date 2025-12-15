@@ -1,0 +1,120 @@
+<h1>src/llmtuner/tuner/core/loader.py</h1>
+<p>这份代码文件 <code>loader.py</code> 的核心作用是 <strong>“组装”</strong>。</p>
+<p>你可以把它想象成一个<strong>汽车改装车间的主管</strong>。它的工作是从仓库（HuggingFace 或 本地）把汽车引擎（大模型）搬出来，给它配上变速箱（分词器），根据你的需求（微调还是推理），决定是给它瘦身（量化），还是加装涡轮（LoRA 适配器），最后把车交给你。</p>
+<p>为了让你更容易理解，我把这个过程拆解成一个 <strong>“任务清单 (Todo List)”</strong>，然后逐步解释代码是怎么执行这些任务的。</p>
+<hr />
+<h3>📋 任务清单 (Task Todo List)</h3>
+<ol>
+<li><strong>环境安检</strong>：检查工具包（库版本）是否齐全。</li>
+<li><strong>准备翻译机 (Tokenizer)</strong>：加载分词器，让模型能看懂人类语言。</li>
+<li><strong>制定瘦身计划 (Quantization)</strong>：如果显存不够，决定是否把模型压缩成 8-bit 或 4-bit。</li>
+<li><strong>搬运引擎 (Load Model)</strong>：从硬盘加载基础模型权重。</li>
+<li><strong>改装准备 (Pre-processing)</strong>：如果是为了训练，做一些前置处理（比如开启梯度检查点）。</li>
+<li><strong>加装外挂 (Adapters)</strong>：如果不是全量微调，就给模型挂载 LoRA 等适配器。</li>
+<li><strong>特殊改装 (RLHF)</strong>：如果是做奖励模型 (RM) 或 PPO 训练，给模型加装“打分头” (Value Head)。</li>
+<li><strong>出厂检查</strong>：打印一下有多少参数需要训练，把模型交出去。</li>
+</ol>
+<hr />
+<h3>🧐 逐步解析 (Step-by-Step Walkthrough)</h3>
+<p>现在我们对照代码，一步步看它是怎么完成上面这个清单的：</p>
+<h4>1. 环境安检 (Imports &amp; Version Checks)</h4>
+<p>代码开头的一堆 import 和 <code>check_min_version</code>。
+*   <strong>观点</strong>：工欲善其事，必先利其器。
+*   <strong>动作</strong>：代码检查 <code>transformers</code>, <code>peft</code> (微调库), <code>bitsandbytes</code> (量化库) 的版本。如果版本太老，直接报错，防止后面出现莫名其妙的 bug。</p>
+<h4>2. 准备翻译机 (Load Tokenizer)</h4>
+<p>对应代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">tokenizer</span> <span class="o">=</span> <span class="n">AutoTokenizer</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="k">if</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">pad_token_id</span> <span class="ow">is</span> <span class="kc">None</span> <span class="o">...</span><span class="p">:</span>
+    <span class="n">tokenizer</span><span class="o">.</span><span class="n">pad_token_id</span> <span class="o">=</span> <span class="mi">0</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：模型听不懂中文或英文，它只认识数字。</li>
+<li><strong>动作</strong>：加载 <code>Tokenizer</code>。</li>
+<li><strong>细节</strong>：代码里特意处理了 <code>pad_token_id</code>。有些模型（比如早期的百川）没有定义“填充符”，这里强制给它指定一个，防止训练时报错。</li>
+</ul>
+<h4>3. 制定瘦身计划 (Quantization Config)</h4>
+<p>对应代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">model_args</span><span class="o">.</span><span class="n">quantization_bit</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">if</span> <span class="n">model_args</span><span class="o">.</span><span class="n">quantization_bit</span> <span class="o">==</span> <span class="mi">8</span><span class="p">:</span>
+        <span class="o">...</span>
+    <span class="k">elif</span> <span class="n">model_args</span><span class="o">.</span><span class="n">quantization_bit</span> <span class="o">==</span> <span class="mi">4</span><span class="p">:</span>
+        <span class="o">...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：大模型太大了，显卡装不下怎么办？用更低的精度（量化）。</li>
+<li><strong>动作</strong>：<ul>
+<li>如果你设置了 <code>quantization_bit=8</code> 或 <code>4</code>，它会配置 <code>BitsAndBytesConfig</code>。</li>
+<li>这相当于告诉加载器：一会加载模型的时候，把原本 16 位的参数压缩成 4 位，这样 10GB 的模型可能只需要 3GB 显存就能跑起来。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 搬运引擎 (Load Base Model)</h4>
+<p>对应代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">model</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span>
+    <span class="n">model_to_load</span><span class="p">,</span>
+    <span class="n">config</span><span class="o">=</span><span class="n">config</span><span class="p">,</span>
+    <span class="o">...</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：这是最核心的一步，把大家伙搬进显存。</li>
+<li><strong>动作</strong>：使用 <code>AutoModelForCausalLM</code> 加载模型。</li>
+<li><strong>细节</strong>：<ul>
+<li><code>device_map="auto"</code>：如果不是训练模式，它会自动把模型切分到不同的显卡上。</li>
+<li><code>torch_dtype</code>：决定是用半精度 (float16) 还是 bf16 加载。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 改装准备 &amp; 6. 加装外挂 (Adapters)</h4>
+<p>对应代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">model</span> <span class="o">=</span> <span class="n">prepare_model_for_training</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> 
+<span class="n">model</span> <span class="o">=</span> <span class="n">init_adapter</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：也就是所谓的“微调 (Fine-tuning)”。通常我们不动原模型（太贵、太慢），而是在旁边挂一个小模型（Adapter/LoRA）来训练。</li>
+<li><strong>动作</strong>：<ul>
+<li><code>prepare_model_for_training</code>：为了省显存，开启一些技术（如 gradient checkpointing）。</li>
+<li><code>init_adapter</code>：这是关键。它会调用另一个文件的方法，把 LoRA 层“插入”到大模型里。以后训练只更新这些 LoRA 层。</li>
+</ul>
+</li>
+</ul>
+<h4>7. 特殊改装 (RLHF - RM/PPO)</h4>
+<p>对应代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">stage</span> <span class="o">==</span> <span class="s2">&quot;rm&quot;</span> <span class="ow">or</span> <span class="n">stage</span> <span class="o">==</span> <span class="s2">&quot;ppo&quot;</span><span class="p">:</span>
+    <span class="n">model</span> <span class="o">=</span> <span class="n">AutoModelForCausalLMWithValueHead</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：RLHF（人类反馈强化学习）需要模型不仅能说话，还能“打分”。</li>
+<li><strong>动作</strong>：<ul>
+<li>如果任务阶段是 <code>rm</code> (奖励模型) 或 <code>ppo</code>，代码会把模型包装进 <code>AutoModelForCausalLMWithValueHead</code>。</li>
+<li>这就好比给汽车装了一个“计价器”，原来的模型负责跑，新加的头负责评价跑得好不好（输出一个分数值）。</li>
+<li>如果是 PPO 阶段，它甚至会加载两个模型：一个负责生成，一个负责打分（Reward Model）。</li>
+</ul>
+</li>
+</ul>
+<h4>8. 出厂检查 (Finalize)</h4>
+<p>对应代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="ow">not</span> <span class="n">is_trainable</span><span class="p">:</span>
+    <span class="n">model</span><span class="o">.</span><span class="n">requires_grad_</span><span class="p">(</span><span class="kc">False</span><span class="p">)</span> <span class="c1"># 冻结所有参数</span>
+<span class="o">...</span>
+<span class="n">print_trainable_params</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
+<span class="k">return</span> <span class="n">model</span><span class="p">,</span> <span class="n">tokenizer</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：不管是训练还是推理，最后都要确认状态。</li>
+<li><strong>动作</strong>：<ul>
+<li>如果只是拿来用（推理），就把所有参数冻结（<code>requires_grad_(False)</code>），防止不小心改动了权重。</li>
+<li><code>print_trainable_params</code>：会在控制台打印：“当前模型有 70亿参数，其中只有 0.1% 是可训练的”。这让你确认 LoRA 挂载成功了。</li>
+<li>最后 <code>return</code>，把准备好的模型和分词器交给下一个流程（训练循环或聊天界面）。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件的逻辑就是：
+<strong>加载配置 -&gt; 加载分词器 -&gt; 决定是否压缩模型 -&gt; 加载模型本体 -&gt; 挂载微调模块 (LoRA) -&gt; (可选) 挂载强化学习模块 -&gt; 返回成品。</strong></p>

@@ -1,0 +1,111 @@
+<h1>src/llmtuner/model/loader.py</h1>
+<p>这段代码看起来确实比较复杂，因为它是一个大模型微调框架（推测是 LLaMA-Factory）的核心部分，负责<strong>“把模型和分词器（Tokenizer）正确地加载到内存里，并做好训练前的准备工作”</strong>。</p>
+<p>为了让你更容易理解，我们可以把这段代码想象成<strong>“组装一台用于特定任务的超级赛车”</strong>的过程。</p>
+<p>我为你列了一个 <strong>Task Todo List（任务清单）</strong>，我们可以按照这个顺序一步步来看它是如何执行的：</p>
+<h3>📝 Task Todo List：模型加载流水线</h3>
+<ol>
+<li><strong>环境安检</strong> (检查工具包版本)</li>
+<li><strong>准备翻译官</strong> (加载 Tokenizer)</li>
+<li><strong>阅读说明书</strong> (加载 Config)</li>
+<li><strong>搬运发动机</strong> (加载基础模型 Base Model)</li>
+<li><strong>改装发动机</strong> (Patch Model - 修正模型细节)</li>
+<li><strong>加装外挂</strong> (Init Adapter - 加载 LoRA/QLoRA)</li>
+<li><strong>安装裁判员</strong> (Add Value Head - 仅限 RLHF 阶段)</li>
+<li><strong>最终调试</strong> (设置训练/推理模式)</li>
+<li><strong>汇报参数</strong> (打印日志)</li>
+</ol>
+<hr />
+<h3>🔍 逐步详细讲解</h3>
+<p>下面我按照上面的清单，把代码对应进去讲给你听：</p>
+<h4>1. 环境安检 (Check Versions)</h4>
+<ul>
+<li><strong>代码位置：</strong> 开头的 <code>require_version(...)</code></li>
+<li><strong>在干什么：</strong>
+    就像开车前检查仪表盘。代码先确认你的 <code>transformers</code>, <code>datasets</code>, <code>peft</code> 等库的版本是否足够新。如果版本太老，程序会直接报错提醒你去升级，避免后面出现莫名其妙的 Bug。</li>
+</ul>
+<h4>2. 准备翻译官 (Load Tokenizer)</h4>
+<ul>
+<li><strong>代码位置：</strong> <code>tokenizer = AutoTokenizer.from_pretrained(...)</code> 和 <code>patch_tokenizer(...)</code></li>
+<li><strong>在干什么：</strong>
+    模型听不懂中文或英文，它只认识数字。Tokenizer 就是翻译官。<ul>
+<li>它从路径加载分词器。</li>
+<li><code>patch_tokenizer</code> 是一个自定义函数，用来修补一些特殊情况（比如处理 padding token 缺失的问题，或者设置左右填充）。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 阅读说明书 (Load Config)</h4>
+<ul>
+<li><strong>代码位置：</strong> <code>config = AutoConfig.from_pretrained(...)</code> 和 <code>patch_config(...)</code></li>
+<li><strong>在干什么：</strong>
+    在加载几G甚至几十G的模型权重前，先加载几KB的“配置文件”。<ul>
+<li>它告诉程序：这个模型有多少层？隐藏层多大？是不是 LLaMA 架构？</li>
+<li><code>patch_config</code>：根据用户传入的参数（比如是否用 FlashAttention，是否做 RoPE 缩放），修改这份说明书。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 搬运发动机 (Load Base Model)</h4>
+<p>这是最重的一步，代码分了两条路走：</p>
+<ul>
+<li><strong>路径 A：使用 Unsloth 加速 (VIP 通道)</strong><ul>
+<li><strong>代码：</strong> <code>if is_trainable and model_args.use_unsloth:</code></li>
+<li><strong>解释：</strong> <code>Unsloth</code> 是一个专门加速 LLaMA/Mistral 模型微调的黑科技库。如果你开启了这个选项，它会用 <code>FastLlamaModel</code> 快速加载模型，省显存又快。</li>
+</ul>
+</li>
+<li><strong>路径 B：普通加载 (标准通道)</strong><ul>
+<li><strong>代码：</strong> <code>if model is None: model = AutoModelForCausalLM.from_pretrained(...)</code></li>
+<li><strong>解释：</strong> 如果没用 Unsloth，就用 HuggingFace 标准的 <code>AutoModel</code> 加载。这里会处理模型精度（比如 float16）、是否用 CPU 卸载等。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 改装发动机 (Patch Model)</h4>
+<ul>
+<li><strong>代码位置：</strong> <code>patch_model(model, ...)</code></li>
+<li><strong>在干什么：</strong>
+    模型加载进来后，可能还不完美。<ul>
+<li>这个函数会去调整模型内部的某些层，比如开启 FlashAttention（加速注意力计算），或者为了量化（Quantization）做一些准备。</li>
+</ul>
+</li>
+</ul>
+<h4>6. 加装外挂 (Init Adapter) ✨最关键的一步</h4>
+<ul>
+<li><strong>代码位置：</strong> <code>model = init_adapter(model, ...)</code></li>
+<li><strong>在干什么：</strong>
+    这是<strong>微调</strong>的核心。<ul>
+<li>如果我们做 <strong>LoRA</strong> 或 <strong>QLoRA</strong> 微调，我们不会训练整个巨大的模型。</li>
+<li>这一步会在原模型上“外挂”一些小参数模块（Adapter）。训练时只更新这些小模块，原模型不动。</li>
+</ul>
+</li>
+</ul>
+<h4>7. 安装裁判员 (Add Value Head - 可选)</h4>
+<ul>
+<li><strong>代码位置：</strong> <code>if add_valuehead:</code></li>
+<li><strong>在干什么：</strong>
+    这通常用于 <strong>RLHF (PPO)</strong> 训练阶段。<ul>
+<li>除了生成文本的模型，还需要一个“打分模型”（Value Head）来评价生成的回答好不好。</li>
+<li>代码会把模型转换成 <code>AutoModelForCausalLMWithValueHead</code> 结构，并尝试加载之前训练好的打分头参数。</li>
+</ul>
+</li>
+</ul>
+<h4>8. 最终调试 (Set Train/Eval Mode)</h4>
+<ul>
+<li><strong>代码位置：</strong> <code>if not is_trainable:</code> ... <code>else: model.train()</code></li>
+<li><strong>在干什么：</strong><ul>
+<li><strong>如果是推理（聊天）：</strong> 把模型设为 <code>eval()</code> 模式，冻结所有梯度（不许学习），不仅省显存也更安全。</li>
+<li><strong>如果是训练：</strong> 把模型设为 <code>train()</code> 模式，准备开始更新参数。</li>
+</ul>
+</li>
+</ul>
+<h4>9. 汇报参数 (Log Parameters)</h4>
+<ul>
+<li><strong>代码位置：</strong> <code>count_parameters(model)</code></li>
+<li><strong>在干什么：</strong><ul>
+<li>最后，程序会算一下账，并在屏幕上打印：</li>
+<li><em>"trainable params: 1000 || all params: 1000000"</em></li>
+<li>告诉你：虽然模型有10亿参数，但你这次只训练了其中的 0.1%（因为用了 LoRA）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结</h3>
+<p>这个文件 <code>loader.py</code> 就是一个<strong>超级工厂的入口</strong>。</p>
+<p>不管你是想训练 LLaMA 还是 Mistral，是想做全量微调还是 LoRA，是想做 PPO 还是 DPO，只要调用这个 <code>load_model_and_tokenizer</code> 函数，它就会帮你把所有乱七八糟的配置、补丁、版本兼容问题处理好，最后交给你一个<strong>“准备就绪的模型对象”</strong>和一个<strong>“分词器”</strong>，你拿到这两个东西就可以直接扔进 Trainer 里开始跑进度条了。</p>

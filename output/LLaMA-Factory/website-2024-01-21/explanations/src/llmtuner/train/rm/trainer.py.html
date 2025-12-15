@@ -1,0 +1,115 @@
+<h1>src/llmtuner/train/rm/trainer.py</h1>
+<p>这份代码的核心功能是定义了一个<strong>奖励模型（Reward Model）的训练器</strong>。</p>
+<p>简单来说，它的任务是训练一个“裁判模型”，这个裁判需要学会：<strong>给定同一个问题的两个不同回答，判断哪一个更好（Chosen），哪一个更差（Rejected）。</strong></p>
+<p>为了让你听懂，我把这个代码的执行逻辑拆解成一个 <strong>Task To-Do List（任务清单）</strong>。每一项任务对应代码里的一段逻辑。</p>
+<hr />
+<h3>📋 奖励模型训练任务清单 (Task To-Do List)</h3>
+<ol>
+<li><strong>准备阶段</strong>：拿到模型计算出的所有打分。</li>
+<li><strong>分组任务</strong>：把数据切分成“好学生（Chosen）”和“差学生（Rejected）”两组。</li>
+<li><strong>找不同任务（核心）</strong>：对比好坏两个回答，找出它们从哪里开始不一样的，忽略掉前面相同的提问部分。</li>
+<li><strong>打分任务</strong>：只对“不一样”的部分计算分数差距。</li>
+<li><strong>计算惩罚（Loss）</strong>：如果裁判认为“差学生”的分数比“好学生”高，就狠狠惩罚模型（Loss 变大）。</li>
+<li><strong>存档任务</strong>：把最终的预测分数存下来。</li>
+</ol>
+<hr />
+<h3>💡 逐步讲解</h3>
+<p>下面我按照这个清单，一步步带你看代码里的观点：</p>
+<h4>Task 1: 准备阶段 - 拿到打分</h4>
+<p><strong>代码位置</strong>：<code>compute_loss</code> 函数开头</p>
+<div class="codehilite"><pre><span></span><code><span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">values</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="o">**</span><span class="n">inputs</span><span class="p">,</span> <span class="n">output_hidden_states</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">return_dict</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲解</strong>：<ul>
+<li><code>inputs</code> 里包含了问题和回答。</li>
+<li><code>model(**inputs)</code>：把数据喂给模型。</li>
+<li><code>values</code>：模型对每一个 token（字/词）都打了一个分（Reward）。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 分组任务 - 区分“好”与“差”</h4>
+<p><strong>代码位置</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">batch_size</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span>
+<span class="n">chosen_input_ids</span><span class="p">,</span> <span class="n">rejected_input_ids</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">][:</span><span class="n">batch_size</span><span class="p">],</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">][</span><span class="n">batch_size</span><span class="p">:]</span>
+<span class="n">chosen_rewards</span><span class="p">,</span> <span class="n">rejected_rewards</span> <span class="o">=</span> <span class="n">values</span><span class="p">[:</span><span class="n">batch_size</span><span class="p">],</span> <span class="n">values</span><span class="p">[</span><span class="n">batch_size</span><span class="p">:]</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点/逻辑</strong>：<ul>
+<li>训练数据的格式是特殊的：<strong>前半部分全是“好回答”，后半部分全是“差回答”</strong>。</li>
+<li>代码通过 <code>// 2</code> 把数据一分为二。</li>
+<li><code>chosen</code> 代表被人类选中的（好的），<code>rejected</code> 代表被人类拒绝的（差的）。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 找不同任务 - 只要干货，不要废话（核心难点）</h4>
+<p><strong>代码位置</strong>：<code>for</code> 循环内部</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 找出哪里是填充的空白（Padding），不要算进去</span>
+<span class="n">chosen_length</span> <span class="o">=</span> <span class="p">(</span><span class="n">chosen_input_ids</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">!=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">pad_token_id</span><span class="p">)</span><span class="o">.</span><span class="n">nonzero</span><span class="p">()[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="mi">1</span>
+<span class="n">rejected_length</span> <span class="o">=</span> <span class="o">...</span>
+
+<span class="c1"># 找出两个句子从哪里开始不一样的</span>
+<span class="n">check_divergence</span> <span class="o">=</span> <span class="p">(</span><span class="n">chosen_input_ids</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">!=</span> <span class="n">rejected_input_ids</span><span class="p">[</span><span class="n">i</span><span class="p">])</span><span class="o">.</span><span class="n">nonzero</span><span class="p">()</span>
+<span class="n">div_index</span> <span class="o">=</span> <span class="n">check_divergence</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="c1"># 分歧点</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点/逻辑</strong>：<ul>
+<li><strong>为什么要找分歧点（div_index）？</strong><ul>
+<li>因为输入里包含了“提问（Prompt）”。对于好坏两个样本，<strong>提问是一模一样的</strong>。</li>
+<li>如果模型去评价“提问”写得好不好，那是浪费时间，因为两边都一样。</li>
+<li><strong>观点</strong>：我们只关心<strong>回答（Response）</strong>部分的差异。所以代码要找到两个句子开始不一样的地方，从那里开始算分。</li>
+</ul>
+</li>
+<li><strong>为什么要找长度？</strong><ul>
+<li>因为模型输入必须定长（比如 2048），不够长的部分补了 0（Padding）。我们不能给空白打分。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 打分任务 - 截取有效片段</h4>
+<p><strong>代码位置</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">chosen_trunc_rewards</span> <span class="o">=</span> <span class="n">chosen_rewards</span><span class="p">[</span><span class="n">i</span><span class="p">,</span> <span class="n">div_index</span><span class="p">:</span><span class="n">end_index</span><span class="p">]</span>
+<span class="n">rejected_trunc_rewards</span> <span class="o">=</span> <span class="n">rejected_rewards</span><span class="p">[</span><span class="n">i</span><span class="p">,</span> <span class="n">div_index</span><span class="p">:</span><span class="n">end_index</span><span class="p">]</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点/逻辑</strong>：<ul>
+<li>根据刚才找到的“分歧点”和“结束点”，把中间这一段有效内容的<strong>分数截取出来</strong>。</li>
+<li>这才是真正代表“回答质量”的分数。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 5: 计算惩罚（Loss） - 好的必须比差的分高</h4>
+<p><strong>代码位置</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">loss</span> <span class="o">+=</span> <span class="o">-</span><span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">logsigmoid</span><span class="p">(</span><span class="n">chosen_trunc_rewards</span> <span class="o">-</span> <span class="n">rejected_trunc_rewards</span><span class="p">)</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点/逻辑</strong>：<ul>
+<li>这是 Pairwise Loss（成对损失）的数学公式。</li>
+<li><code>chosen - rejected</code>：好回答的分数 减去 差回答的分数。</li>
+<li><strong>目标</strong>：我们希望这个差值越大越好（正得越多越好）。</li>
+<li><strong>Loss</strong>：如果差值很大（比如好回答得10分，差回答得1分），Loss 就很小；如果差值很小甚至为负（模型认为差回答更好），Loss 就会非常大。</li>
+<li><strong>结论</strong>：通过优化这个 Loss，迫使模型学会给“好回答”打高分，给“差回答”打低分。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 6: 存档任务 - 记录结果</h4>
+<p><strong>代码位置</strong>：<code>save_predictions</code> 函数</p>
+<div class="codehilite"><pre><span></span><code><span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">({</span><span class="s2">&quot;chosen&quot;</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="nb">float</span><span class="p">(</span><span class="n">c_score</span><span class="p">),</span> <span class="mi">2</span><span class="p">),</span> <span class="s2">&quot;rejected&quot;</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="nb">float</span><span class="p">(</span><span class="n">r_score</span><span class="p">),</span> <span class="mi">2</span><span class="p">)})</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点/逻辑</strong>：<ul>
+<li>训练完或者评估完，我们想看看效果。</li>
+<li>这里把模型给“好回答”打的最终分，和给“差回答”打的最终分存进 <code>generated_predictions.jsonl</code> 文件里，方便人类检查。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件的核心观点是：<strong>训练奖励模型时，不要看整句话，而要对比“好回答”和“差回答”在差异部分的得分差距。</strong></p>
+<p>如果你能理解“老师改卷子，不仅看谁写得对，还要对比两个学生在同一道题上谁写得更好”，你就理解了这个代码的逻辑。</p>

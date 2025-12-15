@@ -1,0 +1,89 @@
+<h1>src/llmtuner/train/ppo/utils.py</h1>
+<p>这份代码确实涉及到了大模型训练中比较高阶的 <strong>PPO（强化学习）</strong> 和 <strong>LoRA（微调技术）</strong> 的结合，如果不了解背景，确实像看天书。</p>
+<p>别担心，我们把它想象成一个 <strong>“特工训练计划”</strong>。为了训练出一个厉害的特工（大模型），我们需要完成一系列的任务。</p>
+<p>这份代码就是这个计划里的 <strong>“工具箱” (<code>utils.py</code>)</strong>。</p>
+<p>下面是你的 <strong>学习任务清单 (Todo List)</strong>，我们一步步拆解：</p>
+<hr />
+<h3>✅ 任务一：理解背景 —— 我们在干什么？</h3>
+<p><strong>目标</strong>：搞清楚这代码是为谁服务的。
+*   <strong>场景</strong>：我们在做 <strong>RLHF</strong>（基于人类反馈的强化学习）。简单说，就是让模型写出答案，然后给它打分，分高就奖励，分低就惩罚。
+*   <strong>核心角色</strong>：
+    1.  <strong>学生 (Actor/Policy)</strong>：负责写作业（生成文本）。
+    2.  <strong>老师 (Reward Model/Critic)</strong>：负责批改作业（打分）。</p>
+<hr />
+<h3>✅ 任务二：搞定“打分”环节</h3>
+<p><strong>代码对应函数</strong>：<code>get_rewards_from_server</code>
+<strong>解读</strong>：
+有时候，“老师”（打分模型）太大了，或者部署在别的机器上，我们的训练代码跑不起来。怎么办？</p>
+<ul>
+<li><strong>观点</strong>：<strong>外包打分</strong>。</li>
+<li><strong>操作步骤</strong>：<ol>
+<li>把学生写的作业（<code>messages</code>）打包。</li>
+<li>通过网络（<code>requests.post</code>）发给远处的服务器（<code>server_url</code>）。</li>
+<li>服务器返回一个分数（<code>scores</code>）。</li>
+<li>把分数变成 PyTorch 能看懂的格式（<code>torch.Tensor</code>）。</li>
+</ol>
+</li>
+</ul>
+<p><strong>总结</strong>：这个函数就是<strong>打电话问分数的</strong>。</p>
+<hr />
+<h3>✅ 任务三：学会“变脸” (最难懂的部分)</h3>
+<p><strong>代码对应函数</strong>：<code>replace_model</code>
+<strong>解读</strong>：
+这是这份代码最核心、最“省钱”的逻辑。
+在 PPO 训练中，我们需要两个模型：一个负责生成（学生），一个负责打分（老师/价值网络）。如果加载两个巨大的模型，显存就爆了。</p>
+<ul>
+<li>
+<p><strong>观点</strong>：<strong>一机两用（LoRA 切换技术）</strong>。
+    我们只加载<strong>一个</strong>基础大模型，但是给它准备了两套“面具”（LoRA Adapter）和两顶“帽子”（输出层 Head）。</p>
+<ul>
+<li><strong>Default 模式</strong>：戴上“学生面具”，负责生成文本。</li>
+<li><strong>Reward 模式</strong>：戴上“老师面具”，负责预估分数（Value）。</li>
+</ul>
+</li>
+<li>
+<p><strong>代码流程拆解</strong>：</p>
+<ol>
+<li><strong><code>target == "reward"</code></strong>：如果要变身成“老师”，先把“学生”的帽子（<code>valuehead</code> 的权重）暂存起来，别弄丢了。</li>
+<li><strong><code>model.pretrained_model.set_adapter(target)</code></strong>：<strong>换面具</strong>。告诉底层模型，现在激活哪一套 LoRA 参数。</li>
+<li><strong><code>model.v_head.load_state_dict(...)</code></strong>：<strong>换帽子</strong>。把输出层（Value Head）的参数换成对应角色的参数。</li>
+</ol>
+</li>
+</ul>
+<p><strong>总结</strong>：这个函数是为了<strong>省显存</strong>，让同一个模型在“生成者”和“打分者”之间<strong>反复横跳</strong>。</p>
+<hr />
+<h3>✅ 任务四：保护“精密仪器”</h3>
+<p><strong>代码对应函数</strong>：<code>dump_layernorm</code> 和 <code>restore_layernorm</code>
+<strong>解读</strong>：
+大模型训练时，为了快，我们通常用半精度（FP16/BF16，小数点后位数少）。但是，模型里有一种叫 <code>LayerNorm</code> 的层，它对精度非常敏感，如果精度不够，训练容易崩溃（NaN）。</p>
+<ul>
+<li>
+<p><strong>观点</strong>：<strong>关键时刻用高精度</strong>。
+    有些操作步骤比较危险，我们需要把这些敏感参数拿出来保护好，或者在特定计算时进行转换。</p>
+</li>
+<li>
+<p><strong>代码流程拆解</strong>：</p>
+<ol>
+<li><strong><code>dump_layernorm</code>（备份并降级）</strong>：<ul>
+<li>遍历模型，找到 <code>LayerNorm</code> 层。</li>
+<li>如果是高精度（float32），先把这份<strong>高精度的原件</strong>备份到字典里（<code>layer_norm_params</code>）。</li>
+<li>然后把模型里的参数强制转成低精度（<code>model.config.torch_dtype</code>），以便进行某些统一格式的计算。</li>
+</ul>
+</li>
+<li><strong><code>restore_layernorm</code>（还原）</strong>：<ul>
+<li>计算完后，把刚才备份的<strong>高精度原件</strong>塞回去。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<p><strong>总结</strong>：这两个函数是<strong>为了防止模型训练算崩了</strong>，做的临时数据类型转换和恢复。</p>
+<hr />
+<h3>📝 最终总结 (Takeaway)</h3>
+<p>如果你要给同事讲这个文件主要干了啥，你可以这么说：</p>
+<blockquote>
+<p>“这个 <code>utils.py</code> 主要是为了解决 PPO 训练中的<strong>工程化问题</strong>：
+1.  它支持调用<strong>远程 API</strong> 来算奖励分，解耦了奖励模型。
+2.  它实现了 <strong>LoRA 的动态切换</strong>，让一个模型能分饰两角（Actor 和 Critic），极大节省显存。
+3.  它还处理了 <strong>LayerNorm 的精度转换</strong>，保证训练数值的稳定性。”</p>
+</blockquote>

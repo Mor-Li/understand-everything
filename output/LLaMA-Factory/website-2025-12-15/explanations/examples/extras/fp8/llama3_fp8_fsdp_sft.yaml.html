@@ -1,0 +1,100 @@
+<h1>examples/extras/fp8/llama3_fp8_fsdp_sft.yaml</h1>
+<p>这份配置文件确实包含了很多“硬核”的术语，主要涉及<strong>大模型训练的显存优化和加速</strong>。看不懂很正常，因为它是在解决“如何在一堆显卡上高效训练一个巨大模型”的高级问题。</p>
+<p>为了让你理解，我把这份文件拆解成一个 <strong>“6步走的任务清单 (To-Do List)”</strong>。我们把训练模型想象成<strong>教一个学生（模型）读书</strong>。</p>
+<hr />
+<h3>✅ Task 1：确认“我们要教谁？”（模型配置）</h3>
+<p>首先，我们需要知道这次训练的主角是谁。</p>
+<ul>
+<li><strong>文件对应代码：</strong>
+    <code>yaml
+    model_name_or_path: meta-llama/Meta-Llama-3-8B-Instruct</code></li>
+<li><strong>通俗解释：</strong>
+    我们要训练的是 <strong>Llama 3</strong>，参数量是 <strong>80亿 (8B)</strong>。
+    这就好比我们选定了一个叫“Llama 3”的大学生来辅导。</li>
+</ul>
+<hr />
+<h3>✅ Task 2：确认“我们要怎么教？”（训练方式）</h3>
+<p>选好人之后，我们要决定辅导的深度。是只教几个知识点，还是把整个大脑重塑一遍？</p>
+<ul>
+<li><strong>文件对应代码：</strong>
+    <code>yaml
+    stage: sft
+    finetuning_type: full</code></li>
+<li><strong>通俗解释：</strong><ul>
+<li><code>sft</code> (Supervised Fine-Tuning)：有监督微调。就是拿着“问题+标准答案”去教它。</li>
+<li><code>full</code> (Full parameter)：<strong>全量微调</strong>。这是重点！这里不是用 LoRA（一种省力的方式），而是要更新模型里<strong>所有的参数</strong>。</li>
+<li><strong>难点：</strong> 全量微调 8B 模型非常消耗显存（内存），通常一张显卡根本装不下。所以我们需要后面的“黑科技”。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3：解决“脑子装不下”的问题（FSDP 切分）</h3>
+<p>既然全量微调太占地方，单张显卡扛不住，我们就需要把模型切开。</p>
+<ul>
+<li><strong>文件对应代码：</strong>
+    ```yaml
+    fsdp:<ul>
+<li>full_shard</li>
+<li>auto_wrap
+fsdp_transformer_layer_cls_to_wrap: LlamaDecoderLayer
+```</li>
+</ul>
+</li>
+<li><strong>通俗解释：</strong><ul>
+<li><strong>FSDP (Fully Sharded Data Parallel)</strong>：全切分数据并行。</li>
+<li><strong>原理：</strong> 假设你有 8 张显卡，FSDP 不会把整个模型复制 8 份，而是把模型<strong>切成 8 块</strong>，每张卡只存 1/8。需要计算时，显卡之间互相快速传递数据。</li>
+<li><strong>目的：</strong> 强行让多张显卡合体，共同分担巨大的显存压力。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 4：解决“算得太慢/显存还是不够”的问题（FP8 核心黑科技）</h3>
+<p>这是这份文件<strong>最核心、最先进</strong>的地方。普通的训练用 16位浮点数 (BF16/FP16)，这个文件要用 <strong>8位浮点数 (FP8)</strong>。</p>
+<ul>
+<li><strong>文件对应代码：</strong>
+    <code>yaml
+    fp8: true
+    fp8_backend: torchao
+    fp8_enable_fsdp_float8_all_gather: true</code></li>
+<li><strong>通俗解释：</strong><ul>
+<li><strong>FP8 (Float 8)</strong>：通常电脑存一个数字需要 16 个格子（16-bit），现在我们强制压缩到只用 8 个格子。</li>
+<li><strong>好处：</strong><ol>
+<li><strong>显存减半</strong>：模型占用的空间直接砍半。</li>
+<li><strong>速度起飞</strong>：在最新的显卡（如 H100, H800, RTX 4090）上，计算 8-bit 的速度比 16-bit 快得多。</li>
+</ol>
+</li>
+<li><code>fp8_enable_fsdp_float8_all_gather</code>：显卡之间交换数据时，也用压缩后的 8-bit 数据传输，<strong>通信速度也变快了</strong>。</li>
+<li><code>torchao</code>：这是 PyTorch 官方推出的一个高性能库，专门用来处理这种压缩计算的。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 5：准备“教材”和“课程表”（数据与训练参数）</h3>
+<p>技术问题解决了，现在设置具体的上课细节。</p>
+<ul>
+<li><strong>文件对应代码：</strong>
+    <code>yaml
+    dataset: identity
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 8
+    num_train_epochs: 3.0
+    learning_rate: 5.0e-5</code></li>
+<li><strong>通俗解释：</strong><ul>
+<li><code>dataset</code>：用什么书教（这里用的是一个叫 identity 的数据集）。</li>
+<li><code>batch_size: 1</code>：一次只看 1 条数据（为了省显存）。</li>
+<li><code>gradient_accumulation_steps: 8</code>：虽然一次只看 1 条，但我攒够 8 条再修改一次模型参数（变相增大批次，稳定训练）。</li>
+<li><code>epochs: 3.0</code>：这本教材反复学 3 遍。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 6：总结这份文件的“人设”</h3>
+<p>看完上面 5 步，我们可以给这份文件做一个总结性的画像。</p>
+<p><strong>这份配置文件的目的是：</strong></p>
+<blockquote>
+<p>在<strong>多张显卡</strong>的环境下，利用 <strong>FSDP（模型切片技术）</strong> 和 <strong>FP8（8位精度压缩技术）</strong>，实现对 <strong>Llama 3 8B</strong> 模型的<strong>全参数（Full）</strong> 高效微调。</p>
+</blockquote>
+<p><strong>它适合谁？</strong>
+*   适合有高端显卡（支持 FP8），想进行全量微调，但显存又有点捉襟见肘，或者想追求极致训练速度的人。</p>
+<p><strong>简单一句话：</strong>
+这是一个<strong>“为了省显存、提速度，把模型切碎了、压扁了再进行全方位训练”</strong>的配置单。</p>

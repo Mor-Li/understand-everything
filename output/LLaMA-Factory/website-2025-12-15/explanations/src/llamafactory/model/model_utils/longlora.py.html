@@ -1,0 +1,123 @@
+<h1>src/llamafactory/model/model_utils/longlora.py</h1>
+<p>这份代码看起来很复杂，但其实它只做了一件事：<strong>为了让大模型能以更低的显存成本训练更长的上下文（Long Context），它“魔改”了 Llama 模型的注意力机制。</strong></p>
+<p>这是基于 <strong>LongLoRA</strong> 这篇论文的技术实现，核心叫 <strong>S2-Attn (Shift Short Attention)</strong>。</p>
+<p>为了让你听懂，我把这段代码的逻辑拆解成一个 <strong>“任务清单 (Todo List)”</strong>。想象你是一个包工头，你要指挥代码一步步完成这个“偷天换日”的操作。</p>
+<hr />
+<h3>📋 任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1: 检查开关 (Configuration)</strong><ul>
+<li>看看用户是不是想开启“长窗口微调”模式 (LongLoRA)？如果是，设定好参数。</li>
+</ul>
+</li>
+<li><strong>Task 2: 偷梁换柱 (Patching)</strong><ul>
+<li>把 Transformers 库里原本的 Llama 模型注意力计算函数（Attention Forward）偷偷替换成我们自己写的“魔改版”函数。</li>
+</ul>
+</li>
+<li><strong>Task 3: 准备数据 (Standard Prep)</strong><ul>
+<li>(进入魔改版函数后) 像往常一样计算 Query, Key, Value (Q, K, V)。</li>
+</ul>
+</li>
+<li><strong>Task 4: 核心魔法 —— “错位与分组” (Shift &amp; Group)</strong><ul>
+<li><strong>这是最关键的一步！</strong> 如果正在训练，把原本很长的序列切成好几段（分组），并且把一部分注意力头（Heads）的数据“挪一挪位置”（Shift），让模型能看到组与组之间的关联。</li>
+</ul>
+</li>
+<li><strong>Task 5: 计算注意力 (Compute Attention)</strong><ul>
+<li>在“分组”后的短序列上计算注意力（这样计算量就变小了，省显存）。</li>
+</ul>
+</li>
+<li><strong>Task 6: 还原现场 (Shift Back)</strong><ul>
+<li>把刚才“挪动”过的数据挪回去，拼回原本的长序列形状。</li>
+</ul>
+</li>
+<li><strong>Task 7: 输出结果</strong><ul>
+<li>把结果交给下一层。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🧐 逐步详解 (Step-by-Step)</h3>
+<p>现在我们结合代码，一步步看它是怎么完成这些 Task 的。</p>
+<h4>Task 1: 检查开关 (Configuration)</h4>
+<p><strong>对应代码末尾的 <code>configure_longlora</code> 函数。</strong></p>
+<ul>
+<li><strong>逻辑</strong>：代码运行前，先看 <code>model_args.shift_attn</code> 是不是 <code>True</code>。</li>
+<li><strong>动作</strong>：如果是，它会设置 <code>group_size_ratio = 0.25</code>（意思把长序列切成原本的 1/4 长度来计算），然后调用 <code>_apply_llama_patch()</code> 开始搞事。</li>
+</ul>
+<h4>Task 2: 偷梁换柱 (Patching)</h4>
+<p><strong>对应代码 <code>_apply_llama_patch</code> 函数。</strong></p>
+<ul>
+<li><strong>代码</strong>：
+    <code>python
+    LlamaAttention.forward = llama_attention_forward
+    LlamaFlashAttention2.forward = llama_flash_attention_2_forward
+    # ...</code></li>
+<li><strong>解释</strong>：Python 允许动态修改类的方法。这里强制把 Llama 模型原本的 <code>forward</code>（向前传播）函数，替换成了文件上面定义的 <code>llama_attention_forward</code> 等函数。以后模型跑的时候，跑的都是在这个文件里写的代码。</li>
+</ul>
+<h4>Task 3: 准备数据 (Standard Prep)</h4>
+<p><strong>对应魔改函数（如 <code>llama_attention_forward</code>）的前半部分。</strong></p>
+<ul>
+<li><strong>解释</strong>：这部分和原版 Llama 没区别。就是把输入 <code>hidden_states</code> 变成 <code>query</code>, <code>key</code>, <code>value</code>，然后加上旋转位置编码（RoPE）。这部分不用深究，就是常规操作。</li>
+</ul>
+<h4>Task 4: 核心魔法 —— “错位与分组” (Shift &amp; Group)</h4>
+<p><strong>这是文件中最难懂的部分，也是 LongLoRA 的精髓。</strong></p>
+<ul>
+<li><strong>代码片段</strong>：
+    ```python
+    if getattr(self.config, "group_size_ratio", None) and self.training:  # 只有训练时开启
+        # 定义 shift 函数
+        def shift(state):
+            # 1. 也就是把一半的头(Heads)保持原样，另一半头的数据向后滚动(roll/shift)一段距离
+            state = torch.cat(
+                (state[:, :, : self.num_heads // 2], state[:, :, self.num_heads // 2 :].roll(-groupsz // 2, dims=1)),
+                dim=2,
+            )
+            # 2. 变形：把原本的长序列 (Batch, Length, ...) 变成 (Batch * Group数, Group大小, ...)
+            return state.reshape(...) <div class="codehilite"><pre><span></span><code>query_states, key_states, value_states = shift(query_states), shift(key_states), shift(value_states)
+</code></pre></div>
+
+<p>```
+*   <strong>通俗解释</strong>：
+*   假设你有一篇 4000 字的文章，显存不够，一次算不动。
+*   <strong>分组</strong>：LongLoRA 说：“把它切成 4 段，每段 1000 字”。这样显存就够了。
+*   <strong>问题</strong>：如果直接切断，第 1 段结尾就看不见第 2 段开头了，上下文断了。
+*   <strong>Shift (错位)</strong>：为了解决这个问题，它把注意力头（比如一共 32 个头）分成两组。
+    *   <strong>A组头</strong>：老老实实看原本切分好的段落。
+    *   <strong>B组头</strong>：<strong>把数据“错位”一下</strong>（比如向后挪半个段落），然后再切分。
+*   <strong>结果</strong>：通过这种“错位”，B组头就能看到原本被切断的边界处的上下文。这样既省了显存（因为是在短序列上算），又没有丢失长距离的信息。</p>
+</li>
+</ul>
+<h4>Task 5: 计算注意力 (Compute Attention)</h4>
+<ul>
+<li><strong>代码</strong>：
+    <code>python
+    # 这里的 query_states 已经是变形后的“短”序列了
+    attn_output = torch.matmul(query_states, key_states.transpose(2, 3)) ...</code></li>
+<li><strong>解释</strong>：现在 GPU 以为它在处理很多个“短序列”（Batch Size 变大了，Sequence Length 变小了）。计算速度快，显存占用低。</li>
+</ul>
+<h4>Task 6: 还原现场 (Shift Back)</h4>
+<ul>
+<li><strong>代码</strong>：
+    <code>python
+    if getattr(self.config, "group_size_ratio", None) and self.training:  # shift back
+        # 把刚才 roll 过的另一半头，再 roll 回去
+        attn_output = torch.cat(
+            (
+                attn_output[:, :, : self.num_heads // 2],
+                attn_output[:, :, self.num_heads // 2 :].roll(groupsz // 2, dims=1),
+            ),
+            dim=2,
+        )</code></li>
+<li><strong>解释</strong>：算完注意力后，得把数据恢复成原来的样子，不然下一层网络就乱套了。刚才怎么挪的，现在就反向挪回来。</li>
+</ul>
+<h4>Task 7: 输出结果</h4>
+<ul>
+<li><strong>解释</strong>：最后经过 <code>o_proj</code> 输出，任务完成。</li>
+</ul>
+<hr />
+<h3>总结：为什么要搞这么复杂？</h3>
+<p>如果不这么做：
+*   <strong>全量注意力 (Full Attention)</strong>：训练 32k 长度的文本，显存会爆炸 (O(N^2) 复杂度)。</p>
+<p>用了这个文件里的代码 (LongLoRA / S2-Attn)：
+*   <strong>稀疏注意力</strong>：通过“切分+错位”，把计算量降下来了，接近线性复杂度。
+*   <strong>效果</strong>：你可以在普通的显卡上微调非常长的上下文，而且效果和全量注意力差不多。</p>
+<p><strong>一句话概括：这个文件就是给 Llama 模型打了个补丁，让它在训练时通过“左右横跳”的方式，用很少的显存看懂很长的文章。</strong></p>

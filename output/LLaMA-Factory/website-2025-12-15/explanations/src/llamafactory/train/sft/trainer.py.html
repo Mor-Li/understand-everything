@@ -1,0 +1,67 @@
+<h1>src/llamafactory/train/sft/trainer.py</h1>
+<p>没问题。这段代码是 <strong>LlamaFactory</strong> 项目中用于 <strong>SFT（有监督微调）</strong> 的核心训练器代码。</p>
+<p>为了让你更容易理解，我们可以把训练 AI 模型想象成<strong>“一位教练（Trainer）在训练一名学生（Model）准备考试”</strong>。</p>
+<p>这个文件 <code>CustomSeq2SeqTrainer</code> 就是这位<strong>定制版的教练</strong>。它继承自 HuggingFace 标准的 <code>Seq2SeqTrainer</code>（标准教练），但增加了很多 LlamaFactory 特有的“私教课程”和“辅助工具”。</p>
+<p>下面我为你列一个 <strong>“教练的任务清单 (Todo List)”</strong>，然后按这个清单一步步给你拆解代码在干什么。</p>
+<hr />
+<h3>📋 教练的任务清单 (Task List)</h3>
+<ol>
+<li><strong>入职准备 (Initialization):</strong> 检查训练环境，准备好教材（Tokenizer/Processor），配置特殊训练技巧（如 FP8 加速、Badam 优化器）。</li>
+<li><strong>制定学习计划 (Optimizer &amp; Scheduler):</strong> 决定学生该怎么学（优化器）以及学习进度怎么调整（学习率调度器）。</li>
+<li><strong>安排练习题顺序 (Sampler):</strong> 决定练习题是随机抽还是按顺序做。</li>
+<li><strong>模拟考试与评分 (Prediction Step):</strong> 让学生做题（生成文本），并把题目部分遮住，只看答案写得对不对。</li>
+<li><strong>填写成绩单 (Save Predictions):</strong> 把学生生成的答案翻译成人话，保存到文件里供人类检查。</li>
+</ol>
+<hr />
+<h3>🧐 逐步代码拆解</h3>
+<h4>Task 1: 入职准备 (Initialization)</h4>
+<p><strong>对应代码：</strong> <code>__init__</code> 方法</p>
+<p>这位教练在刚上岗时做了很多配置工作：
+*   <strong>FP8 环境配置 (<code>configure_fp8_environment</code>):</strong>
+    *   如果用户开启了 FP8（一种更节省显存的低精度训练模式），教练会先设置好环境。
+*   <strong>兼容性处理 (<code>processing_class</code>):</strong>
+    *   HuggingFace 的库更新很快，代码里判断了版本（<code>&gt;4.46</code>），确保“分词器（Tokenizer）”能被正确识别。
+*   <strong>特殊插件 (Callbacks &amp; Badam):</strong>
+    *   <code>SaveProcessorCallback</code>: 确保训练完不仅保存模型，还保存处理数据的工具（Processor）。
+    *   <code>use_badam</code>: 如果开启了 Badam（一种省显存的优化算法），教练会加载对应的插件。
+    *   <code>use_dft_loss</code>: 如果开启了 DFT Loss（一种特殊的损失函数），教练会替换掉标准的评分标准。</p>
+<h4>Task 2: 制定学习计划 (Optimizer &amp; Scheduler)</h4>
+<p><strong>对应代码：</strong> <code>create_optimizer</code> 和 <code>create_scheduler</code></p>
+<p>标准的教练（HuggingFace 原版）只懂通用的教学方法。这位定制教练懂更多：
+*   <strong><code>create_optimizer</code>:</strong> 它没有直接使用默认优化器，而是调用了 <code>create_custom_optimizer</code>。这通常是为了支持 <strong>LoRA</strong>、<strong>Galore</strong> 或者 <strong>BitAndBytes</strong>（量化）等微调技术。它能识别哪些参数该更新，哪些该冻结。
+*   <strong><code>create_scheduler</code>:</strong> 同样调用了定制的 <code>create_custom_scheduler</code>，用来控制学习率（Learning Rate）随时间变化的曲线（比如预热 Warmup，余弦衰减 Cosine 等）。</p>
+<h4>Task 3: 安排练习题顺序 (Sampler)</h4>
+<p><strong>对应代码：</strong> <code>_get_train_sampler</code></p>
+<ul>
+<li>通常训练时，数据是<strong>随机打乱</strong>（Shuffle）喂给模型的，防止模型死记硬背。</li>
+<li>但这段代码加了一个判断：<code>if self.finetuning_args.disable_shuffling</code>。</li>
+<li><strong>作用：</strong> 如果用户特别要求（比如为了调试，或者数据本身有时序关系），教练可以按<strong>顺序</strong>把数据喂给模型，而不是打乱。</li>
+</ul>
+<h4>Task 4: 模拟考试与评分 (Prediction Step)</h4>
+<p><strong>对应代码：</strong> <code>prediction_step</code> <strong>（这是重点！）</strong></p>
+<p>这是 Seq2Seq（序列到序列）训练中最关键的一步。
+*   <strong>背景：</strong> 在做生成任务（比如问答）时，输入是“问题”，模型输出是“回答”。
+*   <strong>问题：</strong> 模型生成时，有时候会把“问题”也复读一遍，或者在内部计算时包含了“问题”的 token。
+*   <strong>代码逻辑：</strong>
+    1.  <code>generated_tokens[:, : inputs["input_ids"].size(-1)] = self.processing_class.pad_token_id</code>
+    2.  这行代码的意思是：<strong>把生成结果中属于“提示词（Prompt/Input）”的那部分，全部涂掉（替换成 PAD token）</strong>。
+*   <strong>目的：</strong> 我们算分（比如 BLEU 或 ROUGE 分数）的时候，只关心模型<strong>新写出来的答案</strong>好不好，不关心它复述的问题。如果不涂掉，分数会虚高。</p>
+<h4>Task 5: 填写成绩单 (Save Predictions)</h4>
+<p><strong>对应代码：</strong> <code>save_predictions</code></p>
+<p>训练或预测结束后，我们需要看结果。
+*   <strong>解码 (Decode):</strong> 模型吐出的是一堆数字（Token IDs），人类看不懂。这段代码用 <code>batch_decode</code> 把数字转回文字。
+*   <strong>处理 Padding:</strong>
+    *   代码里有一段循环 <code>for i in range(len(preds))</code>，是在处理填充符号（Padding）。它把填充符移到最后，确保解码出来的句子是连贯的。
+*   <strong>保存文件 (<code>generated_predictions.jsonl</code>):</strong>
+    *   它将三样东西打包存入文件：
+        1.  <code>prompt</code>: 题目（输入）。
+        2.  <code>predict</code>: 学生写的答案（模型生成）。
+        3.  <code>label</code>: 标准答案（Ground Truth）。
+    *   这样你就可以打开这个 JSONL 文件，直观地看到模型到底学得怎么样了。</p>
+<hr />
+<h3>总结</h3>
+<p>这个 <code>trainer.py</code> 文件就是 <strong>LlamaFactory 的训练总管</strong>。</p>
+<p>它没有重写所有底层逻辑（因为继承了 transformers 的 <code>Seq2SeqTrainer</code>），而是<strong>针对大模型微调（SFT）的场景进行了“魔改”</strong>：
+1.  支持了更多省显存的黑科技（FP8, Badam）。
+2.  修正了生成评估时的逻辑（去掉 Prompt 干扰）。
+3.  提供了更方便的人类可读的日志输出。</p>

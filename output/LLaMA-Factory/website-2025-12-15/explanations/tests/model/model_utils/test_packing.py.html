@@ -1,0 +1,78 @@
+<h1>tests/model/model_utils/test_packing.py</h1>
+<p>这是一个非常好的提问。这段代码是一个 <strong>单元测试（Unit Test）</strong> 文件，它的作用是用来验证 LlamaFactory 中关于 <strong>“序列打包（Sequence Packing）”</strong> 功能的两个核心函数是否计算正确。</p>
+<p>简单来说，这段代码在测试：<strong>当我们把好几句话“拼”在同一行里输入给模型时，程序能不能正确地识别出哪几个词属于第一句，哪几个词属于第二句，并且把没用的填充（Padding）去掉。</strong></p>
+<p>为了让你彻底搞懂，我为你列了一个 <strong>“学习任务清单 (To-Do List)”</strong>，我们一步步来拆解。</p>
+<hr />
+<h3>📋 任务清单：一步步读懂代码逻辑</h3>
+<h4>✅ Task 1：理解背景——为什么要“打包 (Packing)”？</h4>
+<p>在看代码前，先建立一个概念。
+*   <strong>传统做法</strong>：一个 Batch（批次）里有长句和短句。为了对齐，短句后面要补很多 <code>0</code> (Padding)。
+    *   <em>坏处</em>：GPU 算这些 <code>0</code> 是在浪费电和时间。
+*   <strong>打包做法 (Packing)</strong>：把短句拼在一起，像“拼车”一样填满一行。
+    *   <em>例子</em>：原本一行只放一句 "Hello"，补了5个0。现在一行放 "Hello" + "World" + "Nice to meet you"，没有0了。
+    *   <em>难点</em>：模型得知道哪里是第一句结束，哪里是第二句开始，否则会读成一整句乱码。</p>
+<h4>✅ Task 2：看懂输入数据——特殊的 <code>attention_mask</code></h4>
+<p>代码里最让人困惑的是这个输入数据：</p>
+<div class="codehilite"><pre><span></span><code><span class="p">[</span>
+    <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">0</span><span class="p">],</span>
+    <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">3</span><span class="p">],</span>
+<span class="p">]</span>
+</code></pre></div>
+
+<p>这不是普通的 0/1 Mask，这是一个 <strong>“ID Mask”</strong>。
+*   <strong>第一行</strong> <code>[1, 1, 2, 2, 2, 0]</code>：
+    *   <code>1, 1</code>：代表第 1 个样本（长度为 2）。
+    *   <code>2, 2, 2</code>：代表第 2 个样本（长度为 3）。
+    *   <code>0</code>：代表填充（Padding），没用的部分。
+*   <strong>第二行</strong> <code>[1, 2, 2, 3, 3, 3]</code>：
+    *   <code>1</code>：代表第 3 个样本（长度为 1）。
+    *   <code>2, 2</code>：代表第 4 个样本（长度为 2）。
+    *   <code>3, 3, 3</code>：代表第 5 个样本（长度为 3）。</p>
+<p><strong>结论</strong>：这个 Batch 里一共塞进去了 <strong>5 个独立的小句子</strong>。</p>
+<h4>✅ Task 3：解读第一个测试函数 <code>test_get_seqlens_in_batch</code></h4>
+<p>这个任务的目标是：<strong>数一数每个小句子有多长。</strong></p>
+<ul>
+<li><strong>输入</strong>：刚才那个 ID Mask。</li>
+<li><strong>代码逻辑</strong>：调用 <code>get_seqlens_in_batch</code>。</li>
+<li><strong>预期输出 (<code>golden_seq_lens</code>)</strong>：<code>[2, 3, 1, 2, 3]</code><ul>
+<li>第一行的样本1长度是 <strong>2</strong> (两个1)。</li>
+<li>第一行的样本2长度是 <strong>3</strong> (三个2)。</li>
+<li>第二行的样本1长度是 <strong>1</strong> (一个1)。</li>
+<li>第二行的样本2长度是 <strong>2</strong> (两个2)。</li>
+<li>第二行的样本3长度是 <strong>3</strong> (三个3)。</li>
+</ul>
+</li>
+<li><strong>测试目的</strong>：验证程序算出来的长度和我们人眼数的长度是否一致。</li>
+</ul>
+<h4>✅ Task 4：解读第二个测试函数 <code>test_get_unpad_data</code> (核心难点)</h4>
+<p>这个任务的目标是：<strong>为 FlashAttention（一种加速技术）准备数据。</strong>
+FlashAttention 不喜欢处理二维矩阵里的 <code>0</code>，它喜欢把所有有效数据压扁成一维长条。</p>
+<p>我们需要验证函数 <code>get_unpad_data</code> 返回的三个东西：</p>
+<p><strong>1. <code>indices</code> (有效数据的索引)</strong>
+*   <strong>含义</strong>：告诉 GPU，原始矩阵里哪些位置是有字儿的，哪些是 <code>0</code> (垃圾)。
+*   <strong>数据</strong>：<code>[0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11]</code>
+*   <strong>解释</strong>：注意看，里面<strong>少了 <code>5</code></strong>。因为原始矩阵第一行第6个位置（索引5）是 <code>0</code>。这个列表的作用就是把那个 <code>0</code> 扔掉，保留其他所有数字的坐标。</p>
+<p><strong>2. <code>cu_seqlens</code> (Cumulative Sequence Lengths，累积长度)</strong>
+*   <strong>含义</strong>：这是给 GPU 切分数据用的“剪刀位置”。它是一个前缀和（Prefix Sum）。
+*   <strong>数据</strong>：<code>[0, 2, 5, 6, 8, 11]</code>
+*   <strong>怎么算的？</strong>
+    *   <code>0</code> (起始点)
+    *   0 + <strong>2</strong> (第一个句子长) = <code>2</code>
+    *   2 + <strong>3</strong> (第二个句子长) = <code>5</code>
+    *   5 + <strong>1</strong> (第三个句子长) = <code>6</code>
+    *   6 + <strong>2</strong> (第四个句子长) = <code>8</code>
+    *   8 + <strong>3</strong> (第五个句子长) = <code>11</code>
+*   <strong>作用</strong>：GPU 拿到这个列表就知道：第0-2个词是第一句，第2-5个词是第二句……以此类推。</p>
+<p><strong>3. <code>max_seqlen_in_batch</code> (最大长度)</strong>
+*   <strong>含义</strong>：所有小句子里，最长的那个多长？
+*   <strong>数据</strong>：<code>3</code>
+*   <strong>解释</strong>：因为最长的句子只有 3 个词（比如 <code>[2, 2, 2]</code>）。这通常用于分配显存缓冲区大小。</p>
+<hr />
+<h3>🚀 总结</h3>
+<p>这段代码虽然看起来枯燥，但它在测试大模型训练中最重要的数据预处理步骤之一：</p>
+<ol>
+<li><strong><code>test_get_seqlens_in_batch</code></strong>：测试能不能从“拼车”的数据里，正确识别出每一位乘客（句子）的长度。</li>
+<li><strong><code>test_get_unpad_data</code></strong>：测试能不能把这些二维数据正确地“压扁”并“去重（去掉0）”，同时生成正确的“切割点（cu_seqlens）”，以便喂给底层加速算法（如 FlashAttention）。</li>
+</ol>
+<p><strong>简单一句话：</strong>
+这两个测试保证了 LlamaFactory 在把多个句子塞进同一个 Batch 训练时，数据不会乱，也不会把填充的 0 当作有效内容去计算。</p>

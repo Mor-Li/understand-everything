@@ -1,0 +1,131 @@
+<h1>src/llmtuner/tuner/ppo/trainer.py</h1>
+<p>这份代码是 <strong>LLaMA-Factory (原 LLM-Tuner)</strong> 项目中用于 <strong>PPO（Proximal Policy Optimization）</strong> 训练的核心逻辑。</p>
+<p>简单来说，这是大模型训练的“第三阶段”——<strong>RLHF（基于人类反馈的强化学习）</strong>。在这个阶段，模型不再是简单地背诵课文（SFT），而是像学生一样，写出答案，老师（奖励模型）打分，然后模型根据分数调整自己，争取下次得分更高。</p>
+<p>为了让你更容易理解，我将这份代码的逻辑拆解为一个 <strong>“任务清单 (Todo List)”</strong>，然后一步步对应代码给你讲解。</p>
+<hr />
+<h3>📋 PPO 训练流程任务清单 (Todo List)</h3>
+<p>想象这是一个正在运行的机器人，它的任务列表如下：</p>
+<ol>
+<li><strong>准备工作</strong>：初始化环境，确定要训练多少轮，准备好数据。</li>
+<li><strong>开始循环</strong>（针对每一个训练步）：<ul>
+<li><strong>Task A: 做作业 (Generate)</strong> —— 给模型看题目（Query），让模型生成答案（Response）。</li>
+<li><strong>Task B: 老师打分 (Compute Rewards)</strong> —— 把题目和答案拿给“奖励模型”看，算出一个分数。</li>
+<li><strong>Task C: 订正学习 (PPO Step)</strong> —— 根据分数，调整模型的参数（如果分数高就强化这种写法，分数低就避免）。</li>
+<li><strong>Task D: 记录与存档 (Log &amp; Save)</strong> —— 记下这一轮的平均分、Loss，如果到了存档点就保存模型。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🔍 逐步代码讲解</h3>
+<p>下面我按照上面的清单，带你读懂代码中的关键点。</p>
+<h4>1. 类的定义与初始化 (准备工作)</h4>
+<p>代码开头定义了 <code>PPOPeftTrainer</code> 类。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">PPOPeftTrainer</span><span class="p">(</span><span class="n">PPOTrainer</span><span class="p">,</span> <span class="n">PeftTrainer</span><span class="p">):</span>
+    <span class="c1"># ...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：这是一个“混血儿”。它继承了 <code>PPOTrainer</code>（来自 <code>trl</code> 库，专门做强化学习）和 <code>PeftTrainer</code>（专门处理 LoRA 等高效微调）。</li>
+<li><strong>含义</strong>：这意味着我们不是全量微调大模型，而是用轻量级的 LoRA 技术来进行 PPO 训练，节省显存。</li>
+</ul>
+<h4>2. 核心函数 <code>ppo_train</code> (主循环)</h4>
+<p>这是代码中最长的方法，也是核心逻辑所在。</p>
+<p><strong>Task A: 做作业 (Generate)</strong></p>
+<p>在 <code>for step in tqdm(...)</code> 循环内部：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 关掉梯度检查点和缓存，为了推理加速</span>
+<span class="n">unwrapped_model</span><span class="o">.</span><span class="n">gradient_checkpointing_disable</span><span class="p">()</span>
+<span class="n">unwrapped_model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">use_cache</span> <span class="o">=</span> <span class="kc">True</span>
+
+<span class="c1"># 2. 获取题目 (Query)</span>
+<span class="n">query_tensors</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">=</span> <span class="n">batch</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">]</span>
+
+<span class="c1"># 3. 让模型生成答案 (Response)</span>
+<span class="n">response_tensors</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">batch</span><span class="p">,</span> <span class="n">length_sampler</span><span class="o">=</span><span class="n">output_length_sampler</span><span class="p">,</span> <span class="n">return_prompt</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="o">**</span><span class="n">gen_kwargs</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：这里模型处于“推理模式”。它看到 <code>batch</code> 里的 Prompt，然后自由发挥生成文本。</li>
+<li><strong>细节</strong>：代码后面有一段 <code>for i in range(len(query_tensors))</code> 的循环，那是为了把 padding（填充符）去掉，只保留有效的文本，因为 PPO 对 padding 很敏感。</li>
+</ul>
+<p><strong>Task B: 老师打分 (Compute Rewards)</strong></p>
+<p>这是这份代码里比较特殊且巧妙的地方：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 切换模型身份！</span>
+<span class="n">replace_model</span><span class="p">(</span><span class="n">unwrapped_model</span><span class="p">,</span> <span class="n">target</span><span class="o">=</span><span class="s2">&quot;reward&quot;</span><span class="p">)</span>
+
+<span class="c1"># 2. 计算分数</span>
+<span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">values</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">(</span><span class="o">**</span><span class="bp">self</span><span class="o">.</span><span class="n">prepare_model_inputs</span><span class="p">(</span><span class="n">queries</span><span class="p">,</span> <span class="n">responses</span><span class="p">))</span>
+<span class="n">rewards</span> <span class="o">=</span> <span class="p">[</span><span class="n">reward</span> <span class="k">for</span> <span class="n">reward</span> <span class="ow">in</span> <span class="n">values</span><span class="p">[:,</span> <span class="o">-</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)]</span>
+
+<span class="c1"># 3. 切回模型身份！</span>
+<span class="n">replace_model</span><span class="p">(</span><span class="n">unwrapped_model</span><span class="p">,</span> <span class="n">target</span><span class="o">=</span><span class="s2">&quot;default&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>核心观点</strong>：<strong>同一个基础模型，挂载了两个不同的 LoRA 适配器（Adapter）。</strong><ul>
+<li>一个是用于生成的（Actor/Default）。</li>
+<li>一个是用于打分的（Reward）。</li>
+</ul>
+</li>
+<li><strong>操作</strong>：<ul>
+<li><code>replace_model(..., target="reward")</code>：把模型瞬间变成“奖励模型”。</li>
+<li>计算出 <code>rewards</code>（分数）。</li>
+<li><code>replace_model(..., target="default")</code>：把模型瞬间变回“生成模型”，准备接下来的训练更新。</li>
+</ul>
+</li>
+<li><strong>为什么这么做？</strong> 为了省显存。不需要加载两个巨大的模型，只需要加载一个模型主体和两份很小的 LoRA 参数。</li>
+</ul>
+<p><strong>Task C: 订正学习 (PPO Step)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 开启梯度检查点 (为了省显存进行反向传播)</span>
+<span class="n">unwrapped_model</span><span class="o">.</span><span class="n">gradient_checkpointing_enable</span><span class="p">()</span>
+<span class="n">unwrapped_model</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">use_cache</span> <span class="o">=</span> <span class="kc">False</span>
+
+<span class="c1"># 2. 执行 PPO 更新</span>
+<span class="n">stats</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">step</span><span class="p">(</span><span class="n">queries</span><span class="p">,</span> <span class="n">responses</span><span class="p">,</span> <span class="n">rewards</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：<code>self.step</code> 是父类 <code>PPOTrainer</code> 提供的方法。</li>
+<li><strong>内部逻辑</strong>：它会拿刚才生成的“题目+答案”以及“分数”，去计算 PPO Loss（包括策略梯度的 Loss 和 KL 散度惩罚）。KL 散度是为了防止模型为了拿高分而“胡言乱语”，偏离原始模型太远。这一步会真正更新模型的参数。</li>
+</ul>
+<p><strong>Task D: 记录与存档 (Log &amp; Save)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_world_process_zero</span><span class="p">()</span> <span class="ow">and</span> <span class="p">(</span><span class="n">step</span><span class="o">+</span><span class="mi">1</span><span class="p">)</span> <span class="o">%</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">logging_steps</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+    <span class="n">logs</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="s2">&quot;loss&quot;</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="n">loss_meter</span><span class="o">.</span><span class="n">avg</span><span class="p">,</span> <span class="mi">4</span><span class="p">),</span>
+        <span class="s2">&quot;reward&quot;</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="n">reward_meter</span><span class="o">.</span><span class="n">avg</span><span class="p">,</span> <span class="mi">4</span><span class="p">),</span> <span class="c1"># 最重要的指标：看分数有没有上涨</span>
+        <span class="c1"># ...</span>
+    <span class="p">}</span>
+    <span class="nb">print</span><span class="p">(</span><span class="n">logs</span><span class="p">)</span>
+    <span class="c1"># ...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：每隔几步打印一次日志。在 RLHF 中，我们最关注 <code>reward</code> 指标。如果 <code>reward</code> 曲线稳步上升，说明模型变聪明了。</li>
+</ul>
+<h4>3. 辅助函数 <code>generate</code></h4>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">generate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+    <span class="c1"># ...</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">,</span> <span class="n">layer_norm_params</span> <span class="o">=</span> <span class="n">cast_layernorm_dtype</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">)</span>
+    <span class="c1"># ...</span>
+    <span class="n">response</span> <span class="o">=</span> <span class="n">unwrapped_model</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="o">**</span><span class="n">inputs</span><span class="p">,</span> <span class="o">**</span><span class="n">generation_kwargs</span><span class="p">)</span>
+    <span class="c1"># ...</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">cast_layernorm_dtype</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">,</span> <span class="n">layer_norm_params</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">response</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：为了生成时的数值稳定性。</li>
+<li><strong>解释</strong>：在半精度（FP16/BF16）训练时，生成的概率分布有时候会溢出。这里用 <code>cast_layernorm_dtype</code> 临时把 LayerNorm 层转成 FP32（全精度）来生成，生成完再转回去。这是一种工程上的 Trick（技巧）。</li>
+</ul>
+<hr />
+<h3>💡 总结</h3>
+<p>这个文件的核心故事是：</p>
+<ol>
+<li><strong>利用 LoRA 的灵活性</strong>：在一个模型上动态切换“演员（生成）”和“裁判（打分）”的身份。</li>
+<li><strong>标准的 RL 循环</strong>：<ul>
+<li><strong>采样</strong>：模型自己生成数据。</li>
+<li><strong>打分</strong>：奖励模型给出评价。</li>
+<li><strong>更新</strong>：利用 PPO 算法优化模型，让它生成的答案更符合奖励模型的口味。</li>
+</ul>
+</li>
+</ol>
+<p>如果你要修改或调试代码，重点关注 <code>ppo_train</code> 里的循环部分，特别是 <code>replace_model</code> 前后的逻辑，那是 LLaMA-Factory 独特的设计。</p>

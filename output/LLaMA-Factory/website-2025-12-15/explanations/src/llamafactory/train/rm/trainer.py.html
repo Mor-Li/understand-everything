@@ -1,0 +1,113 @@
+<h1>src/llamafactory/train/rm/trainer.py</h1>
+<p>完全没问题。这段代码确实涉及了很多大模型微调（Fine-tuning）的具体细节，特别是<strong>RLHF（人类反馈强化学习）</strong>流程中的<strong>奖励模型（Reward Model, RM）</strong>训练。</p>
+<p>如果不了解背景，这就只是一堆难懂的函数。为了让你读懂它，我们把它拆解成一个<strong>“打造一个AI评分员”</strong>的任务清单（To-Do List）。</p>
+<p>我们将分 <strong>5个步骤</strong> 来完成这个任务，每一步对应代码中的一部分。</p>
+<hr />
+<h3>任务清单：打造一个“奖励模型”（AI评分员）</h3>
+<h4>✅ Task 1: 搞清楚我们在做什么 (背景知识)</h4>
+<p><strong>目标：</strong> 理解什么是 <code>PairwiseTrainer</code>。
+<strong>解释：</strong>
+在训练大模型像 ChatGPT 一样说话时，有一步叫 <strong>RLHF</strong>。我们需要先训练一个“裁判模型”（Reward Model）。
+这个裁判看两个答案：
+1.  <strong>好的回答（Chosen）</strong>
+2.  <strong>坏的回答（Rejected）</strong></p>
+<p>裁判的任务是：<strong>给“好的回答”打高分，给“坏的回答”打低分。</strong>
+因为是成对（Pair）比较，所以这个训练器叫 <code>PairwiseTrainer</code>。</p>
+<hr />
+<h4>✅ Task 2: 继承家产 (基础架构)</h4>
+<p><strong>代码位置：</strong> 类定义 和 <code>__init__</code>
+<strong>观点：</strong> 别从头造轮子，直接借用 HuggingFace 的工具。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">PairwiseTrainer</span><span class="p">(</span><span class="n">Trainer</span><span class="p">):</span>
+<span class="w">    </span><span class="sa">r</span><span class="sd">&quot;&quot;&quot;Inherits Trainer to compute pairwise loss.&quot;&quot;&quot;</span>
+    <span class="c1"># ...</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+*   它继承自 <code>transformers.Trainer</code>。这意味着：加载数据、保存模型、多卡训练这些脏活累活，HuggingFace 已经做好了，我们只需要修改核心逻辑。
+*   <strong><code>__init__</code> 函数</strong>里做了一些杂事：
+    *   <code>FixValueHeadModelCallback</code>：这是为了确保模型存盘时格式正确。
+    *   <code>use_badam</code>：如果你在参数里开启了 BAdam（一种省显存的优化算法），这里会做特殊设置。
+    *   这就好比：开工前先把工具箱整理好。</p>
+<hr />
+<h4>✅ Task 3: 准备“大脑”和“课程表” (优化器与调度器)</h4>
+<p><strong>代码位置：</strong> <code>create_optimizer</code> 和 <code>create_scheduler</code>
+<strong>观点：</strong> 使用 LlamaFactory 特制的优化策略。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="nd">@override</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">create_optimizer</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;torch.optim.Optimizer&quot;</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">optimizer</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">optimizer</span> <span class="o">=</span> <span class="n">create_custom_optimizer</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">model</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">finetuning_args</span><span class="p">)</span>
+        <span class="k">return</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">create_optimizer</span><span class="p">()</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+*   标准的 Trainer 有通用的优化器（SGD, AdamW）。
+*   这里重写（Override）了它，告诉程序：“用我们 LlamaFactory 自己定制的 <code>create_custom_optimizer</code>”。
+*   这就好比：不用学校通用的教材，我们要用自己编写的“学霸笔记”来训练模型。</p>
+<hr />
+<h4>✅ Task 4: <strong>核心逻辑</strong> —— 怎么算分？ (计算 Loss)</h4>
+<p><strong>代码位置：</strong> <code>compute_loss</code> <strong>(这是全文件最重要的地方)</strong>
+<strong>观点：</strong> 这里的数学逻辑决定了模型能不能学会“分辨好坏”。</p>
+<p>我们一行行看这部分逻辑：</p>
+<p><strong>1. 让模型打分</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">values</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="o">**</span><span class="n">inputs</span><span class="p">,</span> <span class="n">output_hidden_states</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">return_dict</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">use_cache</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li>把数据喂给模型，模型吐出 <code>values</code>（分数）。</li>
+</ul>
+<p><strong>2. 拆分数据</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">batch_size</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span>
+<span class="n">chosen_masks</span><span class="p">,</span> <span class="n">rejected_masks</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="n">inputs</span><span class="p">[</span><span class="s2">&quot;attention_mask&quot;</span><span class="p">],</span> <span class="n">batch_size</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+<span class="n">chosen_rewards</span><span class="p">,</span> <span class="n">rejected_rewards</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="n">values</span><span class="p">,</span> <span class="n">batch_size</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>关键点：</strong> 输入数据是拼在一起的。假设 Batch Size 是 4，那么前 2 个是“好回答”，后 2 个是对应的“坏回答”。</li>
+<li>这里用 <code>// 2</code> 把它们切开，分成 <code>chosen</code>（好）和 <code>rejected</code>（坏）两组。</li>
+</ul>
+<p><strong>3. 提取分数</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">chosen_scores</span> <span class="o">=</span> <span class="n">chosen_rewards</span><span class="o">.</span><span class="n">gather</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span> <span class="n">index</span><span class="o">=</span><span class="p">(</span><span class="n">chosen_masks</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span> <span class="n">keepdim</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">))</span>
+<span class="c1"># ... (rejected_scores 同理)</span>
+</code></pre></div>
+
+<ul>
+<li>模型对每个字都会打分。但我们只需要<strong>整句话说完时的那个分数</strong>。</li>
+<li>这行代码的意思是：找到句子的最后一个有效字符（EOS），把那个位置的分数拿出来作为整句话的得分。</li>
+</ul>
+<p><strong>4. 计算损失 (Loss)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">loss</span> <span class="o">=</span> <span class="o">-</span><span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">logsigmoid</span><span class="p">(</span><span class="n">chosen_scores</span><span class="o">.</span><span class="n">float</span><span class="p">()</span> <span class="o">-</span> <span class="n">rejected_scores</span><span class="o">.</span><span class="n">float</span><span class="p">())</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span>
+</code></pre></div>
+
+<ul>
+<li><strong>公式翻译：</strong> <code>Score(好) - Score(坏)</code>。</li>
+<li><strong>期望：</strong> 我们希望 <code>好 - 坏</code> 的差值越大越好。</li>
+<li><strong>LogSigmoid：</strong> 这是一个数学函数。如果差值很大，Loss 就很小（接近0）；如果差值很小（甚至坏的比好的分高），Loss 就会非常大。</li>
+<li>这就是在告诉模型：“你给好回答的分数必须比坏回答高，否则我就惩罚你！”</li>
+</ul>
+<hr />
+<h4>✅ Task 5: 看看成绩单 (保存预测结果)</h4>
+<p><strong>代码位置：</strong> <code>save_predictions</code>
+<strong>观点：</strong> 训练完或者评估时，把分数存下来看看。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">save_predictions</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">predict_results</span><span class="p">:</span> <span class="s2">&quot;PredictionOutput&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="c1"># ...</span>
+    <span class="n">output_prediction_file</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">output_dir</span><span class="p">,</span> <span class="s2">&quot;generated_predictions.jsonl&quot;</span><span class="p">)</span>
+    <span class="c1"># ...</span>
+    <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">output_prediction_file</span><span class="p">,</span> <span class="s2">&quot;w&quot;</span><span class="p">,</span> <span class="n">encoding</span><span class="o">=</span><span class="s2">&quot;utf-8&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">writer</span><span class="p">:</span>
+        <span class="c1"># ...</span>
+        <span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">({</span><span class="s2">&quot;chosen&quot;</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="nb">float</span><span class="p">(</span><span class="n">c_score</span><span class="p">),</span> <span class="mi">2</span><span class="p">),</span> <span class="s2">&quot;rejected&quot;</span><span class="p">:</span> <span class="nb">round</span><span class="p">(</span><span class="nb">float</span><span class="p">(</span><span class="n">r_score</span><span class="p">),</span> <span class="mi">2</span><span class="p">)})</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+*   这部分不是为了训练，是为了给人看。
+*   它把模型预测出的“好回答分数”和“坏回答分数”写入一个 <code>.jsonl</code> 文件。
+*   你可以打开这个文件检查：比如 <code>chosen: 5.8, rejected: 2.1</code> —— 很好，模型学懂了。如果 <code>chosen: 1.0, rejected: 9.0</code> —— 完蛋，模型学反了。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件的核心故事就是：</p>
+<ol>
+<li><strong>我是个训练器</strong>（继承 Trainer）。</li>
+<li><strong>我的任务是比大小</strong>（Pairwise）。</li>
+<li><strong>核心算法是</strong>：把数据劈成两半，一半是好的一半是坏的，强迫模型给好的一半打高分（<code>compute_loss</code>）。</li>
+<li><strong>最后交卷</strong>：把打分结果存成文件给我看（<code>save_predictions</code>）。</li>
+</ol>
+<p>现在再回头看代码，是不是清晰很多了？</p>

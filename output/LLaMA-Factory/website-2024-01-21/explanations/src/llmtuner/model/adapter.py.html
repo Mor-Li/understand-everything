@@ -1,0 +1,121 @@
+<h1>src/llmtuner/model/adapter.py</h1>
+<p>完全没问题。这段代码对于刚接触大模型微调的人来说确实有点复杂，因为它集成了多种微调方式（全量、冻结、LoRA）以及一些像 DeepSpeed 或 Unsloth 这样的优化工具逻辑。</p>
+<p>你可以把这个文件 <code>adapter.py</code> 看作是一个 <strong>“模型改装车间主任”</strong>。它的任务是：<strong>拿着一个原始的大模型（Base Model），根据你的需求（配置文件），把它改装成可以开始训练或者推理的状态。</strong></p>
+<p>为了让你听懂，我把这个“主任”的工作流程拆解成一个 <strong>To-Do List</strong>，然后一步一步对照代码给你讲。</p>
+<hr />
+<h3>📋 模型改装主任的 To-Do List</h3>
+<ol>
+<li><strong>接待检查</strong>：你是来训练的还是只来做推理（使用）的？如果啥也不改，直接放行。</li>
+<li><strong>路径 A：全量改装 (Full)</strong>：如果要练整个模型，把所有零件精度调高。</li>
+<li><strong>路径 B：局部改装 (Freeze)</strong>：把模型大部分锁死，只留几层让你动。</li>
+<li><strong>路径 C：外挂改装 (LoRA)</strong> —— <em>这是最核心、最复杂的部分</em>：<ul>
+<li>4.1 <strong>旧挂件处理</strong>：如果有旧的外挂（Adapter），是把它融合进模型，还是接着练？</li>
+<li>4.2 <strong>新挂件安装</strong>：如果是新训练，挂件挂在哪里？（Target Modules）</li>
+<li>4.3 <strong>工具适配</strong>：有没有用 Unsloth 这种加速工具？</li>
+<li>4.4 <strong>正式挂载</strong>：使用 PEFT 库把 LoRA 挂上去。</li>
+</ul>
+</li>
+<li><strong>最终安检</strong>：把需要训练的参数调整好数据格式（精度），打印日志，交货。</li>
+</ol>
+<hr />
+<h3>逐步讲解（对照代码）</h3>
+<h4>1. 接待检查 (Entry Check)</h4>
+<p>代码开头部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="p">(</span><span class="ow">not</span> <span class="n">is_trainable</span><span class="p">)</span> <span class="ow">and</span> <span class="n">model_args</span><span class="o">.</span><span class="n">adapter_name_or_path</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="c1"># ... return model</span>
+</code></pre></div>
+
+<ul>
+<li><strong>主任说</strong>：“如果你不是来训练的 (<code>not is_trainable</code>)，而且也没带任何外挂配件 (<code>adapter_name_or_path is None</code>)，那你把原始模型直接拿走吧，别浪费我时间。”</li>
+</ul>
+<h4>2. 路径 A：全量微调 (Full Fine-tuning)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">finetuning_args</span><span class="o">.</span><span class="n">finetuning_type</span> <span class="o">==</span> <span class="s2">&quot;full&quot;</span> <span class="ow">and</span> <span class="n">is_trainable</span><span class="p">:</span>
+    <span class="c1"># ...</span>
+    <span class="n">model</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">float</span><span class="p">()</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：全量微调意味着模型的所有参数都要更新。</li>
+<li><strong>操作</strong>：主任把模型的所有参数转成了 <code>float32</code> 格式。为什么？因为全量微调对精度要求高，用半精度（float16）容易数值溢出，训练不稳定。</li>
+</ul>
+<h4>3. 路径 B：冻结微调 (Freeze Fine-tuning)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">finetuning_args</span><span class="o">.</span><span class="n">finetuning_type</span> <span class="o">==</span> <span class="s2">&quot;freeze&quot;</span> <span class="ow">and</span> <span class="n">is_trainable</span><span class="p">:</span>
+    <span class="c1"># ...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：有时候显存不够，或者只想改改最后几层，就用 Freeze。</li>
+<li><strong>操作</strong>：<ol>
+<li><strong>计算层数</strong>：先看看模型一共有多少层。</li>
+<li><strong>确定白名单</strong>：根据配置 <code>num_layer_trainable</code>（比如最后3层），算出哪些层的 ID 是允许动的。</li>
+<li><strong>上锁</strong>：遍历模型所有参数。如果不在白名单里，设置 <code>requires_grad_(False)</code>（上锁，不更新）；如果在白名单里，转成 <code>float32</code> 准备训练。</li>
+</ol>
+</li>
+</ul>
+<h4>4. 路径 C：LoRA 微调 (LoRA Fine-tuning) —— <em>重头戏</em></h4>
+<p>这是代码最长的部分 <code>if finetuning_args.finetuning_type == "lora":</code>。LoRA 就像是在模型旁边贴“贴纸”，不改原模型，只练贴纸。</p>
+<p><strong>4.1 处理既有适配器 (Handle Existing Adapters)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">model_args</span><span class="o">.</span><span class="n">adapter_name_or_path</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="c1"># ... 判断是否合并(merge) ...</span>
+    <span class="k">for</span> <span class="n">adapter</span> <span class="ow">in</span> <span class="n">adapter_to_merge</span><span class="p">:</span>
+        <span class="n">model</span> <span class="o">=</span> <span class="n">PeftModel</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">adapter</span><span class="p">)</span>
+        <span class="n">model</span> <span class="o">=</span> <span class="n">model</span><span class="o">.</span><span class="n">merge_and_unload</span><span class="p">()</span>
+</code></pre></div>
+
+<ul>
+<li><strong>场景</strong>：你可能已经有一个练了一半的 LoRA，或者你想在旧 LoRA 基础上练新的。</li>
+<li><strong>操作</strong>：<ul>
+<li><strong>Merge (融合)</strong>：有些情况下（比如量化模型或 DeepSpeed Zero3），不能挂多个外挂。主任会把旧的 LoRA <strong>彻底融合</strong> 到基础模型里（变成模型的一部分），然后再进行下一步。</li>
+<li><strong>Resume (继续)</strong>：如果是接着练同一个 LoRA，就把它加载进来继续。</li>
+</ul>
+</li>
+</ul>
+<p><strong>4.2 准备新 LoRA (Create New LoRA)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">is_trainable</span> <span class="ow">and</span> <span class="n">adapter_to_resume</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="c1"># ...</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">finetuning_args</span><span class="o">.</span><span class="n">lora_target</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span> <span class="o">...</span><span class="p">:</span>
+        <span class="n">target_modules</span> <span class="o">=</span> <span class="n">find_all_linear_modules</span><span class="p">(</span><span class="n">model</span><span class="p">)</span>
+    <span class="c1"># ...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：LoRA 需要挂在模型的特定层上（通常是 Linear 层，比如 Q、K、V 矩阵）。</li>
+<li><strong>操作</strong>：<ul>
+<li>如果你没指定挂哪，主任会用 <code>find_all_linear_modules</code> 自动寻找所有能挂的地方。</li>
+<li>准备好配置参数：<code>r</code> (秩，贴纸的大小), <code>lora_alpha</code> (贴纸的影响力) 等。</li>
+</ul>
+</li>
+</ul>
+<p><strong>4.3 工具适配与挂载 (Unsloth &amp; PEFT)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">model_args</span><span class="o">.</span><span class="n">use_unsloth</span><span class="p">:</span>
+    <span class="c1"># ... 使用 Unsloth 加速库 ...</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="n">lora_config</span> <span class="o">=</span> <span class="n">LoraConfig</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="n">model</span> <span class="o">=</span> <span class="n">get_peft_model</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">lora_config</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>操作</strong>：<ul>
+<li><strong>Unsloth</strong>：这是一个专门加速 Llama/Mistral 微调的库。如果开启了，主任会调用 Unsloth 特有的方法来创建 LoRA 模型。</li>
+<li><strong>PEFT</strong>：这是 HuggingFace 官方的标准库。如果没有特殊加速，就用标准的 <code>get_peft_model</code> 把 LoRA 挂载到模型上。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 最终安检 (Final Polish)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">for</span> <span class="n">param</span> <span class="ow">in</span> <span class="nb">filter</span><span class="p">(</span><span class="k">lambda</span> <span class="n">p</span><span class="p">:</span> <span class="n">p</span><span class="o">.</span><span class="n">requires_grad</span><span class="p">,</span> <span class="n">model</span><span class="o">.</span><span class="n">parameters</span><span class="p">()):</span>
+    <span class="n">param</span><span class="o">.</span><span class="n">data</span> <span class="o">=</span> <span class="n">param</span><span class="o">.</span><span class="n">data</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span> <span class="k">if</span> <span class="n">finetuning_args</span><span class="o">.</span><span class="n">lora_bf16_mode</span> <span class="k">else</span> <span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：混合精度训练需要确定的数据类型。</li>
+<li><strong>操作</strong>：主任最后检查一遍所有 <strong>需要更新的参数</strong>（比如 LoRA 的参数）。<ul>
+<li>如果开启了 <code>lora_bf16_mode</code>，就把它们转成 <code>bfloat16</code>（这种格式在大显卡上又快又稳）。</li>
+<li>否则转成 <code>float32</code> 以保证计算稳定。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件的核心逻辑就是：
+<strong>拿到模型 -&gt; 看你怎么练(Full/Freeze/LoRA) -&gt; 如果是 LoRA，处理好旧的挂件，装上新的挂件 -&gt; 调整好参数精度 -&gt; 返回改装好的模型。</strong></p>
+<p>现在再回去看代码，是不是清晰一些了？</p>

@@ -1,0 +1,91 @@
+<h1>src/llmtuner/extras/patches/llama_patch.py</h1>
+<p>这份代码其实是在做一个“手术”（Monkey Patch），把原版 LLaMA 模型里的<strong>注意力机制（Attention）</strong>给替换掉了。</p>
+<p>它的核心目的是为了实现 <strong>LongLoRA</strong>（或者类似的 Shifted Sparse Attention）技术。简单说，就是为了<strong>让模型在训练时能处理超长的文本，但又不会显存爆炸</strong>。</p>
+<p>为了让你听懂，我把这段代码执行的过程想象成一个<strong>流水线工人的 To-Do List</strong>。我们来看看这个工人（代码）在处理数据时，一步步都干了啥。</p>
+<hr />
+<h3>📋 任务清单：LLaMA 注意力机制流水线</h3>
+<h4>✅ Task 1: 准备原材料 (Q, K, V 投影)</h4>
+<p>这是所有 Transformer 模型的第一步，完全标准的流程，没有魔改。
+*   <strong>动作</strong>：拿到输入的隐藏状态（Hidden States），把它们变成 Query (查询), Key (键), Value (值)。
+*   <strong>代码对应</strong>：
+    <code>python
+    query_states = self.q_proj(hidden_states)
+    key_states = self.k_proj(hidden_states)
+    value_states = self.v_proj(hidden_states)</code></p>
+<h4>✅ Task 2: 给原材料打上“位置标签” (RoPE)</h4>
+<p>这也是标准流程。模型得知道哪个词在前，哪个词在后。
+*   <strong>动作</strong>：计算旋转位置编码（RoPE），并应用到 Q 和 K 上。
+*   <strong>代码对应</strong>：
+    <code>python
+    cos, sin = self.rotary_emb(...)
+    query_states, key_states = apply_rotary_pos_emb(...)</code></p>
+<h4>✅ Task 3: 【核心魔改点】“切块”与“错位” (Shift Logic)</h4>
+<p><strong>这是这段代码存在的唯一意义。</strong> 如果没有这一步，它就是原版代码。
+*   <strong>背景</strong>：如果文本太长（比如 10万字），直接算注意力会算死（计算量是长度的平方）。
+*   <strong>策略</strong>：把长文本切成很多小块（Group）。但是，如果只在小块内部算，块与块之间就没联系了。所以需要“错位”。
+*   <strong>动作</strong>：
+    1.  <strong>检查</strong>：看配置里有没有 <code>group_size_ratio</code> 且正在训练中 (<code>self.training</code>)。
+    2.  <strong>切分</strong>：把长序列分成若干个组 (<code>groupsz</code>)。
+    3.  <strong>错位 (Shift)</strong>：把<strong>一半的注意力头（Heads）</strong>向后挪半个组的位置（<code>.roll</code> 操作）。
+        *   <em>比喻</em>：这就好比两队人排队传话。A队人只跟本组人说话；B队人往后退几步，跨在两个组中间说话。这样信息就能在组与组之间流通了。
+    4.  <strong>变形</strong>：把数据形状改变，让电脑以为我们在处理很多个短句子，而不是一个长句子（为了省显存）。
+*   <strong>代码对应</strong>：
+    <code>python
+    if getattr(self.config, "group_size_ratio", None) and self.training:
+        # 定义 shift 函数，核心是那个 .roll
+        def shift(state):
+            # ...前一半头不动，后一半头滚动(roll)...
+            state = torch.cat((..., .roll(-groupsz // 2, ...)), dim=2)
+            # ...
+        # 应用 shift
+        query_states, key_states, value_states = shift(query_states), shift(...), shift(...)</code></p>
+<h4>✅ Task 4: 计算注意力 (Attention Calculation)</h4>
+<p>现在原材料已经被切成小块且错位了，开始正式计算。
+*   <strong>动作</strong>：计算 Q 和 K 的相似度，得出权重，再乘上 V。
+*   <strong>区别</strong>：
+    *   <code>llama_torch_attn_forward</code> 函数用的是传统的数学公式计算。
+    *   <code>llama_flash_attn_forward</code> 函数用的是 Flash Attention 2 加速库计算。
+    *   但逻辑是一样的：因为 Task 3 已经把长文本伪装成了短文本（Batch size 变大了，Sequence length 变小了），所以这里计算非常快，显存占用低。</p>
+<h4>✅ Task 5: 【核心魔改点】“复原” (Shift Back)</h4>
+<p>算完了，得把数据变回原来的样子，不然下一层网络就看不懂了。
+*   <strong>动作</strong>：
+    1.  把形状变回去（Reshape）。
+    2.  把刚才 Task 3 里挪错位的那一半头，再<strong>挪回来</strong>（反向 Roll）。
+*   <strong>代码对应</strong>：
+    <code>python
+    if getattr(self.config, "group_size_ratio", None) and self.training:
+        # ...
+        attn_output = torch.cat(
+            (
+                attn_output[:, :, : self.num_heads // 2], # 前一半不动
+                attn_output[:, :, self.num_heads // 2 :].roll(groupsz // 2, dims=1), # 后一半滚回来
+            )
+        )</code></p>
+<h4>✅ Task 6: 输出与收尾</h4>
+<ul>
+<li><strong>动作</strong>：最后经过一个输出层（O projection），把结果返回。</li>
+<li><strong>代码对应</strong>：
+    <code>python
+    attn_output = self.o_proj(attn_output)
+    return attn_output, ...</code></li>
+</ul>
+<h4>✅ Task 7: 偷天换日 (Apply Patch)</h4>
+<p>这是文件的最后一部分。
+*   <strong>动作</strong>：把 transformers 库里原装的 <code>LlamaAttention.forward</code> 偷偷换成上面定义的这个魔改版函数。
+*   <strong>代码对应</strong>：
+    <code>python
+    def apply_llama_patch() -&gt; None:
+        LlamaAttention.forward = llama_torch_attn_forward
+        LlamaFlashAttention2.forward = llama_flash_attn_forward</code></p>
+<hr />
+<h3>总结：这段代码到底在干嘛？</h3>
+<p><strong>一句话解释</strong>：
+这是一个<strong>长文本训练加速补丁</strong>（通常用于 LongLoRA 方法）。</p>
+<p><strong>它的核心逻辑是</strong>：
+1.  <strong>原版 LLaMA</strong>：看 10000 字的文章，需要消耗 10000² 的资源。
+2.  <strong>打了补丁的 LLaMA</strong>：
+    *   把 10000 字切成 10 段，每段 1000 字。
+    *   通过“错位”技巧，让模型既能享受到“只算 1000 字”的低资源消耗，又能通过错位的头去感知上下文，不丢失长距离的语义。
+    *   训练完后，推理（使用）时通常不需要这个 Shift 操作，或者以特定方式推理。</p>
+<p><strong>你需要关注的重点</strong>：
+如果你不是在研究 LongLoRA 的底层原理，你只需要知道：<strong>只要运行了这个 <code>apply_llama_patch()</code>，你的 LLaMA 模型在训练时就会自动开启“省显存长文本模式”</strong>。</p>

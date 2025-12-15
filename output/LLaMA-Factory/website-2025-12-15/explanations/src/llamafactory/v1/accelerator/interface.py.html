@@ -1,0 +1,116 @@
+<h1>src/llamafactory/v1/accelerator/interface.py</h1>
+<p>这份代码确实涉及到了深度学习中最复杂的部分之一：<strong>分布式训练（Distributed Training）</strong>。如果不了解背景，看这些代码就像看天书。</p>
+<p>简单来说，这个文件是 LlamaFactory 用来<strong>管理多张显卡（GPU）如何协同工作</strong>的“总指挥部”。</p>
+<p>为了让你能看懂，我制定了一个 <strong>5步走的 Task List</strong>。我们不谈深奥的数学，用大白话和比喻来一步步拆解。</p>
+<hr />
+<h3>📋 学习任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1: 理解基础黑话 (Rank &amp; World Size)</strong> - 搞懂多卡训练的基本单位。</li>
+<li><strong>Task 2: 理解切分策略 (Dim Enum)</strong> - 搞懂怎么把大模型和大任务拆解开。</li>
+<li><strong>Task 3: 算术题 (DistributedStrategy)</strong> - 搞懂代码里是怎么分配显卡的。</li>
+<li><strong>Task 4: 建立通讯网 (DeviceMesh)</strong> - 搞懂显卡之间是怎么分组聊天的。</li>
+<li><strong>Task 5: 发号施令 (Interface Methods)</strong> - 搞懂如何让显卡同步数据。</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>✅ Task 1: 理解基础黑话 (Rank &amp; World Size)</h4>
+<p>在看代码之前，你得先建立一个场景：<strong>你是老师，你有 8 个学生（8张显卡）帮你做这一套超难的卷子（训练模型）。</strong></p>
+<ul>
+<li><strong>World Size (世界大小)</strong>: 就是学生总数（比如 8）。</li>
+<li><strong>Rank (等级/编号)</strong>: 每个学生的学号（0, 1, 2, ... 7）。</li>
+<li><strong>Local Rank</strong>: 如果这8个学生分在两个教室（两台服务器），每个教室4人。那你在教室里的编号就是 Local Rank (0-3)。</li>
+</ul>
+<p><strong>对应代码：</strong>
+代码里引用了 <code>get_rank</code>, <code>get_world_size</code> 等函数，就是为了让程序知道：“我是谁？（第几号显卡）”、“这里一共有多少人？（总显卡数）”。</p>
+<hr />
+<h4>✅ Task 2: 理解切分策略 (Dim Enum)</h4>
+<p>看代码里的 <code>class Dim(str, Enum)</code> 部分。这是定义<strong>“怎么切蛋糕”</strong>。</p>
+<p>训练大模型有三种切法，代码里定义了这些维度：</p>
+<ol>
+<li>
+<p><strong>DP (Data Parallel - 数据并行)</strong>:</p>
+<ul>
+<li><em>比喻</em>：卷子太长，复印 8 份，每个学生做不同的题目（处理不同的数据），最后把答案汇总。</li>
+<li><em>代码</em>：<code>Dim.DP</code></li>
+</ul>
+</li>
+<li>
+<p><strong>MP (Model Parallel - 模型并行)</strong>:</p>
+<ul>
+<li>包含 <code>MP_SHARD</code> (切片) 和 <code>MP_REPLICATE</code> (复制)。</li>
+<li><em>比喻</em>：课本（模型）太厚了，一个人的脑子（显存）记不住。于是把课本撕开，学生A背前50页，学生B背后50页。这一起才算一个完整的脑子。</li>
+<li><em>代码</em>：<code>Dim.MP_SHARD</code></li>
+</ul>
+</li>
+<li>
+<p><strong>CP (Context Parallel - 上下文并行)</strong>:</p>
+<ul>
+<li><em>比喻</em>：阅读理解的文章太长了（长文本），一个人读不完。学生A读第一段，学生B读第二段。</li>
+<li><em>代码</em>：<code>Dim.CP</code></li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 3: 算术题 (DistributedStrategy)</h4>
+<p>看代码里的 <code>class DistributedStrategy</code>。这是一个数据类（dataclass），专门做<strong>小学算术</strong>。</p>
+<p>它的逻辑是：<strong>总显卡数是固定的，你必须把它们分配给不同的策略。</strong></p>
+<p><strong>核心逻辑 (<code>__post_init__</code> 方法):</strong>
+假设你有 <strong>8张卡</strong> (<code>world_size = 8</code>)。</p>
+<ul>
+<li>如果你想搞 <strong>模型并行 (MP)</strong>，把模型切成 2 份 (<code>mp_shard_size = 2</code>)。</li>
+<li>如果你想搞 <strong>上下文并行 (CP)</strong>，设为 1 (不切)。</li>
+<li>那么剩下的卡用来搞 <strong>数据并行 (DP)</strong>。</li>
+<li><strong>公式</strong>：<code>DP大小 * MP大小 * CP大小 = 总卡数</code>。</li>
+</ul>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 如果没指定 dp_size，它会自动算：</span>
+<span class="c1"># dp_size = 总卡数 / (mp_size * cp_size)</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">dp_size</span> <span class="o">=</span> <span class="n">get_world_size</span><span class="p">()</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">cp_size</span>
+</code></pre></div>
+
+<p>这段代码就是为了确保：不管你怎么切，最后所有维度的乘积必须等于你拥有的显卡总数。</p>
+<hr />
+<h4>✅ Task 4: 建立通讯网 (DeviceMesh)</h4>
+<p>这是 PyTorch 2.x 的新概念，也是代码里 <code>DistributedInterface</code> 初始化的核心。</p>
+<p><strong>场景</strong>：虽然有8个学生，但他们不是跟所有人都说话。
+*   做“切书本”任务的学生（MP组）需要频繁交流：“哎，我算完第一层了，结果发给你算第二层”。
+*   做“切数据”任务的学生（DP组）只需要最后对答案：“我算出的梯度是X，你的是Y，咱们平均一下”。</p>
+<p><strong>DeviceMesh (设备网格)</strong> 就是把这8张卡画成一个表格（矩阵）。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 初始化模型并行的网格</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">model_device_mesh</span> <span class="o">=</span> <span class="n">init_device_mesh</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="c1"># 初始化数据并行的网格</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">data_device_mesh</span> <span class="o">=</span> <span class="n">init_device_mesh</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p>这部分代码在画圈圈，规定哪些显卡是一个小组的。比如卡0和卡1是一个MP小组，卡0、卡2、卡4、卡6是一个DP小组。</p>
+<hr />
+<h4>✅ Task 5: 发号施令 (Interface Methods)</h4>
+<p>最后看 <code>DistributedInterface</code> 里的方法，这是给外部调用的<strong>遥控器</strong>。</p>
+<p>这是一个<strong>单例模式 (Singleton)</strong>，保证全局只有一个指挥官。</p>
+<p>它提供了两个最关键的动作：</p>
+<ol>
+<li>
+<p><strong><code>all_gather</code> (收集)</strong>:</p>
+<ul>
+<li><em>意思</em>：所有人把手里的东西交上来，拼成一个完整的。</li>
+<li><em>代码</em>：<code>def all_gather(...)</code></li>
+</ul>
+</li>
+<li>
+<p><strong><code>all_reduce</code> (规约/汇总)</strong>:</p>
+<ul>
+<li><em>意思</em>：所有人手里的数字拿出来，求个平均值（Mean）或者求和（Sum），然后每个人都拿一份这个最终结果。</li>
+<li><em>代码</em>：<code>def all_reduce(...)</code></li>
+</ul>
+</li>
+</ol>
+<p><strong>为什么需要 <code>dim</code> 参数？</strong>
+因为你要指定在哪个小组里做这件事。
+*   <code>all_reduce(dim=Dim.DP)</code>: 意思是“所有做数据并行的人，把你们算的梯度拿出来平均一下”。</p>
+<hr />
+<h3>💡 总结：这代码到底是干啥的？</h3>
+<p>如果不写这个文件，每次你想在 LlamaFactory 里做多卡训练，你都得手写一堆复杂的 PyTorch 代码来计算 rank，初始化通信组，处理显卡分组。</p>
+<p><strong>这个文件的作用是：</strong>
+它把复杂的<strong>分布式环境初始化</strong>、<strong>显卡分组计算</strong>、<strong>通信组建立</strong>全部封装好了。</p>
+<p>外部程序只需要说：“我要用 8 张卡，2张卡切模型，4张卡做数据并行”，这个类就会自动帮你把后台的通讯网格（Mesh）搭好，并提供简单的接口让你去同步数据。</p>

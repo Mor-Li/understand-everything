@@ -1,0 +1,95 @@
+<h1>src/llmtuner/model/utils.py</h1>
+<p>没问题，这个文件 <code>utils.py</code> 其实就像是一个<strong>大语言模型训练的“瑞士军刀”或者“后勤管家”</strong>。它里面没有核心的训练算法，全是帮大模型<strong>做准备工作</strong>的辅助工具。</p>
+<p>为了让你更容易理解，我们可以把“微调一个大模型”想象成<strong>“装修一栋大楼”</strong>。</p>
+<p>我们可以把这个文件的功能拆解成下面这个 <strong>ToDo List（任务清单）</strong>，每一步都对应代码里的一个或几个函数：</p>
+<h3>📋 任务清单 (ToDo List)</h3>
+<ol>
+<li><strong>【搬运工】把大模型搬进显卡里</strong>（如果楼太大，还得拆开搬进不同的房间）。<ul>
+<li>对应函数：<code>dispatch_model</code></li>
+</ul>
+</li>
+<li><strong>【定位员】找到可以“动刀”装修的墙面</strong>（寻找适合 LoRA 微调的层）。<ul>
+<li>对应函数：<code>find_all_linear_modules</code></li>
+</ul>
+</li>
+<li><strong>【配件员】如果是搞强化学习，得把特殊的“评价组件”装上去</strong>（加载 Value Head）。<ul>
+<li>对应函数：<code>load_valuehead_params</code></li>
+</ul>
+</li>
+<li><strong>【登记员】给这栋楼办身份证和档案</strong>（准备模型卡片信息）。<ul>
+<li>对应函数：<code>get_modelcard_args</code></li>
+</ul>
+</li>
+<li><strong>【联络员】确保新式建筑能被系统识别</strong>（注册 AutoClass）。<ul>
+<li>对应函数：<code>register_autoclass</code></li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<p>下面我按照这个清单，一步步给你讲代码在干啥。</p>
+<h4>1. 任务：把大模型搬进显卡里</h4>
+<p><strong>函数：</strong> <code>dispatch_model</code></p>
+<ul>
+<li><strong>痛点：</strong> 现在的模型太大了（比如 70B 的模型），一张显卡（GPU）根本装不下。或者你有好几张显卡，你想把模型均匀地铺在这些显卡上，防止某一张卡爆显存。</li>
+<li><strong>代码逻辑：</strong><ul>
+<li>先检查模型是不是已经量化（压缩）过了，如果是，通常不需要动。</li>
+<li><strong>核心判断：</strong> 如果你有多张显卡 (<code>torch.cuda.device_count() &gt; 1</code>) 且模型允许拆分：<ul>
+<li>它会调用 <code>accelerate</code> 库的工具。</li>
+<li>计算每张卡该分多少显存 (<code>get_balanced_memory</code>)。</li>
+<li>计算“地图” (<code>infer_auto_device_map</code>)，决定模型的哪一层放在哪张卡上。</li>
+<li>最后把模型按这个地图“分发”出去 (<code>dispatch_model</code>)。</li>
+</ul>
+</li>
+<li><strong>如果只有一张卡：</strong> 直接扔进当前显卡里 (<code>model.to(...)</code>)。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 任务：找到可以“动刀”装修的墙面</h4>
+<p><strong>函数：</strong> <code>find_all_linear_modules</code></p>
+<ul>
+<li><strong>背景：</strong> 我们通常使用 <strong>LoRA</strong> 技术来微调模型。LoRA 不会训练整个模型，而是像“便利贴”一样贴在模型的某些特定层（主要是 Linear 层，即全连接层）上进行训练。</li>
+<li><strong>痛点：</strong> 模型里层太多了，而且如果你用了 4-bit 或 8-bit 量化（压缩模型），这些层的名字和类型会变（变成 <code>bnb.nn.Linear4bit</code> 之类的）。我们需要自动把它们找出来。</li>
+<li><strong>代码逻辑：</strong><ul>
+<li><strong>看类型：</strong> 如果模型被压缩了（bitsandbytes），就找压缩版的 Linear 层；没压缩就找普通的 <code>torch.nn.Linear</code>。</li>
+<li><strong>排除法：</strong> 它是为了防止把“最后输出层”（比如 <code>lm_head</code>）也给微调了（通常最后输出层参数量巨大且不需要 LoRA）。</li>
+<li><strong>搜索：</strong> 遍历模型的所有模块，只要是 Linear 层且不是输出层，就把它的名字（比如 <code>q_proj</code>, <code>v_proj</code>）记下来。</li>
+<li><strong>结果：</strong> 返回一个列表，告诉 LoRA 算法：“嘿，去微调这些层！”</li>
+</ul>
+</li>
+</ul>
+<h4>3. 任务：加载“评价组件” (仅用于 RLHF)</h4>
+<p><strong>函数：</strong> <code>load_valuehead_params</code></p>
+<ul>
+<li><strong>背景：</strong> 在做 RLHF（人类反馈强化学习，像 ChatGPT 的最后一步训练）时，除了模型本身，还需要一个<strong>Value Head（价值头）</strong>。你可以把它理解为一个“打分器”，用来评价模型说的话好不好。</li>
+<li><strong>痛点：</strong> 这个“打分器”的参数通常是单独存的一个文件，不包含在主模型里。</li>
+<li><strong>代码逻辑：</strong><ul>
+<li>它会去 Hugging Face 或本地路径找特定的文件（通常叫 <code>value_head.safetensors</code> 或 <code>value_head.bin</code>）。</li>
+<li>它优先尝试用 <code>safetensors</code>（一种更安全更快的格式）加载。</li>
+<li>如果找不到，就尝试用旧的 <code>torch.load</code> 加载。</li>
+<li>如果都找不到，就打个日志说“没找到”，这在普通微调时是正常的。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 任务：给模型办“身份证”</h4>
+<p><strong>函数：</strong> <code>get_modelcard_args</code></p>
+<ul>
+<li><strong>背景：</strong> 当你训练完模型上传到 Hugging Face 时，网页上会显示一个“Model Card”（模型介绍卡片）。</li>
+<li><strong>代码逻辑：</strong><ul>
+<li>这个函数就是把训练时的信息打包成一个字典。</li>
+<li>它记录了：任务类型（文本生成）、许可协议、你是基于哪个模型微调的 (<code>finetuned_from</code>)、用了什么数据集 (<code>dataset</code>)、打了什么标签（比如 <code>lora</code>, <code>llama-factory</code>）。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 任务：确保新式建筑能被识别</h4>
+<p><strong>函数：</strong> <code>register_autoclass</code></p>
+<ul>
+<li><strong>背景：</strong> Hugging Face 有一个强大的功能叫 <code>AutoModel</code>，你给它路径，它自动识别是 Llama 还是 Qwen。但如果你用的是一个非常新或者魔改过的模型架构，<code>AutoModel</code> 可能不认识。</li>
+<li><strong>代码逻辑：</strong><ul>
+<li>这个函数检查模型的配置里有没有 <code>auto_map</code>（自动映射表）。</li>
+<li>如果有，它就强制把这个自定义的模型类注册到系统里，保证后续代码能通过 <code>AutoModel</code> 加载它，而不会报错说“我不认识这个架构”。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这段代码虽然看起来很杂，但核心就是：<strong>为了让微调脚本能顺滑地运行，处理硬件分配、层定位、参数加载和元数据记录这些杂活。</strong> 它是 LLaMA-Factory 这个工厂里的“后勤部”。</p>

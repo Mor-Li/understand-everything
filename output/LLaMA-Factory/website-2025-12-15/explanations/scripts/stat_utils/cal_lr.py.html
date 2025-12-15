@@ -1,0 +1,88 @@
+<h1>scripts/stat_utils/cal_lr.py</h1>
+<p>没问题。这个脚本看起来全是代码，但其实它只做了一件事：<strong>帮你算出一个“科学的”学习率（Learning Rate）</strong>。</p>
+<p>在训练大模型时，学习率不能瞎填。通常有一个黄金法则：<strong>你的数据量（Batch Size）越大，学习率就应该越大</strong>。</p>
+<p>但是，因为我们微调（SFT）的时候，有些数据是“无效”的（比如提问的部分我们是不训练的），所以很难直接估算真实的 Batch Size。</p>
+<p>为了让你看懂，我把这个脚本的工作拆解成 <strong>5 个待办事项（Todo List）</strong>，我们一步步来完成：</p>
+<hr />
+<h3>✅ Task 1: 确立基准（找个参照物）</h3>
+<p><strong>目标</strong>：我们需要一个“标准答案”作为参考。
+<strong>代码对应位置</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">BASE_LR</span> <span class="o">=</span> <span class="mf">3e-4</span>  <span class="c1"># 基础学习率</span>
+<span class="n">BASE_BS</span> <span class="o">=</span> <span class="mi">4_000_000</span>  <span class="c1"># 基础 Batch Size (400万 tokens)</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：
+作者参考了 Llama 论文的设定。
+*   Llama 官方说：如果一次训练 <strong>400万</strong> 个 Token（字/词），推荐的学习率是 <strong>3e-4</strong>。
+*   <strong>观点</strong>：我们要拿你现在的训练配置，去和这个“400万”做对比，按比例缩放学习率。</p>
+<hr />
+<h3>✅ Task 2: 准备数据环境</h3>
+<p><strong>目标</strong>：把你的模型、数据集加载进来，准备开始数数。
+<strong>代码对应位置</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># ... get_train_args(...) ...</span>
+<span class="n">tokenizer</span> <span class="o">=</span> <span class="n">tokenizer_module</span><span class="p">[</span><span class="s2">&quot;tokenizer&quot;</span><span class="p">]</span>
+<span class="c1"># ... get_dataset(...) ...</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：
+*   这部分主要是杂活。它加载了你指定的模型（<code>model_name_or_path</code>）和数据集（<code>dataset</code>）。
+*   它区分了你是要做 <strong>预训练（pt）</strong> 还是 <strong>微调（sft）</strong>。
+    *   如果是微调（SFT），数据里会有“提问”和“回答”。</p>
+<hr />
+<h3>✅ Task 3: 算出“有效数据的比例” (核心步骤)</h3>
+<p><strong>目标</strong>：找出你的数据里，到底有多少是真正用来训练的，有多少是被忽略的（比如Padding或者用户提问）。
+<strong>代码对应位置</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 遍历所有数据</span>
+<span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">tqdm</span><span class="p">(</span><span class="n">dataloader</span><span class="p">,</span> <span class="n">desc</span><span class="o">=</span><span class="s2">&quot;Collecting valid tokens&quot;</span><span class="p">):</span>
+    <span class="c1"># 统计有多少个标签不是“忽略(IGNORE_INDEX)”</span>
+    <span class="n">valid_tokens</span> <span class="o">+=</span> <span class="n">torch</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">batch</span><span class="p">[</span><span class="s2">&quot;labels&quot;</span><span class="p">]</span> <span class="o">!=</span> <span class="n">IGNORE_INDEX</span><span class="p">)</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+    <span class="c1"># 统计总共有多少个标签</span>
+    <span class="n">total_tokens</span> <span class="o">+=</span> <span class="n">torch</span><span class="o">.</span><span class="n">numel</span><span class="p">(</span><span class="n">batch</span><span class="p">[</span><span class="s2">&quot;labels&quot;</span><span class="p">])</span>
+
+<span class="c1"># 算出有效比例</span>
+<span class="n">valid_ratio</span> <span class="o">=</span> <span class="n">valid_tokens</span> <span class="o">/</span> <span class="n">total_tokens</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：
+这是脚本最重要的一步。
+*   在微调（SFT）中，我们通常<strong>只训练模型生成的回答</strong>，而不训练用户的提问。提问部分的 Label 会被设为 <code>IGNORE_INDEX</code>（忽略）。
+*   <strong>观点</strong>：如果你的数据里 90% 都是提问，只有 10% 是回答，那你实际的训练量其实很小。我们需要算出这个 <strong><code>valid_ratio</code>（有效比例）</strong>。</p>
+<hr />
+<h3>✅ Task 4: 计算真实的 Batch Size</h3>
+<p><strong>目标</strong>：结合你设置的参数和刚才算的比例，得出真实的训练量。
+<strong>代码对应位置</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 你的设定：长度 * 批次大小 * 有效比例</span>
+<span class="n">token_batch_size</span> <span class="o">=</span> <span class="n">cutoff_len</span> <span class="o">*</span> <span class="n">batch_size</span> <span class="o">*</span> <span class="n">valid_ratio</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：
+*   假设你设置的 <code>batch_size</code> 是 16，最大长度 <code>cutoff_len</code> 是 2048。
+*   表面上你一次训练了 $16 \times 2048$ 个 Token。
+*   但如果 Task 3 算出只有 50% 是有效的，那你<strong>真实的</strong> <code>token_batch_size</code> 其实只有一半。</p>
+<hr />
+<h3>✅ Task 5: 套用公式，输出建议</h3>
+<p><strong>目标</strong>：用“平方根缩放法则”算出最终的学习率。
+<strong>代码对应位置</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 公式：新LR = 基准LR * sqrt(你的量 / 基准量)</span>
+<span class="n">lr</span> <span class="o">=</span> <span class="n">BASE_LR</span> <span class="o">*</span> <span class="n">math</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="n">token_batch_size</span> <span class="o">/</span> <span class="n">BASE_BS</span><span class="p">)</span>
+
+<span class="c1"># 特殊处理：如果是 Mistral 或 Gemma 模型，除以 6</span>
+<span class="n">lr</span> <span class="o">=</span> <span class="n">lr</span> <span class="o">/</span> <span class="mf">6.0</span> <span class="k">if</span> <span class="n">is_mistral_or_gemma</span> <span class="k">else</span> <span class="n">lr</span>
+
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Optimal learning rate is </span><span class="si">{</span><span class="n">lr</span><span class="si">:</span><span class="s2">.2e</span><span class="si">}</span><span class="s2"> ...&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：
+*   <strong>核心观点（数学公式）</strong>：学习率的变化应该与 Batch Size 的<strong>平方根</strong>成正比。
+*   如果你的真实 Batch Size 比 Llama 的基准（400万）小，学习率就要相应调小。
+*   <strong>例外情况</strong>：Mistral 和 Gemma 这两种模型比较特殊，它们需要更小的学习率，所以作者手动除以了 6。</p>
+<hr />
+<h3>总结</h3>
+<p>这个脚本的逻辑链条是：</p>
+<ol>
+<li>Llama 官方在大数据量下有个<strong>标准学习率</strong>。</li>
+<li>你的训练数据里有很多<strong>无效部分</strong>（比如Padding和Prompt）。</li>
+<li>脚本把所有数据跑一遍，算出<strong>真实有效的数据量</strong>。</li>
+<li>根据真实数据量和标准数据量的差距，<strong>按比例折算</strong>出适合你的学习率。</li>
+</ol>
+<p><strong>也就是告诉你：别瞎猜了，根据你的数据密度，用这个数字填到 <code>learning_rate</code> 参数里最合适。</strong></p>

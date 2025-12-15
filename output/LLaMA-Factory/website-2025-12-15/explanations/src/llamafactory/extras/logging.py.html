@@ -1,0 +1,74 @@
+<h1>src/llamafactory/extras/logging.py</h1>
+<p>这份代码确实看起来有点“绕”，因为它涉及到了<strong>多线程</strong>、<strong>异步写入</strong>、<strong>分布式训练（多显卡）</strong>以及Python的<strong>动态修改（Monkey Patching）</strong>。</p>
+<p>别担心，我们把这份代码想象成一个<strong>“日志大管家”</strong>。它的任务就是管理LlamaFactory在运行时的所有“碎碎念”（报错、提示、进度条）。</p>
+<p>为了让你看懂，我把这个大管家的工作拆解成一个 <strong>Task List（任务清单）</strong>，我们可以一步步勾选来看它是怎么实现的。</p>
+<hr />
+<h3>📋 任务清单 (Task List)</h3>
+<h4>✅ Task 1: 建立一个统一的“发言人” (基础设置)</h4>
+<p><strong>目标</strong>：不管在哪个文件里，只要想打印日志，都要用统一的格式，不能乱来。
+<strong>代码对应</strong>：<code>_configure_library_root_logger</code> 和 <code>get_logger</code></p>
+<ul>
+<li><strong>原来的痛点</strong>：如果随便用 <code>print()</code>，不知道是几点打印的，也不知道是哪个模块打印的。</li>
+<li><strong>代码怎么做</strong>：<ul>
+<li>它定义了一个 <code>Formatter</code>（格式化器），规定长这样：<code>[级别|时间] 文件名:行号 &gt;&gt; 消息</code>。</li>
+<li><code>get_logger</code> 函数保证你拿到的 logger 都是配置好这个格式的。</li>
+<li><code>_get_default_logging_level</code> 还会去读环境变量 <code>LLAMAFACTORY_VERBOSITY</code>，决定是只打印重要的错误，还是连废话（Debug）也打印。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 给Web界面留一份“文字记录” (文件日志)</h4>
+<p><strong>目标</strong>：LlamaFactory 有个 Web UI 界面（LLaMA Board）。界面上需要实时显示训练过程，所以必须把日志写到一个文件里让界面去读。
+<strong>代码对应</strong>：<code>class LoggerHandler(logging.Handler)</code></p>
+<ul>
+<li><strong>代码怎么做</strong>：<ul>
+<li><strong>创建文件</strong>：在 <code>__init__</code> 里，它会创建一个 <code>running_log</code> 文件。</li>
+<li><strong>过滤废话</strong>：在 <code>emit</code> 方法里，它写了一句 <code>if record.name == "httpx": return</code>，意思是：“如果是网络请求库httpx产生的日志，太啰嗦了，别写进文件里”。</li>
+<li><strong>不卡顿（关键点）</strong>：写文件是很慢的（IO操作）。如果训练每跑一步都要停下来等写文件，训练会变慢。<ul>
+<li>于是它用了 <code>ThreadPoolExecutor</code>（线程池）。</li>
+<li><code>self.thread_pool.submit(...)</code> 的意思是：“嘿，帮我把这条日志写到文件里，<strong>你去后台慢慢写，不要卡住我的主程序</strong>”。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 多显卡训练时，不要“七嘴八舌” (Rank0 机制)</h4>
+<p><strong>目标</strong>：这是AI训练中最常见的问题。假设你有 8 张显卡在同时训练（分布式训练），代码会在 8 个进程里同时跑。
+<strong>代码对应</strong>：<code>info_rank0</code>, <code>warning_rank0</code> 以及文件底部的修改。</p>
+<ul>
+<li><strong>原来的痛点</strong>：如果不加控制，8张卡同时跑完一步，屏幕上会瞬间刷出 8 条一模一样的“Training Step 1 Finished”。这太吵了。</li>
+<li><strong>代码怎么做</strong>：<ul>
+<li>它定义了 <code>info_rank0</code> 函数。</li>
+<li>逻辑是：<code>if int(os.getenv("LOCAL_RANK", "0")) == 0:</code></li>
+<li><strong>翻译</strong>：检查一下我的身份证（LOCAL_RANK）。如果我是 <strong>0号显卡（主卡）</strong>，我就打印；如果我是 1-7 号小弟，我就闭嘴。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 避免重复啰嗦 (Once 机制)</h4>
+<p><strong>目标</strong>：有些警告，打印一次我就知道了，不要循环打印一万次刷屏。
+<strong>代码对应</strong>：<code>warning_rank0_once</code></p>
+<ul>
+<li><strong>代码怎么做</strong>：<ul>
+<li>使用了 <code>@lru_cache(None)</code> 装饰器。</li>
+<li>这是一个Python技巧。如果同样的参数传进来，它会直接返回缓存的结果（也就是什么都不做），只有第一次会真正执行打印。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 给系统打“补丁” (Monkey Patching)</h4>
+<p><strong>目标</strong>：让 Python 自带的 <code>logging</code> 模块直接拥有上面说的“Rank0”功能，这样其他文件写代码时更方便。
+<strong>代码对应</strong>：文件最后几行</p>
+<ul>
+<li><strong>代码怎么做</strong>：
+    <code>python
+    logging.Logger.info_rank0 = info_rank0
+    logging.Logger.warning_rank0 = warning_rank0</code></li>
+<li><strong>解释</strong>：这叫“猴子补丁”。它强行把上面定义的 <code>info_rank0</code> 函数，“粘”到了 Python 标准库的 <code>Logger</code> 类上。</li>
+<li><strong>效果</strong>：以后在别的代码里，程序员可以直接写 <code>logger.info_rank0("...")</code>，而不需要导入这个特殊文件里的特殊类。</li>
+</ul>
+<hr />
+<h3>总结：这个文件到底讲了啥？</h3>
+<p>简单来说，这个文件就是 <strong>LlamaFactory 的“宣传部长”</strong>，它做了三件事：</p>
+<ol>
+<li><strong>定规矩</strong>：规定日志长什么样（带时间戳、文件名）。</li>
+<li><strong>做记录</strong>：开了一个后台线程，专门把日志偷偷写到文件里，给 Web 界面看。</li>
+<li><strong>管纪律</strong>：在多显卡训练时，捂住其他显卡的嘴，只让主显卡（Rank 0）说话，防止刷屏。</li>
+</ol>

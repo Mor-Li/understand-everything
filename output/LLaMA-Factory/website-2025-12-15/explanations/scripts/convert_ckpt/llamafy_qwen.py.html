@@ -1,0 +1,115 @@
+<h1>scripts/convert_ckpt/llamafy_qwen.py</h1>
+<p>这份代码的核心作用可以用一句话概括：<strong>“把 Qwen（通义千问）模型的格式，强行修改成 Llama（羊驼）模型的格式。”</strong></p>
+<p>为什么要这么做？因为 Llama 生态最成熟，很多工具、推理引擎只支持 Llama 结构。把 Qwen “伪装”成 Llama，就能直接用那些工具了。</p>
+<p>下面我把这个脚本的工作流程拆解成一个 <strong>Task List (待办事项清单)</strong>，带你一步步看它是怎么完成“整容手术”的。</p>
+<hr />
+<h3>📋 任务清单：Qwen 到 Llama 的整容手术</h3>
+<p>这个脚本主要执行了以下 5 个 Task：</p>
+<ol>
+<li><strong>【准备工作】</strong>：检查环境，创建输出文件夹。</li>
+<li><strong>【读取旧模型】</strong>：把 Qwen 的原始权重文件（<code>.safetensors</code>）全部加载到内存。</li>
+<li><strong>【核心手术：权重转换】</strong>：遍历每一个权重参数，<strong>改名</strong>（重命名变量）并<strong>重组</strong>（切割或合并矩阵），使其符合 Llama 的命名规范。</li>
+<li><strong>【保存新模型】</strong>：把改好名的数据切片，保存为新的权重文件。</li>
+<li><strong>【修改身份证：配置文件】</strong>：读取 Qwen 的 <code>config.json</code>，修改参数名，另存为 Llama 格式的配置。</li>
+</ol>
+<hr />
+<h3>🧐 详细步骤讲解</h3>
+<h4>Task 1: 准备工作 (Setup)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>llamafy_qwen</code> 函数 (脚本最下方)。</li>
+<li><strong>动作</strong>：<ul>
+<li>你运行命令时传入 <code>input_dir</code> (Qwen路径) 和 <code>output_dir</code> (新路径)。</li>
+<li>脚本检查 <code>output_dir</code> 是否存在，不存在就创建。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 读取旧模型 (Load Weights)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>save_weight</code> 函数的开头部分。</li>
+<li><strong>动作</strong>：<ul>
+<li>它会扫描你输入文件夹里的所有 <code>.safetensors</code> 文件。</li>
+<li>使用 <code>safe_open</code> 把里面的权重数据（Tensor）全部读出来，存到一个大字典 <code>qwen_state_dict</code> 里。</li>
+<li><em>此时内存里装的是原汁原味的 Qwen 数据。</em></li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 核心手术 (Convert Format)</h4>
+<p>这是最复杂的一步，对应代码中长长的 <code>for key, value in ...</code> 循环。它在做<strong>字典映射</strong>。</p>
+<ul>
+<li>
+<p><strong>原理</strong>：</p>
+<ul>
+<li>Qwen 的参数叫 <code>transformer.h...</code>，Llama 的参数叫 <code>model.layers...</code>。</li>
+<li>Qwen 的 Attention 层把 Q、K、V 三个矩阵拼在一起存，Llama 是分开存的。</li>
+</ul>
+</li>
+<li>
+<p><strong>具体操作 (TODO List)</strong>：</p>
+<ol>
+<li><strong>词表层 (<code>wte</code>)</strong>：改名为 <code>model.embed_tokens.weight</code>。</li>
+<li><strong>最终归一化层 (<code>ln_f</code>)</strong>：改名为 <code>model.norm.weight</code>。</li>
+<li><strong>注意力层 (Attention)</strong>：<ul>
+<li>遇到 <code>attn.c_attn</code> (Qwen 把 QKV 拼在一起)：<ul>
+<li><strong>切一刀</strong>：把矩阵除以3，切成三份。</li>
+<li>分别改名为 <code>self_attn.q_proj</code>, <code>self_attn.k_proj</code>, <code>self_attn.v_proj</code>。</li>
+</ul>
+</li>
+<li>遇到 <code>attn.c_proj</code> (输出层)：改名为 <code>self_attn.o_proj</code>。</li>
+</ul>
+</li>
+<li><strong>层归一化 (LayerNorm)</strong>：<ul>
+<li><code>ln_1</code> -&gt; 改名 <code>input_layernorm</code> (输入前的 Norm)。</li>
+<li><code>ln_2</code> -&gt; 改名 <code>post_attention_layernorm</code> (注意力后的 Norm)。</li>
+</ul>
+</li>
+<li><strong>前馈网络 (MLP)</strong>：<ul>
+<li><code>mlp.w1</code> -&gt; <code>mlp.up_proj</code></li>
+<li><code>mlp.w2</code> -&gt; <code>mlp.gate_proj</code></li>
+<li><code>mlp.c_proj</code> -&gt; <code>mlp.down_proj</code></li>
+</ul>
+</li>
+<li><strong>输出头 (<code>lm_head</code>)</strong>：名字不用改，直接保留。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 4: 保存新模型 (Save Weights)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>save_weight</code> 函数的后半部分。</li>
+<li><strong>动作</strong>：<ul>
+<li>由于模型可能很大（比如 14GB），不能存成一个巨型文件。</li>
+<li><code>split_torch_state_dict_into_shards</code>：这个工具负责把刚才改好名的大字典，切分成几个小块（Shard），比如每块 2GB。</li>
+<li><code>save_file</code> 或 <code>torch.save</code>：把这些小块写入硬盘。</li>
+<li>生成索引文件（<code>model.safetensors.index.json</code>），告诉程序哪个参数在哪个文件里。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 5: 修改身份证 (Save Config)</h4>
+<ul>
+<li><strong>代码位置</strong>：<code>save_config</code> 函数。</li>
+<li><strong>动作</strong>：<ul>
+<li>读取旧的 <code>config.json</code>。</li>
+<li>创建一个新的字典 <code>llama2_config_dict</code>。</li>
+<li><strong>关键修改</strong>：<ul>
+<li><code>architectures</code>: 强制改成 <code>["LlamaForCausalLM"]</code> (告诉 Transformers 库：我是 Llama)。</li>
+<li><code>model_type</code>: 改成 <code>"llama"</code>。</li>
+<li><code>num_key_value_heads</code>: 计算一下 KV heads 的数量（Qwen 和 Llama 计算方式略有不同）。</li>
+<li><code>intermediate_size</code>: 这里的 <code>// 2</code> 是因为 Qwen 的原始配置里为了兼容某些旧逻辑写大了，转成 Llama 标准格式时需要除以 2 才能对齐参数量。</li>
+</ul>
+</li>
+<li>最后把这个新字典存为 <code>config.json</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这脚本就是一个<strong>翻译器</strong>。</p>
+<ul>
+<li><strong>输入</strong>：讲“Qwen 方言”的模型。</li>
+<li><strong>过程</strong>：<ol>
+<li>把变量名翻译成“Llama 普通话”。</li>
+<li>把连在一起的 QKV 矩阵拆散。</li>
+<li>把配置文件里的“身份证号”改成 Llama。</li>
+</ol>
+</li>
+<li><strong>输出</strong>：一个看起来完全像 Llama，但核心权重依然是 Qwen 训练出来的模型。</li>
+</ul>

@@ -1,0 +1,160 @@
+<h1>src/llmtuner/train/sft/workflow.py</h1>
+<p>这份代码是 <strong>LLaMA-Factory</strong>（或者类似的 LLM 微调框架）中用于 <strong>SFT（Supervised Fine-Tuning，有监督微调）</strong> 的核心工作流脚本。</p>
+<p>简单来说，你可以把这个文件看作是一个 <strong>“施工队长”</strong>。它不负责具体的搬砖（计算梯度）或画图（模型架构），它的任务是<strong>协调</strong>：把模型拿来，把数据拿来，告诉工人怎么干活，最后验收成果。</p>
+<p>为了让你更容易理解，我把 <code>run_sft</code> 这个函数拆解成一个 <strong>“微调大模型任务清单 (Todo List)”</strong>，我们一步步来看它干了什么。</p>
+<hr />
+<h3>📋 SFT 微调任务清单</h3>
+<h4>1. 准备阶段：找工具和备料</h4>
+<ul>
+<li><strong>Task 1.1:</strong> 加载模型 (Model) 和 分词器 (Tokenizer)。</li>
+<li><strong>Task 1.2:</strong> 获取并处理数据集。</li>
+<li><strong>Task 1.3:</strong> 调整分词器的设置（为了适应生成任务）。</li>
+</ul>
+<h4>2. 打包阶段：整理数据</h4>
+<ul>
+<li><strong>Task 2.1:</strong> 设置数据整理器 (Data Collator)，负责把数据打包成一个个批次 (Batch)。</li>
+</ul>
+<h4>3. 组队阶段：初始化训练器</h4>
+<ul>
+<li><strong>Task 3.1:</strong> 再次确认训练参数（比如生成文本的最大长度）。</li>
+<li><strong>Task 3.2:</strong> 启动 Trainer（训练器），把模型、数据、参数都交给它。</li>
+</ul>
+<h4>4. 执行阶段：训练、考试与应用</h4>
+<ul>
+<li><strong>Task 4.1:</strong> (如果需要) <strong>开始训练</strong>，并保存模型和画图。</li>
+<li><strong>Task 4.2:</strong> (如果需要) <strong>进行评估</strong>，看看模型学得怎么样。</li>
+<li><strong>Task 4.3:</strong> (如果需要) <strong>进行预测</strong>，让模型实际生成一些结果。</li>
+</ul>
+<h4>5. 收尾阶段：写报告</h4>
+<ul>
+<li><strong>Task 5.1:</strong> 生成模型卡片 (Model Card) 并上传。</li>
+</ul>
+<hr />
+<h3>🧐 详细步骤讲解 (中英对照)</h3>
+<p>现在我们按照上面的清单，深入代码看看它是怎么实现的。</p>
+<h4>Task 1: 准备阶段 (Setup)</h4>
+<p><strong>代码片段：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">model</span><span class="p">,</span> <span class="n">tokenizer</span> <span class="o">=</span> <span class="n">load_model_and_tokenizer</span><span class="p">(</span><span class="n">model_args</span><span class="p">,</span> <span class="n">finetuning_args</span><span class="p">,</span> <span class="n">training_args</span><span class="o">.</span><span class="n">do_train</span><span class="p">)</span>
+<span class="n">dataset</span> <span class="o">=</span> <span class="n">get_dataset</span><span class="p">(</span><span class="n">tokenizer</span><span class="p">,</span> <span class="n">model_args</span><span class="p">,</span> <span class="n">data_args</span><span class="p">,</span> <span class="n">training_args</span><span class="p">,</span> <span class="n">stage</span><span class="o">=</span><span class="s2">&quot;sft&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong><ul>
+<li>第一行：去仓库把“大脑”（模型）和“字典”（Tokenizer）搬出来。</li>
+<li>第二行：根据配置读取训练数据（比如问答对），并用字典把文字转换成数字索引。</li>
+<li><code>stage="sft"</code> 告诉系统我们要进行的是有监督微调的数据处理。</li>
+</ul>
+</li>
+</ul>
+<p><strong>代码片段：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">training_args</span><span class="o">.</span><span class="n">predict_with_generate</span><span class="p">:</span>
+    <span class="n">tokenizer</span><span class="o">.</span><span class="n">padding_side</span> <span class="o">=</span> <span class="s2">&quot;left&quot;</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong><ul>
+<li>这是一个小细节。如果我们要让模型<strong>生成</strong>文本（比如写作文），通常需要从左边填充空白（Left Padding），这样生成的字才能顺着往右写。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 打包阶段 (Collator)</h4>
+<p><strong>代码片段：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">data_collator</span> <span class="o">=</span> <span class="n">DataCollatorForSeq2Seq</span><span class="p">(</span>
+    <span class="n">tokenizer</span><span class="o">=</span><span class="n">tokenizer</span><span class="p">,</span>
+    <span class="n">pad_to_multiple_of</span><span class="o">=</span><span class="mi">8</span> <span class="o">...</span>
+    <span class="n">label_pad_token_id</span><span class="o">=</span><span class="n">IGNORE_INDEX</span> <span class="o">...</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong><ul>
+<li><strong>Data Collator</strong> 就像是一个打包员。因为每句话长度不一样，但显卡喜欢整齐的数据。</li>
+<li>它的工作是把短的句子补齐（Padding），把它们凑成一个整齐的方块（Batch）。</li>
+<li><code>IGNORE_INDEX</code> 是告诉模型：“这些补齐的空白部分你不用学，跳过不算分”。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 组队阶段 (Trainer Initialization)</h4>
+<p><strong>代码片段：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">trainer</span> <span class="o">=</span> <span class="n">CustomSeq2SeqTrainer</span><span class="p">(</span>
+    <span class="n">model</span><span class="o">=</span><span class="n">model</span><span class="p">,</span>
+    <span class="n">args</span><span class="o">=</span><span class="n">training_args</span><span class="p">,</span>
+    <span class="n">tokenizer</span><span class="o">=</span><span class="n">tokenizer</span><span class="p">,</span>
+    <span class="n">data_collator</span><span class="o">=</span><span class="n">data_collator</span><span class="p">,</span>
+    <span class="o">**</span><span class="n">split_dataset</span><span class="p">(</span><span class="n">dataset</span><span class="p">,</span> <span class="n">data_args</span><span class="p">,</span> <span class="n">training_args</span><span class="p">),</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong><ul>
+<li>这里初始化了 <strong><code>CustomSeq2SeqTrainer</code></strong>。这是最核心的“教练”。</li>
+<li>你把之前准备好的所有东西（模型、参数、字典、打包员、切分好的训练/验证集）都交给它。之后所有的累活都由它来调度。</li>
+</ul>
+</li>
+</ul>
+<p><strong>代码片段：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">gen_kwargs</span> <span class="o">=</span> <span class="n">generating_args</span><span class="o">.</span><span class="n">to_dict</span><span class="p">()</span>
+<span class="o">...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong><ul>
+<li>这里设置了“生成参数”。比如：模型在预测时，遇到什么词停止（eos_token），由于生成是一个字一个字蹦出来的，这些参数控制生成的行为。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 执行阶段 (Execution)</h4>
+<p><strong>Task 4.1: 训练 (Training)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">training_args</span><span class="o">.</span><span class="n">do_train</span><span class="p">:</span>
+    <span class="n">train_result</span> <span class="o">=</span> <span class="n">trainer</span><span class="o">.</span><span class="n">train</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 开始跑进度条训练</span>
+    <span class="n">trainer</span><span class="o">.</span><span class="n">save_model</span><span class="p">()</span>              <span class="c1"># 训练完保存模型权重</span>
+    <span class="n">trainer</span><span class="o">.</span><span class="n">log_metrics</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>          <span class="c1"># 记录训练指标（比如Loss是多少）</span>
+    <span class="n">trainer</span><span class="o">.</span><span class="n">save_state</span><span class="p">()</span>              <span class="c1"># 保存训练状态</span>
+    <span class="k">if</span> <span class="o">...</span> <span class="n">plot_loss</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>             <span class="c1"># 画出 Loss 曲线图</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong> 这是最耗时的部分，显卡开始发热，模型开始学习。</li>
+</ul>
+<p><strong>Task 4.2: 评估 (Evaluation)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">training_args</span><span class="o">.</span><span class="n">do_eval</span><span class="p">:</span>
+    <span class="n">metrics</span> <span class="o">=</span> <span class="n">trainer</span><span class="o">.</span><span class="n">evaluate</span><span class="p">(</span><span class="n">metric_key_prefix</span><span class="o">=</span><span class="s2">&quot;eval&quot;</span><span class="p">,</span> <span class="o">**</span><span class="n">gen_kwargs</span><span class="p">)</span>
+    <span class="o">...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong> 训练中或训练后，用验证集考考模型。</li>
+<li><code>predict_with_generate</code> 如果开启，意味着我们会让模型真的去写答案，然后计算 BLEU 或 ROUGE 分数（文本相似度），而不仅仅是看 Loss（损失值）。</li>
+</ul>
+<p><strong>Task 4.3: 预测 (Prediction)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">training_args</span><span class="o">.</span><span class="n">do_predict</span><span class="p">:</span>
+    <span class="n">predict_results</span> <span class="o">=</span> <span class="n">trainer</span><span class="o">.</span><span class="n">predict</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="n">trainer</span><span class="o">.</span><span class="n">save_predictions</span><span class="p">(</span><span class="n">predict_results</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong> 用测试集让模型真正跑一遍，并把生成的结果保存成文件，方便人工检查。</li>
+</ul>
+<h4>Task 5: 收尾阶段 (Finalize)</h4>
+<p><strong>代码片段：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">create_modelcard_and_push</span><span class="p">(</span><span class="n">trainer</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong><ul>
+<li>自动生成一个 <code>README.md</code>（模型卡片），里面记录了你用了什么参数、训练了多久、Loss 曲线长什么样。</li>
+<li>如果配置了 Hub token，还会自动把模型上传到 Hugging Face 网站。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个脚本 <code>workflow.py</code> 的逻辑其实非常线性：</p>
+<ol>
+<li><strong>加载</strong> (Load) -&gt; 模型和数据</li>
+<li><strong>配置</strong> (Config) -&gt; 修正参数和打包器</li>
+<li><strong>实例化</strong> (Init) -&gt; 创建 Trainer</li>
+<li><strong>运行</strong> (Run) -&gt; 根据开关决定是 Train(训练), Eval(评估) 还是 Predict(预测)</li>
+<li><strong>记录</strong> (Log) -&gt; 保存结果和文档</li>
+</ol>
+<p>你看懂这个流程后，再回看代码，就会发现它只是在一步步填空而已。</p>

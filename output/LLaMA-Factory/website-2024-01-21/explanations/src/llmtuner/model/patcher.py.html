@@ -1,0 +1,91 @@
+<h1>src/llmtuner/model/patcher.py</h1>
+<p>这份代码文件 <code>patcher.py</code> 的核心作用就是给大模型<strong>“打补丁” (Patching)</strong> 和 <strong>“改装”</strong>。</p>
+<p>你可以把大模型想象成一辆刚出厂的“赛车”，而这个文件就是一位<strong>高级改装技师</strong>。在把车开上赛道（开始训练或推理）之前，这位技师需要拿着一份清单（To-Do List），根据你的需求（参数），对这辆车进行一系列的调整和加固。</p>
+<p>如果没有这个文件，模型可能跑不快（没有FlashAttention）、跑不远（显存不够）、或者在长跑中翻车（数值不稳定）。</p>
+<p>下面我为你列出这位“技师”手中的 <strong>任务清单 (To-Do List)</strong>，一步步带你看懂他在做什么：</p>
+<hr />
+<h3>🛠️ 任务清单：模型改装流水线</h3>
+<h4>✅ 第一阶段：修改图纸 (配置阶段 <code>patch_config</code>)</h4>
+<p>在模型真正加载到内存之前，我们需要先修改它的配置单（Config），告诉它我们要用什么特殊技术。</p>
+<ul>
+<li><strong>Task 1.1: 决定计算精度 (Data Type)</strong><ul>
+<li><strong>代码对应:</strong> <code>infer_optim_dtype</code></li>
+<li><strong>观点:</strong> 技师会检查你的显卡支持什么，优先使用 <code>bf16</code>（新显卡标配，防溢出），其次是 <code>fp16</code>，最后才是 <code>fp32</code>。</li>
+</ul>
+</li>
+<li><strong>Task 1.2: 开启“涡轮增压” (FlashAttention)</strong><ul>
+<li><strong>代码对应:</strong> <code>_configure_flashattn</code></li>
+<li><strong>观点:</strong> 如果你安装了 FlashAttention-2，技师会在配置里把开关打开。这能极大提升训练速度并节省显存。</li>
+</ul>
+</li>
+<li><strong>Task 1.3: 扩充“油箱”容量 (RoPE Scaling)</strong><ul>
+<li><strong>代码对应:</strong> <code>_configure_rope</code></li>
+<li><strong>观点:</strong> 如果你想让模型处理比原版更长的文本（比如从 4k 扩充到 32k），直接硬跑会报错。技师会修改“旋转位置编码（RoPE）”的参数，强行拉伸模型的处理能力。</li>
+</ul>
+</li>
+<li><strong>Task 1.4: 启用“省油模式” (Quantization / 量化)</strong><ul>
+<li><strong>代码对应:</strong> <code>_configure_quantization</code></li>
+<li><strong>观点:</strong> 如果显存不够，技师会把模型从“高精度”压缩成 8-bit 或 4-bit。<ul>
+<li><strong>GPTQ:</strong> 一种预先压缩好的格式。</li>
+<li><strong>BitsAndBytes:</strong> 现场加载时实时压缩（常用 <code>load_in_4bit</code>）。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>✅ 第二阶段：车体改装 (模型加载后 <code>patch_model</code>)</h4>
+<p>现在模型已经加载到内存里了，技师开始对模型本身动手术。</p>
+<ul>
+<li><strong>Task 2.1: 扩充词表 (Resize Vocabulary)</strong><ul>
+<li><strong>代码对应:</strong> <code>_resize_embedding_layer</code></li>
+<li><strong>观点:</strong> 如果你在训练中加入了一些新词（比如特殊的 emoji 或行业术语），模型的“字典”大小需要扩容。</li>
+<li><strong>细节 (<code>_noisy_mean_initialization</code>):</strong> 新加的词向量不能全是 0，否则训练初期效果很差。技师的做法是：算出原有词向量的<strong>平均值</strong>，再加一点点<strong>随机噪声</strong>，赋值给新词。这叫“带噪声的均值初始化”。</li>
+</ul>
+</li>
+<li><strong>Task 2.2: 启用“省力模式” (Gradient Checkpointing)</strong><ul>
+<li><strong>代码对应:</strong> <code>_prepare_model_for_training</code> 中的 <code>gradient_checkpointing_enable</code></li>
+<li><strong>观点:</strong> 这是一个经典的“拿时间换空间”策略。不存中间激活值，反向传播时重算。虽然慢了一点点，但能让你在有限的显存里跑更大的 Batch Size。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ 第三阶段：加固防滚架 (训练稳定性准备)</h4>
+<p>为了防止训练过程中数值溢出导致模型“甚至（Loss NaN）”，需要做一些加固。</p>
+<ul>
+<li><strong>Task 3.1: 关键零件用好材料 (Upcast LayerNorm &amp; Head)</strong><ul>
+<li><strong>代码对应:</strong> <code>_prepare_model_for_training</code></li>
+<li><strong>观点:</strong><ol>
+<li><strong>LayerNorm:</strong> 这一层对精度很敏感，技师会强制把它转成 <code>float32</code>（全精度），防止计算误差累积。</li>
+<li><strong>LM Head (输出层):</strong> 计算 Loss 的地方，技师也会给它挂一个钩子（Hook），强制它在输出时转回 <code>float32</code>，保证计算梯度的准确性。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<h4>✅ 第四阶段：特殊车型适配 (Edge Cases)</h4>
+<p>针对一些特殊的模型或需求做的小修补。</p>
+<ul>
+<li><strong>Task 4.1: 修补分词器 (Patch Tokenizer)</strong><ul>
+<li><strong>代码对应:</strong> <code>patch_tokenizer</code></li>
+<li><strong>观点:</strong> 有些 Tokenizer 的代码写得不规范（缺少 padding 方法），这里给它手动补上一个默认的 padding 逻辑。</li>
+</ul>
+</li>
+<li><strong>Task 4.2: 适配 LongLoRA (Shift Short Attention)</strong><ul>
+<li><strong>代码对应:</strong> <code>_configure_longlora</code></li>
+<li><strong>观点:</strong> 如果你要用 LongLoRA 技术来训练超长文本，需要修改 Attention 的分组方式（Group Size）。</li>
+</ul>
+</li>
+<li><strong>Task 4.3: 适配 RLHF 模型 (Patch ValueHead)</strong><ul>
+<li><strong>代码对应:</strong> <code>patch_valuehead_model</code></li>
+<li><strong>观点:</strong> 在做强化学习（PPO）时，模型会多出一个 Value Head。这里是为了修复保存模型时可能出现的参数不匹配问题。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p><strong>这个文件 <code>patcher.py</code> 实际上就是一个“大模型训练前的环境配置管家”。</strong></p>
+<ul>
+<li><strong>输入：</strong> 原始的 HuggingFace 模型、你的一堆参数（我要量化、我要长文本、我要FlashAttn...）。</li>
+<li><strong>过程：</strong> 修改 Config -&gt; 加载模型 -&gt; 修改模型层 -&gt; 调整精度。</li>
+<li><strong>输出：</strong> 一个“改装完毕”、可以直接扔进训练循环（Trainer）的 PyTorch 模型对象。</li>
+</ul>
+<p>你看不懂是因为它涉及了很多<strong>工程化</strong>的细节（如 DeepSpeed 兼容性、不同量化库的版本检查等），但核心逻辑就是上面这四个阶段。</p>

@@ -1,0 +1,107 @@
+<h1>src/llamafactory/data/collator.py</h1>
+<p>这份代码看起来很复杂，是因为它处理的是<strong>多模态大模型（Multimodal LLM）</strong>的训练数据，而且还要兼顾各种不同的模型架构（比如 Qwen-VL, Llama 等）和训练方式（SFT, DPO, KTO）。</p>
+<p>简单来说，这个文件的作用就是<strong>“打包员”</strong>。</p>
+<p>在训练开始前，你有一堆乱七八糟的数据（有的只有文字，有的有图片，有的长，有的短）。这个脚本的任务就是把这些数据整理成整齐划一的“包裹（Batch）”，塞给显卡（GPU）去计算。</p>
+<p>为了让你听懂，我们把这个脚本的工作想象成一个<strong>流水线工人的“任务清单 (Todo List)”</strong>。</p>
+<hr />
+<h3>核心任务清单 (Todo List)</h3>
+<p>我们将代码逻辑拆解为以下 5 个步骤：</p>
+<ol>
+<li><strong>【分拣】</strong>：把混在一起的文字、图片、视频、音频分开拿出来。</li>
+<li><strong>【防崩坏（兜底）】</strong>：如果模型需要看图，但这一批数据里一张图都没有，为了防止机器报错，必须造一个“假图”塞进去。</li>
+<li><strong>【预处理】</strong>：把图片/视频转换成模型能看懂的数字（Tensor），并算出它们占了多少个 Token。</li>
+<li><strong>【对齐与填充】</strong>：因为每句话长度不一样，要把短的补齐（Padding），让大家长度一致，才能打包。</li>
+<li><strong>【计算位置信息（最难点）】</strong>：对于视觉模型（如 Qwen-VL），图片是二维/三维的，不是简单的线性文字，需要专门计算复杂的“3D 位置坐标”（RoPE index）。</li>
+</ol>
+<hr />
+<h3>逐步讲解（对应代码）</h3>
+<h4>第一步：基础准备与分拣</h4>
+<p><strong>代码位置</strong>：<code>MultiModalDataCollatorForSeq2Seq</code> 类的 <code>__call__</code> 方法开头。</p>
+<ul>
+<li><strong>工人独白</strong>：“老板给了我一堆数据 <code>features</code>，我得先把里面的图片、视频、音频单独拎出来，剩下的就是纯文本 ID。”</li>
+<li><strong>代码行为</strong>：
+    <code>python
+    # 循环遍历每一条数据
+    for feature in features:
+        # 把 images, videos, audios 拔出来(pop)，如果没有就是空列表
+        images = feature.pop("images", None) or []
+        # ... 把它们存到 batch_images 等列表中
+        batch_input_ids.append(feature["input_ids"])</code></li>
+</ul>
+<h4>第二步：防崩坏（兜底机制）</h4>
+<p><strong>代码位置</strong>：<code>__call__</code> 方法中间的 <code>fake_input_ids</code> 相关逻辑。</p>
+<ul>
+<li><strong>工人独白</strong>：“坏了！这一批数据全是纯文字，但我们训练的是多模态模型（比如 Qwen-VL），多卡训练时如果某张卡没收到图片数据，程序会卡死（Hanging）。我得赶紧<strong>造一个假数据</strong>混进去。”</li>
+<li><strong>代码行为</strong>：<ul>
+<li>检查 <code>sum(batch_imglens) == 0</code>（是不是一张图都没有？）。</li>
+<li>如果是，创建一个 <code>fake_images</code>（全白色的 64x64 像素小图）。</li>
+<li>创建一个 <code>fake_messages</code>（假对话）。</li>
+<li>把它加到第一条数据里，强行让这批数据“包含图片”，确保程序跑通。</li>
+<li><em>注：这部分代码看着很乱，其实就是为了修补分布式训练的一个 Bug。</em></li>
+</ul>
+</li>
+</ul>
+<h4>第三步：打包文字与多模态输入</h4>
+<p><strong>代码位置</strong>：<code>super().__call__(features)</code> 和 <code>mm_inputs</code> 部分。</p>
+<ul>
+<li><strong>工人独白</strong>：“图片视频都拿出来了，现在我要调用工具（<code>mm_plugin</code>）把它们处理好。然后，把文字部分长短不一的句子，用 0 填充（Padding）到一样长。”</li>
+<li><strong>代码行为</strong>：<ul>
+<li><code>self.template.mm_plugin.get_mm_inputs(...)</code>：处理多模态输入。</li>
+<li><code>super().__call__(features)</code>：调用父类（HuggingFace 的标准功能）把文字 ID 补齐并转成 PyTorch Tensor。</li>
+</ul>
+</li>
+</ul>
+<h4>第四步：计算复杂的 3D 位置 (RoPE)</h4>
+<p><strong>代码位置</strong>：<code>if self.get_rope_func is not None:</code> 这一大块。</p>
+<ul>
+<li><strong>工人独白</strong>：“这是最头疼的。普通的文字是一行写下去的（1D）。但现在的 Qwen2-VL 这种模型，它把图片看作一个立方体（时间 x 高 x 宽）。我必须告诉模型，每个 Token 在这个立方体的哪个坐标。”</li>
+<li><strong>代码行为</strong>：<ul>
+<li>判断模型是不是 <code>qwen2_vl</code> 或类似架构。</li>
+<li>准备参数 <code>image_grid_thw</code>（图片的时间、高、宽网格）。</li>
+<li>调用 <code>self.get_rope_func</code> 计算 <code>position_ids</code>（位置 ID）和 <code>rope_deltas</code>。</li>
+<li><strong>目的</strong>：让模型理解“这张图的这个像素，是在左上角”这种空间关系。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>不同的“工种” (子类解释)</h3>
+<p>代码后面定义了几个继承自 <code>MultiModalDataCollatorForSeq2Seq</code> 的子类，它们是针对不同任务的“特种工人”。</p>
+<h4>1. <code>SFTDataCollatorWith4DAttentionMask</code></h4>
+<ul>
+<li><strong>任务</strong>：<strong>SFT（有监督微调）</strong>。</li>
+<li><strong>特点</strong>：它多干了一件事——<code>prepare_4d_attention_mask</code>。</li>
+<li><strong>解释</strong>：为了提高训练效率，有时会把多条短数据拼成一条长的（Packing）。这时候需要一个复杂的 4D 掩码（Mask），告诉模型：“虽然你们拼在一起了，但前一句话不能看后一句话，大家各论各的。”</li>
+</ul>
+<h4>2. <code>PairwiseDataCollatorWithPadding</code></h4>
+<ul>
+<li><strong>任务</strong>：<strong>偏好对齐（DPO / RLHF）</strong>。</li>
+<li><strong>特点</strong>：它处理的数据是成对的——“好的回答 (Chosen)” vs “坏的回答 (Rejected)”。</li>
+<li><strong>解释</strong>：<ul>
+<li>输入：一条数据里包含 <code>chosen_input_ids</code> 和 <code>rejected_input_ids</code>。</li>
+<li>操作：它把这两部分拆开，变成两条独立的数据，拼成一个 2倍大小的 Batch。</li>
+<li>目的：让模型学习“选这个，别选那个”。</li>
+</ul>
+</li>
+</ul>
+<h4>3. <code>KTODataCollatorWithPadding</code></h4>
+<ul>
+<li><strong>任务</strong>：<strong>KTO 对齐（另一种不需要成对数据的对齐算法）</strong>。</li>
+<li><strong>特点</strong>：处理 <code>target</code>（目标数据）和 <code>kl</code>（参考数据）。</li>
+<li><strong>解释</strong>：它会把数据整理成 KTO 算法需要的格式，包括一个布尔标签 <code>kto_tags</code>（告诉模型这句话是好是坏）。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件 <code>collator.py</code> 就是一个<strong>超级数据整理箱</strong>。</p>
+<ol>
+<li><strong>输入</strong>：一堆原始的、长短不一的、带图带字的 Python 字典。</li>
+<li><strong>处理</strong>：<ul>
+<li>把图/视频转成数字。</li>
+<li>如果没有图，造假图防报错。</li>
+<li>把文字补齐长度。</li>
+<li>给 Qwen-VL 这种高级模型计算 3D 坐标。</li>
+<li>根据是 SFT 还是 DPO，把数据排成特殊的队列。</li>
+</ul>
+</li>
+<li><strong>输出</strong>：整齐的 PyTorch Tensor，直接喂给 GPU 训练。</li>
+</ol>
+<p>你看不懂是因为它把<strong>数据清洗</strong>、<strong>分布式训练的坑</strong>、<strong>特定模型的数学逻辑</strong>全部揉在一起了。只要记住它的核心目的是<strong>“把数据格式化成模型能吃的样子”</strong>即可。</p>

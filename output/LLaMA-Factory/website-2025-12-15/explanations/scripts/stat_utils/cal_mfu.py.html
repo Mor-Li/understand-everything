@@ -1,0 +1,91 @@
+<h1>scripts/stat_utils/cal_mfu.py</h1>
+<p>没问题，这个代码乍一看确实全是数学公式和参数，容易晕。</p>
+<p>简单来说，这个脚本是一个<strong>“显卡摸鱼检测器”</strong>。它的核心目的是计算 <strong>MFU (Model FLOPs Utilization)</strong>，也就是<strong>模型算力利用率</strong>。</p>
+<p><strong>通俗解释：</strong>
+你买了一辆法拉利（昂贵的GPU），理论最高时速是 300km/h。你现在开着它去送快递（训练模型），如果你实际跑出来的速度只有 30km/h，那利用率就是 10%（你在亏钱）。这个脚本就是帮你算出这个百分比的。</p>
+<p>为了让你看懂，我把它拆解成 <strong>5个待办任务（Todo List）</strong>，我们一步步来完成这个任务：</p>
+<hr />
+<h3>✅ Task 1: 理解基础概念 (什么是 FLOPs?)</h3>
+<p>在看代码前，先懂这个词：<strong>FLOPs</strong> (Floating Point Operations)。
+*   你可以把它理解为<strong>“计算量”</strong>。
+*   训练模型就是做无数次的加减乘除。
+*   <strong>MFU 公式</strong> = (模型实际每秒做的运算量) / (显卡理论每秒能做的最大运算量)。</p>
+<h3>✅ Task 2: 算出“做一道题”需要多少步？</h3>
+<p><strong>对应代码函数：</strong> <code>compute_model_flops</code></p>
+<p>这个函数是用来<strong>纸上谈兵</strong>的。它不运行模型，而是根据模型的“身材”（参数）来估算训练一步（Forward + Backward）需要做多少次加减乘除。</p>
+<ul>
+<li><strong>它的逻辑是：</strong><ol>
+<li><strong>读取模型配置</strong> (<code>AutoConfig</code>)：看看模型有多大（层数、隐藏层大小、词表大小）。</li>
+<li><strong>计算 MLP 部分</strong>：全连接层的计算量。</li>
+<li><strong>计算 Attention 部分</strong>：注意力机制的矩阵乘法计算量。</li>
+<li><strong>计算 Embedding 部分</strong>：查词表的计算量。</li>
+<li><strong>考虑反向传播</strong> (<code>include_backward</code>)：训练不仅要往前算（Forward），还要往回算梯度（Backward）。通常反向传播的计算量是前向的 2 倍。</li>
+<li><strong>汇总</strong>：把上面所有加起来，得到 <code>total_flops</code>（训练一个 Batch 的数据需要的总计算次数）。</li>
+</ol>
+</li>
+</ul>
+<blockquote>
+<p><strong>结论：</strong> 这个函数告诉我们要训练这个模型，每迈出一步，显卡必须完成多少次运算。</p>
+</blockquote>
+<h3>✅ Task 3: 查查“法拉利”的理论极速是多少？</h3>
+<p><strong>对应代码函数：</strong> <code>compute_device_flops</code></p>
+<p>这个函数非常简单粗暴，它用来查询你的显卡理论极限是多少。</p>
+<ul>
+<li><strong>它的逻辑是：</strong><ol>
+<li>问 PyTorch：现在的显卡叫啥名字？(<code>torch.cuda.get_device_name</code>)</li>
+<li><strong>查表</strong>：<ul>
+<li>如果是 <strong>H100/H800</strong>：每秒能跑 $989 \times 10^{12}$ 次运算。</li>
+<li>如果是 <strong>A100/A800</strong>：每秒能跑 $312 \times 10^{12}$ 次运算。</li>
+<li>如果是 <strong>4090</strong>：每秒能跑 $98 \times 10^{12}$ 次运算。</li>
+</ul>
+</li>
+<li>如果是多卡训练，乘以显卡数量 (<code>world_size</code>)。</li>
+</ol>
+</li>
+</ul>
+<blockquote>
+<p><strong>结论：</strong> 这个函数定义了分母，也就是硬件的物理上限。</p>
+</blockquote>
+<h3>✅ Task 4: 上路跑一圈，看看实际速度</h3>
+<p><strong>对应代码函数：</strong> <code>calculate_mfu</code> (前半部分)</p>
+<p>光有理论不行，得真跑一下才知道实际有多快。</p>
+<ul>
+<li><strong>它的逻辑是：</strong><ol>
+<li><strong>准备参数</strong>：构造一个训练参数字典 <code>args</code>。设置只跑很少的步数（比如 100 步），用假数据或者 demo 数据。</li>
+<li><strong>开始跑 (<code>run_exp</code>)</strong>：调用 LlamaFactory 的核心训练函数 <code>run_exp(args)</code>。这会真的启动一个微调任务。</li>
+<li><strong>记录成绩</strong>：训练结束后，结果会保存在 <code>saves/test_mfu/all_results.json</code> 里。里面有一个关键指标：<code>train_steps_per_second</code>（每秒能训练多少步）。</li>
+</ol>
+</li>
+</ul>
+<blockquote>
+<p><strong>结论：</strong> 这一步是为了获取<strong>“实际车速”</strong>（每秒跑几步）。</p>
+</blockquote>
+<h3>✅ Task 5: 最终计算，输出成绩</h3>
+<p><strong>对应代码函数：</strong> <code>calculate_mfu</code> (后半部分)</p>
+<p>最后一步，把前面所有的数据拿来做除法。</p>
+<ul>
+<li>
+<p><strong>计算公式：</strong>
+    $$ MFU = \frac{\text{每秒跑几步} \times \text{每步需要的计算量 (Task 2)}}{\text{显卡每秒理论最大计算量 (Task 3)}} $$</p>
+</li>
+<li>
+<p><strong>代码对应：</strong>
+    <code>python
+    mfu_value = (
+        result["train_steps_per_second"]  # Task 4 的结果
+        * compute_model_flops(...)        # Task 2 的结果
+        / compute_device_flops(...)       # Task 3 的结果
+    )
+    print(f"MFU: {mfu_value * 100:.2f}%")</code></p>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>你不需要看懂里面矩阵乘法的具体数学公式（比如 <code>3 * BASE * hidden_size...</code>），你只需要知道这个脚本的<strong>工作流</strong>：</p>
+<ol>
+<li><strong>算一下</strong>这模型训练一步<strong>本来应该</strong>要做多少运算。</li>
+<li><strong>查一下</strong>你的显卡<strong>理论上</strong>一秒能做多少运算。</li>
+<li><strong>跑一下</strong>几十步训练，看每秒能跑几步。</li>
+<li><strong>除一下</strong>，看看你的显卡是不是在“全力输出”。</li>
+</ol>
+<p>如果算出来 MFU 是 50% 以上，说明显卡利用率很高；如果是 20%，说明可能数据传输太慢、或者模型太小、或者配置不对，显卡大部分时间在空转等待。</p>

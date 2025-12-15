@@ -1,0 +1,126 @@
+<h1>src/llmtuner/tuner/rm/trainer.py</h1>
+<p>这份代码确实涉及到了大模型训练中比较核心 concepts（概念），特别是 <strong>RLHF（基于人类反馈的强化学习）</strong> 中的 <strong>Reward Model（奖励模型）</strong> 训练部分。</p>
+<p>看不懂很正常，因为它省略了数据处理的前置步骤，直接展示了最核心的数学计算。</p>
+<p>为了让你彻底理解，我制定了一个 <strong>5步走的 Task List</strong>，我们一步步来拆解这段代码背后的逻辑。</p>
+<hr />
+<h3>学习任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1: 理解目标 —— 我们在造什么？（裁判员）</strong></li>
+<li><strong>Task 2: 理解数据 —— 输入是什么样子的？（成对比较）</strong></li>
+<li><strong>Task 3: 理解技巧 —— 代码里为什么除以 2？（拼接技巧）</strong></li>
+<li><strong>Task 4: 理解评分 —— 为什么取最后一个数？（EOS Token）</strong></li>
+<li><strong>Task 5: 理解核心 —— 损失函数是怎么算的？（Sigmoid Log Loss）</strong></li>
+</ol>
+<hr />
+<h3>逐步讲解</h3>
+<h4>Task 1: 理解目标 —— 我们在造什么？</h4>
+<p>这段代码是在训练一个 <strong>Reward Model (RM，奖励模型)</strong>。
+你可以把它想象成一个 <strong>“裁判员”</strong>。
+*   <strong>输入</strong>：一个问答句子。
+*   <strong>输出</strong>：一个分数（Score）。分数越高，代表回答越好。</p>
+<p>这个裁判员训练好之后，会被用来指导 ChatGPT 这样的模型生成更好的回答。</p>
+<h4>Task 2: 理解数据 —— 输入是什么样子的？</h4>
+<p>为了训练这个“裁判员”，我们需要给它看很多例子。在 RM 训练中，数据通常是 <strong>成对 (Pairwise)</strong> 出现的：
+*   <strong>Prompt (问题)</strong>: "天空为什么是蓝的？"
+*   <strong>Answer A (好的回答/Chosen)</strong>: "因为瑞利散射..." (记为 $r_{accept}$)
+*   <strong>Answer B (坏的回答/Rejected)</strong>: "因为上帝心情好..." (记为 $r_{reject}$)</p>
+<p>我们要教模型：<strong>Answer A 的分数 必须比 Answer B 的分数高</strong>。</p>
+<h4>Task 3: 理解技巧 —— 代码里为什么除以 2？</h4>
+<p>看代码这一行：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">batch_size</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span>
+</code></pre></div>
+
+<p><strong>为什么要除以 2？</strong></p>
+<p>在深度学习训练中，为了效率，我们通常把数据打包成 Batch（批次）。
+在这个特殊的训练器里，数据加载器做了一个<strong>拼接操作</strong>：
+它把 <strong>所有的“好回答”</strong> 和 <strong>所有的“坏回答”</strong> 拼在了一起，塞进了同一个 Batch 里传给模型。</p>
+<p>假设 Batch Size 是 4（指 2 对数据）：
+*   输入列表里的前 2 个是：[好回答1, 好回答2]
+*   输入列表里的后 2 个是：[坏回答1, 坏回答2]</p>
+<p>所以 <code>inputs["input_ids"].size(0)</code> 是总条数（4条），除以 2 得到真实的“对数”（2对）。
+*   <strong>前 n 个</strong> = 好的 (Chosen)
+*   <strong>后 n 个</strong> = 坏的 (Rejected)</p>
+<h4>Task 4: 理解评分 —— 为什么取最后一个数？</h4>
+<p>看代码这两行：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">values</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="o">**</span><span class="n">inputs</span><span class="p">)</span>
+<span class="n">r_accept</span><span class="p">,</span> <span class="n">r_reject</span> <span class="o">=</span> <span class="n">values</span><span class="p">[:,</span> <span class="o">-</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="n">batch_size</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+</code></pre></div>
+
+<ol>
+<li><strong><code>model(**inputs)</code></strong>: 模型读入句子，计算输出。这里的模型经过改造，输出的不是单词概率，而是一个数值（Value）。</li>
+<li><strong><code>values[:, -1]</code></strong>: 这是一个关键点。<ul>
+<li>模型对句子里的<strong>每一个字</strong>都会算一个分。</li>
+<li>但我们只需要<strong>整句话</strong>的一个总分。</li>
+<li>通常约定：<strong>最后一个 Token (EOS, End of Sentence)</strong> 的分数代表整句话的得分。所以取 <code>[-1]</code>。</li>
+</ul>
+</li>
+<li><strong><code>.split(...)</code></strong>: 把混在一起的分数切开。<ul>
+<li><code>r_accept</code>: 拿到前半部分（好回答的分数）。</li>
+<li><code>r_reject</code>: 拿到后半部分（坏回答的分数）。</li>
+</ul>
+</li>
+</ol>
+<h4>Task 5: 理解核心 —— 损失函数是怎么算的？</h4>
+<p>这是全篇最难也是最重要的一行代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">loss</span> <span class="o">=</span> <span class="o">-</span><span class="n">torch</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">sigmoid</span><span class="p">(</span><span class="n">r_accept</span> <span class="o">-</span> <span class="n">r_reject</span><span class="p">))</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span>
+</code></pre></div>
+
+<p>我们把它拆开成中文逻辑：</p>
+<ol>
+<li>
+<p><strong><code>r_accept - r_reject</code> (分差)</strong>:</p>
+<ul>
+<li>我们希望好回答的分数比坏回答高。</li>
+<li>所以，我们希望这个 <strong>差值越大越好</strong>。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>torch.sigmoid(...)</code> (归一化)</strong>:</p>
+<ul>
+<li>Sigmoid 函数把任意数值压缩到 0 到 1 之间。</li>
+<li>如果差值是正无穷大，Sigmoid 结果接近 1。</li>
+<li>如果差值是负无穷大，Sigmoid 结果接近 0。</li>
+<li>我们希望差值很大，所以我们<strong>希望 Sigmoid 的结果越接近 1 越好</strong>。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>-torch.log(...)</code> (负对数)</strong>:</p>
+<ul>
+<li>这是计算 Loss（损失/惩罚）的标准套路。</li>
+<li>如果 Sigmoid 结果是 1（完美），Log(1) 是 0，负号后还是 0。<strong>惩罚为 0</strong>。</li>
+<li>如果 Sigmoid 结果是 0.001（完全错了，坏回答分更高），Log(0.001) 是个很大的负数，加了负号变成很大的正数。<strong>惩罚很大</strong>。</li>
+</ul>
+</li>
+</ol>
+<p><strong>总结这行代码的含义：</strong>
+如果模型给“好回答”打的分 远高于 “坏回答”，Loss 就很小（模型学对了）；反之 Loss 就很大（模型需要调整参数）。</p>
+<hr />
+<h3>整体代码回顾 (中文注释版)</h3>
+<p>现在再看一遍代码，应该清晰多了：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">PairwisePeftTrainer</span><span class="p">(</span><span class="n">PeftTrainer</span><span class="p">):</span>
+    <span class="c1"># ... 省略初始化 ...</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">compute_loss</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">return_outputs</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+        <span class="c1"># 1. 计算有多少对数据。</span>
+        <span class="c1"># 因为输入是 [好1, 好2, ..., 坏1, 坏2, ...] 拼起来的，所以总数除以2就是对数。</span>
+        <span class="n">batch_size</span> <span class="o">=</span> <span class="n">inputs</span><span class="p">[</span><span class="s2">&quot;input_ids&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span>
+
+        <span class="c1"># 2. 让模型打分。</span>
+        <span class="c1"># model 返回的 values 是所有 token 的隐层状态或分数。</span>
+        <span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">values</span> <span class="o">=</span> <span class="n">model</span><span class="p">(</span><span class="o">**</span><span class="n">inputs</span><span class="p">)</span>
+
+        <span class="c1"># 3. 提取分数并拆分。</span>
+        <span class="c1"># values[:, -1] 表示只取每句话最后一个 token (EOS) 的分数作为整句得分。</span>
+        <span class="c1"># split 把分数拆回成 [好回答的一组分数] 和 [坏回答的一组分数]。</span>
+        <span class="n">r_accept</span><span class="p">,</span> <span class="n">r_reject</span> <span class="o">=</span> <span class="n">values</span><span class="p">[:,</span> <span class="o">-</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="n">batch_size</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+
+        <span class="c1"># 4. 计算损失 (Loss)。</span>
+        <span class="c1"># 公式含义：最大化 (好分数 - 坏分数) 的概率。</span>
+        <span class="n">loss</span> <span class="o">=</span> <span class="o">-</span><span class="n">torch</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">sigmoid</span><span class="p">(</span><span class="n">r_accept</span> <span class="o">-</span> <span class="n">r_reject</span><span class="p">))</span><span class="o">.</span><span class="n">mean</span><span class="p">()</span>
+
+        <span class="c1"># 5. 返回结果。</span>
+        <span class="k">return</span> <span class="p">(</span><span class="n">loss</span><span class="p">,</span> <span class="p">[</span><span class="n">loss</span><span class="p">,</span> <span class="n">r_accept</span><span class="p">,</span> <span class="n">r_reject</span><span class="p">])</span> <span class="k">if</span> <span class="n">return_outputs</span> <span class="k">else</span> <span class="n">loss</span>
+</code></pre></div>
+
+<h3>总结</h3>
+<p>这个文件就是告诉计算机：<strong>“我给你看两组答案，前面的好，后面的坏。请你调整你的参数，确保你给前面的打分比后面的高。如果给反了，我就狠狠惩罚你（Loss变大）。”</strong></p>

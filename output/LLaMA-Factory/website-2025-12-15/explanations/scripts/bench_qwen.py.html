@@ -1,0 +1,83 @@
+<h1>scripts/bench_qwen.py</h1>
+<p>这份代码 <code>scripts/bench_qwen.py</code> 的核心目的只有一个：<strong>对 Qwen2-VL（一个多模态大模型）进行性能基准测试（Benchmark）。</strong></p>
+<p>简单来说，它不是用来真正训练模型让模型变聪明的，而是用来<strong>测速</strong>的（测试显存占用、训练速度等）。为了测得准、测得快，它甚至不读取真实数据，而是直接在内存里“造假数据”。</p>
+<p>我为你整理了一个<strong>Task Todo List</strong>，模拟计算机执行这个脚本时的思维过程，带你一步步看懂它：</p>
+<h3>📋 Task Todo List (执行清单)</h3>
+<ol>
+<li><strong>[配置阶段]</strong>：设定测试参数（显存优化、批次大小、序列长度）。</li>
+<li><strong>[造假阶段]</strong>：创建一个“假”数据集，自动生成随机的文本、图片和视频数据。</li>
+<li><strong>[打包阶段]</strong>：定义如何把这些假数据打包成模型能吃的格式（特别是处理 Qwen 特有的 3D 位置编码）。</li>
+<li><strong>[加载阶段]</strong>：加载 Qwen2-VL 模型和分词器。</li>
+<li><strong>[开跑阶段]</strong>：启动训练循环，开始烧显卡，输出性能日志。</li>
+</ol>
+<hr />
+<h3>逐步详解 (Step-by-Step)</h3>
+<h4>1. [配置阶段] 设置参数</h4>
+<p><strong>对应代码：</strong> <code>def bench_qwen(...)</code> 函数的开头部分。</p>
+<ul>
+<li><strong>任务：</strong> 准备一份配置单。</li>
+<li><strong>解释：</strong><ul>
+<li>代码手动构造了一个 <code>args</code> 字典，模拟了我们在命令行输入 LlamaFactory 训练命令时的参数。</li>
+<li>关键参数包括：<code>finetuning_type="full"</code>（全量微调）、<code>deepspeed</code>（开启 DeepSpeed 加速）、<code>bf16=True</code>（使用半精度训练）。</li>
+<li><strong>目的：</strong> 确保测试环境符合高性能训练的标准配置。</li>
+</ul>
+</li>
+</ul>
+<h4>2. [造假阶段] 制造假数据 (DummyDataset)</h4>
+<p><strong>对应代码：</strong> <code>class DummyDataset(Dataset)</code></p>
+<ul>
+<li><strong>任务：</strong> 既然是测速，读硬盘太慢了，直接在内存里生成一堆随机数当作数据。</li>
+<li><strong>解释：</strong><ul>
+<li><strong>构造函数 <code>__init__</code></strong>：计算一张图片占多少 Token，一段视频占多少 Token。它把总长度（比如 2048）按比例分配给文本（25%）、图片和视频。</li>
+<li><strong>获取数据 <code>__getitem__</code></strong>：<ul>
+<li><code>input_ids</code>：随机生成的整数（假装是文字 Token）。</li>
+<li><code>pixel_values</code>：<code>torch.rand</code> 生成的随机噪点图（假装是图片）。</li>
+<li><code>pixel_values_videos</code>：随机生成的噪点视频（假装是视频）。</li>
+</ul>
+</li>
+<li><strong>目的：</strong> 排除硬盘读取速度（I/O）的干扰，纯粹测试 GPU 的计算能力。</li>
+</ul>
+</li>
+</ul>
+<h4>3. [打包阶段] 处理特殊编码 (DataCollator)</h4>
+<p><strong>对应代码：</strong> <code>class MultiModalDataCollatorForSeq2Seq</code></p>
+<ul>
+<li><strong>任务：</strong> 把上面生成的单条数据，打包成一个 Batch，并且加上 Qwen2-VL 特有的“佐料”。</li>
+<li><strong>解释：</strong><ul>
+<li>Qwen2-VL 这个模型很特殊，它处理图像和视频时使用了一种叫 <strong>mrope (3D Rotary Positional Embeddings)</strong> 的技术。简单说，它需要知道每个像素在“时间、高度、宽度”这三个维度的坐标。</li>
+<li>代码里的 <code>get_rope_index</code> 就是在计算这个复杂的 3D 坐标。</li>
+<li><code>__call__</code> 函数负责把一堆图片拼起来 (<code>torch.cat</code>)，并计算出 <code>position_ids</code> 和 <code>rope_deltas</code>。</li>
+<li><strong>目的：</strong> 如果没有这一步，喂给模型的数据格式就是错的，模型会报错。这是 Qwen2-VL 独有的前处理逻辑。</li>
+</ul>
+</li>
+</ul>
+<h4>4. [加载阶段] 准备模型</h4>
+<p><strong>对应代码：</strong> <code>bench_qwen</code> 函数的中后部</p>
+<ul>
+<li><strong>任务：</strong> 把大象（模型）装进冰箱（显存）。</li>
+<li><strong>解释：</strong><ul>
+<li><code>load_tokenizer</code>：加载分词器。</li>
+<li><code>load_model</code>：加载模型权重。</li>
+<li><strong>目的：</strong> 准备好计算核心。</li>
+</ul>
+</li>
+</ul>
+<h4>5. [开跑阶段] 开始压测</h4>
+<p><strong>对应代码：</strong> <code>CustomSeq2SeqTrainer</code> 和 <code>trainer.train()</code></p>
+<ul>
+<li><strong>任务：</strong> 踩下油门，开始跑圈。</li>
+<li><strong>解释：</strong><ul>
+<li>使用 LlamaFactory 的 <code>CustomSeq2SeqTrainer</code>。</li>
+<li>传入刚才定义的假数据集 (<code>trainset</code>) 和数据打包器 (<code>data_collator</code>)。</li>
+<li>执行 <code>trainer.train()</code>：这会让 GPU 开始疯狂计算梯度、反向传播。</li>
+<li><strong>目的：</strong> 此时你会看到控制台不断打印 loss 和 速度（it/s），这就是我们想要的基准测试结果。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这就好比你要测试一辆法拉利（Qwen2-VL 模型）的引擎极限速度：
+1.  你不想去真实的马路上跑（真实数据），因为红绿灯（硬盘读取）会影响速度。
+2.  所以你把车架在测速台架上（<strong>DummyDataset</strong>）。
+3.  你往油箱里灌入模拟燃料（<strong>随机生成的 Tensor</strong>）。
+4.  你请了一个专门的机械师（<strong>DataCollator</strong>）调整引擎参数（<strong>mrope</strong>）以适配这款车。
+5.  最后把油门踩到底（<strong>Trainer.train</strong>），看仪表盘上的转速。</p>

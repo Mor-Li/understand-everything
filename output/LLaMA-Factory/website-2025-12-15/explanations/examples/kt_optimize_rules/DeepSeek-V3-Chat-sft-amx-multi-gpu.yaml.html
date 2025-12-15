@@ -1,0 +1,96 @@
+<h1>examples/kt_optimize_rules/DeepSeek-V3-Chat-sft-amx-multi-gpu.yaml</h1>
+<p>这份文件其实是一份<strong>“作战部署图”</strong>。</p>
+<p>它的核心目的是：<strong>如何把巨大的 DeepSeek-V3 模型拆解开，塞进 2 张 GPU 和 CPU 内存里，不仅要能跑，还要跑得快。</strong></p>
+<p>文件名 <code>DeepSeek-V3-Chat-sft-amx-multi-gpu.yaml</code> 里的 <code>amx</code> 代表利用 Intel CPU 的加速指令集，<code>multi-gpu</code> 代表多显卡并行。</p>
+<p>为了让你看懂，我列了一个 <strong>Task List（任务清单）</strong>，我们按照这个清单一步一步把这个文件“扒光”。</p>
+<hr />
+<h3>Task 1：看懂基本语法——“查找与替换”</h3>
+<p>这个文件全是重复的结构，你只需要看懂这一个逻辑：
+*   <strong>Match（查找）</strong>: 就像你在 Word 里按 <code>Ctrl+F</code>。它通过名字（比如“第几层”、“什么零件”）找到模型里的特定部分。
+*   <strong>Replace（替换/分配）</strong>: 找到后，给这个部分下达新指令。比如“你去 GPU 0 上干活”、“你用 CPU 干活”或者“你换个更快的算法”。</p>
+<h3>Task 2：看懂“分家”策略——把模型切成两半</h3>
+<p>DeepSeek-V3 模型很大（61层），单张显卡装不下。文件里通过“正则表达式”把模型切成了前后两段。</p>
+<ul>
+<li><strong>观察点 1</strong>: <code>(0|[1-9]|[12][0-9])</code><ul>
+<li><strong>含义</strong>: 这是正则，代表数字 0 到 29。也就是模型的<strong>前 30 层</strong>。</li>
+<li><strong>指令</strong>: 文件中凡是匹配到这几层的，<code>device</code> 都被设为了 <code>"cuda:0"</code>（第 1 张显卡）。</li>
+</ul>
+</li>
+<li><strong>观察点 2</strong>: <code>([3456][0-9])</code><ul>
+<li><strong>含义</strong>: 代表数字 30 到 69（实际上模型只有61层）。也就是模型的<strong>后 30 多层</strong>。</li>
+<li><strong>指令</strong>: 文件中凡是匹配到这几层的，<code>device</code> 都被设为了 <code>"cuda:1"</code>（第 2 张显卡）。</li>
+</ul>
+</li>
+</ul>
+<p><strong>👉 结论</strong>：这是一个<strong>流水线</strong>工作模式。数据先在 GPU 0 处理前一半，然后传给 GPU 1 处理后一半。</p>
+<h3>Task 3：核心优化——“大脑”放内存，“神经”放显存</h3>
+<p>这是这个配置文件的<strong>灵魂所在</strong>。DeepSeek-V3 是 MoE（混合专家）模型，参数量巨大，显存根本不够。</p>
+<p>请找到文件中 <code>match: ...mlp.experts</code> 的部分（这是模型里参数量最大、最占地方的“专家”模块）：</p>
+<ul>
+<li><strong>Todo</strong>: 观察 <code>replace</code> 里的 <code>kwargs</code>。
+    <code>yaml
+    generate_device: "cpu"          # 生成阶段：用 CPU 跑
+    generate_op: "KSFTExpertsCPU"   # 算法：用 CPU 专用的专家算法
+    backend: "AMXInt8"              # 加速：用 Intel AMX 指令集 + Int8 量化
+    out_device: "cuda:0" (或 cuda:1) # 结果：算完把结果扔回显卡</code></li>
+</ul>
+<p><strong>👉 结论</strong>：
+为了省显存，它把<strong>最占地方的“专家参数”全部扔到了系统内存（RAM）里</strong>，利用 CPU 的 AMX 加速来计算。
+而其他轻量级的部件（如注意力机制 Attention、门控 Gate），依然留在 GPU 上跑，因为它快。
+这就是所谓的“CPU Offload”（CPU 卸载）。</p>
+<h3>Task 4：逐层解析——从头到尾的流水线</h3>
+<p>现在我们把文件从上到下过一遍，看看数据是怎么流动的：</p>
+<ol>
+<li>
+<p><strong>开头 (<code>embed_tokens</code>)</strong></p>
+<ul>
+<li><code>device: "cpu"</code></li>
+<li><strong>解读</strong>: 词表嵌入层（把文字变数字）放 CPU，为了省 GPU 显存。</li>
+</ul>
+</li>
+<li>
+<p><strong>中间层 - 旋转位置编码 (<code>RotaryEmbedding</code>)</strong></p>
+<ul>
+<li><strong>解读</strong>: 这是一个计算坐标的小零件。前30层在 GPU0，后30层在 GPU1。</li>
+</ul>
+</li>
+<li>
+<p><strong>中间层 - 线性层 (<code>Linear</code>)</strong></p>
+<ul>
+<li><code>class: ktransformers.operators.linear.KTransformersLinear</code></li>
+<li><strong>解读</strong>: 把 PyTorch 原生的线性层，换成了 KTransformers 优化过的版本（跑得更快），分布在两张卡上。</li>
+</ul>
+</li>
+<li>
+<p><strong>中间层 - 混合专家 (<code>mlp.experts</code>) —— 最重要！</strong></p>
+<ul>
+<li><strong>解读</strong>: 如 Task 3 所述，这是显存杀手。<strong>平时存在 CPU 内存里</strong>。只有在推理生成（Generate）的时候，CPU 疯狂计算，算出结果传回 GPU。</li>
+<li><em>注意</em>：这里有个 <code>prefill_device: "cuda"</code>。意思是“预填充阶段”（刚开始读你问题的时候），如果显存够，尽量用 GPU 算一下，因为那时候是并行的，CPU 算不过来；但生成回答时（一个字一个字蹦），就切回 CPU。</li>
+</ul>
+</li>
+<li>
+<p><strong>中间层 - 注意力 (<code>self_attn</code>)</strong></p>
+<ul>
+<li><code>class: ...KDeepseekV2Attention</code></li>
+<li><strong>解读</strong>: 这是模型的“注意力”机制。因为计算量大但参数不算特别大，所以<strong>必须留在 GPU 上</strong>，并使用了专门优化的算子（MLA）。</li>
+</ul>
+</li>
+<li>
+<p><strong>结尾 (<code>lm_head</code>)</strong></p>
+<ul>
+<li><code>device: "cuda:1"</code></li>
+<li><strong>解读</strong>: 最后的输出层，放在第 2 张显卡上，负责输出最终的字。</li>
+</ul>
+</li>
+</ol>
+<h3>Task 5：总结——这份文件到底干了啥？</h3>
+<p>如果你把这个文件翻译成人话，它是在对计算机说：</p>
+<blockquote>
+<p>“嘿，听着！我们要跑 DeepSeek-V3 这个大家伙。
+1.  把模型<strong>一分为二</strong>，前一半给 1 号显卡，后一半给 2 号显卡。
+2.  <strong>词表</strong>这种不常用的，扔到 <strong>CPU</strong> 去。
+3.  <strong>注意力（Attention）</strong> 这种费脑子的，留在 <strong>GPU</strong> 上算，要快！
+4.  <strong>专家（Experts）</strong> 这种特别占地方的胖子，全部赶到 <strong>CPU 内存</strong> 里去！生成的时候用 CPU 的 <strong>AMX</strong> 强力计算，算完把结果扔回 GPU。
+5.  把所有普通的计算层，都替换成我们要用的<strong>特制优化版（KTransformers）</strong>。”</p>
+</blockquote>
+<p><strong>最终效果</strong>：你可以在只有 48GB 甚至更少显存的双卡机器上，流畅运行原本需要 100GB+ 显存的模型，且速度还不错（因为利用了 AMX 和 CPU 并行）。</p>

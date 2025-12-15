@@ -1,0 +1,111 @@
+<h1>src/llmtuner/train/dpo/trainer.py</h1>
+<p>完全没问题。这段代码确实涉及比较核心的大模型训练逻辑（DPO，直接偏好优化），如果不熟悉背景很难看懂。</p>
+<p>我们可以把这段代码想象成<strong>“一个严格的老师（Trainer）在教学生（Model）如何分辨好坏”</strong>的过程。</p>
+<p>为了让你听懂，我把阅读和理解这段代码拆解成一个 <strong>5步走的 Task List（任务清单）</strong>。我们一步一步打钩，每一步只讲一个核心概念。</p>
+<hr />
+<h3>📋 任务清单：理解 CustomDPOTrainer</h3>
+<ul>
+<li>[ ] <strong>Task 1: 搞懂我们在干什么 (核心概念)</strong></li>
+<li>[ ] <strong>Task 2: 准备工作 (初始化 <code>__init__</code>)</strong></li>
+<li>[ ] <strong>Task 3: 怎么处理试卷 (前向传播 <code>concatenated_forward</code>)</strong></li>
+<li>[ ] <strong>Task 4: 怎么打分 (计算损失 <code>get_batch_loss_metrics</code>)</strong></li>
+<li>[ ] <strong>Task 5: 怎么看成绩 (指标记录 Metrics)</strong></li>
+</ul>
+<hr />
+<h3>✅ Task 1: 搞懂我们在干什么 (核心概念)</h3>
+<p><strong>DPO (Direct Preference Optimization)</strong> 是干嘛的？
+简单来说，就是给模型看两段回答：
+1.  一段是<strong>好的（Chosen）</strong>。
+2.  一段是<strong>坏的（Rejected）</strong>。</p>
+<p>我们的目标是：让模型给“好的”打高分，给“坏的”打低分。</p>
+<p><strong>这个文件 (<code>trainer.py</code>) 的角色：</strong>
+它就是那个“教练”。它负责拿着数据（好坏对），喂给模型，计算出模型做错了多少（Loss），然后告诉模型怎么改。</p>
+<hr />
+<h3>✅ Task 2: 准备工作 (初始化 <code>__init__</code>)</h3>
+<p>看代码里的 <code>__init__</code> 函数。这就像上课前的准备。</p>
+<p><strong>代码里的关键点：</strong>
+1.  <strong><code>ref_model</code> (参考模型)</strong>:
+    *   <strong>观点</strong>：DPO 训练需要两个模型。一个是<strong>正在训练的学生（Model）</strong>，一个是<strong>原来的老师（Ref Model）</strong>。
+    *   <strong>为什么</strong>：我们希望学生进步，但不能“忘本”或者变得太离谱。所以计算 Loss 时，会对比学生和老师的差异。如果学生和老师差别太大（KL散度），也要惩罚。
+    *   <em>代码逻辑</em>：如果传入了 <code>ref_model</code>，就把它准备好（冻结住，不让它学习，只做参考）。</p>
+<ol>
+<li>
+<p><strong><code>disable_dropout</code></strong>:</p>
+<ul>
+<li><strong>观点</strong>：关闭 Dropout（随机丢弃神经元）。</li>
+<li><strong>为什么</strong>：DPO 对概率非常敏感，我们希望模型输出是稳定的，不要因为 Dropout 产生随机波动。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>ftx_gamma</code></strong>:</p>
+<ul>
+<li><strong>观点</strong>：这是一个混合训练的系数。</li>
+<li><strong>为什么</strong>：有时候纯粹比好坏（DPO）容易练崩，所以我们加一点点传统的“背诵标准答案”（SFT）的任务进去。这个参数决定了混入多少“背诵任务”。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 3: 怎么处理试卷 (前向传播 <code>concatenated_forward</code>)</h3>
+<p>看代码里的 <code>concatenated_forward</code> 函数。这是模型“做题”的过程。</p>
+<p><strong>代码里的关键点：</strong>
+1.  <strong>拼接 (Concatenated)</strong>:
+    *   <strong>观点</strong>：为了省时间，我们把“好的回答”和“坏的回答”拼在一起，一次性塞进模型里算。
+    *   <em>代码逻辑</em>：<code>model(input_ids=...)</code> 这一行就是模型在计算。</p>
+<ol>
+<li><strong>拆分 (Split)</strong>:<ul>
+<li>算完之后，得到了一大堆分数（Logits/Logps）。</li>
+<li><em>代码逻辑</em>：<code>chosen_logps, rejected_logps = all_logps.split(...)</code>。</li>
+<li><strong>解释</strong>：这里把结果切开。前半部分是模型对“好回答”的评分，后半部分是对“坏回答”的评分。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 4: 怎么打分 (计算损失 <code>get_batch_loss_metrics</code>)</h3>
+<p>这是<strong>全篇最重要</strong>的函数。教练根据做题结果打分。</p>
+<p><strong>步骤分解：</strong></p>
+<ol>
+<li>
+<p><strong>学生做题 (<code>policy_...</code>)</strong>:</p>
+<ul>
+<li>调用 <code>concatenated_forward(model, batch)</code>。</li>
+<li>拿到当前模型对好坏数据的评分。</li>
+</ul>
+</li>
+<li>
+<p><strong>老师做题 (<code>reference_...</code>)</strong>:</p>
+<ul>
+<li>调用 <code>concatenated_forward(ref_model, batch)</code>。</li>
+<li><em>注意</em>：这里用了 <code>with torch.no_grad():</code>，因为老师（参考模型）不需要学习，只负责提供参考分数。</li>
+<li><em>特殊情况</em>：如果为了省显存没加载额外的老师模型，代码里有一个 <code>disable_adapter()</code> 的骚操作，把当前模型临时的“外挂”关掉，变回原始模型来充当老师。</li>
+</ul>
+</li>
+<li>
+<p><strong>计算 DPO Loss</strong>:</p>
+<ul>
+<li><em>代码逻辑</em>：<code>self.dpo_loss(...)</code>。</li>
+<li><strong>核心观点</strong>：这个公式的核心意思是 —— <strong>(好回答的分数 - 坏回答的分数)</strong> 越大越好。同时，不能偏离老师太远。</li>
+</ul>
+</li>
+<li>
+<p><strong>计算 SFT Loss (可选)</strong>:</p>
+<ul>
+<li><em>代码逻辑</em>：<code>if self.ftx_gamma &gt; 1e-6: ... += self.sft_loss(...)</code>。</li>
+<li><strong>核心观点</strong>：这就是 Task 2 里说的“背诵任务”。如果开启了这个功能，会额外要求模型单纯地把“好回答”背下来（即提高好回答的概率），防止模型为了拉开好坏差距而走火入魔。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 5: 怎么看成绩 (指标记录 Metrics)</h3>
+<p>函数最后返回的 <code>metrics</code> 字典。这是给你看训练进度的仪表盘。</p>
+<p><strong>关键指标解释：</strong>
+*   <strong><code>rewards/chosen</code></strong>: 模型给“好回答”的平均奖励分（越高越好）。
+*   <strong><code>rewards/rejected</code></strong>: 模型给“坏回答”的平均奖励分（越低越好）。
+*   <strong><code>rewards/accuracies</code></strong>: <strong>准确率</strong>。意思是：在多少次比较中，模型给“好回答”的分数确实高于“坏回答”？（这个最直观，通常希望能升到 0.7~0.9）。
+*   <strong><code>rewards/margins</code></strong>: <strong>分差</strong>。即 <code>好分数 - 坏分数</code>。这个差值越大，说明模型越能分辨好坏。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件其实就干了一件事：</p>
+<blockquote>
+<p><strong>它是 DPO 训练的管家。它把数据里的“好坏对”分别丢给“当前模型”和“参考模型”去算分，然后计算出 DPO 损失（也许还混了一点 SFT 损失），最后告诉你模型现在的分辨能力（准确率）怎么样。</strong></p>
+</blockquote>
+<p>现在回头看代码，是不是稍微清晰一点了？</p>

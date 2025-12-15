@@ -1,0 +1,89 @@
+<h1>src/llmtuner/api/app.py</h1>
+<p>没问题，这段代码对于不熟悉后端开发（特别是 FastAPI 框架）或者大模型 API 协议的人来说，确实像天书一样。</p>
+<p>简单来说，<strong>这个文件的作用是把一个本地的大模型（LLM）包装成一个可以通过网络访问的 API 服务</strong>。而且，它特意把接口设计得和 <strong>OpenAI 的 API（GPT-3.5/4）一模一样</strong>。这样你就可以用任何支持 OpenAI 的软件（比如 LangChain、各种 Chat 客户端）来连接你本地的模型了。</p>
+<p>我们把它想象成你要<strong>开一家餐馆（API 服务）</strong>。</p>
+<p>下面是一个 <strong>“从零读懂这份代码”的 Todo List</strong>，我们一步步来拆解：</p>
+<hr />
+<h3>✅ Task 1: 搞清楚“基础设施” (Imports &amp; Setup)</h3>
+<p>在开餐馆前，先得把水电煤气接好。
+*   <strong>代码位置</strong>：开头到 <code>lifespan</code> 函数。
+*   <strong>核心概念</strong>：
+    *   <code>FastAPI</code>: 这是一个 Web 框架，相当于你的<strong>服务员</strong>，负责接待客人（接收请求）和上菜（返回数据）。
+    *   <code>ChatModel</code>: 这是<strong>大厨</strong>，也就是你本地的那个 AI 模型。
+    *   <code>Protocol</code>: 这是<strong>菜单</strong>，定义了客人怎么点菜（请求格式）以及怎么上菜（返回格式）。
+    *   <code>lifespan</code>: 这是一个<strong>保洁阿姨</strong>。它的作用是当服务关闭时，清理显存（<code>torch_gc</code>），防止显卡爆掉。</p>
+<h3>✅ Task 2: 准备“翻译工具” (Helper Functions)</h3>
+<p>因为大厨（模型）只懂一种数据格式，而服务员（FastAPI）和客人懂另一种，需要翻译。
+*   <strong>代码位置</strong>：<code>dictify</code> 和 <code>jsonify</code> 函数。
+*   <strong>核心概念</strong>：
+    *   这两个函数是为了兼容性（Pydantic V1 和 V2 版本）。
+    *   简单理解：它们就是把 Python 的对象转换成字典（Dict）或者 JSON 字符串，方便数据传输。</p>
+<h3>✅ Task 3: 搭建“餐馆大厅” (create_app)</h3>
+<p>这是主函数，负责把餐馆建起来。
+*   <strong>代码位置</strong>：<code>create_app</code> 函数的开头部分。
+*   <strong>核心概念</strong>：
+    *   <code>app = FastAPI(...)</code>: 挂上招牌。
+    *   <code>CORSMiddleware</code>: 这是<strong>安保系统</strong>。代码里设置了 <code>allow_origins=["*"]</code>，意思是允许任何人、从任何网站发请求过来（不拦截跨域请求）。
+    *   <code>semaphore</code>: 这是<strong>限流器/排号机</strong>。<code>MAX_CONCURRENT</code> 决定了同时能有多少人跟大厨说话。如果设为 1，大家就得排队，防止大厨（显卡）累死。</p>
+<h3>✅ Task 4: 设立“查询柜台” (GET /v1/models)</h3>
+<p>这是一个假的接口，为了骗过那些只认 OpenAI 的客户端。
+*   <strong>代码位置</strong>：<code>@app.get("/v1/models")</code>。
+*   <strong>核心概念</strong>：
+    *   很多客户端连接时会问：“你这有哪些模型呀？”
+    *   这个接口统一回答：“我有 <code>gpt-3.5-turbo</code>”。其实后台跑的可能是 LLaMA 或 ChatGLM，但为了兼容性，我们假装自己是 GPT。</p>
+<h3>✅ Task 5: 核心业务——“聊天服务” (POST /v1/chat/completions)</h3>
+<p><strong>这是全文件最重要的地方</strong>，处理对话请求。
+*   <strong>代码位置</strong>：<code>@app.post("/v1/chat/completions")</code> 及其内部逻辑。
+*   <strong>步骤拆解</strong>：
+    1.  <strong>检查大厨状态</strong>：<code>if not chat_model.can_generate</code>，如果模型是专门用来打分的（不能生成文本），就拒绝服务。
+    2.  <strong>检查点单规范</strong>：
+        *   必须有消息。
+        *   最后一条消息必须是用户（User）发的。
+        *   <strong>格式校验</strong>：代码里有一堆 <code>if</code> 判断 <code>role</code>。它强制要求对话格式必须是 <code>用户 -&gt; AI -&gt; 用户 -&gt; AI</code> 这样交替进行（A/B/A/B...），不能乱插话。
+    3.  <strong>处理工具（Tools）</strong>：如果请求里包含了 <code>tools</code>（函数调用功能），需要把它们转换成 JSON 格式喂给模型。
+    4.  <strong>把单子交给大厨</strong>：<code>run_in_executor</code>。因为生成文字很慢，不能让服务员傻站着等，这里用了异步（Async）机制，把任务扔给后台线程去跑。</p>
+<h3>✅ Task 6: 大厨做菜的两种方式 (Sync vs Stream)</h3>
+<p>模型生成回复有两种模式，代码里分成了两个内部函数。</p>
+<h4>模式 A：一次性上齐 (<code>chat_completion</code>)</h4>
+<ul>
+<li><strong>场景</strong>：你问一个问题，等几十秒，然后整段话突然全部显示出来。</li>
+<li><strong>逻辑</strong>：<ul>
+<li>调用 <code>chat_model.chat(...)</code>。</li>
+<li>模型算完所有结果后，把结果封装成 <code>ChatCompletionResponse</code>（OpenAI 的标准格式）。</li>
+<li>如果有 <code>tools</code>（工具调用），还要解析一下模型的输出是不是在调用函数。</li>
+<li>最后返回完整的 JSON。</li>
+</ul>
+</li>
+</ul>
+<h4>模式 B：像打字机一样上菜 (<code>stream_chat_completion</code>)</h4>
+<ul>
+<li><strong>场景</strong>：ChatGPT 那种，字是一个一个蹦出来的。</li>
+<li><strong>逻辑</strong>：<ul>
+<li>如果你请求里写了 <code>stream=True</code>。</li>
+<li>使用 <code>EventSourceResponse</code>（SSE 技术）。</li>
+<li>代码里用了 <code>yield</code> 关键字。<code>chat_model.stream_chat</code> 每生成一个字，这里就立刻打包成一个小的数据包发给客户端。</li>
+<li>最后发一个 <code>[DONE]</code> 告诉客户端结束了。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 7: 附加业务——“打分服务” (POST /v1/score/evaluation)</h3>
+<p>这不是用来聊天的，是用来给句子打分的（通常用于 RLHF 训练中的 Reward Model）。
+*   <strong>代码位置</strong>：<code>@app.post("/v1/score/evaluation")</code>。
+*   <strong>核心概念</strong>：
+    *   如果模型是生成式的（能聊天的），这个接口就禁用。
+    *   它调用 <code>chat_model.get_scores</code>，给输入的对话打一个分数（比如好/坏，或者安全性评分）。</p>
+<h3>✅ Task 8: 开门营业 (<strong>main</strong>)</h3>
+<p>最后几行代码。
+*   <strong>代码位置</strong>：<code>if __name__ == "__main__":</code>
+*   <strong>核心概念</strong>：
+    *   <code>chat_model = ChatModel()</code>: 叫醒大厨（加载模型到显存，这步最慢）。
+    *   <code>uvicorn.run(...)</code>: 启动服务器，默认监听 <code>8000</code> 端口。</p>
+<hr />
+<h3>总结一下</h3>
+<p>这个脚本就是一个<strong>适配器（Adapter）</strong>。</p>
+<ul>
+<li><strong>左边</strong>是：你的本地模型（LLaMA, Qwen, Baichuan 等）。</li>
+<li><strong>中间</strong>是：这个 <code>app.py</code> 脚本。</li>
+<li><strong>右边</strong>是：任何兼容 OpenAI 协议的软件。</li>
+</ul>
+<p>它把右边的“OpenAI 格式请求”拆解、校验，喂给左边的模型；再把模型吐出来的字，封装成“OpenAI 格式响应”还回去。</p>

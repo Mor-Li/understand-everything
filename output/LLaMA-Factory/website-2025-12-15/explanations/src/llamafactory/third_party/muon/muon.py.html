@@ -1,0 +1,103 @@
+<h1>src/llamafactory/third_party/muon/muon.py</h1>
+<p>这份代码实现了一个名为 <strong>Muon</strong> 的新型优化器（Optimizer）。</p>
+<p>简单来说，优化器就是用来告诉神经网络“如何根据错误（Loss）来修改参数”的工具。大家最常用的是 AdamW，而 Muon 是最近（2024-2025年）提出来的一种新算法，号称在训练大模型时比 AdamW 更高效、效果更好。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“学习任务清单 (To-Do List)”</strong>，我们一步步来勾选完成。</p>
+<hr />
+<h3>✅ Task 1: 搞清楚它的核心定位</h3>
+<p><strong>目标</strong>：知道 Muon 是用来干嘛的，以及它采用了什么策略。</p>
+<ul>
+<li><strong>它的身份</strong>：它是一个 PyTorch 优化器（继承自 <code>torch.optim.Optimizer</code>）。</li>
+<li><strong>它的策略</strong>：<strong>“分而治之”</strong>。<ul>
+<li>在这个代码里，它并不是把模型里所有的参数都用同一种方法更新。</li>
+<li>它把参数分成了两类：<ol>
+<li><strong>大矩阵参数（2D）</strong>：比如 Transformer 里的 Linear 层（全连接层）。这些用 <strong>Muon</strong> 算法更新。</li>
+<li><strong>小参数或特殊层</strong>：比如 Embedding 层、最后的输出头（Head）、或者一维的向量（Bias, LayerNorm）。这些依然用传统的 <strong>AdamW</strong> 算法更新。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<p><strong>代码对应</strong>：
+在 <code>__init__</code> 函数里，你可以看到 <code>muon_params</code>（用 Muon 的）和 <code>adamw_params</code>（用 AdamW 的）被分开处理了。</p>
+<hr />
+<h3>✅ Task 2: 理解 Muon 的“必杀技” —— Newton-Schulz 迭代</h3>
+<p><strong>目标</strong>：理解代码中最难懂的函数 <code>zeropower_via_newtonschulz5</code>。</p>
+<ul>
+<li><strong>背景</strong>：通常的优化器（如 SGD）直接拿梯度的数值去更新参数。但如果梯度矩阵的数值很不稳定（有的特大，有的特小），训练就容易崩。</li>
+<li><strong>Muon 的做法</strong>：它想把更新量的矩阵变得“这就标准”、“很正交”。<ul>
+<li>所谓的“正交化”或者“零次幂（Zeroth Power）”，你可以理解为对梯度矩阵做了一次<strong>“整形”</strong>。</li>
+<li>它保留了梯度的<strong>方向</strong>，但强制把矩阵的<strong>整体缩放比例（谱范数）</strong> 限制在 1 附近。</li>
+</ul>
+</li>
+<li><strong>Newton-Schulz 是什么？</strong>：<ul>
+<li>要实现这个“整形”通常需要做 SVD（奇异值分解），但这在 GPU 上计算太慢了。</li>
+<li>Newton-Schulz 是一种<strong>迭代算法</strong>，只用简单的矩阵乘法（加减乘）就能逼近 SVD 的效果。</li>
+<li>代码中的 <code>zeropower_via_newtonschulz5</code> 就是在做这件事：输入一个矩阵 <code>G</code>，循环几次（<code>steps</code>），输出一个“整形”后的矩阵 <code>X</code>。</li>
+</ul>
+</li>
+</ul>
+<p><strong>代码对应</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">zeropower_via_newtonschulz5</span><span class="p">(</span><span class="n">G</span><span class="p">,</span> <span class="n">steps</span><span class="p">):</span>
+    <span class="c1"># ... 省略 ...</span>
+    <span class="c1"># 这是一个纯数学的迭代公式，用来快速清洗矩阵，使其更稳定</span>
+    <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">steps</span><span class="p">):</span>
+        <span class="n">A</span> <span class="o">=</span> <span class="n">X</span> <span class="o">@</span> <span class="n">X</span><span class="o">.</span><span class="n">T</span>
+        <span class="n">B</span> <span class="o">=</span> <span class="n">b</span> <span class="o">*</span> <span class="n">A</span> <span class="o">+</span> <span class="n">c</span> <span class="o">*</span> <span class="n">A</span> <span class="o">@</span> <span class="n">A</span>
+        <span class="n">X</span> <span class="o">=</span> <span class="n">a</span> <span class="o">*</span> <span class="n">X</span> <span class="o">+</span> <span class="n">B</span> <span class="o">*</span> <span class="n">X</span>
+    <span class="k">return</span> <span class="n">X</span>
+</code></pre></div>
+
+<hr />
+<h3>✅ Task 3: 梳理 Muon 的更新流程</h3>
+<p><strong>目标</strong>：看懂 <code>step</code> 函数里的前半部分（Muon loop）。</p>
+<p>当模型进行一次更新时，Muon 对那些“大矩阵”做了以下几步操作：</p>
+<ol>
+<li><strong>获取梯度 (Gradient)</strong>：拿到当前算出来的梯度 <code>g</code>。</li>
+<li><strong>加动量 (Momentum)</strong>：就像滚雪球一样，把之前的梯度惯性加进来。<ul>
+<li><code>buf.mul_(momentum).add_(g)</code></li>
+</ul>
+</li>
+<li><strong>✨ 核心步骤：正交化 (Orthogonalization)</strong>：<ul>
+<li>调用 Task 2 里的 <code>zeropower_via_newtonschulz5(g, ...)</code>。</li>
+<li>把带有动量的梯度变成一个“标准化的更新矩阵” <code>u</code>。</li>
+</ul>
+</li>
+<li><strong>调整学习率 (Scaling)</strong>：<ul>
+<li>调用 <code>adjust_lr_for_muon</code>。</li>
+<li>Muon 认为，矩阵越大，学习率应该稍微大一点点（基于 RMS 缩放）。</li>
+</ul>
+</li>
+<li><strong>权重衰减 (Weight Decay)</strong> &amp; <strong>应用更新</strong>：<ul>
+<li>最后修改参数 <code>p.data</code>。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话总结 Muon 的逻辑</strong>：
+<strong>SGD + 动量 -&gt; 强制用牛顿-舒尔茨算法把更新量“整形”为正交矩阵 -&gt; 更新参数。</strong></p>
+<hr />
+<h3>✅ Task 4: 梳理 AdamW 的“保底”流程</h3>
+<p><strong>目标</strong>：看懂 <code>step</code> 函数里的后半部分（Adam backup）。</p>
+<ul>
+<li>这部分代码就是标准的 AdamW 实现。</li>
+<li>对于那些不适合用 Muon 的参数（比如 Embedding 层），代码会回退到使用 AdamW。</li>
+<li>它维护了两个状态：一阶矩（Moment1，梯度的平均）和二阶矩（Moment2，梯度平方的平均），然后做一个除法来归一化。</li>
+</ul>
+<p><strong>为什么要有这一步？</strong>
+因为 Muon 的“强制正交化”对维度很低或者像 Embedding 这样的查表层效果不好，甚至可能导致崩盘。所以这是一个混合（Hybrid）优化器。</p>
+<hr />
+<h3>✅ Task 5: 总结全文观点</h3>
+<p><strong>目标</strong>：用人话把这个文件的核心逻辑串起来。</p>
+<p>这个 <code>muon.py</code> 文件实现了一个<strong>混合优化器</strong>，它的工作流如下：</p>
+<ol>
+<li><strong>初始化</strong>：把模型参数分成两堆，一堆是大矩阵（Linear层），一堆是其他。</li>
+<li><strong>训练每一步</strong>：<ul>
+<li><strong>对大矩阵</strong>：不直接用梯度更新，而是先加动量，然后用 <strong>Newton-Schulz 算法</strong> 把更新矩阵“洗”一遍，让它的几何性质更好（正交化），最后更新。这能让大模型训练更稳定、收敛更快。</li>
+<li><strong>对其他参数</strong>：老老实实由 <strong>AdamW</strong> 接管，保证不出错。</li>
+</ul>
+</li>
+</ol>
+<h3>你的“任务清单”总结</h3>
+<p>如果你要向别人复述，可以按照这个顺序：
+1.  <strong>它是个混合优化器</strong>：Muon 处理大层，AdamW 处理小层。
+2.  <strong>它的核心算法</strong>：利用 Newton-Schulz 迭代来快速近似矩阵的正交化。
+3.  <strong>它的目的</strong>：为了在大模型训练中替代 AdamW，试图降低显存占用或提高收敛效率（Muon 通常被认为比 AdamW 更节省显存，因为它不需要存储二阶矩）。</p>

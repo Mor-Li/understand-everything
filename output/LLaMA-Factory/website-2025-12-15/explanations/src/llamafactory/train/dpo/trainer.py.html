@@ -1,0 +1,60 @@
+<h1>src/llamafactory/train/dpo/trainer.py</h1>
+<p>这份代码文件 <code>src/llamafactory/train/dpo/trainer.py</code> 定义了一个类 <code>CustomDPOTrainer</code>。</p>
+<p>简单来说，<strong>它的核心任务是教大模型“做选择题”</strong>。也就是我们常说的 <strong>DPO（Direct Preference Optimization，直接偏好优化）</strong>。</p>
+<p>在 DPO 训练中，我们会给模型两个答案：
+1.  <strong>Chosen（胜出/好的回答）</strong> 👍
+2.  <strong>Rejected（拒绝/坏的回答）</strong> 👎</p>
+<p>这个 <code>Trainer</code> 的工作就是<strong>惩罚</strong>模型生成“坏回答”，<strong>奖励</strong>模型生成“好回答”。</p>
+<p>为了让你更清楚，我把它拆解成一个 <strong>Project Manager 的任务清单（Todo List）</strong>，一步步带你看它是怎么工作的：</p>
+<hr />
+<h3>📋 任务清单：教模型分辨好坏</h3>
+<h4>Task 1: 准备工作 (Initialization)</h4>
+<p><strong>代码位置：</strong> <code>__init__</code> 方法
+<strong>任务描述：</strong>
+这是项目启动阶段。Trainer 需要把“学生”（要训练的模型）和“参考标准”（Ref Model，通常是训练前的原始模型）准备好。
+*   <strong>加载模型</strong>：把主模型 (<code>model</code>) 和参考模型 (<code>ref_model</code>) 加载进来。
+*   <strong>设定规则</strong>：读取参数，比如 <code>beta</code>（控制偏好强度的参数）、<code>loss_type</code>（是用 DPO 还是其他变体如 ORPO, SimPO）。
+*   <strong>特殊处理</strong>：如果有特殊的优化器（如 BAdam）或者需要禁用 Dropout（为了训练稳定），在这里处理。</p>
+<h4>Task 2: 让“学生”做题 (Forward Pass)</h4>
+<p><strong>代码位置：</strong> <code>concatenated_forward</code> 方法
+<strong>任务描述：</strong>
+把数据喂给正在训练的模型，看看它对“好回答”和“坏回答”的反应。
+*   <strong>输入数据</strong>：把 Prompt + Chosen 和 Prompt + Rejected 拼接起来喂给模型。
+*   <strong>计算 Log Probabilities (Logps)</strong>：这是核心。模型不会直接说“我选A”，它会输出生成每个字的<strong>概率</strong>。
+    *   我们需要算出模型生成“好回答”的概率总分 (<code>chosen_logps</code>)。
+    *   也要算出模型生成“坏回答”的概率总分 (<code>rejected_logps</code>)。</p>
+<h4>Task 3: 看看“参考标准”怎么想 (Reference Log Probs)</h4>
+<p><strong>代码位置：</strong> <code>compute_reference_log_probs</code> 方法
+<strong>任务描述：</strong>
+DPO 的精髓在于<strong>对比</strong>。我们需要知道：在没训练之前，原始模型是怎么看这两个答案的？
+*   <strong>冻结模型</strong>：使用 <code>ref_model</code>（不更新参数）。
+*   <strong>计算基准</strong>：同样计算原始模型对“好回答”和“坏回答”的概率分数。
+*   <strong>目的</strong>：如果原始模型本来就觉得“坏回答”概率很低，那我们就不需要太刻意去惩罚它；如果原始模型觉得“坏回答”概率很高，我们就得狠狠地修正它。</p>
+<h4>Task 4: 算出“考分” (Compute Loss)</h4>
+<p><strong>代码位置：</strong> <code>compute_preference_loss</code> 以及 <code>odds_ratio_loss</code>, <code>simpo_loss</code>, <code>bco_loss</code>
+<strong>任务描述：</strong>
+根据学生模型和参考模型的表现，算出一个“损失值”（Loss），告诉模型错得有多离谱。
+*   <strong>选择算法</strong>：根据配置 (<code>loss_type</code>) 选择计分公式：
+    *   <strong>标准 DPO</strong>：比较 (学生好 - 学生坏) 和 (参考好 - 参考坏) 的差距。
+    *   <strong>ORPO / SimPO</strong>：这些是 DPO 的变体，计算公式不同（例如 SimPO 不需要参考模型，直接算 Margin）。
+*   <strong>计算 Rewards</strong>：顺便算一下“奖励分”，看看模型现在多大程度上倾向于“好回答”。</p>
+<h4>Task 5: 生成成绩单 (Metrics)</h4>
+<p><strong>代码位置：</strong> <code>get_batch_loss_metrics</code>
+<strong>任务描述：</strong>
+在每一步训练后，整理出人类能看懂的指标。
+*   <strong>Accuracy</strong>：模型判断对了吗？（即：好回答的概率 &gt; 坏回答的概率）。
+*   <strong>Margins</strong>：好回答比坏回答的得分高出多少？
+*   <strong>Rewards</strong>：现在的奖励分是多少。
+*   <strong>SFT Loss</strong>：模型生成的语言通顺吗？（有时会加这个辅助项）。</p>
+<h4>Task 6: 汇报进度 (Logging)</h4>
+<p><strong>代码位置：</strong> <code>log</code> 方法
+<strong>任务描述：</strong>
+把上面计算出来的 Loss 和 Metrics 打印到控制台或 WandB 面板上，防止数据在多卡训练时丢失，做一些平均化处理。</p>
+<hr />
+<h3>总结：这段代码在干嘛？</h3>
+<p>这段代码是一个<strong>高度定制化的 DPO 训练器</strong>。</p>
+<p>它继承自 HuggingFace TRL 库的 <code>DPOTrainer</code>，但为了适应 LLaMA-Factory 的需求，它做了以下增强：
+1.  <strong>支持更多算法</strong>：不仅支持 DPO，还手写实现了 ORPO, SimPO, BCO 等最新的偏好对齐算法。
+2.  <strong>兼容性修改</strong>：处理了不同版本 Transformers 的兼容问题，以及 DeepSpeed 分布式训练的细节。
+3.  <strong>自定义优化</strong>：加入了一些 LLaMA-Factory 特有的参数（比如 <code>ftx_gamma</code> 用于混合 SFT loss）。</p>
+<p><strong>简单一句话：</strong> 这是一个负责拿“好坏数据对”来训练模型，让模型学会“说话好听点”的那个核心管家。</p>

@@ -1,0 +1,98 @@
+<h1>scripts/llama_pro.py</h1>
+<p>这份代码其实在做一件非常有意思的事情，叫做 <strong>“模型层拓展” (Block Expansion)</strong>，其核心思想源自 <strong>LLaMA-Pro</strong> 这篇论文。</p>
+<p>简单来说，它的目的是：<strong>把一个训练好的小模型（比如 7B），通过“插队”的方式塞进去一些新层，把它变成一个更大的模型（比如 9B），然后只训练这些新层，让模型变聪明。</strong></p>
+<p>为了让你听懂，我把这个代码的逻辑拆解成一个 <strong>“施工队改造大楼”</strong> 的 ToDo List。</p>
+<hr />
+<h3>🛠️ 任务清单：如何给大模型“加盖”楼层</h3>
+<p>假设原来的模型是一栋 <strong>32层</strong> 的大楼（Llama-2-7b），我们要给它新增 <strong>8层</strong>（<code>num_expand=8</code>），变成 <strong>40层</strong>。</p>
+<h4>✅ Step 1: 施工前核算 (配置检查)</h4>
+<ul>
+<li><strong>代码对应：</strong> <code>block_expansion</code> 函数开头部分。</li>
+<li><strong>动作：</strong><ol>
+<li>读取原大楼图纸（<code>config</code>）。</li>
+<li>计算原来的层数（32层）。</li>
+<li><strong>算术检查：</strong> 32层能不能被新增的8层整除？（32 / 8 = 4）。这意味着：<strong>每隔 4 层旧楼层，就要插入 1 层新楼层</strong>。</li>
+<li>修改图纸：把总层数从 32 改成 40，保存新图纸。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Step 2: 准备材料 (加载模型)</h4>
+<ul>
+<li><strong>代码对应：</strong> <code>tokenizer</code> 和 <code>model</code> 的加载部分。</li>
+<li><strong>动作：</strong><ol>
+<li>把原来的模型权重（<code>state_dict</code>）全部搬到内存里。</li>
+<li>准备一个空的列表（<code>output_state_dict</code>），用来存放新的40层大楼的权重。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Step 3: 逐层盖楼与“插队” (核心逻辑)</h4>
+<ul>
+<li><strong>代码对应：</strong> <code>for i in range(num_layers):</code> 循环部分。</li>
+<li>
+<p><strong>动作：</strong> 这是一个循环，从第0层走到第31层（原模型）。</p>
+<ul>
+<li>
+<p><strong>动作 A (搬运旧层)：</strong></p>
+<ul>
+<li>拿到原模型的第 <code>i</code> 层。</li>
+<li>给它改个名字（重编号），比如原来的第0层还是第0层，但原来的第5层可能因为前面插了队，变成了第6层。</li>
+<li>直接把参数复制过去。</li>
+</ul>
+</li>
+<li>
+<p><strong>动作 B (判断是否插入新层)：</strong></p>
+<ul>
+<li><strong>逻辑：</strong> <code>if (i + 1) % split == 0:</code></li>
+<li>如果当前层数是 4 的倍数（比如第4层、第8层...），就在这里<strong>插入一层全新的楼层</strong>。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Step 4: 装修新楼层 (零初始化技巧)</h4>
+<ul>
+<li><strong>代码对应：</strong> <code>if "down_proj" in key or "o_proj" in key:</code></li>
+<li><strong>这是最关键的一步！</strong> 新插入的这一层，参数从哪来？<ul>
+<li><strong>大部分参数（Attention, MLP的输入部分）：</strong> 直接 <strong>复制</strong> 上一层的参数（<code>torch.clone</code>）。</li>
+<li><strong>输出参数（down_proj, o_proj）：</strong> 全部 <strong>设为 0</strong> (<code>torch.zeros_like</code>)。</li>
+</ul>
+</li>
+<li><strong>为什么这么做？</strong><ul>
+<li>如果输出是0，那么这一层对数据的影响就是“没有影响”（输出为0，加到残差连接上还是原样）。</li>
+<li>这意味着：<strong>刚改造完还没训练时，这栋40层大楼的功能和原来32层大楼一模一样，完全不会报错或乱说话。</strong> 这为后续训练打下了完美的基础。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Step 5: 补全其他设施 (非层参数)</h4>
+<ul>
+<li><strong>代码对应：</strong> 循环结束后的 <code>for key, value in state_dict.items():</code></li>
+<li><strong>动作：</strong> 楼层盖好了，别忘了大楼的“地基”（Embedding层）和“楼顶”（LM Head / Norm层）。把这些没动过的参数原封不动地搬进新模型。</li>
+</ul>
+<h4>✅ Step 6: 验收与存档 (保存模型)</h4>
+<ul>
+<li><strong>代码对应：</strong> <code>split_torch_state_dict_into_shards</code> 和 <code>save_file</code>。</li>
+<li><strong>动作：</strong><ol>
+<li>因为模型变大了，一个文件存不下，需要切分成碎片（Shards）。</li>
+<li>保存为 <code>.safetensors</code> 或 <code>.bin</code> 格式。</li>
+<li>生成索引文件（index json），告诉加载器哪个参数在哪个文件里。</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Step 7: 留下说明书 (打印训练指南)</h4>
+<ul>
+<li><strong>代码对应：</strong> 最后几个 <code>print</code>。</li>
+<li><strong>动作：</strong> 告诉用户：<ul>
+<li>“新模型做好了！”</li>
+<li>“你去微调的时候，记得选 <code>freeze</code> 模式。”</li>
+<li>“只训练我新加的那 8 层 (<code>freeze_trainable_layers: 8</code>)，旧的层冻结别动。”</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p><strong>这段代码在干嘛？</strong>
+它在做一个<strong>“无损扩容”</strong>。它把一个 Llama 模型像拉面一样拉长了，在中间均匀地插入了新层。</p>
+<p><strong>新层有什么特点？</strong>
+新层的输出权重被初始化为 0。这保证了<strong>扩容后的模型在微调之前，表现和原模型完全一致</strong>（这就是所谓的 Identity Initialization）。</p>
+<p><strong>之后要做什么？</strong>
+你需要拿着这个输出的新模型路径，去进行微调训练。训练时，原有的知识（旧层）会被冻结保留，模型会利用新插入的层去学习新的知识（比如特定领域的知识）。这就是 LLaMA-Pro 的核心玩法。</p>

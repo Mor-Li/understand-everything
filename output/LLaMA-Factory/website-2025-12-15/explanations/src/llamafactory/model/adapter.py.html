@@ -1,0 +1,136 @@
+<h1>src/llamafactory/model/adapter.py</h1>
+<p>这份代码文件 <code>src/llamafactory/model/adapter.py</code> 的核心作用是：<strong>给大模型“穿装备”或“做手术”，以便让它准备好进行训练（微调）。</strong></p>
+<p>它就像一个<strong>总调度员</strong>，根据你设定的微调方式（全量微调、冻结微调、还是LoRA微调），来调整模型的参数状态。</p>
+<p>为了让你看懂，我把它拆解成一个<strong>程序执行的 TODO List（任务清单）</strong>。想象一下，当程序运行到这个文件时，它实际上是在按顺序执行以下任务：</p>
+<hr />
+<h3>🟢 主任务清单：<code>init_adapter</code> (总入口)</h3>
+<p>当代码调用 <code>init_adapter</code> 函数时，它主要做三件事：</p>
+<ol>
+<li>
+<p><strong>[检查] 兼容性检查</strong></p>
+<ul>
+<li><strong>Task:</strong> 检查模型是否被“量化”（压缩）过。</li>
+<li><strong>逻辑:</strong> 如果模型是量化的（比如4bit/8bit），那你只能用 LoRA 或 OFT 微调。想做全量微调？直接报错，因为量化模型不支持全量训练。</li>
+</ul>
+</li>
+<li>
+<p><strong>[决策] 决定精度（数据类型）</strong></p>
+<ul>
+<li><strong>Task:</strong> 决定是否要把那些需要训练的参数强制转成 <code>float32</code>（高精度）。</li>
+<li><strong>逻辑:</strong><ul>
+<li>如果是纯 <code>bf16</code> 训练或者是 <code>BAdam</code> 优化器 -&gt; <strong>不转</strong>（保持半精度，省显存）。</li>
+<li>如果用了 DeepSpeed ZeRO3 -&gt; <strong>不转</strong>（ZeRO3 会自己处理）。</li>
+<li>其他情况（比如 QLoRA） -&gt; <strong>转成 float32</strong>（为了保证数值稳定性，防止训练飞了）。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>[分发] 选择微调流派</strong></p>
+<ul>
+<li><strong>Task:</strong> 根据你的配置 <code>finetuning_type</code>，把模型送到不同的“车间”去处理。</li>
+<li><strong>分支:</strong><ul>
+<li>是 <code>full</code> (全量)？ -&gt; 执行 <strong>任务 A</strong> (<code>_setup_full_tuning</code>)</li>
+<li>是 <code>freeze</code> (冻结)？ -&gt; 执行 <strong>任务 B</strong> (<code>_setup_freeze_tuning</code>)</li>
+<li>是 <code>lora</code> 或 <code>oft</code>？ -&gt; 执行 <strong>任务 C</strong> (<code>_setup_lora_tuning</code>) <strong>(最常用，代码最长)</strong></li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🟠 支线任务 A：全量微调 (<code>_setup_full_tuning</code>)</h3>
+<p>如果选择了全量微调，程序做这些事：</p>
+<ol>
+<li><strong>[设置]</strong> 打印日志：“Fine-tuning method: Full”。</li>
+<li><strong>[筛选]</strong> 找出所有参数。</li>
+<li><strong>[执行]</strong><ul>
+<li>如果是“被禁止”的模块（比如某些特殊的层）：<strong>锁住</strong>（不训练）。</li>
+<li>如果是普通参数：<strong>解锁</strong>（设为可训练），并根据主任务中的决定，可能将其转为 <code>float32</code>。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🟠 支线任务 B：冻结微调 (<code>_setup_freeze_tuning</code>)</h3>
+<p>如果选择了冻结微调（只练最后几层，或者特定层），程序做这些事：</p>
+<ol>
+<li><strong>[计算]</strong> 算出模型一共有多少层。</li>
+<li><strong>[筛选]</strong> 根据你的配置（比如 <code>freeze_trainable_layers</code>），计算出<strong>具体哪几层需要训练</strong>（例如：只练最后3层）。</li>
+<li><strong>[处理]</strong> 处理一些特殊的模块（比如 Vision Transformer 的投影层），决定是否要加入训练列表。</li>
+<li><strong>[执行]</strong> 遍历模型所有参数：<ul>
+<li>如果在“训练名单”里 -&gt; <strong>解锁</strong>。</li>
+<li>不在名单里 -&gt; <strong>锁住</strong>（Freeze）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🟠 支线任务 C：LoRA/OFT 微调 (<code>_setup_lora_tuning</code>)</h3>
+<p>这是最复杂的部分，也是代码最长的地方。它的逻辑如下：</p>
+<ol>
+<li>
+<p><strong>[加载] 处理旧的 Adapter (如果有)</strong></p>
+<ul>
+<li><strong>Task:</strong> 检查你是不是想在已有的 LoRA 基础上继续练，或者合并多个 LoRA。</li>
+<li><strong>逻辑:</strong> 如果有 <code>adapter_name_or_path</code>，就把这些旧的“外挂”加载进来。如果是为了合并，就用 <code>merge_and_unload</code> 把它们融合进主模型。</li>
+</ul>
+</li>
+<li>
+<p><strong>[新建] 准备新的 Adapter (如果是训练模式)</strong></p>
+<ul>
+<li>
+<p><strong>Task 2.1: 找靶子 (Target Modules)</strong></p>
+<ul>
+<li>LoRA 需要挂载在具体的层上（比如 <code>q_proj</code>, <code>v_proj</code>）。程序会去寻找这些层。</li>
+<li>如果是 <code>all</code>，它会自动扫描所有线性层。</li>
+<li>如果用了 <code>KTransformers</code>（一种推理加速库），它会调整层名称以匹配。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 2.2: 扩充词表检查</strong></p>
+<ul>
+<li>如果你扩充了词表（加了新词），程序会自动把 <code>embed_tokens</code> (词向量层) 和 <code>lm_head</code> (输出层) 加入训练目标，否则新词学不到东西。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 2.3: 配置参数</strong></p>
+<ul>
+<li>设置 LoRA 的 <code>rank</code> (秩), <code>alpha</code>, <code>dropout</code> 等参数。</li>
+<li>如果是 <code>DoRA</code> 或 <code>OFT</code>，做相应的特殊配置。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 2.4: 挂载 (Get PEFT Model)</strong></p>
+<ul>
+<li><strong>核心动作:</strong> 调用 <code>peft</code> 库或者 <code>unsloth</code> / <code>ktransformers</code> 库，把 LoRA 模块“插”到模型里。</li>
+<li><strong>特殊处理:</strong><ul>
+<li>如果是 <strong>Unsloth</strong> (加速训练库)：调用 <code>get_unsloth_peft_model</code>。</li>
+<li>如果是 <strong>KTransformers</strong>：调用 <code>get_kt_peft_model</code>。</li>
+<li>如果是 <strong>PiSSA</strong> (一种特殊的初始化)：使用 PiSSA 算法初始化权重。</li>
+<li><strong>普通情况:</strong> 调用标准的 <code>get_peft_model</code>。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>[收尾] 再次确认精度</strong></p>
+<ul>
+<li>最后再检查一遍，把所有需要训练的参数（LoRA A/B 矩阵等）确保转成了 <code>float32</code>（如果之前要求了的话）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结</h3>
+<p>这篇代码其实就是一个<strong>精细化的“开关管理器”</strong>：</p>
+<ol>
+<li><strong>Full Tuning:</strong> 打开所有开关。</li>
+<li><strong>Freeze Tuning:</strong> 关掉大部分开关，只开最后几个。</li>
+<li><strong>LoRA Tuning:</strong><ul>
+<li>保持原模型开关全关。</li>
+<li>在旁边外接一个小电路（Adapter）。</li>
+<li>只打开这个小电路的开关。</li>
+<li>还要负责处理这个小电路的安装、旧电路的合并以及兼容各种加速插件（Unsloth/DeepSpeed）。</li>
+</ul>
+</li>
+</ol>

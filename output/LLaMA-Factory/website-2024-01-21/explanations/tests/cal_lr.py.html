@@ -1,0 +1,73 @@
+<h1>tests/cal_lr.py</h1>
+<p>没问题，这个脚本乍一看全是代码，其实它的核心逻辑非常简单，就是为了解决一个终极问题：<strong>“我微调模型的时候，学习率（Learning Rate）到底该设多少？”</strong></p>
+<p>通常我们是靠猜或者凭经验，但这个脚本试图用<strong>数学公式</strong>和<strong>统计数据</strong>来给出一个科学的建议。</p>
+<p>为了让你更容易理解，我把这个脚本的逻辑拆解成一个 <strong>“待办事项清单 (To-Do List)”</strong>，我们一步步来完成这个任务，顺便解释其中的核心观点。</p>
+<hr />
+<h3>📋 任务清单：寻找最佳学习率</h3>
+<h4>✅ Task 1: 准备工作 —— 搞清楚“我们在训练什么”</h4>
+<p><strong>代码对应部分：</strong> <code>get_train_args</code>, <code>load_model_and_tokenizer</code>, <code>get_dataset</code>
+<strong>解释：</strong>
+在你开始计算之前，脚本需要知道你的训练环境。
+*   <strong>观点 1：配置决定一切。</strong> 你用的模型（比如 LLaMA 还是 Mistral）、你的显存能塞下多大的 Batch Size、你设定的最大序列长度（Cutoff Len），这些都是计算的基础。
+*   <strong>操作：</strong> 脚本加载了你的配置文件、Tokenizer（分词器）和数据集。</p>
+<h4>✅ Task 2: 扫描数据 —— 并不是所有文字都有用</h4>
+<p><strong>代码对应部分：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">valid_tokens</span><span class="p">,</span> <span class="n">total_tokens</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span>
+<span class="k">for</span> <span class="n">batch</span> <span class="ow">in</span> <span class="n">tqdm</span><span class="p">(</span><span class="n">dataloader</span><span class="p">):</span>
+    <span class="n">valid_tokens</span> <span class="o">+=</span> <span class="n">torch</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">batch</span><span class="p">[</span><span class="s2">&quot;labels&quot;</span><span class="p">]</span> <span class="o">!=</span> <span class="n">IGNORE_INDEX</span><span class="p">)</span><span class="o">.</span><span class="n">item</span><span class="p">()</span>
+    <span class="n">total_tokens</span> <span class="o">+=</span> <span class="n">torch</span><span class="o">.</span><span class="n">numel</span><span class="p">(</span><span class="n">batch</span><span class="p">[</span><span class="s2">&quot;labels&quot;</span><span class="p">])</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+这是脚本里最耗时的一步。它会把你的训练数据遍历一遍。
+*   <strong>观点 2：“有效 token” 才是关键。</strong>
+    *   在微调（SFT）时，我们通常只计算模型“回答”部分的 Loss，而不计算“提问”部分的 Loss。
+    *   而且，如果句子太短，后面会补很多“填充物”（Padding）。
+    *   这些“提问”和“填充物”在代码里被标记为 <code>IGNORE_INDEX</code>（比如 -100）。
+    *   <strong>核心逻辑：</strong> 只有真正参与计算 Loss 的 token（有效 token）才应该影响学习率的计算。这个步骤就是在统计：你的数据里，到底有多少是干货，多少是水分。</p>
+<h4>✅ Task 3: 计算“真实”的 Batch Size</h4>
+<p><strong>代码对应部分：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">batch_max_len</span> <span class="o">=</span> <span class="n">cutoff_len</span> <span class="o">*</span> <span class="n">batch_size</span>
+<span class="n">valid_ratio</span> <span class="o">=</span> <span class="n">valid_tokens</span> <span class="o">/</span> <span class="n">total_tokens</span>
+<span class="n">batch_valid_len</span> <span class="o">=</span> <span class="n">batch_max_len</span> <span class="o">*</span> <span class="n">valid_ratio</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+*   <strong>观点 3：名义 Batch Size ≠ 真实 Batch Size。</strong>
+    *   假设你设定的 Batch Size 是 16，最大长度是 1024。理论上你一次塞给了模型 <code>16 * 1024</code> 个 token。
+    *   但在 Task 2 中我们发现，假设只有 50% 是有效 token（<code>valid_ratio</code> = 0.5）。
+    *   那么你<strong>真实</strong>的、有效的 Batch Size 其实只有 <code>16 * 1024 * 0.5</code>。这个数值叫 <code>batch_valid_len</code>。</p>
+<h4>✅ Task 4: 套用“缩放定律”公式 —— 魔法发生的地方</h4>
+<p><strong>代码对应部分：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">BASE_LR</span> <span class="o">=</span> <span class="mf">3e-4</span>
+<span class="n">BASE_BS</span> <span class="o">=</span> <span class="mi">4_000_000</span>
+<span class="n">lr</span> <span class="o">=</span> <span class="n">BASE_LR</span> <span class="o">*</span> <span class="n">math</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="n">batch_valid_len</span> <span class="o">/</span> <span class="n">BASE_BS</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+这是全篇最核心的观点，源自 LLaMA 的论文和深度学习的 Scaling Law。
+*   <strong>观点 4：学习率应该随 Batch Size 的平方根缩放。</strong>
+    *   <code>BASE_BS = 4,000,000</code>：LLaMA 论文里训练时的基准 Batch Size 是 400万个 token。
+    *   <code>BASE_LR = 3e-4</code>：LLaMA 在那个基准下的学习率是 0.0003。
+    *   <strong>公式逻辑：</strong> 如果你的有效数据量（Task 3 算出来的）比 400万小，你的学习率就应该相应变小。
+    *   <strong>为什么是平方根 (<code>sqrt</code>)？</strong> 这是一个经验法则。Batch Size 变大，梯度的噪声变小，我们可以步子迈大一点（提高学习率），但不是线性提高，而是按平方根比例提高。</p>
+<h4>✅ Task 5: 特殊模型特殊处理 (Mistral)</h4>
+<p><strong>代码对应部分：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">lr</span> <span class="o">=</span> <span class="n">lr</span> <span class="o">/</span> <span class="mf">6.0</span> <span class="k">if</span> <span class="n">is_mistral</span> <span class="k">else</span> <span class="n">lr</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+*   <strong>观点 5：不同架构的模型“脾气”不同。</strong>
+    *   Mistral 这种模型被发现对学习率非常敏感。如果用 LLaMA 的标准去训练它，它可能会“学崩了”（Loss 不下降甚至爆炸）。
+    *   所以，如果是 Mistral 模型，作者简单粗暴地把算出来的结果除以 6，让步子迈得更小一点，更稳一点。</p>
+<hr />
+<h3>📝 总结</h3>
+<p>这个脚本其实就干了一件事：</p>
+<blockquote>
+<p><strong>通过统计你的数据里有多少“干货”（去除填充和提问），计算出真实的训练吞吐量，然后利用 LLaMA 论文里的“平方根缩放定律”，帮你算出一个科学的初始学习率，而不是让你瞎猜。</strong></p>
+</blockquote>
+<p><strong>最终输出：</strong>
+它会告诉你：
+1.  <strong>Valid Ratio</strong>: 你的数据里有多少是有效的（比如 45%）。
+2.  <strong>Effective Batch Size</strong>: 你每一步真正训练了多少 token。
+3.  <strong>Optimal Learning Rate</strong>: 建议你设置的学习率是多少（比如 2e-5）。</p>
