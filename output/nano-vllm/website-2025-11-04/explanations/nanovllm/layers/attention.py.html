@@ -1,0 +1,103 @@
+<h1>nanovllm/layers/attention.py</h1>
+<p>这份代码确实涉及了很多大模型推理（Inference）底层的优化技术，包括 <strong>Triton 并行编程</strong>、<strong>显存管理（KV Cache）</strong> 以及 <strong>Flash Attention</strong> 的调用。看不懂是很正常的，因为它假设你已经懂了 PagedAttention 的原理。</p>
+<p>为了让你能够消化这段代码，我为你制定了一个 <strong>“学习任务清单” (To-Do List)</strong>。我们将代码拆解为 4 个任务，一步步攻克。</p>
+<hr />
+<h3>📝 学习任务清单 (To-Do List)</h3>
+<ul>
+<li><strong>Task 1：理解背景</strong> —— 这段代码到底是干嘛的？（核心概念：KV Cache）</li>
+<li><strong>Task 2：搬运工</strong> —— 看懂 <code>store_kvcache_kernel</code> （如何把数据存入显存？）</li>
+<li><strong>Task 3：调度员</strong> —— 看懂 <code>Attention</code> 类的初始化与输入。</li>
+<li><strong>Task 4：两条路</strong> —— 看懂 <code>forward</code> 函数中的 <code>Prefill</code> 和 <code>Decode</code> 逻辑。</li>
+</ul>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>✅ Task 1：理解背景</h4>
+<p>首先，你要知道这段代码是用在 <strong>LLM 推理（生成文本）</strong> 阶段的，而不是训练阶段。</p>
+<p>在生成文本时，模型每生成一个字，都需要回头看之前所有的字。为了不重复计算之前字的 Key 和 Value 矩阵，我们需要把它们存起来，这就是 <strong>KV Cache</strong>。</p>
+<ul>
+<li><strong>难点在于</strong>：显存是有限的，不能乱存。现代推理引擎（如 vLLM）使用“分页内存管理”技术，把 KV Cache 分成一块一块的（Block），而不是连续的一大条。</li>
+<li><strong>本文件的作用</strong>：实现一个 Attention 层，它不仅负责计算注意力，还负责把新算出来的 K 和 V <strong>精准地填入</strong> 到显存中那些零散的空位（Slot）里。</li>
+</ul>
+<hr />
+<h4>✅ Task 2：搬运工 (<code>store_kvcache_kernel</code>)</h4>
+<p>代码的前半部分是一个 <strong>Triton Kernel</strong>。Triton 是一种跑在 GPU 上的语言，比 CUDA 写起来简单。</p>
+<p><strong>代码片段：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@triton</span><span class="o">.</span><span class="n">jit</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">store_kvcache_kernel</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="c1"># ... 省略细节 ...</span>
+    <span class="n">slot</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">slot_mapping_ptr</span> <span class="o">+</span> <span class="n">idx</span><span class="p">)</span> <span class="c1"># 1. 拿到“停车位”号码</span>
+    <span class="k">if</span> <span class="n">slot</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">:</span> <span class="k">return</span>
+    <span class="c1"># ...</span>
+    <span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">k_cache_ptr</span> <span class="o">+</span> <span class="n">cache_offsets</span><span class="p">,</span> <span class="n">key</span><span class="p">)</span> <span class="c1"># 2. 把 Key 存进去</span>
+    <span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">v_cache_ptr</span> <span class="o">+</span> <span class="n">cache_offsets</span><span class="p">,</span> <span class="n">value</span><span class="p">)</span> <span class="c1"># 3. 把 Value 存进去</span>
+</code></pre></div>
+
+<p><strong>通俗解释：</strong>
+想象 KV Cache 是一个巨大的<strong>停车场</strong>，里面的车位（显存地址）是打散的。
+这个函数就是一个<strong>泊车小弟</strong>：
+1.  <strong>输入</strong>：当前新算出来的 <code>key</code> 和 <code>value</code>（新车），以及 <code>slot_mapping</code>（停车票，上面写着这辆车该停在第几号车位）。
+2.  <strong>动作</strong>：
+    *   它查看 <code>slot_mapping</code>，找到对应的物理地址（<code>slot</code>）。
+    *   把 <code>key</code> 和 <code>value</code> 数据搬运到那个物理地址去。
+3.  <strong>目的</strong>：为后续的 Attention 计算准备好数据。</p>
+<p><code>store_kvcache</code> 普通函数只是用来启动这个 GPU Kernel 的“发令枪”。</p>
+<hr />
+<h4>✅ Task 3：调度员 (<code>Attention</code> 类)</h4>
+<p>接下来是 PyTorch 的类定义。</p>
+<p><strong>代码片段：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">Attention</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+        <span class="c1"># ... 初始化参数 ...</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">k_cache</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">v_cache</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([])</span> <span class="c1"># 初始化为空</span>
+</code></pre></div>
+
+<p><strong>通俗解释：</strong>
+*   这里定义了注意力层的基本属性（头数、维度等）。
+*   注意 <code>self.k_cache</code> 和 <code>self.v_cache</code> 初始化为空，但在实际运行时，推理引擎的外部管理器（Context）会把巨大的显存池赋值给它们。</p>
+<hr />
+<h4>✅ Task 4：两条路 (<code>forward</code> 函数)</h4>
+<p>这是最核心的部分。LLM 推理分为两个截然不同的阶段，代码里用 <code>if/else</code> 分开了。</p>
+<p><strong>代码片段：</strong></p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">q</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">k</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">v</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
+        <span class="n">context</span> <span class="o">=</span> <span class="n">get_context</span><span class="p">()</span> <span class="c1"># 获取全局上下文（包含显存表、当前状态等）</span>
+
+        <span class="c1"># 1. 存数据</span>
+        <span class="k">if</span> <span class="n">k_cache</span><span class="o">.</span><span class="n">numel</span><span class="p">()</span> <span class="ow">and</span> <span class="n">v_cache</span><span class="o">.</span><span class="n">numel</span><span class="p">():</span>
+            <span class="n">store_kvcache</span><span class="p">(</span><span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">k_cache</span><span class="p">,</span> <span class="n">v_cache</span><span class="p">,</span> <span class="n">context</span><span class="o">.</span><span class="n">slot_mapping</span><span class="p">)</span>
+
+        <span class="c1"># 2. 算 Attention</span>
+        <span class="k">if</span> <span class="n">context</span><span class="o">.</span><span class="n">is_prefill</span><span class="p">:</span>
+            <span class="c1"># 路 A：Prefill (预填充/处理提示词)</span>
+            <span class="c1"># ...</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="c1"># 路 B：Decode (解码/逐字生成)</span>
+            <span class="c1"># ...</span>
+</code></pre></div>
+
+<p>让我们详细拆解这两条路：</p>
+<p><strong>路 A：Prefill 阶段 (<code>context.is_prefill</code> 为真)</strong>
+*   <strong>场景</strong>：用户刚发过来一段话（Prompt），比如 "你好，请介绍一下你自己"。
+*   <strong>特点</strong>：一次性处理很多个 Token，并行计算量大。
+*   <strong>逻辑</strong>：
+    *   <code>if context.block_tables is not None</code>: 如果启用了 Prefix Cache（比如多轮对话中复用之前的历史），直接从 Cache 里拿 K/V。
+    *   调用 <code>flash_attn_varlen_func</code>：这是 Flash Attention 的函数，专门处理变长序列。它一次性算出 Prompt 中所有 token 的注意力结果。</p>
+<p><strong>路 B：Decode 阶段 (<code>else</code> 分支)</strong>
+*   <strong>场景</strong>：模型已经读完了 Prompt，开始一个字一个字地往外蹦（生成）。
+*   <strong>特点</strong>：每次只处理 1 个 Token（当前的 Query），但需要和之前所有存下的 KV Cache 做交互。
+*   <strong>逻辑</strong>：
+    *   调用 <code>flash_attn_with_kvcache</code>：这是专门为解码优化的函数。
+    *   它接收当前的 <code>q</code>（1个token）。
+    *   它接收巨大的 <code>k_cache</code>, <code>v_cache</code>（历史记忆）。
+    *   它接收 <code>block_table</code>（页表）：告诉 GPU，“历史记忆”分别散落在显存的哪些角落里，不用连续读取，直接去那些角落算。</p>
+<hr />
+<h3>💡 总结 (Big Picture)</h3>
+<p>这段代码做的事情就是一个高效的 <strong>“存”</strong> 和 <strong>“算”</strong>：</p>
+<ol>
+<li><strong>存 (<code>store_kvcache</code>)</strong>：利用 Triton Kernel，根据页表（Slot Mapping），把当前计算出的 K/V 碎片化地塞进显存的空隙里。</li>
+<li><strong>算 (<code>forward</code>)</strong>：<ul>
+<li>如果是刚开始（Prefill），就用针对长序列并行的 Flash Attention 算。</li>
+<li>如果是正在生成（Decode），就用针对 KV Cache 优化的 Flash Attention 算，利用页表（Block Table）去读取分散的历史记忆。</li>
+</ul>
+</li>
+</ol>
+<p>这就是现代大模型推理引擎（如 vLLM, SGLang, NanoVLLM）底层的核心逻辑：<strong>PagedAttention</strong> 的实现方式。</p>

@@ -1,0 +1,87 @@
+<h1>nanovllm/engine/block_manager.py</h1>
+<p>这份代码确实涉及了大模型推理中最核心、但也最抽象的内存管理部分。简单来说，它在实现类似 <strong>vLLM</strong> 中的 <strong>PagedAttention</strong> 和 <strong>Prefix Caching（前缀缓存）</strong> 机制。</p>
+<p>为了让你彻底搞懂，我把阅读这份代码的任务拆解成一个 <strong>5步走的 TODO List</strong>。我们不直接读代码，而是通过解决5个具体问题来理解它。</p>
+<hr />
+<h3>🌟 核心背景：这是在干什么？</h3>
+<p>在大模型推理（生成文字）时，模型需要记住之前说过的话（这叫 <strong>KV Cache</strong>）。
+*   <strong>传统做法</strong>：给每个请求分配一大块连续的显存。这很浪费，因为你不知道在这个请求结束前会生成多少字。
+*   <strong>这份代码的做法</strong>：把显存切成很多小块（<strong>Block</strong>），像写书一样，写满一页（Block）再拿新的一页。而且，如果两本书的前言一样，它们可以<strong>共享</strong>同一页纸（缓存/共享内存）。</p>
+<hr />
+<h3>✅ Task 1: 理解基本单位 —— <code>Block</code> (页)</h3>
+<p><strong>目标</strong>：搞懂显存是怎么被切分的。</p>
+<p>看代码中的 <code>class Block</code>：
+*   <strong>概念</strong>：你可以把它想象成笔记本上的一张“活页纸”。
+*   <strong><code>block_id</code></strong>：页码（比如第5号物理内存块）。
+*   <strong><code>token_ids</code></strong>：这张纸上写了哪些字（Token）。代码里设定 <code>block_size=256</code>，也就是一张纸能写256个Token。
+*   <strong><code>ref_count</code> (引用计数)</strong>：这是最关键的！表示有多少个句子（Sequence）正在看这张纸。
+    *   如果 <code>ref_count &gt; 1</code>，说明多个请求共享了这段记忆（比如大家都问“你好”，这个Block就可以复用）。
+*   <strong><code>hash</code></strong>：这张纸内容的“指纹”。如果内容一样，指纹就一样。</p>
+<p><strong>小结</strong>：<code>Block</code> 就是一块存数据的物理内存单元，它知道自己被谁用了，存了什么内容。</p>
+<hr />
+<h3>✅ Task 2: 理解管理员 —— <code>BlockManager</code> (图书管理员)</h3>
+<p><strong>目标</strong>：搞懂谁在分配这些纸张。</p>
+<p>看 <code>class BlockManager</code> 的 <code>__init__</code>：
+*   它初始化了一堆白纸：<code>self.blocks</code>。
+*   它有两个本子记录状态：
+    *   <code>free_block_ids</code>：哪些页码是空的（没人在用）。
+    *   <code>used_block_ids</code>：哪些页码正在被使用。
+*   <code>hash_to_block_id</code>：<strong>这是缓存的核心</strong>。这是一个字典，记录 <code>指纹 -&gt; 页码</code> 的映射。
+    *   比如：指纹是12345的内容，存在第7号Block里。下次有人要写一样的内容，直接查这个字典，告诉他去读第7号Block，不用新写了。</p>
+<hr />
+<h3>✅ Task 3: 理解核心魔法 —— <code>compute_hash</code> (指纹生成)</h3>
+<p><strong>目标</strong>：搞懂如何判断两段内容是否一样。</p>
+<p>看开头的 <code>compute_hash</code> 函数：
+*   它用 <code>xxhash</code> 算法给一串 Token 计算一个数字指纹。
+*   <strong>关键点</strong>：它接受一个 <code>prefix</code> 参数。
+    *   当前的指纹 = <code>hash(前一个Block的指纹 + 当前Block的内容)</code>。
+    *   这就像区块链一样，当前页的哈希值包含了上一页的信息。这样能确保只有当<strong>整个前文</strong>都一样时，才能复用缓存。</p>
+<hr />
+<h3>✅ Task 4: 理解分配逻辑 —— <code>allocate</code> (开始写文章)</h3>
+<p><strong>目标</strong>：当一个新的请求（Sequence）进来时，怎么给它分配内存？</p>
+<p>看 <code>allocate</code> 方法，这是最复杂的逻辑，我们一步步拆：
+1.  <strong>遍历需要的块数</strong>：如果你的Prompt很长，需要好几个Block。
+2.  <strong>计算哈希</strong>：算出当前这部分内容的指纹 <code>h</code>。
+3.  <strong>查缓存 (<code>hash_to_block_id</code>)</strong>：
+    *   <strong>情况 A (Cache Miss)</strong>：以前没见过这段话。
+        *   从 <code>free_block_ids</code> 拿一张白纸（<code>_allocate_block</code>）。
+    *   <strong>情况 B (Cache Hit)</strong>：以前见过！而且内容完全匹配。
+        *   <strong>复用旧纸</strong>：直接把那个旧 Block 的 <code>ref_count + 1</code>。这样既省内存又不用重新计算。
+4.  <strong>记录</strong>：把分配到的 Block ID 记在 <code>seq.block_table</code>（这个句子的页码表）里。</p>
+<p><strong>人话翻译</strong>：</p>
+<blockquote>
+<p>"你要写这段话？我查查...哦，隔壁老王写过一模一样的，在第5页。那你直接引用第5页，不用新开一页了。"</p>
+</blockquote>
+<hr />
+<h3>✅ Task 5: 理解生成过程 —— <code>may_append</code> (续写)</h3>
+<p><strong>目标</strong>：模型每吐出一个新字，内存怎么变？</p>
+<p>看 <code>may_append</code> 方法，它在每个生成步骤后被调用：
+1.  <strong>刚好填满一页 (<code>% block_size == 0</code>)</strong>：
+    *   这一页写满了（256个字齐了）。
+    *   赶紧计算这一页的哈希值（指纹），并存入 <code>hash_to_block_id</code>。
+    *   <strong>目的</strong>：这页变成了“只读”的历史档案，以后别的请求如果开头一样，就可以复用这一页了。
+2.  <strong>刚开始写新的一页 (<code>% block_size == 1</code>)</strong>：
+    *   上一页满了，现在多出来一个字。
+    *   赶紧去 <code>free_block_ids</code> 拿一张新白纸，挂到 <code>block_table</code> 末尾。
+3.  <strong>正在页中间写</strong>：
+    *   不用管，直接往当前 Block 里塞数据就行（代码里没写这部分，因为那是计算层的事，这里只管内存块的分配）。</p>
+<hr />
+<h3>总结：这段代码的完整故事</h3>
+<ol>
+<li><strong>初始化</strong>：你有1000张空白的活页纸。</li>
+<li><strong>新请求来了</strong>：用户发来一段很长的 Prompt。</li>
+<li><strong>查重</strong>：系统把 Prompt 切成每段256字，计算指纹，看之前有没有人处理过相同的前缀。<ul>
+<li>如果有，直接复用旧纸张（引用计数+1）。</li>
+<li>如果没有，拿新纸张存下来，并记下指纹供未来复用。</li>
+</ul>
+</li>
+<li><strong>生成中</strong>：模型一个字一个字往后写。<ul>
+<li>写满一页，就封存这一页（计算哈希入库），申请下一页。</li>
+</ul>
+</li>
+<li><strong>结束</strong>：请求完成，调用 <code>deallocate</code>。<ul>
+<li>把用到的纸张引用计数-1。</li>
+<li>如果某张纸的引用计数变成0（没人看了），擦干净放回空白纸堆（<code>free_block_ids</code>）。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话总结</strong>：这是一个带有<strong>内容去重功能</strong>的<strong>分页内存管理器</strong>，专门用来让大模型推理更省显存、速度更快。</p>

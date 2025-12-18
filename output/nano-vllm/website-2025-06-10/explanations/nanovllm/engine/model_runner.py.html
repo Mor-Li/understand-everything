@@ -1,0 +1,107 @@
+<h1>nanovllm/engine/model_runner.py</h1>
+<p>这份代码确实涉及了很多大模型推理（Inference）的核心底层概念，特别是显存管理和性能优化。如果没接触过 <code>vLLM</code> 或 <code>PagedAttention</code> 这类技术，确实很难懂。</p>
+<p>我们可以把 <code>ModelRunner</code> 想象成一个 <strong>“后厨总管”</strong>。他的工作不是设计菜谱（那是模型训练的事），而是要在高并发的压力下，利用有限的灶台（GPU显存），最快地把客人的菜（生成的文本）做出来。</p>
+<p>下面我列一个 <strong>Task Todo List</strong>，帮你理清这位“总管”每天要干哪些活，然后逐一讲解。</p>
+<hr />
+<h3>📋 ModelRunner 的任务清单 (Task To-Do List)</h3>
+<ol>
+<li><strong>【入职准备】初始化与加载 (Init)</strong><ul>
+<li>穿好工作服（设置数据类型 dtype）。</li>
+<li>把锅碗瓢盆搬进厨房（加载模型权重到 GPU）。</li>
+</ul>
+</li>
+<li><strong>【划分领地】分配显存 (Allocate KV Cache)</strong><ul>
+<li>看看厨房还剩多少空间。</li>
+<li>提前把存放“半成品”（KV Cache）的格子画好，防止做菜时没地儿放。</li>
+</ul>
+</li>
+<li><strong>【准备食材】预处理输入数据 (Prepare Inputs)</strong><ul>
+<li><strong>情况 A：新订单 (Prefill)</strong> -&gt; 客人刚说完一大段话，需要一次性读完。</li>
+<li><strong>情况 B：续盘 (Decode)</strong> -&gt; 已经在生成了，每次只蹦出一个新词，需要接着上文做。</li>
+<li><em>关键动作：</em> 计算每个词应该放在显存的哪个格子里 (<code>slot_mapping</code>)。</li>
+</ul>
+</li>
+<li><strong>【开火烹饪】执行模型计算 (Run Model)</strong><ul>
+<li>把整理好的食材扔进模型里算。</li>
+<li><strong>特殊技能：</strong> 如果是小任务，使用“录像回放”模式（CUDA Graph）瞬间完成，省去指挥的时间。</li>
+</ul>
+</li>
+<li><strong>【摆盘上菜】采样 (Sample)</strong><ul>
+<li>根据算出来的概率，挑选出下一个字（Token）。</li>
+</ul>
+</li>
+<li><strong>【流程总控】主循环 (Run)</strong><ul>
+<li>把上面 3 -&gt; 4 -&gt; 5 串起来执行一遍。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🧐 逐步讲解 (Step-by-Step Explanation)</h3>
+<h4>1. 初始化 (<code>__init__</code>)</h4>
+<p>这是类的构造函数。
+*   <strong>动作</strong>：它加载了 <code>Qwen3</code> 模型，并把它搬到了 GPU 上。
+*   <strong>关键点</strong>：<code>self.capture_model()</code>。如果配置允许，它会“录制”模型运行的轨迹（后面会细讲这是为了加速）。</p>
+<h4>2. 分配显存 (<code>allocate_kv_cache</code>)</h4>
+<p>大模型生成文本时，需要记住之前说过的话，这叫 <strong>KV Cache</strong>。
+*   <strong>痛点</strong>：以前是生成一个词申请一点显存，容易产生碎片，也慢。
+*   <strong>解决方案 (PagedAttention 思想)</strong>：
+    1.  <code>get_gpu_memory()</code>：先看显卡还剩多少空闲内存。
+    2.  <code>config.num_kvcache_blocks</code>：算出这些内存能切成多少个固定大小的“块”（Block）。
+    3.  <code>self.kv_cache = torch.zeros(...)</code>：<strong>一次性</strong>把这些显存全占住，申请一个巨大的张量。
+    4.  然后把这个大张量的引用分发给模型的每一层 (<code>module.k_cache = ...</code>)。
+    *   <em>通俗理解：</em> 就像去图书馆占座，先把空位子全锁死，后面有新书来直接往格子里填，不用临时找座。</p>
+<h4>3. 准备数据 (<code>prepare_prefill</code> 和 <code>prepare_decode</code>)</h4>
+<p>这是最复杂的逻辑部分。模型不能直接吃“字符串”，它需要吃 Tensor。</p>
+<ul>
+<li>
+<p><strong><code>prepare_prefill</code> (预填充阶段)</strong>：</p>
+<ul>
+<li><strong>场景</strong>：用户刚发来一句 "你好，请帮我写首诗"。模型需要一次性处理这8个字。</li>
+<li><strong>核心逻辑</strong>：<ul>
+<li><code>input_ids</code>：把这8个字的ID拿出来。</li>
+<li><code>slot_mapping</code>：<strong>这是重点</strong>。计算这8个字产生的 KV Cache 应该存在刚才申请的大显存里的<strong>第几行第几列</strong>。因为显存是分块管理的（Paged），逻辑上连续的字，物理显存上可能不连续。</li>
+<li><code>set_context</code>：把这些位置信息存入全局上下文，让底层算子（Attention）知道去哪读写数据。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong><code>prepare_decode</code> (解码阶段)</strong>：</p>
+<ul>
+<li><strong>场景</strong>：诗已经写了“白日依山”，现在要生成“尽”。</li>
+<li><strong>核心逻辑</strong>：<ul>
+<li>输入不再是整句话，而只有<strong>上一个生成的字</strong>（比如“山”）。</li>
+<li><code>slot_mapping</code>：只计算这<strong>一个新字</strong>的 KV Cache 存哪。</li>
+<li>这比 prefill 轻量级很多。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>4. 这里的黑科技：CUDA Graph (<code>capture_model</code> &amp; <code>run_model</code>)</h4>
+<ul>
+<li><strong>问题</strong>：Python 是一种解释型语言，每执行一步 PyTorch 操作，CPU 都要给 GPU 发指令。在 <code>Decode</code> 阶段，每次只算 1 个 Token，计算量很小。这时候，<strong>CPU 发指令的时间可能比 GPU 算的时间还长</strong>。这叫 "CPU Overhead"。</li>
+<li><strong>解决 (<code>capture_model</code>)</strong>：<ul>
+<li><strong>录制</strong>：也就是代码最后的 <code>capture_model</code>。它预先针对不同的 Batch Size（比如 1, 2, 4, 8...），让 GPU 假装跑一次，把所有 GPU 指令“录像”存下来。</li>
+</ul>
+</li>
+<li><strong>回放 (<code>run_model</code>)</strong>：<ul>
+<li>如果是 <code>is_prefill</code>（任务重），就老老实实跑 PyTorch (<code>self.model(...)</code>)。</li>
+<li>如果是 <code>decode</code>（任务轻），就直接<strong>回放录像</strong> (<code>graph.replay()</code>)。</li>
+<li><code>reset_graph_vars</code> 和 <code>graph_vars</code>：回放前，只需要把新的输入数据（比如新的 token ID）填到录像预留的内存地址里，然后按一下“播放键”，结果瞬间就出来了。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 整合运行 (<code>run</code>)</h4>
+<p>这是外部调用的唯一接口。
+*   它判断当前是 <strong>Prefill</strong> 还是 <strong>Decode</strong>。
+*   调用对应的 <code>prepare_...</code> 函数整理数据。
+*   调用 <code>run_model</code> 算出 Logits（下一个词的概率分布）。
+*   调用 <code>sampler</code> 根据概率选出最终的 Token ID。
+*   最后 <code>reset_context</code> 清理现场。</p>
+<h3>总结</h3>
+<p>这段代码实现了一个<strong>高性能的大模型推理运行时</strong>。它主要做了三件大事：
+1.  <strong>显存池化管理</strong>：一次性申请大显存，避免碎片（<code>allocate_kv_cache</code>）。
+2.  <strong>分页内存映射</strong>：计算逻辑位置到物理显存的映射（<code>prepare_...</code> 中的 <code>slot_mapping</code>）。
+3.  <strong>图执行加速</strong>：用 CUDA Graph 消除 Python 带来的 CPU 延迟（<code>capture_model</code>）。</p>
+<p>你看懂这个，就基本看懂了 vLLM 这类现代推理引擎的核心逻辑。</p>

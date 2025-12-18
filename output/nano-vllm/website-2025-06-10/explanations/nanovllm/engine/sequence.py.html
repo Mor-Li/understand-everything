@@ -1,0 +1,73 @@
+<h1>nanovllm/engine/sequence.py</h1>
+<p>这份代码其实是一个 <strong>简化版的大语言模型（LLM）推理引擎的核心组件</strong>。看名字 <code>nanovllm</code>，它应该是在模仿著名的 <code>vLLM</code> 项目，主要目的是为了高效地管理显存（KV Cache）。</p>
+<p>你可以把 <code>Sequence</code> 这个类想象成 <strong>“在这个大模型餐厅里，服务员手里拿的一张点餐单”</strong>。</p>
+<p>为了让你彻底搞懂，我为你列了一个由浅入深的 <strong>学习任务清单 (To-Do List)</strong>，我们分 4 个阶段来拆解这段代码：</p>
+<hr />
+<h3>📋 任务清单：从“点餐单”到“内存分页”</h3>
+<h4>✅ Task 1: 理解“点餐单”的基本信息 (基础属性)</h4>
+<p><strong>目标：</strong> 看懂 <code>__init__</code> 和 <code>SequenceStatus</code>。
+<strong>概念：</strong> 每一个用户的提问，在系统里就是一个 <code>Sequence</code> 对象。</p>
+<ul>
+<li><strong>代码对应：</strong><ul>
+<li><code>token_ids</code>: 这就是客人点的菜（用户输入的 Prompt 文字被转换成了数字列表）。</li>
+<li><code>SamplingParams</code>: 客人的口味备注（比如 <code>temperature</code> 温度，决定了回答是更有创意还是更严谨）。</li>
+<li><code>seq_id</code>: 订单号。<code>next(Sequence.counter)</code> 保证每个订单号都不重复。</li>
+<li><code>SequenceStatus</code>: 订单状态。<ul>
+<li><code>WAITING</code>: 在排队。</li>
+<li><code>RUNNING</code>: 厨师（GPU）正在炒菜（生成文字）。</li>
+<li><code>FINISHED</code>: 菜上齐了。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 模拟“上菜”的过程 (生成逻辑)</h4>
+<p><strong>目标：</strong> 看懂 <code>append_token</code> 和 <code>num_completion_tokens</code>。
+<strong>概念：</strong> LLM 是一个字一个字生成的，每生成一个字，都要记在这个单子上。</p>
+<ul>
+<li><strong>代码对应：</strong><ul>
+<li><code>append_token(self, token_id)</code>: 厨师炒好了一道菜（生成了一个新 token），服务员把它加到单子末尾。</li>
+<li><code>num_prompt_tokens</code>: 刚开始客人说了多少字（输入长度）。</li>
+<li><code>num_completion_tokens</code>: 厨师目前生成了多少字（总长度 - 输入长度）。</li>
+<li><code>last_token</code>: 刚刚生成的那个字是什么（用于预测下一个字）。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 这里的核心难点——“分页记账法” (内存管理)</h4>
+<p><strong>目标：</strong> 看懂 <code>block</code>, <code>num_blocks</code>, <code>256</code> 这个数字。
+<strong>概念：</strong> 这是这段代码最硬核的地方。
+在大模型里，记住上下文（KV Cache）非常占显存。如果给每个订单分配一大块连续的内存，很浪费。
+于是，这个引擎采用了 <strong>“分页（PagedAttention）”</strong> 的思想。就像写作业，不是给你一卷无限长的卷纸，而是给你一本 <strong>活页本</strong>，每页纸能写 256 个字。</p>
+<ul>
+<li><strong>代码对应：</strong><ul>
+<li><code>block_size=256</code>: 规定每一页（Block）只能存 256 个 token 的数据。</li>
+<li><code>num_blocks</code>: 算出当前这个订单写满了几页纸。<ul>
+<li>公式 <code>(len + 255) // 256</code> 是典型的向上取整算法。比如你有 257 个字，就需要 2 页。</li>
+</ul>
+</li>
+<li><code>block(i)</code>: 获取第 <code>i</code> 页上的所有内容。</li>
+<li><code>last_block()</code>: 获取“当前正在写的这一页”的内容。</li>
+<li><code>block_table</code>: (在 <code>__init__</code> 里初始化为空列表) 这就是那个“活页夹”，用来记录这个订单用到了哪些物理内存块（页码）。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 缓存优化 (性能加速)</h4>
+<p><strong>目标：</strong> 看懂 <code>num_cached_tokens</code>。
+<strong>概念：</strong> 为了不重复计算，我们需要知道哪些字已经被处理过并存入显存了。</p>
+<ul>
+<li><strong>代码对应：</strong><ul>
+<li><code>num_cached_tokens</code>: 记录有多少个 token 的计算结果已经被“缓存”在显存里了。</li>
+<li><code>assert num_cached_tokens % 256 == 0</code>: 这里有个强制要求，缓存必须是“按整页”来的。也就是说，我们要么不存，要存就存满一页（256个）。这通常是为了对齐内存，提高读取速度。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结：这段代码到底在干啥？</h3>
+<p>如果把这个 <code>nanovllm</code> 比作一个 <strong>操作系统</strong>：</p>
+<ol>
+<li><strong>Sequence 类</strong> 就是一个 <strong>进程 (Process)</strong>。</li>
+<li><strong>token_ids</strong> 是这个进程的数据。</li>
+<li><strong>block (256)</strong> 是 <strong>内存分页 (Paging)</strong>。它不要求显存是连续的，而是把它切成一块块 256 大小的碎片来管理，这样能塞进更多的请求，防止显存碎片化。</li>
+</ol>
+<p><strong>一句话概括：</strong>
+这是一个<strong>支持分页内存管理</strong>的用户请求包装类，它不仅记录了用户说了啥、AI生成了啥，还负责计算“我需要申请几块显存页”来存放这些数据。</p>

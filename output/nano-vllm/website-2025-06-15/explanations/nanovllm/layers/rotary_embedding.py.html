@@ -1,0 +1,143 @@
+<h1>nanovllm/layers/rotary_embedding.py</h1>
+<p>这份代码实现的是大模型（LLM）中非常核心的<strong>RoPE（旋转位置编码）</strong>。如果直接看代码和公式确实很晕。</p>
+<p>我们可以把它想象成你在指挥一支仪仗队。每个词（Token）就是一个士兵。为了让士兵知道自己站在第几排，我们不是直接告诉他“你是第5个”，而是给他一个<strong>旋转的角度</strong>。</p>
+<p>下面我列一个 <strong>学习 To-Do List</strong>，把代码拆解成 4 个任务，带你一步步看懂。</p>
+<hr />
+<h3>📋 学习任务清单 (To-Do List)</h3>
+<ul>
+<li>[ ] <strong>Task 1: 理解核心概念</strong> —— 为什么要“切两半”和“旋转”？</li>
+<li>[ ] <strong>Task 2: 搞定准备工作 (<code>__init__</code>)</strong> —— 提前算好所有可能用到的“角度表”。</li>
+<li>[ ] <strong>Task 3: 定义旋转动作 (<code>apply_rotary_emb</code>)</strong> —— 具体怎么对向量进行旋转？</li>
+<li>[ ] <strong>Task 4: 实际执行流程 (<code>forward</code>)</strong> —— 来了新数据，怎么查表并旋转？</li>
+</ul>
+<hr />
+<h3>✅ Task 1: 理解核心概念</h3>
+<p>在看代码前，先建立一个直觉：
+RoPE 的核心思想是：<strong>通过旋转向量的角度来表示位置。</strong></p>
+<p>想象一个二维平面（X轴，Y轴）。
+*   第 0 个词，不转（0度）。
+*   第 1 个词，转 10 度。
+*   第 2 个词，转 20 度。</p>
+<p>代码里你会看到 <code>x1</code> 和 <code>x2</code>，这是因为<strong>旋转是在二维平面上进行的</strong>。所以我们需要把一个长的向量（比如 64 维），两两配对，切成 32 对，每一对都在自己的平面上转圈圈。</p>
+<hr />
+<h3>✅ Task 2: 搞定准备工作 (<code>__init__</code>)</h3>
+<p><strong>代码位置：</strong> <code>class RotaryEmbedding</code> -&gt; <code>def __init__</code></p>
+<p>既然每个位置对应的角度是固定的，我们没必要每次都在运行的时候算，不如<strong>提前算好一张表，存起来查表用</strong>。这就是 <code>__init__</code> 做的事。</p>
+<p><strong>步骤解析：</strong></p>
+<ol>
+<li>
+<p><strong>计算频率 (<code>inv_freq</code>)</strong>:
+    <code>python
+    inv_freq = 1.0 / (base**(torch.arange(0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim))</code></p>
+<ul>
+<li>这行看着很复杂，其实是在计算“旋转的速度”。</li>
+<li>向量的不同维度，旋转速度不一样（有的转得快，有的转得慢）。这保证了不同位置的区分度。</li>
+</ul>
+</li>
+<li>
+<p><strong>生成位置索引 (<code>t</code>)</strong>:
+    <code>python
+    t = torch.arange(self.max_position_embeddings, dtype=torch.float)</code></p>
+<ul>
+<li>这就是生成一个序列：<code>[0, 1, 2, ..., 2047]</code>（假设最大长度是2048）。代表第几个词。</li>
+</ul>
+</li>
+<li>
+<p><strong>计算角度表 (<code>freqs</code>)</strong>:
+    <code>python
+    freqs = torch.einsum("i,j -&gt; ij", t, inv_freq)</code></p>
+<ul>
+<li>这是个矩阵乘法。它计算出了 <strong>“第 i 个位置，在第 j 个维度，应该转多少角度”</strong>。</li>
+</ul>
+</li>
+<li>
+<p><strong>把角度变成 Cos 和 Sin (<code>cache</code>)</strong>:
+    <code>python
+    cos = freqs.cos()
+    sin = freqs.sin()
+    cache = torch.cat((cos, sin), dim=-1)
+    self.register_buffer("cos_sin_cache", cache, persistent=False)</code></p>
+<ul>
+<li>计算机旋转不用角度，用三角函数。所以把角度算成 <code>cos</code> 和 <code>sin</code>。</li>
+<li><strong>关键点</strong>：它把结果存进了 <code>cos_sin_cache</code>。这就是我们的<strong>“作弊小抄表”</strong>。以后只要告诉它是第几个位置，直接从这里取数就行，不用再算了。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 3: 定义旋转动作 (<code>apply_rotary_emb</code>)</h3>
+<p><strong>代码位置：</strong> 文件最上方的函数 <code>def apply_rotary_emb(...)</code></p>
+<p>拿着上面算好的 <code>cos</code> 和 <code>sin</code>，具体怎么把一个向量 <code>x</code> 转一下呢？这里用的是高中数学里的<strong>复数旋转公式</strong>（或者叫二维旋转矩阵）。</p>
+<p>公式原理：$(x + iy) * (cos + isin) = (x \cdot cos - y \cdot sin) + i(x \cdot sin + y \cdot cos)$</p>
+<p><strong>代码解析：</strong></p>
+<ol>
+<li>
+<p><strong>切分向量 (<code>chunk</code>)</strong>:
+    <code>python
+    x1, x2 = torch.chunk(x.to(torch.float32), 2, dim=-1)</code></p>
+<ul>
+<li>把输入向量劈成两半。比如向量是 <code>[a, b]</code>，切成 <code>x1=[a]</code>, <code>x2=[b]</code>。这就是 Task 1 说的“两两配对”的逻辑实现。</li>
+</ul>
+</li>
+<li>
+<p><strong>执行旋转公式</strong>:
+    <code>python
+    y1 = x1 * cos - x2 * sin
+    y2 = x2 * cos + x1 * sin</code></p>
+<ul>
+<li>这就是上面那个数学公式的代码版。</li>
+<li><code>y1</code> 是旋转后的前半部分。</li>
+<li><code>y2</code> 是旋转后的后半部分。</li>
+</ul>
+</li>
+<li>
+<p><strong>拼回去 (<code>cat</code>)</strong>:
+    <code>python
+    return torch.cat((y1, y2), dim=-1).to(x.dtype)</code></p>
+<ul>
+<li>把转好的两半拼回一个完整的向量。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 4: 实际执行流程 (<code>forward</code>)</h3>
+<p><strong>代码位置：</strong> <code>class RotaryEmbedding</code> -&gt; <code>def forward</code></p>
+<p>现在模型正在运行（推理或训练），来了具体的输入 <code>query</code> 和 <code>key</code>，以及它们对应的位置 <code>positions</code>。</p>
+<p><strong>步骤解析：</strong></p>
+<ol>
+<li>
+<p><strong>查表 (<code>Look up</code>)</strong>:
+    <code>python
+    cos_sin = self.cos_sin_cache[positions]
+    cos, sin = cos_sin.chunk(2, dim=-1)</code></p>
+<ul>
+<li>拿着当前这些词的 <code>positions</code>（比如第5个词），去 Task 2 准备好的 <code>cos_sin_cache</code> 里把对应的数值取出来。</li>
+<li>把取出来的缓存拆回 <code>cos</code> 和 <code>sin</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>调整形状 (<code>view</code>)</strong>:
+    <code>python
+    query = query.view(num_tokens, -1, self.head_size)</code></p>
+<ul>
+<li>把数据整形成方便计算的样子。</li>
+</ul>
+</li>
+<li>
+<p><strong>开始旋转 (<code>apply</code>)</strong>:
+    <code>python
+    query = apply_rotary_emb(query, cos, sin).view(query_shape)
+    key = apply_rotary_emb(key, cos, sin).view(key_shape)</code></p>
+<ul>
+<li><strong>这是最关键的一步</strong>。调用 Task 3 写的函数。</li>
+<li><strong>注意</strong>：RoPE 只旋转 <code>Query</code> 和 <code>Key</code>，<strong>不旋转 Value</strong>。这是因为注意力机制（Attention）是靠 Q 和 K 的点积来计算相似度的，旋转就是为了影响这个点积结果，注入位置信息。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结</h3>
+<p>这整个文件的逻辑就是：</p>
+<ol>
+<li><strong><code>__init__</code></strong>: 我先造一张巨大的表，记录下所有位置对应的旋转参数（Cos/Sin）。</li>
+<li><strong><code>apply_rotary_emb</code></strong>: 我定义一个数学计算器，只要给我向量和参数，我就能算出旋转后的向量。</li>
+<li><strong><code>forward</code></strong>: 每次来数据，我根据数据的位置去<strong>查表</strong>，然后丢给<strong>计算器</strong>，最后把转好的 Q 和 K 还给你。</li>
+</ol>

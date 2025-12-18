@@ -1,0 +1,116 @@
+<h1>nanovllm/utils/loader.py</h1>
+<p>这段代码确实看起来有点绕，因为它涉及到了<strong>深度学习模型加载</strong>中比较底层的逻辑，特别是针对像 LLaMA 这样的大模型，经常需要处理“分片权重”（Sharding）和“合并权重”（Packed Modules）的情况。</p>
+<p>为了让你彻底搞懂，我们把这段代码想象成一个<strong>“搬家公司”</strong>的各种操作规范。</p>
+<p>我们将任务拆解为 <strong>5 个 Todo List</strong>，由浅入深地讲解：</p>
+<hr />
+<h3>Todo 1: 理解基础概念（搬家前的准备）</h3>
+<p>在看代码前，你需要先建立两个概念：</p>
+<ol>
+<li><strong><code>model</code> (骨架)</strong>: 这是你在代码里定义好的网络结构（比如 <code>Linear</code> 层、<code>Attention</code> 层）。它就像一个刚盖好的空房子，有房间（Layer），但里面是空的，全是随机数。</li>
+<li><strong><code>path/*.safetensors</code> (家具/物资)</strong>: 这是硬盘上的文件，里面存着训练好的参数（权重矩阵）。<code>safetensors</code> 是一种比 PyTorch <code>.bin</code> 更快更安全的文件格式。</li>
+</ol>
+<p><strong>代码的目标</strong>：把硬盘里的“家具”（权重数值），精准地搬进空房子（模型）的对应位置。</p>
+<h3>Todo 2: 遍历文件（寻找物资箱）</h3>
+<p>代码的第一步是找到所有的权重文件。大模型通常很大，一个文件存不下，所以会切分成很多个 <code>.safetensors</code> 文件。</p>
+<ul>
+<li><strong>对应代码：</strong>
+    <code>python
+    for file in glob(os.path.join(path, "*.safetensors")):
+        with safe_open(file, "pt", "cpu") as f:
+            # ...</code></li>
+<li><strong>解读：</strong><ol>
+<li>去指定的 <code>path</code> 文件夹下，找到所有后缀是 <code>.safetensors</code> 的文件。</li>
+<li>用 <code>safe_open</code> 打开这些文件（就像打开搬家公司的箱子），准备读取里面的数据。</li>
+</ol>
+</li>
+</ul>
+<h3>Todo 3: 简单搬运（普通权重的加载）</h3>
+<p>这是最常见的情况：箱子里的标签叫“A”，房子里也有个位置叫“A”，直接放进去就行。</p>
+<ul>
+<li><strong>对应代码（关注 <code>else</code> 部分）：</strong>
+    ```python
+    # ... (前面的 if 没匹配上，进入 else)
+    else:
+        # 1. 在模型里找到对应的参数对象
+        param = model.get_parameter(weight_name)<div class="codehilite"><pre><span></span><code><span class="c1"># 2. 看看这个参数有没有特殊的搬运技巧，没有就用默认的(default_weight_loader)</span>
+<span class="n">weight_loader</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">getattr</span><span class="p">(</span><span class="n">param</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;weight_loader&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">default_weight_loader</span><span class="p">)</span>
+
+<span class="c1"># 3. 把数据从文件里读出来，塞进参数里</span>
+<span class="n">weight_loader</span><span class="p">(</span><span class="n">param</span><span class="p">,</span><span class="w"> </span><span class="n">f</span><span class="o">.</span><span class="n">get_tensor</span><span class="p">(</span><span class="n">weight_name</span><span class="p">))</span>
+</code></pre></div>
+
+<p><code>``
+*   **解读：**
+*</code>f.keys()<code>拿到了文件里所有权重的名字（比如</code>layers.0.mlp.gate_proj.weight<code>）。
+*   如果这个名字很普通，代码就直接去模型里找这个参数 (</code>get_parameter<code>)。
+*   **关键点**：</code>default_weight_loader<code>函数的内容就是</code>param.data.copy_(loaded_weight)`，意思就是简单的“复制粘贴”。</p>
+</li>
+</ul>
+<h3>Todo 4: 复杂搬运（处理“打包”的权重）</h3>
+<p>这是代码里最难懂的部分（<code>if</code> 里面）。
+<strong>场景</strong>：有时候，硬盘里的权重是<strong>合并</strong>存储的，但模型里是<strong>分开</strong>定义的；或者反过来。
+最典型的例子是 <strong>QKV</strong>（Query, Key, Value）。在某些模型里，Q、K、V 是三个不同的层，但在权重文件里，它们被拼成了一个大矩阵存起来了。</p>
+<ul>
+<li><strong>对应代码：</strong>
+    ```python
+    packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
+    # ...
+    for k in packed_modules_mapping:
+        if k in weight_name:
+            # 找到匹配了！比如 weight_name 是 "qkv.weight"，k 也是 "qkv"
+            v, shard_id = packed_modules_mapping[k]<div class="codehilite"><pre><span></span><code><span class="w">    </span><span class="c1"># 换个名字找参数。比如把 &quot;qkv&quot; 替换成模型里真实的层名字</span>
+<span class="w">    </span><span class="n">param_name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">weight_name</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="n">k</span><span class="p">,</span><span class="w"> </span><span class="n">v</span><span class="p">)</span>
+<span class="w">    </span><span class="n">param</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">model</span><span class="o">.</span><span class="n">get_parameter</span><span class="p">(</span><span class="n">param_name</span><span class="p">)</span>
+
+<span class="w">    </span><span class="c1"># 获取专门的加载器</span>
+<span class="w">    </span><span class="n">weight_loader</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">getattr</span><span class="p">(</span><span class="n">param</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;weight_loader&quot;</span><span class="p">)</span>
+
+<span class="w">    </span><span class="c1"># 传入 shard_id (切片ID)，告诉加载器：只取这一大块肉里的哪一小部分</span>
+<span class="w">    </span><span class="n">weight_loader</span><span class="p">(</span><span class="n">param</span><span class="p">,</span><span class="w"> </span><span class="n">f</span><span class="o">.</span><span class="n">get_tensor</span><span class="p">(</span><span class="n">weight_name</span><span class="p">),</span><span class="w"> </span><span class="n">shard_id</span><span class="p">)</span>
+<span class="w">    </span><span class="k">break</span>
+</code></pre></div>
+
+<p><code>``
+*   **解读：**
+1.</code>packed_modules_mapping<code>: 这是一个“映射表”，告诉程序哪些权重是特殊的。
+2.</code>if k in weight_name<code>: 检查当前文件里的权重名，是不是包含特殊关键字（比如</code>qkv<code>）。
+3.</code>shard_id<code>: 这是核心。比如 QKV 拼在一起，Q 是第0部分，K 是第1部分，V 是第2部分。这里就是告诉加载器：“虽然文件里是一整块，但我现在只要第</code>shard_id<code>块”。
+4.</code>break<code>: 找到了特殊处理方式，处理完就跳出循环，不再执行下面的</code>else`（普通加载）了。</p>
+</li>
+</ul>
+<h3>Todo 5: 总结流程（全景图）</h3>
+<p>现在我们把整个逻辑串起来，这就是 <code>load_model</code> 做的事情：</p>
+<ol>
+<li><strong>准备</strong>：拿到模型和文件夹路径。</li>
+<li><strong>循环文件</strong>：打开每一个 <code>.safetensors</code> 权重包。</li>
+<li><strong>循环权重</strong>：看包里的每一个权重名字。</li>
+<li><strong>判断</strong>：<ul>
+<li><strong>情况 A (特殊)</strong>：名字里包含“打包标记”（如 QKV 合并）。<ul>
+<li>-&gt; 算出它对应模型里的哪个参数。</li>
+<li>-&gt; 调用该参数特有的 <code>weight_loader</code>，并传入 <code>shard_id</code>（切片ID），把大矩阵切开，只加载属于它的那部分。</li>
+</ul>
+</li>
+<li><strong>情况 B (普通)</strong>：名字很正常。<ul>
+<li>-&gt; 直接找到模型参数。</li>
+<li>-&gt; 把数据复制进去。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<h3>补充的小知识点</h3>
+<ul>
+<li><strong>Python 的 <code>for ... else</code></strong>:
+    代码里用到了这个冷门语法。
+    <code>python
+    for k in mapping:
+        if k in name:
+            ...
+            break # 如果找到了特殊映射，就跳出循环
+    else:
+        ... # 只有当循环完整跑完（没有被 break 打断）时，才执行这里。
+            # 意思是：遍历了所有特殊规则都没匹配上，那它就是个普通权重。</code></li>
+<li><strong><code>getattr</code></strong>:
+    <code>getattr(obj, "name", default)</code>。尝试获取对象的属性，如果没有，就返回默认值。这使得代码很灵活，如果参数没有自定义加载器，就用默认的复制粘贴。</li>
+</ul>
+<p>希望这个 List 能帮你理清思路！这段代码本质上就是一个<strong>兼容了“切片/合并”特殊情况的权重加载器</strong>。</p>

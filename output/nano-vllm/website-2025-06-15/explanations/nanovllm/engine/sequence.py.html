@@ -1,0 +1,81 @@
+<h1>nanovllm/engine/sequence.py</h1>
+<p>这份代码确实涉及到了 LLM（大语言模型）推理引擎的核心概念，特别是模仿了 <strong>vLLM</strong> 这种高性能推理框架的设计。</p>
+<p>如果只看代码细节很容易晕，我们换个角度。想象你正在<strong>开发一个 ChatGPT 的后台系统</strong>。当用户发来一句话（比如“你好”），你需要建立一个<strong>任务单</strong>来追踪这个请求的全过程。</p>
+<p>这个 <code>Sequence</code> 类，就是这个<strong>任务单</strong>。</p>
+<p>为了让你看懂，我列一个<strong>“打造 LLM 任务管理器”的 To-Do List</strong>，我们将代码里的功能拆解到这 5 个具体的步骤中：</p>
+<hr />
+<h3>Task 1: 给每个任务发个“身份证”和“状态牌”</h3>
+<p>当成千上万个用户同时提问时，系统得知道谁是谁，以及他们处理到哪一步了。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>seq_id</code>, <code>counter</code>, <code>SequenceStatus</code></li>
+<li><strong>解读：</strong><ul>
+<li><code>SequenceStatus</code>: 这是一个枚举（Enum）。任务只有三种状态：排队中 (<code>WAITING</code>)、正在生成 (<code>RUNNING</code>)、写完了 (<code>FINISHED</code>)。</li>
+<li><code>counter</code>: 一个全局计数器。</li>
+<li><code>seq_id</code>: 每个任务独一无二的编号（ID）。</li>
+<li><strong>逻辑：</strong> 就像你去银行办业务，先取个号（ID），然后看屏幕显示你是“等待中”还是“办理中”。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 2: 区分“用户说的话”和“AI 刚生成的词”</h3>
+<p>LLM 的工作原理是：拿着用户的话，一个词一个词地往后续写。我们需要把这两部分分清楚。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>token_ids</code>, <code>num_prompt_tokens</code>, <code>num_completion_tokens</code></li>
+<li><strong>解读：</strong><ul>
+<li><code>token_ids</code>: 这是一个列表，存放所有的数字（Token）。<strong>注意：</strong> 电脑不看汉字，只看数字 ID。比如“你好”可能是 <code>[101, 203]</code>。</li>
+<li><code>num_prompt_tokens</code>: 用户提问的长度（Prompt）。比如用户说了 5 个词，这个值就是 5。</li>
+<li><code>completion_token_ids</code> (属性): AI 生成的部分。就是从第 5 个词往后的所有内容。</li>
+<li><strong>逻辑：</strong> 系统需要知道哪些是题目（Prompt），哪些是答案（Completion）。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 3: 让 AI 动起来（一个词一个词往外蹦）</h3>
+<p>AI 不是一下子把整段话吐出来的，而是像挤牙膏一样，一次挤一个词。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>append_token(self, token_id)</code></li>
+<li><strong>解读：</strong><ul>
+<li>每当模型算出一个新词（比如 token ID 是 <code>999</code>），就调用这个方法。</li>
+<li>它把 <code>999</code> 加到 <code>token_ids</code> 列表的末尾。</li>
+<li>更新 <code>num_tokens</code>（总长度 +1）。</li>
+<li><strong>逻辑：</strong> 这就是“生成”的动作。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 4: 【核心难点】像管理内存分页一样管理显存 (Blocks)</h3>
+<p>这是 <code>nanovllm</code> (以及 vLLM) 最精髓的地方。
+LLM 的显存（KV Cache）非常昂贵。如果给每个任务预留一大块连续内存，非常浪费。
+<strong>解决方案：</strong> 把显存切成一块块小碎片（Block），就像笔记本的一页纸。写满一页，再拿一张新纸，不需要连续。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>block_size = 256</code>, <code>block_table</code>, <code>num_blocks</code></li>
+<li><strong>解读：</strong><ul>
+<li><code>block_size = 256</code>: 规定每一块（页）能存 256 个词的数据。</li>
+<li><code>num_blocks</code>: 算出当前这句话占用了几页纸。公式是 <code>(总长度 + 255) // 256</code>。</li>
+<li><code>block(i)</code>: 获取第 <code>i</code> 页上的内容。</li>
+<li><code>block_table</code>: (虽然在 <code>__init__</code> 里是空的 list，但在引擎的其他地方会用到) 这是一个映射表，记录逻辑上的“第1页”对应物理显存里的“第几号坑位”。</li>
+<li><strong>逻辑：</strong> 就像写作业，不用买一整卷无限长的纸，而是用活页本。写满一页（256字）就加一页。这样系统能同时处理更多人的请求。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 5: 设定什么时候停下来 (Sampling Params)</h3>
+<p>AI 什么时候闭嘴？怎么控制它的创造力？</p>
+<ul>
+<li><strong>代码对应：</strong> <code>SamplingParams</code>, <code>is_finished</code></li>
+<li><strong>解读：</strong><ul>
+<li><code>temperature</code>: 温度。越高 AI 越胡说八道（有创造力），越低越死板。</li>
+<li><code>max_tokens</code>: 最多生成多少个词。到了这个数必须停。</li>
+<li><code>ignore_eos</code>: 是否忽略“结束符”。通常 AI 输出一个特殊的“结束符”就会自动停，如果设为 True，它就会一直唠叨下去直到达到最大长度。</li>
+<li><code>is_finished</code>: 判断任务状态是不是 <code>FINISHED</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这个文件在讲什么故事？</h3>
+<p>这个 <code>Sequence.py</code> 定义了一个<strong>对象</strong>，这个对象在说：</p>
+<blockquote>
+<p>"我是第 <strong><code>seq_id</code></strong> 号任务。
+用户刚开始跟我说了 <strong><code>num_prompt_tokens</code></strong> 个词。
+我现在正处于 <strong><code>status</code></strong> 状态。
+我每生成一个新词，你就用 <strong><code>append_token</code></strong> 塞给我。
+为了省显存，请把我的数据按 <strong>256</strong> 个词为一组切成块 (<strong>Block</strong>) 管理。
+记得根据 <strong><code>temperature</code></strong> 和 <strong><code>max_tokens</code></strong> 来决定我怎么说话以及何时闭嘴。"</p>
+</blockquote>
+<p>现在再回看代码，是不是清晰多了？</p>

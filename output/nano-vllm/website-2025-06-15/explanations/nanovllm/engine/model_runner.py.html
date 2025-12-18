@@ -1,0 +1,63 @@
+<h1>nanovllm/engine/model_runner.py</h1>
+<p>这份代码 <code>nanovllm/engine/model_runner.py</code> 是一个<strong>大模型推理引擎的核心执行者</strong>。你可以把它想象成一个<strong>“大厨”</strong>，负责管理灶台（GPU）、准备食材（数据）、以及实际炒菜（运行模型计算）。</p>
+<p>为了让你看懂，我把这个 <code>ModelRunner</code> 的工作拆解成一个 <strong>“入职待办清单” (To-Do List)</strong>。只要完成了这些 Task，这个类就能正常工作了。</p>
+<hr />
+<h3>📋 ModelRunner 的工作待办清单 (Task List)</h3>
+<h4>Task 1: 入职报到与环境准备 (初始化 <code>__init__</code>)</h4>
+<p><strong>目标</strong>：把模型加载到 GPU 上，准备好干活。
+*   <strong>1.1 认领身份</strong>：确认自己是第几个 GPU（<code>rank</code>）。如果是多卡并行，需要通过 <code>dist.init_process_group</code> 建立通讯组。
+*   <strong>1.2 搬运工具</strong>：把 PyTorch 的默认设备设为 GPU，并加载模型权重（<code>load_model</code>）。这里用的是 Qwen3 模型。
+*   <strong>1.3 准备餐具</strong>：初始化采样器 <code>Sampler</code>（用于最后根据概率选字）。</p>
+<h4>Task 2: 建立通讯机制 (多卡协作)</h4>
+<p><strong>目标</strong>：如果是多张显卡一起跑，主卡 (Rank 0) 需要给副卡发号施令。
+*   <strong>2.1 设立公告板 (<code>SharedMemory</code>)</strong>：
+    *   <strong>Rank 0 (主卡)</strong>：创建一块共享内存（Shared Memory），用来写命令。
+    *   <strong>Rank &gt; 0 (副卡)</strong>：连接到这块共享内存，时刻盯着看。
+*   <strong>2.2 进入待命循环 (<code>loop</code>)</strong>：
+    *   副卡执行 <code>loop()</code> 方法，进入死循环，不断从共享内存里读取方法名和参数（<code>read_shm</code>）。一旦主卡写了“跑模型”，副卡就跟着跑；主卡写“退出”，副卡就下班。
+*   <strong>2.3 发送指令 (<code>write_shm</code> / <code>call</code>)</strong>：
+    *   主卡通过 <code>call</code> 方法调用函数时，会顺便把这个调用动作写入共享内存，通知其他副卡同步执行。</p>
+<h4>Task 3: 规划仓库空间 (显存管理 <code>allocate_kv_cache</code>)</h4>
+<p><strong>目标</strong>：LLM 生成文字需要记住之前的上下文（KV Cache）。为了不爆显存，我们需要提前把显存“切块”分好。
+*   <strong>3.1 计算余量</strong>：查看 GPU 还剩多少显存 (<code>free</code>)。
+*   <strong>3.2 预订格子</strong>：计算一个 KV Block（比如能存16个token的显存块）占多大空间。然后把剩下的显存全部切成一个个 Block。
+*   <strong>3.3 分配地址</strong>：创建一个巨大的 Tensor <code>self.kv_cache</code> 作为显存池，并把这些物理地址告诉模型的每一层（<code>module.k_cache = ...</code>）。
+    *   <em>通俗理解：就像去图书馆提前把空位子都占好，以后有新书（token）直接填进去，不用临时找座。</em></p>
+<h4>Task 4: 练习“连招” (性能优化 <code>capture_cudagraph</code>)</h4>
+<p><strong>目标</strong>：Python 发送 GPU 指令太慢了，对于固定大小的小批量任务，我们要录制“宏”。
+*   <strong>4.1 录制脚本</strong>：<code>capture_cudagraph</code> 方法会针对不同的 Batch Size（比如 1, 2, 4, 8...）预先跑一遍模型。
+*   <strong>4.2 保存图纸</strong>：利用 <code>torch.cuda.CUDAGraph</code> 把这些 GPU 运算步骤录制下来。
+*   <strong>4.3 快速回放</strong>：以后真正推理时，如果符合这些 Batch Size，直接回放录好的图纸，速度飞快。这主要用于<strong>Decode 阶段</strong>（逐字生成阶段）。</p>
+<h4>Task 5: 备菜 (数据预处理 <code>prepare_...</code>)</h4>
+<p><strong>目标</strong>：把用户输入的文本（Sequence 对象）转换成模型能吃进去的 Tensor。
+*   <strong>5.1 准备 Block Table (<code>prepare_block_tables</code>)</strong>：告诉 GPU，每一句话的数据分散存储在显存池的哪些“格子”里（PagedAttention 的核心）。
+*   <strong>5.2 准备首字推理 (<code>prepare_prefill</code>)</strong>：
+    *   这是处理 Prompt 的阶段（一次性处理很多字）。
+    *   把所有 Token 拼起来，计算位置编码，生成 <code>cu_seqlens</code>（用于 FlashAttention）。
+*   <strong>5.3 准备逐字生成 (<code>prepare_decode</code>)</strong>：
+    *   这是生成回答的阶段（一次生成一个字）。
+    *   只需要取每个序列的<strong>最后一个 token</strong> 作为输入。
+    *   设置 <code>slot_mapping</code>，告诉模型新生成的这个 KV 应该填到显存池的哪个物理位置。</p>
+<h4>Task 6: 正式炒菜 (运行模型 <code>run</code> &amp; <code>run_model</code>)</h4>
+<p><strong>目标</strong>：把处理好的数据喂给模型，吐出下一个字的概率。
+*   <strong>6.1 区分阶段</strong>：
+    *   如果是 <strong>Prefill</strong>（第一阶段）或者数据量太大：直接用 PyTorch 原生模式跑 (<code>self.model(...)</code>)。
+    *   如果是 <strong>Decode</strong>（生成阶段）：使用 Task 4 录制好的 <strong>CUDA Graph</strong> 进行极速推理 (<code>graph.replay()</code>)。
+*   <strong>6.2 传递元数据 (<code>set_context</code>)</strong>：在跑模型前，把 Block Table、序列长度等信息传给全局上下文，这样底层的 Attention 算子才知道去哪里读写 KV Cache。
+*   <strong>6.3 采样 (<code>sampler</code>)</strong>：模型输出的是 Logits（概率分布），最后一步通过 <code>self.sampler</code> 根据温度（temperature）选出最终的 Token ID。</p>
+<hr />
+<h3>总结一下代码流程</h3>
+<p>当你调用 <code>run()</code> 方法时，代码实际上在做：</p>
+<ol>
+<li><strong>分流</strong>：是刚开始读题（Prefill）还是正在答题（Decode）？</li>
+<li><strong>备料</strong>：调用 <code>prepare_prefill</code> 或 <code>prepare_decode</code>，把 Sequence 对象变成 GPU 上的 Tensor（Input IDs, Positions, Block Tables）。</li>
+<li><strong>下锅</strong>：调用 <code>run_model</code>。<ul>
+<li>如果是 Decode 且 Batch Size 合适，用 <strong>CUDA Graph</strong> 极速模式。</li>
+<li>否则用普通模式。</li>
+</ul>
+</li>
+<li><strong>出锅</strong>：拿到 Logits。</li>
+<li><strong>装盘</strong>：Rank 0 进行采样（Sampling），得到 Token ID，返回结果。</li>
+<li><strong>清理</strong>：<code>reset_context</code> 清理上下文，准备下一轮。</li>
+</ol>
+<p>这就是这个文件的全部核心逻辑！它是连接上层调度器和底层 GPU 算子的桥梁。</p>

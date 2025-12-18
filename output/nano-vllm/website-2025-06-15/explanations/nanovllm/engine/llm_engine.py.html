@@ -1,0 +1,122 @@
+<h1>nanovllm/engine/llm_engine.py</h1>
+<p>这份代码实现了一个简易的大语言模型（LLM）推理引擎的核心控制器。你可以把它想象成是一个<strong>“餐厅经理”</strong>，它的工作是协调厨师（模型）、服务员（调度器）和顾客（用户的输入）。</p>
+<p>为了让你看懂，我把你（作为开发者）需要理解的逻辑拆解成一个 <strong>To-Do List（任务清单）</strong>。每一项任务对应代码中的一部分逻辑。</p>
+<hr />
+<h3>📋 任务清单：构建一个 LLM 引擎</h3>
+<h4>✅ 任务 1：开店准备（初始化与招聘）</h4>
+<p><strong>对应代码：</strong> <code>__init__</code> 方法
+<strong>目标：</strong> 在处理任何请求之前，先把配置读好，把计算资源（GPU进程）准备好。</p>
+<ol>
+<li><strong>读取配置 (<code>Config</code>)</strong>：<ul>
+<li>就像看菜谱和操作手册。代码读取了模型的路径、块大小（<code>block_size</code>）等参数。</li>
+</ul>
+</li>
+<li><strong>招聘多位厨师（多进程并行 <code>mp.Process</code>）</strong>：<ul>
+<li><em>难点逻辑</em>：<code>for i in range(1, config.tensor_parallel_size)</code>。</li>
+<li><strong>解释</strong>：大模型通常很大，一张显卡（一个厨师）干不过来。这里启动了多个进程（Process），让它们协同工作（Tensor Parallelism）。</li>
+<li><code>ModelRunner</code> 就是具体的“厨师”，负责实际的计算。</li>
+</ul>
+</li>
+<li><strong>准备翻译官 (<code>Tokenizer</code>)</strong>：<ul>
+<li>模型看不懂中文英文，只懂数字。<code>AutoTokenizer</code> 负责把“你好”变成 <code>[101, 233]</code> 这种数字。</li>
+</ul>
+</li>
+<li><strong>聘请领班 (<code>Scheduler</code>)</strong>：<ul>
+<li><code>self.scheduler = Scheduler(config)</code>。领班负责决定下一轮该处理哪桌客人的菜，管理内存（KV Cache）。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ 任务 2：接待顾客（接收请求）</h4>
+<p><strong>对应代码：</strong> <code>add_request</code> 方法
+<strong>目标：</strong> 把用户的文字输入变成引擎能理解的任务单。</p>
+<ol>
+<li><strong>翻译需求</strong>：<ul>
+<li>如果用户给的是字符串（<code>prompt: str</code>），用 <code>tokenizer.encode</code> 把它变成数字列表。</li>
+</ul>
+</li>
+<li><strong>建立工单 (<code>Sequence</code>)</strong>：<ul>
+<li>把这些数字包装成一个 <code>Sequence</code> 对象。你可以把它理解为一张“点菜单”，上面写着客人说了啥，以及客人想要什么样的回答（<code>sampling_params</code>）。</li>
+</ul>
+</li>
+<li><strong>交给领班</strong>：<ul>
+<li><code>self.scheduler.add(seq)</code>。把单子递给领班，排队等候。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ 任务 3：核心循环 —— “炒菜”的一个动作（Step）</h4>
+<p><strong>对应代码：</strong> <code>step</code> 方法
+<strong>目标：</strong> 这是引擎的心脏。它不负责“写完一整篇文章”，它只负责<strong>“蹦出一个字”</strong>或者<strong>“读完输入”</strong>。</p>
+<ol>
+<li><strong>领班调度 (<code>scheduler.schedule</code>)</strong>：<ul>
+<li>领班看一眼当前显存够不够，决定这一轮处理哪些单子（<code>seqs</code>）。</li>
+<li><code>is_prefill</code>：这是一个关键概念。<ul>
+<li><strong>Prefill (预填充)</strong>：是处理用户输入的阶段（比如读这篇文档）。</li>
+<li><strong>Decode (解码)</strong>：是模型开始一个字一个字往外蹦的阶段。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>厨师动工 (<code>model_runner.call("run", ...)</code>)</strong>：<ul>
+<li>命令所有显卡开始计算。输入是刚才选中的单子，输出是新的 Token（新的字）。</li>
+</ul>
+</li>
+<li><strong>结果登记 (<code>scheduler.postprocess</code>)</strong>：<ul>
+<li>把新生成的字填回“点菜单”里。如果这单完成了（比如生成了句号或达到长度限制），就标记为 <code>is_finished</code>。</li>
+</ul>
+</li>
+<li><strong>汇报进度</strong>：<ul>
+<li>返回这一步生成的结果，以及统计处理了多少个 Token（用来计算速度）。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ 任务 4：批量处理直到完成（Generate）</h4>
+<p><strong>对应代码：</strong> <code>generate</code> 方法
+<strong>目标：</strong> 这是一个对外的接口。用户调用它，它就在内部一直循环，直到所有活儿都干完。</p>
+<ol>
+<li><strong>批量下单</strong>：<ul>
+<li>把用户给的一堆提示词（Prompts）全部通过 <code>add_request</code> 加进去。</li>
+</ul>
+</li>
+<li><strong>死循环干活 (<code>while not self.is_finished()</code>)</strong>：<ul>
+<li>只要还有单子没做完，就一直调用 <strong>任务 3</strong> 的 <code>step()</code>。</li>
+<li><strong>进度条 (<code>tqdm</code>)</strong>：这里有一大段代码在计算 <code>throughput</code> (吞吐量)，就是为了在控制台显示“每秒处理多少个字”，让你看着不慌。</li>
+</ul>
+</li>
+<li><strong>整理结果</strong>：<ul>
+<li>当循环结束，把所有生成的数字 ID 拿出来，用 <code>tokenizer.decode</code> 变回人类能看的文字。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ 任务 5：打烊（退出）</h4>
+<p><strong>对应代码：</strong> <code>exit</code> 方法
+<strong>目标：</strong> 程序结束时清理垃圾，防止显存泄露。</p>
+<ol>
+<li><strong>通知所有进程</strong>：<ul>
+<li><code>self.model_runner.call("exit")</code>。告诉所有后台跑着的 GPU 进程：“下班了，别空转了”。</li>
+</ul>
+</li>
+<li><strong>确保关闭</strong>：<ul>
+<li><code>p.join()</code> 确保子进程真正结束。</li>
+<li><code>atexit.register(self.exit)</code> 意思是：不管程序是怎么挂的（正常结束或报错），死之前都要运行一下 <code>exit</code>，把资源释放掉。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>💡 总结一下文中的核心观点</h3>
+<p>这个脚本其实在教你<strong>如何手写一个高性能推理引擎的架构</strong>，它的核心观点是：</p>
+<ol>
+<li><strong>控制与计算分离</strong>：<ul>
+<li><code>LLMEngine</code> (这个类) 是<strong>大脑</strong>，只负责逻辑、调度、分发。</li>
+<li><code>ModelRunner</code> (在后台进程里) 是<strong>肌肉</strong>，只负责跑 PyTorch 模型进行矩阵运算。</li>
+</ul>
+</li>
+<li><strong>调度是关键 (Scheduler)</strong>：<ul>
+<li>你不能把所有请求一股脑塞进显卡，会爆显存。必须有一个调度器来决定“这一轮谁进谁出”。</li>
+</ul>
+</li>
+<li><strong>一步一脚印 (Step-based)</strong>：<ul>
+<li>推理不是一次性完成的。引擎是按“步”运行的。每一步只生成一个 Token，然后不断循环。这种设计允许“流式输出”和更灵活的调度（比如中途插入新任务）。</li>
+</ul>
+</li>
+</ol>
+<p>希望这个 List 能帮你把代码逻辑串起来！</p>

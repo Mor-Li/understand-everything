@@ -1,0 +1,103 @@
+<h1>nanovllm/layers/layernorm.py</h1>
+<p>没问题，这段代码确实涉及了不少深度学习的底层细节（特别是Transformer架构中的归一化层）。如果直接看代码容易晕，我们把它拆解成一个<strong>5步走的“通关任务列表”</strong>。</p>
+<p>这段代码实现的是 <strong>RMSNorm (Root Mean Square Normalization)</strong>，它是目前最流行的LLM（如 Llama 3, Gemma, Mistral）都在使用的归一化技术。</p>
+<hr />
+<h3>📋 任务清单：从小白到看懂 RMSNorm</h3>
+<h4>✅ Task 1: 理解核心概念 —— 为什么要“归一化”？</h4>
+<p><strong>目标</strong>：不看代码，先懂逻辑。
+*   <strong>场景</strong>：神经网络里的数据（Tensor）在经过很多层计算后，数值会变得极不稳定。有的变得特别大（爆炸），有的特别小（消失）。这会让模型学傻了。
+*   <strong>解决</strong>：我们需要一个“管理员”，在每一层计算完后，把数据的数值<strong>强行拉回</strong>到一个标准的范围内。
+*   <strong>RMSNorm的做法</strong>：它不关心数据的“平均值”是多少，它只关心数据的<strong>幅度（能量）</strong>。它会把数据的幅度缩放成统一大小，然后再乘以一个可学习的参数。</p>
+<h4>✅ Task 2: 准备原材料 —— <code>__init__</code> 函数</h4>
+<p><strong>目标</strong>：看懂初始化部分。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">eps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1e-6</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">=</span> <span class="n">hidden_size</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">eps</span> <span class="o">=</span> <span class="n">eps</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">weight</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Parameter</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">ones</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">))</span>
+</code></pre></div>
+
+<ul>
+<li><strong><code>hidden_size</code></strong>: 你的数据向量有多长？（比如 4096 维）。</li>
+<li><strong><code>eps</code> (epsilon)</strong>: 一个极小的数（0.000001）。它的作用是<strong>防止除以零</strong>。后面我们要算除法，如果分母是0程序就崩了，所以加个 <code>eps</code> 保底。</li>
+<li><strong><code>self.weight</code></strong>: 这是<strong>最关键的</strong>。<ul>
+<li>归一化把数据强行拉平了，但有时候模型需要某些特征强一点，某些弱一点。</li>
+<li>这个 <code>weight</code> 就是一个<strong>可学习的缩放比例</strong>，让模型自己去调整归一化后的数据大小。它初始全是 1。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 核心烹饪步骤 —— <code>rms_forward</code> 函数</h4>
+<p><strong>目标</strong>：这是最硬核的数学部分，我们一行行拆解。</p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@torch</span><span class="o">.</span><span class="n">compile</span>  <span class="c1"># 这是一个加速器，让PyTorch把代码编译得更快，逻辑上可以忽略</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">rms_forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+    <span class="n">orig_dtype</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">dtype</span>           <span class="c1"># 1. 记住原始数据类型（可能是半精度 float16）</span>
+    <span class="n">x</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>        <span class="c1"># 2. 转成 float32。为了精度！算均方根时精度不够会出错。</span>
+
+    <span class="c1"># 3. 计算方差 (Variance) 的变体</span>
+    <span class="c1"># x.pow(2): 把所有数平方</span>
+    <span class="c1"># .mean(...): 求平均值</span>
+    <span class="c1"># 结果就是：所有元素平方的平均值</span>
+    <span class="n">var</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">pow</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span> <span class="n">keepdim</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span> 
+
+    <span class="c1"># 4. 核心归一化步骤</span>
+    <span class="c1"># rsqrt = reciprocal sqrt = 1 / sqrt(v) (平方根的倒数)</span>
+    <span class="c1"># 相当于 x = x / sqrt(var + eps)</span>
+    <span class="c1"># 这一步把数据的幅度标准化了</span>
+    <span class="n">x</span><span class="o">.</span><span class="n">mul_</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">rsqrt</span><span class="p">(</span><span class="n">var</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">eps</span><span class="p">))</span> 
+
+    <span class="c1"># 5. 还原并加权</span>
+    <span class="c1"># 转回原来的精度 (如 float16)</span>
+    <span class="c1"># 乘以可学习的参数 weight</span>
+    <span class="n">x</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">orig_dtype</span><span class="p">)</span><span class="o">.</span><span class="n">mul_</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="n">x</span>
+</code></pre></div>
+
+<p><strong>简单总结这一步</strong>：把数据转成高精度 -&gt; 算出能量大小 -&gt; 把所有数据除以这个能量大小（归一化） -&gt; 乘上模型想学的缩放比例 -&gt; 变回原精度。</p>
+<h4>✅ Task 4: 进阶连招 —— <code>add_rms_forward</code> 函数</h4>
+<p><strong>目标</strong>：理解为什么要写两个 forward 函数。</p>
+<p>在 Transformer 结构中，通常有一个操作叫 <strong>残差连接 (Residual Connection)</strong>，公式通常是：
+<code>输出 = Norm(输入 + 残差)</code></p>
+<p>如果分两步算：先算加法，存下来，再算归一化，会比较慢且占内存。
+这个函数把 <strong>“加法”</strong> 和 <strong>“归一化”</strong> 融合在一起做了（算子融合）：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">add_rms_forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">residual</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
+    <span class="n">orig_dtype</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">dtype</span>
+    <span class="c1"># 1. 先把残差加进去 (x = x + residual)</span>
+    <span class="n">x</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span><span class="o">.</span><span class="n">add_</span><span class="p">(</span><span class="n">residual</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">))</span>
+
+    <span class="c1"># 2. 备份一下加完后的结果，作为新的 residual 返回给下一层用</span>
+    <span class="n">residual</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">orig_dtype</span><span class="p">)</span>
+
+    <span class="c1"># 3. 下面和 Task 3 一模一样：算方差、归一化、加权</span>
+    <span class="n">var</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">pow</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span> <span class="n">keepdim</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">x</span><span class="o">.</span><span class="n">mul_</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">rsqrt</span><span class="p">(</span><span class="n">var</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">eps</span><span class="p">))</span>
+    <span class="n">x</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">orig_dtype</span><span class="p">)</span><span class="o">.</span><span class="n">mul_</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="p">)</span>
+
+    <span class="c1"># 返回：归一化后的结果(给当前层用) 和 加完残差的原始结果(给下一层做残差用)</span>
+    <span class="k">return</span> <span class="n">x</span><span class="p">,</span> <span class="n">residual</span>
+</code></pre></div>
+
+<h4>✅ Task 5: 总指挥 —— <code>forward</code> 函数</h4>
+<p><strong>目标</strong>：理解对外的接口。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">residual</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+    <span class="c1"># 如果没传残差，就做普通的 RMSNorm (Task 3)</span>
+    <span class="k">if</span> <span class="n">residual</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">rms_forward</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+    <span class="c1"># 如果传了残差，就做“加法+归一化”的融合操作 (Task 4)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">add_rms_forward</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">residual</span><span class="p">)</span>
+</code></pre></div>
+
+<p>这是为了代码的通用性。有时候你只需要归一化，有时候你需要处理残差。这个函数自动帮你判断走哪条路。</p>
+<hr />
+<h3>总结：这段代码到底在干啥？</h3>
+<p>简单来说，这个文件定义了一个<strong>“数据整形器”</strong>：</p>
+<ol>
+<li>它接收一堆乱七八糟数值的输入。</li>
+<li><strong>如果有残差（老本）</strong>，先把老本加上去。</li>
+<li><strong>计算能量</strong>：看看这堆数据整体有多“响”（方差）。</li>
+<li><strong>消音/扩音</strong>：把数据除以它的能量，让它变成标准音量。</li>
+<li><strong>调音</strong>：乘上一个可学习的 <code>weight</code>，让模型自己微调最终的音量。</li>
+<li><strong>输出</strong>：把整理好的数据交还给下一层网络。</li>
+</ol>
+<p>现在的 LLM 之所以能训练得这么深（几十上百层），全靠这种归一化层在中间维持数据的稳定，否则模型早就崩了。</p>

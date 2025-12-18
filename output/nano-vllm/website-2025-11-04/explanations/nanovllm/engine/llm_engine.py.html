@@ -1,0 +1,91 @@
+<h1>nanovllm/engine/llm_engine.py</h1>
+<p>这份代码实现了一个 <strong>LLM 推理引擎（Inference Engine）</strong> 的核心控制逻辑。你可以把它想象成一个<strong>“中央指挥官”</strong>，它的工作是协调各个部门（模型计算、任务调度、分词处理）来完成文本生成的任务。</p>
+<p>这段代码的风格非常像目前流行的 <code>vLLM</code> 框架的简化版。</p>
+<p>为了让你读懂，我把这个 <code>LLMEngine</code> 的工作拆解成一个 <strong>5步走的 Task List（任务清单）</strong>。</p>
+<hr />
+<h3>任务清单：构建一个 LLM 引擎</h3>
+<h4>Task 1: 组建团队与启动设备 (初始化)</h4>
+<p><strong>对应代码：</strong> <code>__init__</code> 方法
+<strong>目标：</strong> 准备好配置，启动多显卡并行计算，加载分词器。</p>
+<ul>
+<li><strong>配置读取：</strong> 代码首先从 <code>kwargs</code> 里提取配置（Config），比如模型路径、显卡数量等。</li>
+<li><strong>多进程启动 (Tensor Parallelism)：</strong><ul>
+<li>如果需要用多张显卡（<code>config.tensor_parallel_size &gt; 1</code>），它会启动多个 Python 进程 (<code>ctx.Process</code>)。</li>
+<li>每个进程运行一个 <code>ModelRunner</code>（负责实际的模型计算）。</li>
+<li><code>self.ps</code> 保存这些进程，<code>self.events</code> 用于进程间同步。</li>
+</ul>
+</li>
+<li><strong>主控启动：</strong> 主进程自己也持有一个 <code>ModelRunner</code>（通常是第0号卡）。</li>
+<li><strong>招聘“翻译官”：</strong> 加载 <code>Tokenizer</code>，负责把人类文字转换成机器能懂的数字。</li>
+<li><strong>招聘“调度员”：</strong> 初始化 <code>Scheduler</code>，负责决定下一轮该处理哪些请求。</li>
+</ul>
+<h4>Task 2: 接收客户订单 (添加请求)</h4>
+<p><strong>对应代码：</strong> <code>add_request</code> 方法
+<strong>目标：</strong> 当用户输入一段话（Prompt）时，将其打包成系统能处理的格式。</p>
+<ul>
+<li><strong>翻译：</strong> 如果输入是字符串，先用 <code>tokenizer.encode</code> 变成数字列表（Token IDs）。</li>
+<li><strong>打包：</strong> 把这些数字和采样参数（比如温度、Top-P）打包成一个 <code>Sequence</code> 对象。你可以把 <code>Sequence</code> 理解为一个“待处理的任务包”。</li>
+<li><strong>排队：</strong> 把这个任务包扔给调度器 (<code>self.scheduler.add(seq)</code>)，让调度器去安排什么时候做。</li>
+</ul>
+<h4>Task 3: 核心循环 - 迈出一步 (Step)</h4>
+<p><strong>对应代码：</strong> <code>step</code> 方法
+<strong>目标：</strong> 这是引擎的<strong>心脏</strong>。每调用一次 <code>step</code>，模型就往前推理一步（生成一个 Token）。</p>
+<ol>
+<li><strong>调度 (Schedule)：</strong><ul>
+<li><code>self.scheduler.schedule()</code>：调度器看一眼当前的显存和队列，决定这一步处理哪些任务。</li>
+<li>它会告诉引擎：这一轮是做 <strong>Prefill</strong>（新任务刚进来，处理提示词）还是 <strong>Decode</strong>（老任务，逐个字生成）。</li>
+</ul>
+</li>
+<li><strong>计算 (Run)：</strong><ul>
+<li><code>self.model_runner.call("run", seqs, is_prefill)</code>：指挥官下令，“开始计算！”。</li>
+<li>底层的 <code>ModelRunner</code> 会调用神经网络，算出这一步的结果（生成的 Token ID）。</li>
+</ul>
+</li>
+<li><strong>后处理 (Postprocess)：</strong><ul>
+<li><code>self.scheduler.postprocess(...)</code>：拿着计算结果，更新任务状态（把新生成的字加到序列里）。</li>
+<li>如果有任务完成了（生成了结束符 EOS），就标记为完成。</li>
+</ul>
+</li>
+<li><strong>汇报：</strong> 返回这一步完成的任务结果。</li>
+</ol>
+<h4>Task 4: 自动化生产流水线 (生成)</h4>
+<p><strong>对应代码：</strong> <code>generate</code> 方法
+<strong>目标：</strong> 用户调用的主接口。它不断地循环执行 Task 3，直到所有任务都做完。</p>
+<ul>
+<li><strong>批量接单：</strong> 循环调用 <code>add_request</code> 把用户给的一堆 Prompts 全部加进去。</li>
+<li><strong>死循环直到结束：</strong><ul>
+<li><code>while not self.is_finished():</code> 只要调度器里还有活没干完，就一直循环。</li>
+<li>在循环里调用 <code>self.step()</code>。</li>
+</ul>
+</li>
+<li><strong>监控进度：</strong> 代码里用了 <code>tqdm</code> (进度条) 和 <code>perf_counter</code> (计时器) 来计算生成速度（tok/s），让你知道是卡住了还是在跑。</li>
+<li><strong>最终交货：</strong> 当循环结束，把所有生成的数字 ID 用 <code>tokenizer.decode</code> 变回人类文字，返回给用户。</li>
+</ul>
+<h4>Task 5: 下班打扫卫生 (退出)</h4>
+<p><strong>对应代码：</strong> <code>exit</code> 方法
+<strong>目标：</strong> 程序结束时，优雅地关闭资源，防止显存泄露或僵尸进程。</p>
+<ul>
+<li><strong>发送退出信号：</strong> 告诉底层的 <code>ModelRunner</code> 进程：“下班了，退出吧”。</li>
+<li><strong>回收进程：</strong> <code>p.join()</code> 等待所有子进程真正关闭。</li>
+<li><strong>自动触发：</strong> 代码用了 <code>atexit.register(self.exit)</code>，这意味着当 Python 脚本结束时，这个清理函数会自动运行，不用你手动调。</li>
+</ul>
+<hr />
+<h3>总结文中的关键概念</h3>
+<p>为了让你更清楚，这里有几个核心术语的通俗解释：</p>
+<ol>
+<li><strong>Tensor Parallelism (张量并行):</strong><ul>
+<li>模型太大了，一张显卡装不下。于是把模型的每一层切开，分别放在不同的显卡上计算。代码里通过 <code>multiprocessing</code> 启动多个进程就是为了做这个。</li>
+</ul>
+</li>
+<li><strong>Prefill vs Decode:</strong><ul>
+<li><strong>Prefill (预填充):</strong> 处理你输入的提示词（Prompt）。这是一次性并行处理很多字，速度很快。</li>
+<li><strong>Decode (解码):</strong> 逐个字生成回答。必须等上一个字出来才能算下一个字，所以是一步一步来的。</li>
+</ul>
+</li>
+<li><strong>Scheduler (调度器):</strong><ul>
+<li>显存是有限的（KV Cache）。调度器要精打细算，决定当前能同时处理多少个并发请求，防止显存爆掉（OOM）。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话总结这个文件：</strong>
+它是整个系统的<strong>大管家</strong>，负责把用户的文字请求变成任务，协调多张显卡进行计算，并不断循环直到吐出完整的回答。</p>

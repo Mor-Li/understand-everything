@@ -1,0 +1,95 @@
+<h1>nanovllm/layers/layernorm.py</h1>
+<p>没问题，这段代码是现代大模型（如 LLaMA）中非常核心的一个组件，叫做 <strong>RMSNorm（均方根归一化）</strong>。虽然代码看着全是数学运算，但它的逻辑其实非常线性。</p>
+<p>我们把它拆解成一个 <strong>“6步通关任务清单” (Todo List)</strong>，每一步只解决一个问题，带你把逻辑理顺。</p>
+<hr />
+<h3>📋 学习任务清单 (Todo List)</h3>
+<ol>
+<li><strong>Task 1：搞懂“它是干嘛的？”</strong> —— 理解 RMSNorm 的核心作用。</li>
+<li><strong>Task 2：查看装备包 (<code>__init__</code>)</strong> ——看它初始化时带了什么参数。</li>
+<li><strong>Task 3：核心动作分解 (<code>rms_forward</code>)</strong> —— 看它是如何把数据“归一化”的。</li>
+<li><strong>Task 4：理解精度转换技巧</strong> —— 为什么要转成 <code>float32</code> 又转回来？</li>
+<li><strong>Task 5：进阶连招 (<code>add_rms_forward</code>)</strong> —— 为什么要一边做加法一边做归一化？</li>
+<li><strong>Task 6：总指挥 (<code>forward</code>)</strong> —— 看它如何根据输入决定走哪条路。</li>
+</ol>
+<hr />
+<h3>🚀 逐步执行讲解</h3>
+<h4>✅ Task 1：搞懂“它是干嘛的？”</h4>
+<p><strong>核心概念：</strong>
+在大模型神经网络里，数据流经过一层层计算，数值会变得忽大忽小（这会导致训练崩溃）。<strong>RMSNorm</strong> 的作用就像一个“稳压器”或“音量平衡器”。</p>
+<p>不管输入的数据数值多大（比如有的数是 1000，有的是 0.1），经过它处理后，都会被拉回到一个标准的范围内，方便下一层网络处理。</p>
+<hr />
+<h4>✅ Task 2：查看装备包 (<code>__init__</code>)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hidden_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">eps</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1e-6</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">hidden_size</span> <span class="o">=</span> <span class="n">hidden_size</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">eps</span> <span class="o">=</span> <span class="n">eps</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">weight</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Parameter</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">ones</span><span class="p">(</span><span class="n">hidden_size</span><span class="p">))</span>
+</code></pre></div>
+
+<p><strong>代码解读：</strong>
+*   <code>hidden_size</code>: 你的数据向量有多长（比如 4096 维）。
+*   <code>eps</code> (epsilon): 一个极小的数（0.000001），防止做除法时分母为 0（防崩溃用的）。
+*   <strong><code>self.weight</code> (重点)</strong>: 这是一个<strong>可学习的参数</strong>。
+    *   RMSNorm 先把数据强行拉平（归一化），但这可能太死板了。
+    *   <code>weight</code> 就像一个“个性化旋钮”，模型可以通过学习调整这个旋钮，给数据重新乘上一个缩放比例，让它恢复一点表达能力。</p>
+<hr />
+<h4>✅ Task 3：核心动作分解 (<code>rms_forward</code>)</h4>
+<p>这是最核心的数学部分，我们看 <code>rms_forward</code> 函数：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">var</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">pow</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span> <span class="n">keepdim</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>  <span class="c1"># 1. 算平方的均值</span>
+<span class="n">x</span><span class="o">.</span><span class="n">mul_</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">rsqrt</span><span class="p">(</span><span class="n">var</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">eps</span><span class="p">))</span>        <span class="c1"># 2. 算平方根的倒数并相乘</span>
+</code></pre></div>
+
+<p><strong>通俗翻译：</strong>
+想象你手里有一个向量 <code>[3, 4]</code>。
+1.  <strong>平方 (<code>pow(2)</code>)</strong>: 变成 <code>[9, 16]</code>。
+2.  <strong>均值 (<code>mean</code>)</strong>: (9+16)/2 = 12.5。这叫“均方值”。
+3.  <strong>加保险 (<code>+ eps</code>)</strong>: 12.5 + 0.000001 (防止为0)。
+4.  <strong>开根号 (<code>rsqrt</code>)</strong>: <code>rsqrt</code> 是 "Reciprocal Square Root"（平方根倒数，即 $1/\sqrt{x}$）。
+5.  <strong>乘回去 (<code>mul_</code>)</strong>: 原数据 <code>[3, 4]</code> 乘以这个倒数。</p>
+<p><strong>结果：</strong> 这一步就把数据的“幅度”给统一了。</p>
+<hr />
+<h4>✅ Task 4：理解精度转换技巧</h4>
+<p>你会发现在 <code>rms_forward</code> 里有这两行看似多余的代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">orig_dtype</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">dtype</span>             <span class="c1"># 记住原始格式 (可能是 float16 或 bfloat16)</span>
+<span class="n">x</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>          <span class="c1"># 强制转成高精度 (float32)</span>
+<span class="c1"># ... 中间做数学运算 ...</span>
+<span class="n">x</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">orig_dtype</span><span class="p">)</span><span class="o">.</span><span class="n">mul_</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="p">)</span> <span class="c1"># 变回原始格式，并乘上“旋钮”参数</span>
+</code></pre></div>
+
+<p><strong>为什么要这么做？</strong>
+*   <strong>为了稳定</strong>：大模型通常用半精度（float16）跑，为了省显存。但是做平方、累加这种操作时，float16 很容易溢出（数值太大存不下）或者精度丢失。
+*   <strong>解决方案</strong>：计算统计量（均值、方差）时，<strong>必须</strong>临时切换到 <code>float32</code> 这种高精度模式，算完后再切回去。这是大模型训练的“行规”。</p>
+<hr />
+<h4>✅ Task 5：进阶连招 (<code>add_rms_forward</code>)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">add_rms_forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">residual</span><span class="p">):</span>
+    <span class="c1"># ...</span>
+    <span class="n">x</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span><span class="o">.</span><span class="n">add_</span><span class="p">(</span><span class="n">residual</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">))</span> <span class="c1"># 先做加法</span>
+    <span class="n">residual</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">orig_dtype</span><span class="p">)</span>                              <span class="c1"># 保存加法后的结果作为新的残差</span>
+    <span class="c1"># ... 后面接着做 RMSNorm ...</span>
+    <span class="k">return</span> <span class="n">x</span><span class="p">,</span> <span class="n">residual</span>
+</code></pre></div>
+
+<p><strong>这是什么？</strong>
+这是 Transformer 架构中经典的 <strong>"Add &amp; Norm"</strong> 机制。
+*   <strong>Residual (残差)</strong>: 也就是“跳跃连接”，把上一层原本的数据直接加过来，防止信息丢失。
+*   <strong>为什么要写在一起？</strong>
+    *   通常逻辑是：<code>y = Norm(x + residual)</code>。
+    *   这里把“相加”和“归一化”写在一个函数里，是为了<strong>计算效率</strong>（减少内存搬运），并且同样利用了 <code>float32</code> 来保证相加时的精度。</p>
+<hr />
+<h4>✅ Task 6：总指挥 (<code>forward</code>)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">residual</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+    <span class="k">if</span> <span class="n">residual</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">rms_forward</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">add_rms_forward</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">residual</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>逻辑解读：</strong>
+这是一个分流器：
+*   <strong>情况 A</strong>：如果你只给我数据 <code>x</code>，没给我 <code>residual</code>（残差），那我就只做标准的 RMSNorm。
+*   <strong>情况 B</strong>：如果你同时给了我数据 <code>x</code> 和 <code>residual</code>，那我就先把它俩加起来，再做 RMSNorm（这是目前最高效的做法）。</p>
+<hr />
+<h3>💡 总结</h3>
+<p>这段代码其实就做了一件事：
+<strong>为了让模型算得更稳（防止数值爆炸），先把输入数据转成高精度，算出它的平均能量（均方根），用这个数把数据除一遍（归一化），最后乘上一个可学习的参数（weight），再变回原来的精度输出。</strong></p>
+<p>那个 <code>@torch.compile</code> 只是告诉 PyTorch：“请把这个函数编译优化一下，跑快点”，不影响逻辑。</p>

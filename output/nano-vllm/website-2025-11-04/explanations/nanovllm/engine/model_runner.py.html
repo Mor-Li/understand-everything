@@ -1,0 +1,131 @@
+<h1>nanovllm/engine/model_runner.py</h1>
+<p>这份代码确实涉及了很多大模型推理（Inference）的核心底层技术，包括<strong>分布式推理</strong>、<strong>显存管理（PagedAttention）</strong>、<strong>CUDA Graph 优化</strong>等。如果没接触过底层框架，看不懂是很正常的。</p>
+<p>你可以把 <code>ModelRunner</code> 想象成一个<strong>“大模型的高级司机”</strong>。它的工作不仅是踩油门（运行模型），还要负责给车加油（管理显存）、协调车队（多卡通信）以及规划路线（预处理数据）。</p>
+<p>为了让你读懂，我制定了一个 <strong>6步走的 Task List</strong>，我们按照这个顺序，一步步拆解这个文件在干什么。</p>
+<hr />
+<h3>📋 Task List：拆解 ModelRunner</h3>
+<ol>
+<li><strong>Task 1: 启动与组队 (Initialization &amp; Distributed Setup)</strong><ul>
+<li><em>目标</em>：加载模型权重，如果是多张显卡，要建立通信连接。</li>
+</ul>
+</li>
+<li><strong>Task 2: 圈地盘 (KV Cache Allocation)</strong><ul>
+<li><em>目标</em>：计算显存，提前把存放“记忆（KV Cache）”的空间划分好，避免运行时频繁申请内存。</li>
+</ul>
+</li>
+<li><strong>Task 3: 准备食材 (Data Preparation - Prefill &amp; Decode)</strong><ul>
+<li><em>目标</em>：把人类的文本（Sequence）转换成模型能吃进去的 Tensor（包括 Input IDs, Positions 和内存地址映射）。</li>
+</ul>
+</li>
+<li><strong>Task 4: 抄近道 (CUDA Graph Capture)</strong><ul>
+<li><em>目标</em>：对于重复性高的小任务（解码阶段），录制 GPU 指令，以后直接回放，极大提升速度。</li>
+</ul>
+</li>
+<li><strong>Task 5: 开车 (Execution Loop)</strong><ul>
+<li><em>目标</em>：实际执行模型的前向传播（Forward Pass）并采样出下一个 token。</li>
+</ul>
+</li>
+<li><strong>Task 6: 传令兵 (Inter-Process Communication)</strong><ul>
+<li><em>目标</em>：如果是多卡运行，主卡（Rank 0）如何通过共享内存指挥副卡同步干活。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>逐步详细讲解</h3>
+<h4>Task 1: 启动与组队 (Initialization)</h4>
+<p><strong>对应代码：</strong> <code>__init__</code> 方法</p>
+<ul>
+<li><strong>你在看什么</strong>：<ul>
+<li>代码首先初始化了分布式环境 (<code>dist.init_process_group</code>)。在大模型中，模型太大，一张卡放不下或者算得慢，需要切分到多张卡（Tensor Parallelism）。</li>
+<li><code>rank</code> 是显卡的编号，<code>world_size</code> 是总卡数。</li>
+<li><code>load_model</code> 把模型权重加载进显存。</li>
+<li><code>warmup_model</code>：先空跑一下模型，防止第一次运行时因为初始化各种库导致卡顿。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 圈地盘 (KV Cache Allocation)</h4>
+<p><strong>对应代码：</strong> <code>allocate_kv_cache</code> 方法</p>
+<ul>
+<li><strong>核心概念</strong>：<ul>
+<li>大模型在生成文本时，需要记住之前生成过的 token 的 Key 和 Value 矩阵，这叫 <strong>KV Cache</strong>。</li>
+<li>传统的做法很浪费显存。这里采用了类似 <strong>vLLM (PagedAttention)</strong> 的机制。</li>
+</ul>
+</li>
+<li><strong>代码逻辑</strong>：<ol>
+<li>查看当前显卡还有多少空闲显存 (<code>torch.cuda.mem_get_info</code>)。</li>
+<li>计算一个“显存块 (Block)”有多大。</li>
+<li>算出最多能塞下多少个块 (<code>num_kvcache_blocks</code>)。</li>
+<li>一次性申请一个巨大的 Tensor <code>self.kv_cache</code>。</li>
+<li>把这个大 Tensor 切分给模型的每一层 (<code>module.k_cache = ...</code>)。</li>
+<li><strong>比喻</strong>：你去图书馆自习，不是来一个人搬一把椅子，而是管理员根据剩余空间，直接划定一片区域全是座位，谁来了就往空位上坐。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 3: 准备食材 (Data Preparation)</h4>
+<p><strong>对应代码：</strong> <code>prepare_prefill</code> 和 <code>prepare_decode</code></p>
+<ul>
+<li><strong>核心概念</strong>：<ul>
+<li><strong>Prefill (预填充)</strong>：处理用户的 Prompt 阶段，一次性处理很多 token。</li>
+<li><strong>Decode (解码)</strong>：一个字一个字往外蹦的阶段。</li>
+</ul>
+</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li>模型不仅需要 <code>input_ids</code> (输入的字)，还需要知道这些字对应的 KV Cache 存在刚才申请的那个大内存池的哪里。</li>
+<li><strong><code>slot_mapping</code></strong>：这是关键。它告诉显卡：“第5个 token 的数据，请存到显存池的第 1024 号格子里”。</li>
+<li><strong><code>block_tables</code></strong>：记录每个句子占用了哪些内存块（Block）。</li>
+<li><code>set_context</code>：把这些元数据存到全局变量里，供模型层（Attention 层）使用。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 抄近道 (CUDA Graph Capture)</h4>
+<p><strong>对应代码：</strong> <code>capture_cudagraph</code></p>
+<ul>
+<li><strong>痛点</strong>：在 Decode 阶段，每次只处理 1 个 token，计算量很小。但是 Python 发送指令给 GPU 的开销很大（CPU overhead）。可能 CPU 发指令用了 10ms，GPU 算只用了 0.1ms。</li>
+<li><strong>解决方案</strong>：<ul>
+<li><strong>CUDA Graph</strong> 就像“录像机”。</li>
+<li>代码里针对不同的 Batch Size (1, 2, 4, 8...) 分别录制了一遍 GPU 的操作流程。</li>
+<li>以后运行时，只要 Batch Size 匹配，直接“播放录像”，跳过 Python 的指令发送过程。</li>
+</ul>
+</li>
+<li><strong>对应代码</strong>：<code>run_model</code> 里的 <code>graph.replay()</code> 就是在播放录像。</li>
+</ul>
+<h4>Task 5: 开车 (Execution)</h4>
+<p><strong>对应代码：</strong> <code>run</code> 和 <code>run_model</code></p>
+<ul>
+<li><strong>流程</strong>：<ol>
+<li><strong>准备数据</strong>：判断是 Prefill 还是 Decode，调用 Task 3 的函数准备数据。</li>
+<li><strong>运行模型</strong>：<ul>
+<li>如果是 Prefill 或者大 Batch，直接跑 <code>self.model(...)</code>。</li>
+<li>如果是 Decode 小 Batch，使用 Task 4 的 CUDA Graph <code>graph.replay()</code> 加速。</li>
+</ul>
+</li>
+<li><strong>采样 (Sampler)</strong>：模型输出的是概率（Logits），<code>self.sampler</code> 根据概率选出下一个 token ID。</li>
+<li><strong>返回</strong>：把生成的 token ID 返回给上层应用。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 6: 传令兵 (Inter-Process Communication)</h4>
+<p><strong>对应代码：</strong> <code>loop</code>, <code>read_shm</code>, <code>write_shm</code>, <code>call</code></p>
+<ul>
+<li><strong>背景</strong>：如果是多卡运行（比如 2 张卡），Python 会启动 2 个进程。<ul>
+<li><strong>Rank 0 (主进程)</strong>：负责接收外部请求，处理逻辑。</li>
+<li><strong>Rank 1+ (副进程)</strong>：傻傻地等着 Rank 0 给指令。</li>
+</ul>
+</li>
+<li><strong>机制</strong>：<ul>
+<li>使用 <code>SharedMemory</code> (共享内存) 来传输指令。</li>
+<li><strong>Rank 0</strong> 调用 <code>write_shm</code>：把“函数名”和“参数”写进共享内存，然后触发 <code>event.set()</code> 通知大家。</li>
+<li><strong>Rank 1</strong> 运行 <code>loop</code> -&gt; <code>read_shm</code>：一直死循环等信号。收到信号后，从内存读出“哦，主要让我运行 <code>run</code> 函数”，于是它就跟着运行。</li>
+<li>这就是为什么 Rank 0 算完 Sampler 拿到结果，而 Rank 1 不需要返回结果（它只是陪跑，负责算它那一半的矩阵乘法）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件 <code>model_runner.py</code> 是一个<strong>极简版的高性能推理引擎核心</strong>。它去掉了 HuggingFace 那种臃肿的包装，直接操作底层：</p>
+<ol>
+<li><strong>自己管理内存</strong>（为了 PagedAttention）。</li>
+<li><strong>自己管理多进程通信</strong>（为了 Tensor Parallelism）。</li>
+<li><strong>自己优化执行路径</strong>（为了 CUDA Graph）。</li>
+</ol>
+<p>如果你想看懂它，建议先从 <code>run</code> 方法入手，看它如何根据 <code>is_prefill</code> 分流，然后分别看 <code>prepare_...</code> 数据处理，最后看 <code>allocate_kv_cache</code> 理解内存是怎么管理的。</p>

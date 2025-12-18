@@ -1,0 +1,102 @@
+<h1>nanovllm/layers/sampler.py</h1>
+<p>这段代码确实写得非常“数学化”且极其精简，看不懂是很正常的。它实现的功能是 <strong>LLM（大模型）的随机采样（Sampling）</strong>，也就是决定“下一个词选谁”的过程。</p>
+<p>通常我们在教程里看到的采样是用 <code>torch.multinomial</code>，但这里用了一种更底层的数学技巧（Gumbel-Max Trick 的变体）来实现高效采样。</p>
+<p>为了让你彻底理解，我制定了一个 <strong>5步学习任务清单 (Todo List)</strong>，我们一步步拆解：</p>
+<hr />
+<h3>📋 学习任务清单 (Todo List)</h3>
+<ol>
+<li><strong>Task 1: 理解输入是什么</strong> (搞懂 <code>logits</code> 和 <code>temperatures</code>)</li>
+<li><strong>Task 2: 理解温度的作用</strong> (搞懂 <code>div_(temperatures)</code>)</li>
+<li><strong>Task 3: 归一化概率</strong> (搞懂 <code>softmax</code>)</li>
+<li><strong>Task 4: 【核心难点】理解随机抽奖的魔法</strong> (搞懂那行最长的代码)</li>
+<li><strong>Task 5: 选取赢家</strong> (搞懂 <code>argmax</code>)</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 1: 理解输入是什么</h4>
+<p><strong>代码:</strong> <code>def forward(self, logits, temperatures):</code></p>
+<ul>
+<li><strong>场景想象</strong>：模型读了一句“今天天气真”，现在要猜下一个字。</li>
+<li><strong>Logits (分数)</strong>：模型给字典里几万个字打分。<ul>
+<li>比如：“好”: 5.0分, “坏”: -2.0分, “不”: 1.0分。</li>
+<li>这些原始分数就是 <code>logits</code>。</li>
+</ul>
+</li>
+<li><strong>Temperatures (温度)</strong>：这是一个控制“创造力”的参数，通常在 0.1 到 1.0 之间。</li>
+</ul>
+<h4>Task 2: 理解温度的作用</h4>
+<p><strong>代码:</strong> <code>logits = logits.float().div_(temperatures.unsqueeze(dim=1))</code></p>
+<ul>
+<li><strong>动作</strong>：把分数除以温度。</li>
+<li><strong>原理</strong>：<ul>
+<li>如果 <strong>温度很低 (0.1)</strong>：5.0 / 0.1 = 50。分数差距被极其<strong>放大</strong>。“好”字的分数会远超其他字，模型变得很保守，几乎只选最高分的。</li>
+<li>如果 <strong>温度很高 (1.0)</strong>：5.0 / 1.0 = 5。分数差距<strong>保持原样</strong>。模型有更多机会选那些分数稍低但也合理的词（更有创造力）。</li>
+</ul>
+</li>
+<li><strong>总结</strong>：这步是在调整“贫富差距”。</li>
+</ul>
+<h4>Task 3: 归一化概率</h4>
+<p><strong>代码:</strong> <code>probs = torch.softmax(logits, dim=-1)</code></p>
+<ul>
+<li><strong>动作</strong>：使用 Softmax 函数。</li>
+<li><strong>原理</strong>：Logits 只是分数（可以是负数），我们需要把它变成<strong>概率</strong>（0到1之间，加起来等于1）。<ul>
+<li>转换后可能变成：“好”: 0.8, “坏”: 0.01, “不”: 0.19。</li>
+</ul>
+</li>
+<li><strong>状态</strong>：现在 <code>probs</code> 代表了每个词被选中的真实几率。</li>
+</ul>
+<h4>Task 4: 【核心难点】理解随机抽奖的魔法</h4>
+<p><strong>代码:</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">sample_tokens</span> <span class="o">=</span> <span class="n">probs</span><span class="o">.</span><span class="n">div_</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">empty_like</span><span class="p">(</span><span class="n">probs</span><span class="p">)</span><span class="o">.</span><span class="n">exponential_</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">clamp_min_</span><span class="p">(</span><span class="mf">1e-10</span><span class="p">))</span><span class="o">.</span><span class="n">argmax</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+</code></pre></div>
+
+<p>这行代码非常长，它是<strong>全篇最难懂的地方</strong>。它其实是在做<strong>加权随机采样</strong>。</p>
+<p>让我们拆解这行代码的数学魔法（Gumbel-Max Trick 的变体）：</p>
+<ol>
+<li>
+<p><strong>制造噪音 (Noise)</strong>: <code>torch.empty_like(probs).exponential_(1)</code></p>
+<ul>
+<li>这生成了一组服从<strong>指数分布</strong>的随机数（全是正数）。你可以把它想象成给每个词发了一张“随机运气卡”。</li>
+</ul>
+</li>
+<li>
+<p><strong>混合概率与运气</strong>: <code>probs.div_(运气卡)</code></p>
+<ul>
+<li>这里做的是：$\frac{\text{概率}}{\text{随机噪音}}$。</li>
+<li><strong>直觉理解</strong>：<ul>
+<li>如果一个词原本概率(<code>probs</code>)很大，分子大，结果这就容易大。</li>
+<li>如果一个词原本概率很小，除非它运气爆棚（分母极小），否则结果很难变大。</li>
+</ul>
+</li>
+<li><strong>数学原理</strong>：这在数学上等价于根据 <code>probs</code> 的概率分布进行抽签。这是一种在 GPU 上非常高效的实现方式，比传统的 <code>torch.multinomial</code> 往往更快且数值更稳定。</li>
+</ul>
+</li>
+<li>
+<p><strong>防报错</strong>: <code>.clamp_min_(1e-10)</code></p>
+<ul>
+<li>防止随机生成的噪音是 0（除以 0 会报错），所以限制最小值为 $10^{-10}$。</li>
+</ul>
+</li>
+</ol>
+<h4>Task 5: 选取赢家</h4>
+<p><strong>代码:</strong> <code>.argmax(dim=-1)</code></p>
+<ul>
+<li><strong>动作</strong>：选出数值最大的那个索引。</li>
+<li><strong>结果</strong>：<ul>
+<li>经过 Task 4 的“概率 / 噪音”计算后，谁的值最大，谁就是最终选中的词。</li>
+<li>由于概率大的词分子大，它成为最大值的几率就高；概率小的词虽然也有机会（如果噪音极小），但几率低。</li>
+</ul>
+</li>
+<li>这就是实现了<strong>根据概率随机采样</strong>。</li>
+</ul>
+<hr />
+<h3>💡 总结 (TL;DR)</h3>
+<p>这段代码其实就做了一件事：<strong>扔骰子选词</strong>。</p>
+<ol>
+<li><strong>拿分数</strong>：拿到模型输出的原始分。</li>
+<li><strong>调温</strong>：根据温度调整分数差距（决定是保守还是奔放）。</li>
+<li><strong>转概率</strong>：把分数变成百分比。</li>
+<li><strong>扔骰子</strong>：用一种高效的数学技巧（除以指数分布噪声取最大值），根据概率选出一个词。</li>
+</ol>
+<p><strong>为什么作者这么写而不直接用 <code>torch.multinomial</code>？</strong>
+这通常是为了<strong>性能优化</strong>。在深度学习框架（如 PyTorch）底层，这种基于 <code>argmax(log(p) - log(-log(u)))</code> (Gumbel-Max) 或者代码中这种变体的写法，对 GPU 并行计算更友好，速度更快。</p>

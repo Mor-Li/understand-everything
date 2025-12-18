@@ -1,0 +1,75 @@
+<h1>nanovllm/engine/scheduler.py</h1>
+<p>这份代码实现了一个 <strong>LLM（大语言模型）推理调度器（Scheduler）</strong>。</p>
+<p>想象你是一个 <strong>繁忙餐厅的经理（Scheduler）</strong>，你的显存（GPU Memory）就是 <strong>餐厅里的椅子（KV Cache Block）</strong>，而用户的请求（Sequence）就是 <strong>等待吃饭的顾客</strong>。</p>
+<p>为了让你听懂，我把这个代码的逻辑拆解成一个 <strong>“餐厅经理的一天”任务清单 (Todo List)</strong>，每一个任务对应代码中的一部分逻辑。</p>
+<hr />
+<h3>任务清单：如何管理这家“LLM 餐厅”</h3>
+<h4>任务 1：开门营业，准备资源 (初始化)</h4>
+<p><strong>代码位置：</strong> <code>__init__</code>
+*   <strong>经理独白</strong>：“我得先看看店里有多少椅子（KV Cache），最多能同时接待几桌客人（max_num_seqs）。”
+*   <strong>动作</strong>：
+    *   准备两个队列：<code>waiting</code>（在门口排队的客人）和 <code>running</code>（正在吃饭的客人）。
+    *   初始化 <code>BlockManager</code>（椅子管理员），负责分配显存块。</p>
+<h4>任务 2：接待新客人 (接收请求)</h4>
+<p><strong>代码位置：</strong> <code>add(self, seq)</code>
+*   <strong>经理独白</strong>：“有新客人来了，先让他拿号排队。”
+*   <strong>动作</strong>：
+    *   把新来的 <code>seq</code>（请求）加入 <code>waiting</code> 队列。</p>
+<h4>任务 3：决定接下来谁能动筷子 (核心调度 Schedule)</h4>
+<p>这是最复杂的一步，<strong>代码位置：</strong> <code>schedule(self)</code>。经理每次做决定时，会优先处理新客人（Prefill），如果没有新客人，再照顾正在吃饭的客人（Decode）。</p>
+<p><strong>分步流程：</strong></p>
+<ul>
+<li>
+<p><strong>Step 3.1：优先安排新客人入座 (Prefill 阶段)</strong></p>
+<ul>
+<li><strong>代码逻辑</strong>：<code>while self.waiting ...</code></li>
+<li><strong>经理独白</strong>：“门口有人排队吗？如果有，看看店里还有没有空椅子（BlockManager）能让他坐下。”</li>
+<li><strong>判断</strong>：<ul>
+<li>如果椅子够坐，且没超过最大接待人数：<strong>让他进来（Allocate）</strong>，状态改为 <code>RUNNING</code>，从排队区移到用餐区。</li>
+<li>如果椅子不够：<strong>停止接客</strong>，这轮先这样。</li>
+</ul>
+</li>
+<li><strong>结果</strong>：如果有新客人入座，这轮调度就结束了，返回这一批新客人去处理（计算 Prompt）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Step 3.2：照顾正在吃饭的客人 (Decode 阶段)</strong></p>
+<ul>
+<li><strong>代码逻辑</strong>：<code>while self.running ...</code> (如果 Step 3.1 没发生)</li>
+<li><strong>经理独白</strong>：“既然没新客人（或者挤不进来了），那就让正在吃饭的客人吃下一口（生成下一个 Token）。”</li>
+<li><strong>关键冲突</strong>：生成新 Token 需要一点点新显存（新椅子）。</li>
+<li><strong>危机处理 (Preempt)</strong>：<ul>
+<li><strong>代码</strong>：<code>while not self.block_manager.can_append(seq): ... preempt ...</code></li>
+<li><strong>情况</strong>：轮到客人 A 吃下一口，但发现<strong>椅子彻底用光了</strong>！</li>
+<li><strong>动作</strong>：为了让客人 A 能继续吃，经理必须<strong>把另一位客人 B 赶出去</strong>（Preempt）。</li>
+<li><strong>赶人逻辑</strong>：把客人 B 的椅子收走（Free memory），把 B 赶回 <code>waiting</code> 队列的最前面（等下次有空位了再重新进来）。</li>
+</ul>
+</li>
+<li><strong>正常情况</strong>：如果显存够，就分配一点新空间，把这位客人加入 <code>scheduled_seqs</code> 列表，准备生成下一个字。</li>
+</ul>
+</li>
+</ul>
+<h4>任务 4：赶人策略 (抢占 Preempt)</h4>
+<p><strong>代码位置：</strong> <code>preempt(self, seq)</code>
+*   <strong>经理独白</strong>：“抱歉，店里资源不够了，你先去门口重新排队，把椅子让给快吃完的人。”
+*   <strong>动作</strong>：
+    *   状态改为 <code>WAITING</code>。
+    *   <strong>清空他的椅子</strong> (<code>deallocate</code>)：注意，这里为了省事直接清空了显存，意味着下次轮到他时，可能需要重新计算前面的内容（Prefill again）。
+    *   把他插队到 <code>waiting</code> 的最前面 (<code>appendleft</code>)，保证下次有资源优先处理他。</p>
+<h4>任务 5：收拾盘子 (后处理 Postprocess)</h4>
+<p><strong>代码位置：</strong> <code>postprocess</code>
+*   <strong>经理独白</strong>：“刚才那批客人吃了一口（生成了一个 Token），我看看情况。”
+*   <strong>动作</strong>：
+    *   把生成的 Token (<code>token_id</code>) 记在客人的账单上。
+    *   <strong>检查是否吃饱了</strong>：
+        *   如果生成了结束符 (<code>eos</code>) 或者字数达到上限 (<code>max_tokens</code>)。
+        *   <strong>结账走人</strong>：状态改为 <code>FINISHED</code>，回收他的所有椅子 (<code>deallocate</code>)，从 <code>running</code> 列表中移除。</p>
+<hr />
+<h3>总结：这代码到底在干啥？</h3>
+<p>它的核心观点是 <strong>“显存（KV Cache）是稀缺资源，必须精打细算”</strong>。</p>
+<ol>
+<li><strong>先来后到，但资源优先</strong>：它想尽可能多地并行处理请求。</li>
+<li><strong>新老分离</strong>：它把“处理新请求（Prefill）”和“生成后续内容（Decode）”分开了。在这个代码里，如果有新请求且有资源，它会优先处理新请求（这是一种策略，有些调度器反过来）。</li>
+<li><strong>残酷的内存管理</strong>：当正在生成的请求需要更多显存，但显存满了时，它会牺牲掉其中一个正在运行的任务（Preempt），把它踢回等待队列，释放出资源保住当前的任务。这是为了防止系统因为显存耗尽而死锁（OOM）。</li>
+</ol>
+<p><strong>简单一句话：</strong> 这是一个负责<strong>排队</strong>、<strong>分配显存</strong>、并在显存不足时<strong>踢人</strong>的管家程序。</p>

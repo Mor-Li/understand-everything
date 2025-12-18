@@ -1,0 +1,121 @@
+<h1>nanovllm/engine/block_manager.py</h1>
+<p>这段代码确实比较抽象，它是大语言模型（LLM）推理引擎中<strong>显存管理</strong>的核心部分，通常被称为 <strong>PagedAttention</strong> 或者 <strong>KV Cache Block Management</strong>。</p>
+<p>简单来说，这段代码在做一个“图书管理员”的工作：它负责把显存切成一块一块的（Block），然后分配给不同的请求（Sequence），并且尽可能地<strong>复用</strong>已经存在的块（Prefix Caching）来节省显存。</p>
+<p>为了让你彻底搞懂，我制定了一个 <strong>7步走的 Task List</strong>，我们一步一步来拆解。</p>
+<hr />
+<h3>📋 学习任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1: 理解核心背景 (Concept)</strong> - 为什么要搞这一套东西？</li>
+<li><strong>Task 2: 拆解基本单位 (Class Block)</strong> - 什么是“块”？</li>
+<li><strong>Task 3: 认识管理员 (Class BlockManager)</strong> - 它是怎么管库存的？</li>
+<li><strong>Task 4: 理解“指纹”技术 (Hashing)</strong> - 如何识别内容是否重复？</li>
+<li><strong>Task 5: 场景模拟 - 新请求来了 (Allocate)</strong> - 代码是怎么分配内存的？</li>
+<li><strong>Task 6: 场景模拟 - 生成新字了 (Append)</strong> - 怎么处理动态增长？</li>
+<li><strong>Task 7: 场景模拟 - 任务结束 (Deallocate)</strong> - 怎么回收垃圾？</li>
+</ol>
+<hr />
+<h3>🟢 Task 1: 理解核心背景 (Concept)</h3>
+<p>想象你在写作文。
+*   <strong>传统方式</strong>：给你发一整本练习簿。如果你只写两行，剩下的纸都浪费了；如果你写超了，还得重新换本大的。这在显存里叫“连续内存分配”，非常浪费且容易碎片化。
+*   <strong>这段代码的方式 (PagedAttention)</strong>：给你发<strong>活页纸</strong>。写满一张，再给你一张。甚至，如果你和同桌的前半段作文写得一模一样，管理员会直接指着同桌的那张纸说：“你先看他的，不用自己抄一遍了”。</p>
+<p><strong>结论</strong>：这段代码就是管理这些“活页纸（Block）”的系统，目的是<strong>节省显存</strong>和<strong>提高并发</strong>。</p>
+<hr />
+<h3>🟢 Task 2: 拆解基本单位 (Class Block)</h3>
+<p>看代码中的 <code>class Block</code>。这就是那张“活页纸”。</p>
+<ul>
+<li><code>block_id</code>: 这张纸的编号（比如第 5 号物理块）。</li>
+<li><code>token_ids</code>: 这张纸上写了哪些字（Token）。</li>
+<li><code>ref_count</code> (<strong>关键点</strong>): <strong>引用计数</strong>。<ul>
+<li>如果有 1 个人在用这张纸，是 1。</li>
+<li>如果有 3 个不同的请求前半段内容一样，都在共用这张纸，就是 3。</li>
+<li>如果是 0，说明没人用，可以擦掉重写。</li>
+</ul>
+</li>
+<li><code>hash</code>: 这张纸内容的“指纹”。用来快速判断这张纸上的内容以前是不是写过。</li>
+</ul>
+<hr />
+<h3>🟢 Task 3: 认识管理员 (Class BlockManager)</h3>
+<p>看 <code>class BlockManager</code> 的 <code>__init__</code>。</p>
+<ul>
+<li><code>block_size</code>: 一张纸能写几个字（比如 16 个 Token）。</li>
+<li><code>blocks</code>: 所有的物理纸张库存。</li>
+<li><code>free_block_ids</code>: <strong>空闲链表</strong>。存放当前没被使用的纸张编号（比如 <code>[0, 1, 2, 3...]</code>）。</li>
+<li><code>used_block_ids</code>: 正在被使用的纸张编号。</li>
+<li><code>hash_to_block_id</code>: <strong>查找表 (字典)</strong>。<ul>
+<li>Key 是内容的指纹 (Hash)。</li>
+<li>Value 是纸张编号 (Block ID)。</li>
+<li><strong>作用</strong>：比如系统想找“我爱北京天安门”这段话对应的内存块，算一下 Hash，查这个字典，就能直接找到对应的 Block ID，不用重新分配。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🟢 Task 4: 理解“指纹”技术 (Hashing)</h3>
+<p>看 <code>compute_hash</code> 方法。</p>
+<ul>
+<li>它使用了 <code>xxhash</code> 算法。</li>
+<li>输入：一串 Token ID（比如 <code>[101, 200, 305]</code>）和一个前缀（Prefix）。</li>
+<li>输出：一个唯一的整数（Hash值）。</li>
+<li><strong>目的</strong>：为了实现 <strong>Prefix Caching（前缀缓存）</strong>。如果两个请求的 Prompt 都是 "Translate this to Chinese:"，它们的 Hash 值一样，就可以共用同一个 Block，显存直接省一半。</li>
+</ul>
+<hr />
+<h3>🟢 Task 5: 场景模拟 - 新请求来了 (Allocate)</h3>
+<p>这是最复杂的逻辑，看 <code>allocate</code> 方法。假设来了一个新请求 <code>seq</code>（比如 Prompt 很长，需要 3 个 Block）。</p>
+<p><strong>代码逻辑拆解：</strong></p>
+<ol>
+<li><strong>遍历所需的每一个逻辑块</strong> (<code>for i in range(seq.num_blocks)</code>)。</li>
+<li><strong>计算指纹</strong>：拿出这一块的 Token，算出 <code>h</code> (Hash)。</li>
+<li><strong>查表 (Cache Hit/Miss)</strong>：<ul>
+<li><code>block_id = self.hash_to_block_id.get(h, -1)</code></li>
+<li>如果查到了（<code>block_id != -1</code>），说明之前有人生成过一样的内容！</li>
+</ul>
+</li>
+<li><strong>分支 A：没查到 (Cache Miss)</strong><ul>
+<li>从 <code>free_block_ids</code> 里拿一张新纸 (<code>_allocate_block</code>)。</li>
+</ul>
+</li>
+<li><strong>分支 B：查到了 (Cache Hit)</strong><ul>
+<li>直接复用！<code>block = self.blocks[block_id]</code>。</li>
+<li><code>block.ref_count += 1</code> (引用计数加 1，告诉系统多了一个人在用它)。</li>
+<li><code>seq.num_cached_tokens += ...</code> (记录一下省了多少计算量)。</li>
+</ul>
+</li>
+<li><strong>更新记录</strong>：如果这是新分配的块，把它的 Hash 记录到字典里，方便以后复用。</li>
+<li><strong>填表</strong>：把拿到的 <code>block_id</code> 填入 <code>seq.block_table</code> (这个 Sequence 自己的页表)。</li>
+</ol>
+<hr />
+<h3>🟢 Task 6: 场景模拟 - 生成新字了 (Append)</h3>
+<p>LLM 是一个字一个字生成的。看 <code>may_append</code> 方法。</p>
+<p>这里处理三种情况：</p>
+<ol>
+<li><strong>情况 1：刚写满一张纸，需要新纸</strong> (<code>len(seq) % self.block_size == 1</code>)<ul>
+<li>比如 Block 大小是 16，现在生成了第 17 个字。</li>
+<li>动作：从 <code>free_block_ids</code> 拿一张新纸，加到页表里。</li>
+</ul>
+</li>
+<li><strong>情况 2：刚好填满一张纸</strong> (<code>len(seq) % self.block_size == 0</code>)<ul>
+<li>比如刚生成完第 16 个字，这一块满了。</li>
+<li>动作：<strong>计算这一满块的 Hash</strong>，并存入 <code>hash_to_block_id</code>。</li>
+<li><strong>为什么现在才存？</strong> 因为只有写满的块（Immutable）才适合做缓存共享。写了一半的块还在变，不能共享。</li>
+</ul>
+</li>
+<li><strong>情况 3：还在这一页中间写</strong><ul>
+<li>不需要分配新块，也不需要计算 Hash，啥都不用做，直接往当前块里填字就行（这部分逻辑在 Sequence 类里，这里只管 Block 的分配）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🟢 Task 7: 场景模拟 - 任务结束 (Deallocate)</h3>
+<p>请求处理完了，看 <code>deallocate</code> 方法。</p>
+<ol>
+<li><strong>倒序遍历</strong>该 Sequence 用的所有 Block。</li>
+<li><strong>引用计数减 1</strong> (<code>block.ref_count -= 1</code>)。</li>
+<li><strong>判断释放</strong>：<ul>
+<li>如果 <code>ref_count == 0</code>：说明没人用这张纸了。调用 <code>_deallocate_block</code>，把它扔回 <code>free_block_ids</code> 供别人使用。</li>
+<li>如果 <code>ref_count &gt; 0</code>：说明还有别的请求在共用这张纸（Cache Hit 的情况），<strong>不能物理删除</strong>，只是我这个请求不再引用它了。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结</h3>
+<p>这个文件的核心思想是：
+<strong>不要给每个用户单独分配私有的显存。大家共用一个巨大的“活页纸池子”。通过计算内容的 Hash 值，发现内容一样时就多人共用同一张纸（引用计数），从而极大节省显存。</strong></p>

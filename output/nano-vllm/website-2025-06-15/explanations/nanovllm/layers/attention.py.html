@@ -1,0 +1,101 @@
+<h1>nanovllm/layers/attention.py</h1>
+<p>这段代码确实比较硬核，因为它不是普通的 PyTorch 代码，而是<strong>为了极致性能优化过的 LLM（大语言模型）推理代码</strong>。它结合了 <strong>Triton</strong>（一种编写高性能 GPU 内核的语言）和 <strong>FlashAttention</strong>（目前最快的注意力机制实现）。</p>
+<p>为了让你读懂，我们把阅读这段代码当做一个<strong>“构建高性能聊天机器人”</strong>的项目。</p>
+<p>以下是为你定制的 <strong>学习任务清单 (Todo List)</strong>，我们一步步来拆解：</p>
+<hr />
+<h3>任务 1：理解核心背景 —— 什么是 KV Cache 和 PagedAttention？</h3>
+<p><strong>目标</strong>：明白为什么这段代码要搞得这么复杂。</p>
+<ul>
+<li><strong>普通 Attention</strong>：每次生成一个新字，都要把之前所有字的 K 和 V（键和值）重新算一遍。太慢了。</li>
+<li><strong>KV Cache</strong>：把之前算好的 K 和 V 存起来，下次直接用。</li>
+<li><strong>痛点</strong>：通常 KV Cache 需要连续的显存，容易浪费内存（碎片化）。</li>
+<li><strong>解决方案 (PagedAttention)</strong>：像操作系统的内存分页一样，把 K 和 V 切成小块（Block），散落在显存的各个角落，通过一张“表”（Page Table / Block Table）来记录它们在哪。</li>
+<li><strong>代码对应</strong>：<code>store_kvcache</code> 和 <code>slot_mapping</code> 就是在做这件事——把数据存进那个“散落”的显存里。</li>
+</ul>
+<hr />
+<h3>任务 2：理解工具人 —— Triton Kernel (<code>store_kvcache_kernel</code>)</h3>
+<p><strong>目标</strong>：看懂代码前 30 行在干嘛。</p>
+<ul>
+<li><strong>场景</strong>：你刚算出了当前这个字的 K 和 V，现在要把它们存入显存（KV Cache）。</li>
+<li><strong>问题</strong>：因为显存是分页的（不连续），你不能直接 <code>copy</code>。你需要知道当前这个字应该放在哪个“坑位”（Slot）。</li>
+<li><strong>Todo 动作</strong>：<ol>
+<li><strong>输入</strong>：当前的 <code>key</code> 和 <code>value</code>，以及 <code>slot_mapping</code>（这是一个地图，告诉你第几个字对应显存里的哪个地址）。</li>
+<li><strong>Triton 魔法</strong>：<code>tl.program_id(0)</code> 获取当前线程处理的索引。</li>
+<li><strong>寻址</strong>：根据 <code>slot_mapping</code> 找到物理显存地址。</li>
+<li><strong>存储</strong>：<code>tl.store</code> 把数据搬运进去。</li>
+</ol>
+</li>
+<li><strong>结论</strong>：这个函数就是一个<strong>搬运工</strong>，负责把数据精准地填入非连续的内存块中。</li>
+</ul>
+<hr />
+<h3>任务 3：进入主控室 —— <code>Attention</code> 类初始化</h3>
+<p><strong>目标</strong>：看懂 <code>__init__</code>。</p>
+<ul>
+<li><strong>Todo 动作</strong>：<ol>
+<li>初始化常规参数：头数 (<code>num_heads</code>)，维度 (<code>head_dim</code>) 等。</li>
+<li><strong>关键点</strong>：<code>self.k_cache</code> 和 <code>self.v_cache</code> 初始化为空。这说明这个类本身不持有巨大的缓存，缓存通常是由外部管理器（Model Runner）分配好，然后传进来的。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>任务 4：处理流程 —— <code>forward</code> 函数的前半段</h3>
+<p><strong>目标</strong>：数据进来了，先做什么？</p>
+<ul>
+<li><strong>代码位置</strong>：<code>forward</code> 函数开头 到 <code>store_kvcache(...)</code>。</li>
+<li><strong>Todo 动作</strong>：<ol>
+<li><strong>变形</strong>：把输入的 <code>q</code>, <code>k</code>, <code>v</code> 变成合适的形状。</li>
+<li><strong>获取上下文 (<code>get_context</code>)</strong>：这是个全局变量，里面存了当前推理的所有元数据（比如：现在是第几个字？显存表在哪？）。</li>
+<li><strong>搬运数据 (核心)</strong>：调用 <code>store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)</code>。<ul>
+<li><strong>解释</strong>：在计算注意力之前，先把当前新算出来的 K 和 V，通过刚才那个“搬运工”，存到全局的大缓存里去。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>任务 5：分支 A —— 预填充阶段 (Prefill)</h3>
+<p><strong>目标</strong>：理解 <code>if context.is_prefill:</code> 这一块。</p>
+<ul>
+<li><strong>场景</strong>：用户刚发了一大段话过来（比如 "你好，请帮我写首诗"）。模型需要一次性读完这些话。这叫 <strong>Prefill</strong>。</li>
+<li><strong>Todo 动作</strong>：<ol>
+<li><strong>判断</strong>：如果是 Prefill 阶段。</li>
+<li><strong>Prefix Cache (前缀缓存)</strong>：<code>if context.block_tables is not None</code>。如果这段话的前半部分以前问过，直接复用缓存，不用重算了（这是高级优化）。</li>
+<li><strong>计算</strong>：调用 <code>flash_attn_varlen_func</code>。<ul>
+<li>这是 FlashAttention 的函数。</li>
+<li><code>varlen</code> 意味着它能同时处理好几句话，而且每句话长度不一样，不需要填充 0 (padding)，效率极高。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>任务 6：分支 B —— 解码阶段 (Decode)</h3>
+<p><strong>目标</strong>：理解 <code>else:</code> 这一块。</p>
+<ul>
+<li><strong>场景</strong>：模型已经读完输入了，现在开始一个字一个字地往外蹦（生成）。这叫 <strong>Decode</strong>。</li>
+<li><strong>Todo 动作</strong>：<ol>
+<li><strong>输入 Q</strong>：<code>q.unsqueeze(1)</code>。因为解码时，Query 只有一个 token（当前正在生成的这个字）。</li>
+<li><strong>计算</strong>：调用 <code>flash_attn_with_kvcache</code>。<ul>
+<li><strong>这是核心中的核心</strong>。这个函数专门为 PagedAttention 设计。</li>
+<li>它不需要你把 K 和 V 拼成一个大张量。</li>
+<li>你把 <code>block_table</code>（页表）给它，它自己会去显存的各个角落里把之前存的历史 K/V 找出来，和当前的 Q 做运算。</li>
+</ul>
+</li>
+</ol>
+</li>
+<li><strong>结论</strong>：这里没有显式的“读取缓存”代码，因为 <code>flash_attn_with_kvcache</code> 内部全自动处理了读取。</li>
+</ul>
+<hr />
+<h3>总结清单</h3>
+<p>如果你要向别人复述这个文件的逻辑，可以按照这个顺序：</p>
+<ol>
+<li>这是一个<strong>支持 PagedAttention 的注意力层</strong>。</li>
+<li>它包含一个 <strong>Triton 内核</strong>，用来把当前的 K/V 数据写入非连续的显存页中。</li>
+<li>在 <code>forward</code> 也就是推理时，它先<strong>保存</strong>当前的 K/V 到缓存。</li>
+<li>然后根据是<strong>刚开始读题 (Prefill)</strong> 还是<strong>正在答题 (Decode)</strong> 走不同的路：<ul>
+<li><strong>读题时</strong>：用变长 FlashAttention 一口气算完。</li>
+<li><strong>答题时</strong>：用带缓存功能的 FlashAttention，配合页表 (Block Table) 高效读取历史记忆。</li>
+</ul>
+</li>
+</ol>
+<p>现在再看代码，是不是感觉逻辑清晰了一些？</p>

@@ -1,0 +1,131 @@
+<h1>nanovllm/models/qwen3.py</h1>
+<p>这份代码实现的是 <strong>Qwen3（通义千问3）</strong> 大语言模型的一个核心架构文件。特别要注意的是，这不是普通的 pytorch 代码，而是基于一个叫 <code>nanovllm</code> 的框架写的，<strong>专门为了多显卡并行（TP, Tensor Parallel）加速推理</strong>而设计的。</p>
+<p>为了让你看懂，我们可以把搭建这个模型想象成<strong>建造一座摩天大楼</strong>。我给你列一个 <strong>"建筑施工 Todo List"</strong>，我们从最基本的零件开始，一步步把大楼盖起来。</p>
+<hr />
+<h3>🏗️ 施工任务清单 (Todo List)</h3>
+<h4>✅ Task 1: 制造“核心处理单元” —— 注意力机制 (Attention)</h4>
+<p><strong>对应代码类：</strong> <code>class Qwen3Attention</code></p>
+<p>这是大楼里最复杂的精密仪器，负责让模型“理解”文字之间的关联。</p>
+<ul>
+<li><strong>目标</strong>：输入一句话，算出词与词之间的权重（比如“苹果”和“好吃”关联度高）。</li>
+<li><strong>关键步骤解读</strong>：<ol>
+<li><strong>切割任务 (Parallelism)</strong>：<ul>
+<li><code>tp_size = dist.get_world_size()</code>：检查有几张显卡。</li>
+<li><code>self.num_heads = self.total_num_heads // tp_size</code>：把注意力头（Heads）平均分给每张显卡，大家一起算，速度快。</li>
+</ul>
+</li>
+<li><strong>投影变换 (QKV Projection)</strong>：<ul>
+<li><code>self.qkv_proj</code>：把输入变成 Q (Query), K (Key), V (Value) 三种向量。这里用的是 <code>QKVParallelLinear</code>，说明这个矩阵乘法是跨显卡并行的。</li>
+</ul>
+</li>
+<li><strong>Qwen 的特殊工艺 (Q-Norm/K-Norm)</strong>：<ul>
+<li><code>self.q_norm</code> 和 <code>self.k_norm</code>：<strong>这是 Qwen 架构的一个特点</strong>。在计算注意力之前，先对 Q 和 K 向量做一次 <code>RMSNorm</code>。很多其他模型（如 Llama）没有这一步。</li>
+</ul>
+</li>
+<li><strong>位置编码 (RoPE)</strong>：<ul>
+<li><code>self.rotary_emb</code>：给向量加上“位置信息”，让模型知道哪个词在前，哪个在后。</li>
+</ul>
+</li>
+<li><strong>计算输出</strong>：<ul>
+<li><code>self.attn(q, k, v)</code>：计算注意力分数。</li>
+<li><code>self.o_proj</code>：把结果融合输出。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 2: 制造“知识消化单元” —— 前馈神经网络 (MLP)</h4>
+<p><strong>对应代码类：</strong> <code>class Qwen3MLP</code></p>
+<p>如果 Attention 是“看”，MLP 就是“想”。这是模型的大脑皮层，存储知识和逻辑。</p>
+<ul>
+<li><strong>目标</strong>：对 Attention 提取的信息进行非线性变换和筛选。</li>
+<li><strong>关键步骤解读</strong>：<ol>
+<li><strong>阔门进入 (Gate &amp; Up)</strong>：<ul>
+<li><code>self.gate_up_proj</code>：把输入维度放大（通常是隐藏层的几倍）。这里用了 <code>MergedColumnParallelLinear</code>，意思是把“Gate门控”和“Up升维”两个操作合并在一起做，效率更高。</li>
+</ul>
+</li>
+<li><strong>激活函数 (Activation)</strong>：<ul>
+<li><code>self.act_fn = SiluAndMul()</code>：使用 SiLU 激活函数。这是目前大模型的主流标配。</li>
+</ul>
+</li>
+<li><strong>收口输出 (Down)</strong>：<ul>
+<li><code>self.down_proj</code>：把放大的维度再缩回原来的大小，方便传给下一层。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 3: 组装标准楼层 —— 解码层 (Decoder Layer)</h4>
+<p><strong>对应代码类：</strong> <code>class Qwen3DecoderLayer</code></p>
+<p>现在我们要把 Task 1 和 Task 2 组装成一个标准楼层。大模型就是由几十个这样的楼层堆叠起来的。</p>
+<ul>
+<li><strong>目标</strong>：将 Attention 和 MLP 串联，并加上“稳定器”。</li>
+<li><strong>关键步骤解读</strong>：<ol>
+<li><strong>残差连接 (Residual)</strong>：<ul>
+<li>你可以看到 <code>hidden_states, residual = ...</code> 的写法。这是一种防止模型“学傻了”的机制，保留上一层的信息直接传到下一层。</li>
+</ul>
+</li>
+<li><strong>归一化 (RMSNorm)</strong>：<ul>
+<li><code>self.input_layernorm</code> 和 <code>self.post_attention_layernorm</code>：在进入 Attention 和 MLP 之前，先对数据做标准化处理（RMSNorm），防止数值过大溢出，保证训练稳定。</li>
+</ul>
+</li>
+<li><strong>流程</strong>：<ul>
+<li>输入 -&gt; Norm -&gt; Attention -&gt; 残差相加。</li>
+<li>结果 -&gt; Norm -&gt; MLP -&gt; 残差相加 -&gt; 输出。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 4: 搭建大楼主体 —— 模型骨架 (Model)</h4>
+<p><strong>对应代码类：</strong> <code>class Qwen3Model</code></p>
+<p>这是整栋大楼的结构框架。</p>
+<ul>
+<li><strong>目标</strong>：把文字变成数字，通过几十层楼的处理，最后输出特征。</li>
+<li><strong>关键步骤解读</strong>：<ol>
+<li><strong>地基 (Embedding)</strong>：<ul>
+<li><code>self.embed_tokens</code>：把输入的文字 ID（比如 1059）变成向量。用了 <code>VocabParallelEmbedding</code>，说明巨大的词表（Qwen有15万词表）也是切分到多张卡上的。</li>
+</ul>
+</li>
+<li><strong>盖楼 (Layers Loop)</strong>：<ul>
+<li><code>self.layers = nn.ModuleList(...)</code>：循环创建几十个 <code>Qwen3DecoderLayer</code>。</li>
+</ul>
+</li>
+<li><strong>封顶 (Final Norm)</strong>：<ul>
+<li><code>self.norm</code>：出楼之前，做最后一次 RMSNorm。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 5: 装修成可用的产品 —— 语言模型 (ForCausalLM)</h4>
+<p><strong>对应代码类：</strong> <code>class Qwen3ForCausalLM</code></p>
+<p>这是用户最终调用的接口。</p>
+<ul>
+<li><strong>目标</strong>：根据 Task 4 输出的特征，预测“下一个词是什么”。</li>
+<li><strong>关键步骤解读</strong>：<ol>
+<li><strong>包含骨架</strong>：<ul>
+<li><code>self.model = Qwen3Model(config)</code>：拥有了上面说的大楼主体。</li>
+</ul>
+</li>
+<li><strong>输出头 (LM Head)</strong>：<ul>
+<li><code>self.lm_head</code>：这是一个巨大的线性层，把隐藏层向量映射回词表大小（Vocab Size），计算每个词出现的概率。</li>
+</ul>
+</li>
+<li><strong>权重绑定 (Tie Weights)</strong>：<ul>
+<li><code>if self.tie_word_embeddings:</code>：这是一种优化手段。输入的 Embedding 矩阵和输出的 LM Head 矩阵共享同一份权重数据，省显存。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结一下这段代码在讲什么：</h3>
+<p>这段代码就是 <strong>Qwen3 模型的“多显卡加速版”图纸</strong>。</p>
+<ol>
+<li>它<strong>不是</strong>用来训练的，主要是用来<strong>推理（Inference）</strong>的。</li>
+<li>它大量使用了 <code>nanovllm</code> 库里的 <code>ParallelLinear</code>（并行线性层），说明它的核心目的是<strong>让多张显卡合作算得更快</strong>。</li>
+<li>它保留了 Qwen 系列特有的 <strong>Q-Norm / K-Norm</strong> 结构（在 Attention 类里），这是识别 Qwen 模型身份的指纹。</li>
+</ol>
+<p>你看的时候，只要关注 <code>forward</code> 函数，就能看到数据流动的方向：
+<strong>输入 IDs -&gt; 查表变向量 -&gt; 进 Attention (QKV计算+RoPE+SelfAttn) -&gt; 进 MLP (放大+激活+缩小) -&gt; 重复几十次 -&gt; 算概率 -&gt; 输出下一个词。</strong></p>

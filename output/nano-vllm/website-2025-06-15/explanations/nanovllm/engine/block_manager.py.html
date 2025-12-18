@@ -1,0 +1,161 @@
+<h1>nanovllm/engine/block_manager.py</h1>
+<p>这份代码确实比较硬核，它实现的是现代大语言模型（LLM）推理引擎中<strong>最核心的显存管理技术</strong>，通常被称为 <strong>PagedAttention</strong> 的内存管理部分（类似于 vLLM 的核心逻辑）。</p>
+<p>简单来说，它的作用是：<strong>把显存切成一块一块的小方格（Block），像操作系统管理内存一样管理 LLM 的 KV Cache，并且支持“前缀缓存”（Prefix Caching）来复用重复的内容。</strong></p>
+<p>为了让你看懂，我为你制定了一个 <strong>“学习任务清单（Todo List）”</strong>。我们将代码拆解为 5 个任务，一步步通关。</p>
+<hr />
+<h3>🗺️ 学习任务清单</h3>
+<ol>
+<li><strong>Task 1: 理解基础概念</strong> —— 什么是 Block？为什么要 Hash？</li>
+<li><strong>Task 2: 理解管理员 (<code>BlockManager</code>)</strong> —— 它是怎么初始化仓库的？</li>
+<li><strong>Task 3: 核心功能之“分配” (<code>allocate</code>)</strong> —— 新来一个请求，怎么给它分地盘？（含核心魔法：缓存复用）</li>
+<li><strong>Task 4: 核心功能之“生成中” (<code>may_append</code>)</strong> —— 正在吐字时，内存怎么变化？</li>
+<li><strong>Task 5: 核心功能之“清理” (<code>deallocate</code>)</strong> —— 完事了怎么回收？</li>
+</ol>
+<hr />
+<h3>🟢 Task 1: 理解基础概念 (Block &amp; Hash)</h3>
+<p>首先看 <code>compute_hash</code> 函数和 <code>class Block</code>。</p>
+<p><strong>概念解释：</strong>
+*   <strong>KV Cache:</strong> LLM 生成文本时，需要记住之前看过的内容，这占用了大量显存。
+*   <strong>Block (块):</strong> 我们不把一整句话存一起，而是切成固定大小的块（比如一块存 16 个 token）。
+*   <strong>Hash (哈希):</strong> 这里的哈希是内容的“指纹”。如果两段文本的内容完全一样，它们的哈希值就一样。这是为了<strong>复用</strong>（如果别人算过这一块，我就不用重算了，直接引用）。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">compute_hash</span><span class="p">(</span><span class="n">token_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">prefix</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span><span class="p">):</span>
+    <span class="c1"># 给一串 token 算出一个唯一的指纹 ID</span>
+    <span class="c1"># prefix 是前一块的哈希，这样可以形成链式依赖</span>
+    <span class="o">...</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">Block</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">block_id</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">block_id</span> <span class="o">=</span> <span class="n">block_id</span>  <span class="c1"># 物理 ID（比如第 5 号仓库）</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">ref_count</span> <span class="o">=</span> <span class="mi">0</span>        <span class="c1"># 引用计数：有多少个句子正在共用这个块？</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">hash</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span>            <span class="c1"># 这块里面存的内容的指纹</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">token_ids</span> <span class="o">=</span> <span class="p">[]</span>       <span class="c1"># 实际存的 token</span>
+</code></pre></div>
+
+<blockquote>
+<p><strong>通俗理解：</strong> <code>Block</code> 就是一个储物柜。<code>ref_count</code> 是贴在柜子上的条，写着“现在有几个人在用我”。</p>
+</blockquote>
+<hr />
+<h3>🟢 Task 2: 理解管理员 (BlockManager Init)</h3>
+<p>接着看 <code>class BlockManager</code> 的 <code>__init__</code> 部分。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">BlockManager</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">num_blocks</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">block_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span> <span class="o">=</span> <span class="n">block_size</span> <span class="c1"># 一个块能装几个词</span>
+        <span class="c1"># 造出所有的物理块</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">blocks</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">Block</span><span class="p">]</span> <span class="o">=</span> <span class="p">[</span><span class="n">Block</span><span class="p">(</span><span class="n">i</span><span class="p">)</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_blocks</span><span class="p">)]</span>
+
+        <span class="c1"># 核心查找表：通过“内容指纹”找到“物理块ID”</span>
+        <span class="c1"># 比如：Hash(A) -&gt; 块ID 5。下次有人要内容 A，直接给他块 5。</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">hash_to_block_id</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">()</span>
+
+        <span class="c1"># 空闲链表：记录哪些块是空的，可以分配</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">free_block_ids</span><span class="p">:</span> <span class="n">deque</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">deque</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">num_blocks</span><span class="p">))</span>
+        <span class="c1"># 已用集合</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">used_block_ids</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+</code></pre></div>
+
+<blockquote>
+<p><strong>通俗理解：</strong> 管理员开局建立了一个空仓库，手里拿着两个本子：一个记“哪些柜子是空的”，一个记“如果你要找内容X，请去几号柜子”。</p>
+</blockquote>
+<hr />
+<h3>🟢 Task 3: 核心功能之“分配” (allocate) 🌟最难点</h3>
+<p>这是整个文件最精彩的地方。当一个新的请求（Sequence）进来时，我们要给它的 Prompt（提示词）分配内存。</p>
+<p><strong>逻辑流程：</strong>
+1.  遍历这个请求的所有 Token。
+2.  每凑够一个 Block 的大小，就算一下 Hash。
+3.  <strong>查表</strong>：这个 Hash 以前存过吗？
+    *   <strong>如果存过 (Cache Hit):</strong> 太棒了！不用分配新块，直接把旧块的 <code>ref_count + 1</code>（引用计数加1）。这就是<strong>共享内存</strong>。
+    *   <strong>没存过 (Cache Miss):</strong> 没办法，从 <code>free_block_ids</code> 拿一个新块，把数据写进去，记录到 Hash 表里。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">allocate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">seq</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">):</span>
+    <span class="n">h</span> <span class="o">=</span> <span class="o">-</span><span class="mi">1</span>
+    <span class="n">cache_miss</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">seq</span><span class="o">.</span><span class="n">num_blocks</span><span class="p">):</span> <span class="c1"># 遍历需要的块数</span>
+        <span class="n">token_ids</span> <span class="o">=</span> <span class="n">seq</span><span class="o">.</span><span class="n">block</span><span class="p">(</span><span class="n">i</span><span class="p">)</span>
+
+        <span class="c1"># 1. 计算当前内容的哈希（基于内容 + 前一个块的哈希）</span>
+        <span class="n">h</span> <span class="o">=</span> <span class="n">compute_hash</span><span class="p">(</span><span class="n">token_ids</span><span class="p">,</span> <span class="n">h</span><span class="p">)</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">token_ids</span><span class="p">)</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span> <span class="k">else</span> <span class="o">-</span><span class="mi">1</span>
+
+        <span class="c1"># 2. 查表：有没有现成的？</span>
+        <span class="n">block_id</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">hash_to_block_id</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">h</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+
+        <span class="c1"># 3. 如果没找到，或者虽然找到了但内容对不上（哈希碰撞防御），就算 Miss</span>
+        <span class="k">if</span> <span class="n">block_id</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">blocks</span><span class="p">[</span><span class="n">block_id</span><span class="p">]</span><span class="o">.</span><span class="n">token_ids</span> <span class="o">!=</span> <span class="n">token_ids</span><span class="p">:</span>
+            <span class="n">cache_miss</span> <span class="o">=</span> <span class="kc">True</span>
+
+        <span class="k">if</span> <span class="n">cache_miss</span><span class="p">:</span>
+            <span class="c1"># 没命中缓存：拿新块</span>
+            <span class="n">block_id</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">free_block_ids</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+            <span class="n">block</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_allocate_block</span><span class="p">(</span><span class="n">block_id</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="c1"># 命中缓存！</span>
+            <span class="n">seq</span><span class="o">.</span><span class="n">num_cached_tokens</span> <span class="o">+=</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span> <span class="c1"># 记录省了多少算力</span>
+            <span class="k">if</span> <span class="n">block_id</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">used_block_ids</span><span class="p">:</span>
+                <span class="n">block</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">blocks</span><span class="p">[</span><span class="n">block_id</span><span class="p">]</span>
+                <span class="n">block</span><span class="o">.</span><span class="n">ref_count</span> <span class="o">+=</span> <span class="mi">1</span> <span class="c1"># 核心：引用计数+1，多人共享同一个块</span>
+            <span class="k">else</span><span class="p">:</span>
+                <span class="c1"># 这种情况比较少见，可能是逻辑上的防御</span>
+                <span class="n">block</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_allocate_block</span><span class="p">(</span><span class="n">block_id</span><span class="p">)</span>
+
+        <span class="c1"># 更新哈希表，方便下一个人用</span>
+        <span class="k">if</span> <span class="n">h</span> <span class="o">!=</span> <span class="o">-</span><span class="mi">1</span><span class="p">:</span>
+            <span class="n">block</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">h</span><span class="p">,</span> <span class="n">token_ids</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">hash_to_block_id</span><span class="p">[</span><span class="n">h</span><span class="p">]</span> <span class="o">=</span> <span class="n">block_id</span>
+
+        <span class="c1"># 把这个块分配给当前的 Sequence</span>
+        <span class="n">seq</span><span class="o">.</span><span class="n">block_table</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">block_id</span><span class="p">)</span>
+</code></pre></div>
+
+<hr />
+<h3>🟢 Task 4: 核心功能之“生成中” (may_append)</h3>
+<p>LLM 是一个词一个词往外蹦的。<code>allocate</code> 处理的是输入的 Prompt，而 <code>may_append</code> 处理的是<strong>正在生成的回答</strong>。</p>
+<p><strong>逻辑流程：</strong>
+1.  <strong>情况 A：块没满。</strong> 比如块大小是 16，现在只填了 5 个。那不需要新块，直接在原来的块里追加就行（这部分逻辑在 Sequence 类里，这里只负责管理块的状态）。
+2.  <strong>情况 B：块刚满。</strong> 刚才填到了 16 个，现在满了。<strong>立刻计算这个满块的 Hash</strong>，并注册到 <code>hash_to_block_id</code> 表里。为什么？因为万一以后有人生成了一模一样的内容，就可以复用这个块了。
+3.  <strong>情况 C：需要新块。</strong> 刚才满了，现在要写第 17 个词。必须从空闲池里申请一个新的物理块。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">may_append</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">seq</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">):</span>
+    <span class="c1"># ...</span>
+    <span class="c1"># 如果刚好溢出，需要新块 (比如 block_size=16, 现在长度17, 余数是1)</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">seq</span><span class="p">)</span> <span class="o">%</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+        <span class="n">block_id</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">free_block_ids</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="c1"># 拿新块</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_allocate_block</span><span class="p">(</span><span class="n">block_id</span><span class="p">)</span>
+        <span class="n">block_table</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">block_id</span><span class="p">)</span> <span class="c1"># 挂到当前句子的名下</span>
+
+    <span class="c1"># 如果刚好填满一个块 (余数是0)</span>
+    <span class="k">elif</span> <span class="nb">len</span><span class="p">(</span><span class="n">seq</span><span class="p">)</span> <span class="o">%</span> <span class="bp">self</span><span class="o">.</span><span class="n">block_size</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="c1"># 此时这个块“定型”了，赶紧算 Hash 并注册，供未来复用</span>
+        <span class="n">token_ids</span> <span class="o">=</span> <span class="n">seq</span><span class="o">.</span><span class="n">block</span><span class="p">(</span><span class="n">seq</span><span class="o">.</span><span class="n">num_blocks</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+        <span class="c1"># ... 计算 hash ...</span>
+        <span class="n">last_block</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">h</span><span class="p">,</span> <span class="n">token_ids</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">hash_to_block_id</span><span class="p">[</span><span class="n">h</span><span class="p">]</span> <span class="o">=</span> <span class="n">last_block</span><span class="o">.</span><span class="n">block_id</span> <span class="c1"># 注册到查找表</span>
+</code></pre></div>
+
+<hr />
+<h3>🟢 Task 5: 核心功能之“清理” (deallocate)</h3>
+<p>当一个请求处理完了，要释放内存。</p>
+<p><strong>逻辑流程：</strong>
+1.  遍历这个 Sequence 用到的所有块。
+2.  每个块的 <code>ref_count</code> 减 1。
+3.  <strong>关键点：</strong> 只有当 <code>ref_count</code> 变成 0 时，才真正把这个块扔回 <code>free_block_ids</code>。
+4.  <strong>为什么？</strong> 因为可能还有别的 Sequence（比如使用了相同 Prompt 的另一个请求）正在引用这个块。如果别人还在用，你就不能物理删除。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">deallocate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">seq</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">):</span>
+    <span class="k">for</span> <span class="n">block_id</span> <span class="ow">in</span> <span class="nb">reversed</span><span class="p">(</span><span class="n">seq</span><span class="o">.</span><span class="n">block_table</span><span class="p">):</span>
+        <span class="n">block</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">blocks</span><span class="p">[</span><span class="n">block_id</span><span class="p">]</span>
+        <span class="n">block</span><span class="o">.</span><span class="n">ref_count</span> <span class="o">-=</span> <span class="mi">1</span> <span class="c1"># 我不用了，但我不知道别人用不用</span>
+        <span class="k">if</span> <span class="n">block</span><span class="o">.</span><span class="n">ref_count</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_deallocate_block</span><span class="p">(</span><span class="n">block_id</span><span class="p">)</span> <span class="c1"># 也没人用了，彻底回收</span>
+</code></pre></div>
+
+<hr />
+<h3>总结</h3>
+<p>这段代码实现了一个<strong>支持写时复制（Copy-on-Write / Shared Memory）的内存管理器</strong>。</p>
+<ul>
+<li><strong>不懂的时候看这里</strong>：想象你在玩拼图。</li>
+<li><code>Block</code> 是拼图的底板。</li>
+<li><code>allocate</code> 是拼图开始前，先看看这幅画的左上角是不是和以前拼过的一样？一样就直接把以前的底板拿过来用（Ref Count + 1），不用重新拼。</li>
+<li><code>may_append</code> 是拼的过程中，一块板子拼满了，就给它拍个照（Hash），存到底稿库里，然后拿一块新板子继续拼。</li>
+<li><code>deallocate</code> 是拼完了拆掉，但如果别人还在用这块板子，你就不能扔，只能把自己的名字划掉。</li>
+</ul>

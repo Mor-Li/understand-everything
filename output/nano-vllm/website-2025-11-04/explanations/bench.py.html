@@ -1,0 +1,87 @@
+<h1>bench.py</h1>
+<p>这段代码其实是在做一件事：<strong>给大模型做“体能测试”（跑分）</strong>。</p>
+<p>通俗地说，它想看看你的显卡和模型配合起来，<strong>每秒钟能吐出多少个字（Token）</strong>。这通常被称为“吞吐量测试”（Throughput Benchmark）。</p>
+<p>为了让你看懂，我把这段代码拆解成一个<strong>“任务清单” (To-Do List)</strong>。想象一下，你是一个监考官，你要按照这个清单一步步去测试这个模型。</p>
+<hr />
+<h3>📋 监考官的任务清单 (Task To-Do List)</h3>
+<ol>
+<li><strong>准备考场与规则</strong> (设置随机数种子和参数)</li>
+<li><strong>请考生入场</strong> (加载 AI 模型)</li>
+<li><strong>准备考卷</strong> (伪造一批随机的输入数据)</li>
+<li><strong>考前热身</strong> (预热模型，防止刚起床没精神)</li>
+<li><strong>掐表计时：开始！</strong> (记录开始时间)</li>
+<li><strong>疯狂答题</strong> (让模型批量处理数据)</li>
+<li><strong>掐表计时：结束！</strong> (记录结束时间)</li>
+<li><strong>计算成绩</strong> (算出每秒写了多少字)</li>
+</ol>
+<hr />
+<h3>📝 逐步详细讲解</h3>
+<p>下面我把代码对应到上面的每一个步骤里，给你详细讲讲：</p>
+<h4>1. 准备考场与规则</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">seed</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>  <span class="c1"># 这里的 seed(0) 是为了保证每次跑测试，生成的随机数都是一样的，这样结果才公平，可复现。</span>
+<span class="n">num_seqs</span> <span class="o">=</span> <span class="mi">256</span>        <span class="c1"># 设定这次要一次性考 256 道题（模拟 256 个并发请求）。</span>
+<span class="n">max_input_len</span> <span class="o">=</span> <span class="mi">1024</span>  <span class="c1"># 每道题题目最长有多长。</span>
+<span class="n">max_ouput_len</span> <span class="o">=</span> <span class="mi">1024</span>  <span class="c1"># 要求模型最长写多少字的答案。</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：测试需要控制变量，设定好并发量（一次处理多少条）和长度。</li>
+</ul>
+<h4>2. 请考生入场 (加载模型)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">path</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">expanduser</span><span class="p">(</span><span class="s2">&quot;~/huggingface/Qwen3-0.6B/&quot;</span><span class="p">)</span> <span class="c1"># 模型文件放在哪</span>
+<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">enforce_eager</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">max_model_len</span><span class="o">=</span><span class="mi">4096</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：这里初始化了 <code>LLM</code> (Large Language Model)。它把模型从硬盘搬到了显存里。<code>nanovllm</code> 应该是一个高性能的推理库（类似于 vllm）。</li>
+</ul>
+<h4>3. 准备考卷 (伪造数据)</h4>
+<p>这是新手最容易晕的地方。既然是测速度，我们<strong>不在乎模型写得好不好，只在乎写得快不快</strong>。所以我们不需要真的给它写“请帮我写首诗”，直接给它一堆乱码数字就行。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 生成输入：造了 256 个列表，每个列表里全是随机数（代表 Token ID）。</span>
+<span class="c1"># 这就好比给了模型 256 篇由乱码组成的文章让它续写。</span>
+<span class="n">prompt_token_ids</span> <span class="o">=</span> <span class="p">[[</span><span class="n">randint</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">10000</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">randint</span><span class="p">(</span><span class="mi">100</span><span class="p">,</span> <span class="n">max_input_len</span><span class="p">))]</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_seqs</span><span class="p">)]</span>
+
+<span class="c1"># 生成要求：告诉模型，这 256 道题，每道题你必须给我写够多少个字（max_tokens）。</span>
+<span class="c1"># ignore_eos=True 的意思是：就算你写完了也不准停，必须凑够字数，为了压榨出最大性能。</span>
+<span class="n">sampling_params</span> <span class="o">=</span> <span class="p">[</span><span class="n">SamplingParams</span><span class="p">(</span><span class="n">temperature</span><span class="o">=</span><span class="mf">0.6</span><span class="p">,</span> <span class="n">ignore_eos</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">max_tokens</span><span class="o">=</span><span class="n">randint</span><span class="p">(</span><span class="mi">100</span><span class="p">,</span> <span class="n">max_ouput_len</span><span class="p">))</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_seqs</span><span class="p">)]</span>
+</code></pre></div>
+
+<h4>4. 考前热身 (Warm-up)</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">([</span><span class="s2">&quot;Benchmark: &quot;</span><span class="p">],</span> <span class="n">SamplingParams</span><span class="p">())</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：为什么要跑这一句？因为显卡和推理引擎（GPU Kernel）在第一次运行时需要分配内存、编译代码，第一次跑通常会很慢。</li>
+<li><strong>目的</strong>：先随便跑一个简单的，把该加载的加载好，确保后面计时的那一次是“全速运行”的状态。</li>
+</ul>
+<h4>5. 掐表计时：开始</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">t</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span> <span class="c1"># 按下秒表</span>
+</code></pre></div>
+
+<h4>6. 疯狂答题 (核心步骤)</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 把刚才准备的那 256 个乱码输入和要求扔给模型</span>
+<span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">,</span> <span class="n">use_tqdm</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：这是真正的压力测试。模型开始疯狂计算，显卡风扇开始狂转。</li>
+</ul>
+<h4>7. 掐表计时：结束</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">t</span> <span class="o">=</span> <span class="p">(</span><span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span> <span class="o">-</span> <span class="n">t</span><span class="p">)</span> <span class="c1"># 再按一次秒表，算出中间花了多少秒</span>
+</code></pre></div>
+
+<h4>8. 计算成绩</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 算出模型一共写了多少个字（把所有请求要求的输出长度加起来）</span>
+<span class="n">total_tokens</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">sp</span><span class="o">.</span><span class="n">max_tokens</span> <span class="k">for</span> <span class="n">sp</span> <span class="ow">in</span> <span class="n">sampling_params</span><span class="p">)</span>
+
+<span class="c1"># 吞吐量 = 总字数 / 总时间</span>
+<span class="n">throughput</span> <span class="o">=</span> <span class="n">total_tokens</span> <span class="o">/</span> <span class="n">t</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Total: </span><span class="si">{</span><span class="n">total_tokens</span><span class="si">}</span><span class="s2">tok, Time: </span><span class="si">{</span><span class="n">t</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">s, Throughput: </span><span class="si">{</span><span class="n">throughput</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">tok/s&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：最后的 <code>Throughput</code> (tok/s) 是最重要的指标。比如结果是 2000 tok/s，意思就是这个引擎每秒钟能生成 2000 个 token。数值越大，性能越强。</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件的核心观点就是：
+<strong>“别管内容对不对，我就想看看给你 256 个并发任务，让你一直写，你到底能写多快。”</strong></p>

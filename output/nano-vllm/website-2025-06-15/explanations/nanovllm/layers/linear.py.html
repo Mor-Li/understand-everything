@@ -1,0 +1,100 @@
+<h1>nanovllm/layers/linear.py</h1>
+<p>这份代码的核心主题是：<strong>如何在多个 GPU 上并行地运行大模型（LLM）的线性层（Linear Layer）</strong>。</p>
+<p>在大模型中，矩阵乘法（Linear）是最耗费显存和计算量的部分。为了跑得动大模型，我们需要把巨大的矩阵“切分”开，分给不同的显卡去算，这就是所谓的 <strong>张量并行（Tensor Parallelism, TP）</strong>。</p>
+<p>为了让你听懂，我把这个过程拆解成一个 <strong>“多显卡分工合作”的 Task Todo List</strong>，我们一步步来看代码是怎么实现这个目标的。</p>
+<hr />
+<h3>任务清单：构建一个多显卡并行的线性层系统</h3>
+<h4>✅ Task 1: 搞清楚“我是谁”和“咱们有多少人” (基础建设)</h4>
+<p><strong>对应代码：</strong> <code>LinearBase</code> 类</p>
+<p>在开始干活前，每个显卡（GPU）必须知道自己的身份。
+*   <strong>代码解读</strong>：
+    *   <code>dist.get_rank()</code>: 我是第几号显卡？（比如一共2张卡，我是0号还是1号）。
+    *   <code>dist.get_world_size()</code>: 咱们一共有几张卡？（TP size）。
+    *   <code>divide</code> 函数：一个辅助工具，用来确保切分矩阵时能除尽，除不尽就报错。</p>
+<h4>✅ Task 2: 最简单的方案——“每人存一份完整的”</h4>
+<p><strong>对应代码：</strong> <code>ReplicatedLinear</code> 类</p>
+<p>这是最“笨”但最兼容的方法。
+*   <strong>场景</strong>：假设矩阵不大，或者为了简单起见。
+*   <strong>做法</strong>：不切分。每张显卡都加载<strong>完整</strong>的权重（Weight）。
+*   <strong>代码解读</strong>：
+    *   <code>weight_loader</code>：直接把加载进来的权重 <code>copy</code> 给自己，不进行任何切片（slice）操作。
+    *   <code>forward</code>：就是普通的 <code>F.linear</code>，跟单卡跑没区别。</p>
+<h4>✅ Task 3: 竖着切一刀——“列并行” (Column Parallel)</h4>
+<p><strong>对应代码：</strong> <code>ColumnParallelLinear</code> 类</p>
+<ul>
+<li><strong>场景</strong>：通常用于 MLP 的第一层（升维）或者 Attention 的 QKV 计算。</li>
+<li><strong>原理</strong>：<ul>
+<li>假设权重矩阵 $W$ 的形状是 <code>[输出维度, 输入维度]</code>。</li>
+<li>我们把 <strong>输出维度</strong>（列）切开。</li>
+<li>比如 $W$ 是 $100 \times 100$，有2张卡。卡0拿前50行，卡1拿后50行（注意 PyTorch Linear 权重通常是转置存储的，所以代码里切的是 <code>tp_dim</code>）。</li>
+</ul>
+</li>
+<li><strong>结果</strong>：卡0 算出来的结果是最终结果的“上半部分”，卡1 算是“下半部分”。大家算出来的结果形状不一样，拼起来才是完整的。</li>
+<li><strong>代码解读</strong>：<ul>
+<li><code>self.output_size_per_partition = divide(output_size, self.tp_size)</code>: 计算每张卡只负责算多少输出。</li>
+<li><code>weight_loader</code> 中的 <code>narrow(...)</code>: <strong>这是核心</strong>。它根据我的 <code>rank</code>（卡号），只从完整的权重里“抠”出属于我的那一小块。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 进阶切法——“把多个层拼起来切” (Merged Column Parallel)</h4>
+<p><strong>对应代码：</strong> <code>MergedColumnParallelLinear</code> 类</p>
+<ul>
+<li><strong>场景</strong>：在 Llama 等模型中，MLP 层通常有 Gate 和 Up 两个投影层。为了快，我们把这两个矩阵拼在一起算。</li>
+<li><strong>做法</strong>：这其实还是“列并行”，但是因为原来的权重是两个分开的矩阵，加载的时候比较麻烦。</li>
+<li><strong>代码解读</strong>：<ul>
+<li><code>weight_loader</code> 变得复杂了：它需要知道你现在加载的是第几块碎片（<code>loaded_shard_id</code>），然后根据设定好的 <code>output_sizes</code> 列表，精确地计算出每张卡该拿哪一段数据。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 最复杂的切法——“QKV 注意力层切分”</h4>
+<p><strong>对应代码：</strong> <code>QKVParallelLinear</code> 类</p>
+<ul>
+<li><strong>场景</strong>：专门用于 Attention 层的 Q（Query）、K（Key）、V（Value） 投影。</li>
+<li><strong>难点</strong>：现在的模型流行 <strong>GQA (Grouped Query Attention)</strong>，意思是 Q 的头数（Heads）很多，但 K 和 V 的头数很少。<ul>
+<li>比如：Q 有 32 个头，K 和 V 只有 4 个头。</li>
+<li>如果有 2 张卡，我们不能简单地除以 2。我们需要保证每张卡分到的 Q、K、V 的比例是对的。</li>
+</ul>
+</li>
+<li><strong>代码解读</strong>：<ul>
+<li><code>__init__</code> 里算了一堆数学题：根据总头数和卡数，算出每张卡负责多少个 Q 头、多少个 KV 头。</li>
+<li><code>weight_loader</code>：这是全文件最复杂的逻辑。<ul>
+<li>如果加载的是 "q"：切分 Q 的权重。</li>
+<li>如果加载的是 "k"：切分 K 的权重，并把它拼在 Q 的后面。</li>
+<li>它确保了即使 Q 和 K 大小不一样，每张显卡也能拿到正确对应的那一部分。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 6: 横着切一刀——“行并行” (Row Parallel)</h4>
+<p><strong>对应代码：</strong> <code>RowParallelLinear</code> 类</p>
+<ul>
+<li><strong>场景</strong>：通常用于 MLP 的第二层（降维）或者 Attention 的输出层（O_proj）。</li>
+<li><strong>原理</strong>：<ul>
+<li>这次我们切 <strong>输入维度</strong>（行）。</li>
+<li>数学原理：$Y = X_1 W_1 + X_2 W_2$。</li>
+<li>卡0 拿着输入的一部分 $X_1$ 和权重的一部分 $W_1$ 算出 $Y_1$。</li>
+<li>卡1 拿着输入的一部分 $X_2$ 和权重的一部分 $W_2$ 算出 $Y_2$。</li>
+<li><strong>关键点</strong>：最终结果 $Y$ 等于 $Y_1 + Y_2$。这意味着两张卡算完后，必须<strong>通信</strong>，把结果加起来。</li>
+</ul>
+</li>
+<li><strong>代码解读</strong>：<ul>
+<li><code>weight_loader</code>：这次切的是输入维度（<code>input_size_per_partition</code>）。</li>
+<li><strong><code>forward</code> 中的 <code>dist.all_reduce(y)</code></strong>: <strong>这是全文件最重要的通信代码</strong>。<ul>
+<li>它的意思是：所有显卡停下来，把大家手里的 <code>y</code> 加在一起，然后把加好的结果同步给所有人。</li>
+</ul>
+</li>
+<li><em>Bias 处理</em>：Bias（偏置项）只需要加一次。所以代码里写了 <code>self.bias if self.tp_rank == 0 else None</code>，只有 0 号卡加 Bias，其他卡不加，防止重复加。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这代码到底在干啥？</h3>
+<p>想象你要搬一块巨大的砖头（做矩阵运算）：</p>
+<ol>
+<li><strong>ReplicatedLinear</strong>: 每个人都搬一块一模一样的砖头（费力，不拆分）。</li>
+<li><strong>ColumnParallelLinear</strong>: 把砖头<strong>竖着</strong>劈开，你搬左半边，我搬右半边。最后我们把两半拼在一起。</li>
+<li><strong>RowParallelLinear</strong>: 把砖头<strong>横着</strong>劈开，你搬上半截，我搬下半截。最后我们需要把各自的结果<strong>加起来</strong>（All-Reduce）。</li>
+<li><strong>QKVParallelLinear</strong>: 这是特殊的砖头（Attention），形状怪异（GQA），需要精细地切分，保证每个人手里的 Q、K、V 比例合适。</li>
+</ol>
+<p>这个文件就是实现这些“切砖头”和“分配砖头”逻辑的底层代码，是自己写一个简易版 vLLM 或推理框架的基础。</p>

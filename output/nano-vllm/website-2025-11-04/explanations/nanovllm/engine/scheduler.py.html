@@ -1,0 +1,164 @@
+<h1>nanovllm/engine/scheduler.py</h1>
+<p>这份代码实现了一个微型的大语言模型（LLM）<strong>调度器（Scheduler）</strong>。</p>
+<p>你可以把这个 <code>Scheduler</code> 想象成一家<strong>非常火爆的餐厅经理</strong>。他的工作是安排顾客（用户发来的请求/Sequence）入座（占用显存/KV Cache），并决定下一秒钟厨房（GPU）该给谁做菜。</p>
+<p>为了让你读懂，我们将这个过程拆解为 <strong>5 个学习任务（Task）</strong>，一步步带你过一遍代码逻辑。</p>
+<hr />
+<h3>Task 1: 搞清楚“家底”和“排队区” (<code>__init__</code> &amp; <code>add</code>)</h3>
+<p>首先，我们要知道经理手里有什么资源，以及客人来了往哪放。</p>
+<ul>
+<li><strong>观点</strong>：资源是有限的，不能让所有人都同时进来，必须有人排队。</li>
+<li>
+<p><strong>代码对应</strong>：
+    ```python
+    def <strong>init</strong>(self, config: Config):
+        # 限制1：餐厅最多能同时坐多少桌（最大并发序列数）
+        self.max_num_seqs = config.max_num_seqs
+        # 限制2：厨房一次最多能炒多少盘菜（最大批处理 token 数）
+        self.max_num_batched_tokens = config.max_num_batched_tokens</p>
+<div class="codehilite"><pre><span></span><code><span class="err">#</span><span class="w"> </span><span class="n">核心资源</span><span class="err">：</span><span class="n">座位管理器</span><span class="err">（</span><span class="n">显存块管理器</span><span class="err">，</span><span class="n">负责分配</span><span class="w"> </span><span class="n">KV</span><span class="w"> </span><span class="n">Cache</span><span class="err">）</span>
+<span class="n">self</span><span class="p">.</span><span class="n">block_manager</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">BlockManager</span><span class="p">(...)</span>
+
+<span class="err">#</span><span class="w"> </span><span class="n">排队区</span><span class="err">：</span><span class="n">新来的客人在</span><span class="w"> </span><span class="n">waiting</span>
+<span class="n">self</span><span class="p">.</span><span class="nl">waiting</span><span class="p">:</span><span class="w"> </span><span class="n">deque</span><span class="o">[</span><span class="n">Sequence</span><span class="o">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">deque</span><span class="p">()</span>
+<span class="err">#</span><span class="w"> </span><span class="n">就餐区</span><span class="err">：</span><span class="n">正在吃饭的客人在</span><span class="w"> </span><span class="n">running</span>
+<span class="n">self</span><span class="p">.</span><span class="nl">running</span><span class="p">:</span><span class="w"> </span><span class="n">deque</span><span class="o">[</span><span class="n">Sequence</span><span class="o">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">deque</span><span class="p">()</span>
+</code></pre></div>
+
+<p>def add(self, seq: Sequence):
+    # 客人来了，先拿个号，去 waiting 队列等着
+    self.waiting.append(seq)
+```</p>
+</li>
+</ul>
+<h3>Task 2: 调度核心逻辑 —— 优先照顾“新客人” (<code>schedule</code> 的前半部分)</h3>
+<p>LLM 的推理分为两个阶段：
+1.  <strong>Prefill (预填充)</strong>：一次性阅读用户输入的很长的一段话（计算量大）。
+2.  <strong>Decode (解码)</strong>：一个字一个字地往外蹦（计算量小，但吃显存）。</p>
+<p>这段代码的逻辑是：<strong>只要有新客人（Waiting），且资源够，就优先处理新客人的阅读请求（Prefill）。</strong></p>
+<ul>
+<li><strong>观点</strong>：如果排队区有人，且我有空位，就让他们进来开始阅读（Prefill）。</li>
+<li><strong>代码对应</strong>：
+    ```python
+    def schedule(self) -&gt; tuple[list[Sequence], bool]:
+        # --- 第一阶段：尝试处理新客人 (Prefill) ---
+        scheduled_seqs = []<div class="codehilite"><pre><span></span><code><span class="gh">#</span> 只要还有人排队，且正在服务的人数没超标
+while self.waiting and num_seqs &lt; self.max_num_seqs:
+    seq = self.waiting[0] # 看一眼排在第一位的人
+
+    # 检查1：加上这个人，厨房（Token量）会不会爆？
+    # 检查2：还有没有空座位（显存块）分给他？
+    if ... or not self.block_manager.can_allocate(seq):
+        break # 资源不够，停止接客
+
+    # 资源够了，正式接客
+    self.block_manager.allocate(seq) # 分配座位
+    seq.status = SequenceStatus.RUNNING # 状态改为“正在吃”
+    self.waiting.popleft() # 移出排队区
+    self.running.append(seq) # 放入就餐区
+    scheduled_seqs.append(seq) # 加入也就是这一轮要送去GPU计算的名单
+
+<span class="gh">#</span> 如果这一轮选出了新客人，直接返回，让 GPU 去处理他们的 Prompt
+<span class="gh">#</span> True 代表这是 Prefill 阶段
+if scheduled_seqs:
+    return scheduled_seqs, True
+</code></pre></div>
+
+<p>```</p>
+</li>
+</ul>
+<h3>Task 3: 调度核心逻辑 —— 照顾“老客人”继续吃 (<code>schedule</code> 的后半部分)</h3>
+<p>如果没有新客人，或者新客人进不来，经理就要照顾已经在吃饭的 <code>running</code> 里的客人，让他们多吃一口（生成下一个 Token）。</p>
+<ul>
+<li><strong>观点</strong>：对于已经在跑的任务，我们需要给它分配<strong>新</strong>的显存空间（因为生成的字变多了，KV Cache 会变大）。</li>
+<li><strong>代码对应</strong>：
+    ```python
+        # --- 第二阶段：处理老客人 (Decode) ---
+        # 如果没处理新客人，就看看正在运行的序列
+        while self.running and num_seqs &lt; self.max_num_seqs:
+            seq = self.running.popleft() # 拿出一个正在运行的任务<div class="codehilite"><pre><span></span><code>    # ... (这里省略了抢占逻辑，Task 4 讲) ...
+
+    # 尝试给这个任务追加一点显存（为了放新生成的一个字）
+    self.block_manager.may_append(seq) 
+    scheduled_seqs.append(seq)
+
+<span class="gh">#</span> 把选中的人放回 running 队列（因为使用了 popleft，这里要放回去保持顺序）
+self.running.extendleft(reversed(scheduled_seqs))
+
+<span class="gh">#</span> 返回名单，False 代表这是 Decode 阶段
+return scheduled_seqs, False
+</code></pre></div>
+
+<p>```</p>
+</li>
+</ul>
+<h3>Task 4: 危机处理 —— 显存不够了怎么办？ (<code>preempt</code>)</h3>
+<p>这是代码里最难懂的部分。在 <code>Decode</code> 阶段，每个任务每生成一个字，就需要多一点点显存。如果显存满了，无法给当前任务分配空间，必须<strong>踢掉（抢占/Preempt）</strong> 别人，腾出空间。</p>
+<ul>
+<li><strong>观点</strong>：为了让当前这个 VIP 把话讲完，必须把其他正在吃的人赶出去，回收他们的桌子。</li>
+<li>
+<p><strong>代码对应</strong>：
+    ```python
+    def preempt(self, seq: Sequence):
+        # 把人踢回 waiting 队列的头部（插队，下次优先处理）
+        seq.status = SequenceStatus.WAITING
+        self.block_manager.deallocate(seq) # 【关键】把他的显存全部清空回收！
+        self.waiting.appendleft(seq) # 放回排队区最前面</p>
+<h1>回到 schedule 的 Decode 部分看那个 while 循环：</h1>
+<p>while self.running and num_seqs &lt; self.max_num_seqs:
+    seq = self.running.popleft()</p>
+<div class="codehilite"><pre><span></span><code><span class="gh">#</span> 当显存管理器说：“没空间给 seq 追加新 token 了”
+while not self.block_manager.can_append(seq):
+    # 必须牺牲别人！
+    if self.running:
+        # 牺牲队列末尾的人（优先级最低的）
+        self.preempt(self.running.pop())
+    else:
+        # 实在没人可牺牲了，只能牺牲自己（暂停当前任务）
+        self.preempt(seq)
+        break
+else:
+    # 只要上面的 while 循环结束（说明有空间了），就分配空间
+    self.block_manager.may_append(seq)
+    scheduled_seqs.append(seq)
+</code></pre></div>
+
+<p>```</p>
+</li>
+</ul>
+<h3>Task 5: 结账走人 (<code>postprocess</code>)</h3>
+<p>GPU 算完了一轮，生成了新的 Token，经理需要更新状态，并检查客人是不是吃饱了（生成结束）。</p>
+<ul>
+<li><strong>观点</strong>：每次生成完一个字，都要检查：是句号吗？字数超了吗？如果是，就释放资源。</li>
+<li><strong>代码对应</strong>：
+    ```python
+    def postprocess(self, seqs: list[Sequence], token_ids: list[int]):
+        # 遍历刚才算过的任务和生成的新 token
+        for seq, token_id in zip(seqs, token_ids):
+            seq.append_token(token_id) # 把新字加进去<div class="codehilite"><pre><span></span><code>    # 检查结束条件：
+    # 1. 遇到了结束符 (EOS) 且不忽略它
+    # 2. 或者生成的长度达到了最大限制
+    if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+        # 标记为完成
+        seq.status = SequenceStatus.FINISHED
+        # 【重要】客人走了，把桌子（显存块）彻底释放，给别人用
+        self.block_manager.deallocate(seq)
+        # 从 running 队列移除
+        self.running.remove(seq)
+</code></pre></div>
+
+<p>```</p>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个 <code>Scheduler</code> 的工作流程就是：</p>
+<ol>
+<li><strong>Add</strong>: 接受任务进 <code>waiting</code>。</li>
+<li><strong>Schedule</strong>:<ul>
+<li>优先看 <code>waiting</code>，显存够就拉进 <code>running</code> 做 <strong>Prefill</strong>。</li>
+<li>没新任务就看 <code>running</code>，给每个任务追加显存做 <strong>Decode</strong>。</li>
+<li><strong>Preempt</strong>: 如果 Decode 时显存不够，就强制把某些正在跑的任务踢回 <code>waiting</code>，释放显存保帅。</li>
+</ul>
+</li>
+<li><strong>Postprocess</strong>: 拿到 GPU 算出的新字，判断任务是否结束，结束了就还显存。</li>
+</ol>

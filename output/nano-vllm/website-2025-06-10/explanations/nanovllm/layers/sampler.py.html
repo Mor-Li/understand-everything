@@ -1,0 +1,81 @@
+<h1>nanovllm/layers/sampler.py</h1>
+<p>这份代码实现了一个<strong>采样器（Sampler）</strong>。</p>
+<p>简单来说，当大模型输出了很多个“候选词”的评分（logits）时，这个采样器的作用就是<strong>根据这些评分，决定下一个字到底选哪个</strong>。</p>
+<p>它没有使用常见的 <code>torch.multinomial</code>，而是使用了一种数学上等价但更适合 GPU 并行的技巧（Gumbel-Max Trick 的变体）。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>4步走的 To-Do List</strong>，我们一步步来完成这个任务。</p>
+<hr />
+<h3>📝 采样任务 To-Do List</h3>
+<ol>
+<li><strong>数据准备 (Data Prep)</strong>：把数据转成高精度的格式，防止计算出错。</li>
+<li><strong>调节“创造力” (Temperature Scaling)</strong>：根据温度参数，调整模型是该“保守”还是“奔放”。</li>
+<li><strong>计算概率 (Probability)</strong>：把原本随意的分数，变成总和为 1 的百分比概率。</li>
+<li><strong>抽奖 (Sampling)</strong>：根据概率，把最终的中奖者（Token）选出来。</li>
+</ol>
+<hr />
+<h3>🧐 逐步讲解</h3>
+<h4>任务 1：数据准备</h4>
+<p><strong>代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">logits</span> <span class="o">=</span> <span class="n">logits</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲人话</strong>：
+    模型的原始输出（logits）可能是半精度（float16）的，这种格式为了省显存，精度不高。但在做概率计算（除法、指数）时，精度不够容易溢出或报错。</li>
+<li><strong>做什么</strong>：
+    强行把它转成 <code>float32</code>（全精度浮点数），保证后面算得准。</li>
+</ul>
+<h4>任务 2：调节“创造力” (Temperature)</h4>
+<p><strong>代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">temperatures</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">logits</span><span class="o">.</span><span class="n">div_</span><span class="p">(</span><span class="n">temperatures</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="n">dim</span><span class="o">=</span><span class="mi">1</span><span class="p">))</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲人话</strong>：
+    这就是我们在用 ChatGPT 时常见的“温度（Temperature）”参数。<ul>
+<li><code>logits</code> 是模型给每个词打的分。</li>
+<li><strong>如果温度 &lt; 1 (比如 0.1)</strong>：分数会被放大（除以小数等于乘以大数）。原本分数高的词，差距会被拉得更大，强者恒强。模型会变得很保守、很确定。</li>
+<li><strong>如果温度 &gt; 1 (比如 2.0)</strong>：分数会被缩小。原本分数高低的差距变小了，众生平等。模型就容易选出一些冷门的词，变得“胡言乱语”或“更有创造力”。</li>
+</ul>
+</li>
+<li><strong>做什么</strong>：
+    把分数除以温度，调整分数的分布形态。</li>
+</ul>
+<h4>任务 3：计算概率 (Softmax)</h4>
+<p><strong>代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">probs</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">softmax</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲人话</strong>：
+    <code>logits</code> 的分数是任意实数（比如 5.2, -1.3, 8.0），这没法直接抽奖。我们需要把它变成概率（比如 10%, 5%, 85%）。</li>
+<li><strong>做什么</strong>：
+    使用 <code>Softmax</code> 函数，把所有分数变成 0 到 1 之间的小数，并且加起来等于 1。这就构成了抽奖的转盘。</li>
+</ul>
+<h4>任务 4：抽奖 (The Magic Trick) 🌟 <em>最难懂的一行</em></h4>
+<p><strong>代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">sampled_tokens</span> <span class="o">=</span> <span class="n">probs</span><span class="o">.</span><span class="n">div_</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">empty_like</span><span class="p">(</span><span class="n">probs</span><span class="p">)</span><span class="o">.</span><span class="n">exponential_</span><span class="p">(</span><span class="mi">1</span><span class="p">))</span><span class="o">.</span><span class="n">argmax</span><span class="p">(</span><span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li>
+<p><strong>讲人话</strong>：
+    这一行代码非常“骚气”，它用了一个数学技巧（Gumbel-Max Trick 的变体）来代替传统的抽签。</p>
+<p>通常我们会用 <code>torch.multinomial</code> 来根据概率抽签，但这里用了另一种方法：
+1.  <code>torch.empty_like(probs).exponential_(1)</code>：生成了一组服从<strong>指数分布</strong>的随机噪声（你可以理解为给每个候选词扔了一组随机的干扰项）。
+2.  <code>probs.div_(...)</code>：把原本的概率 <strong>除以</strong> 这个随机噪声。
+3.  <code>argmax(dim=-1)</code>：选出除完之后<strong>数值最大</strong>的那个词。</p>
+<p><strong>为什么要这么做？</strong>
+数学上可以证明：<strong>“选出 (概率 / 指数噪声) 最大的那个词”，等价于 “按照概率大小随机抽取一个词”。</strong></p>
+<p><em>举个例子</em>：
+如果“苹果”的概率很高，哪怕除以一个随机噪声，它大概率还是很大，容易被 <code>argmax</code> 选中。
+如果“香蕉”概率很低，除非它的随机噪声特别小（除以极小值变很大），否则很难被选中。</p>
+</li>
+<li>
+<p><strong>做什么</strong>：
+    通过引入随机噪声并取最大值的方法，完成了一次<strong>加权随机采样</strong>，选出了最终的下一个字（<code>sampled_tokens</code>）。</p>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这段代码虽然短，但实现了一个完整的<strong>带温度控制的随机采样</strong>功能。</p>
+<p>你看不懂的那行核心代码，其实就是：<strong>给概率加点特殊的随机噪声，然后选最大的那个，这就等于按概率抽奖。</strong> 这种写法在底层优化中很常见，因为它不需要计算前缀和，对 GPU 更友好。</p>

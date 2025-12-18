@@ -1,0 +1,141 @@
+<h1>nanovllm/layers/embed_head.py</h1>
+<p>这份代码确实涉及到了大模型（LLM）底层比较硬核的知识：<strong>张量并行（Tensor Parallelism, TP）</strong>。简单来说，就是显卡显存不够大，或者为了算得更快，把一个巨大的神经网络层“切开”，分给好几张显卡一起算。</p>
+<p>为了让你读懂，我制定了一个 <strong>5步学习清单（Task List）</strong>。我们把这个复杂的流程拆解开，就像剥洋葱一样，一步步看它是怎么把任务分给多张显卡的。</p>
+<hr />
+<h3>📋 学习任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1: 理解“切蛋糕”的概念</strong> —— 怎么把词表（Vocabulary）分给多张卡？</li>
+<li><strong>Task 2: 看懂 <code>VocabParallelEmbedding</code> 的初始化</strong> —— 每个人只领自己的那份工资（权重）。</li>
+<li><strong>Task 3: 看懂 Embedding 的 <code>forward</code> 过程</strong> —— 如何做到“各算各的，最后汇总”？</li>
+<li><strong>Task 4: 进阶到 <code>ParallelLMHead</code></strong> —— 最后的输出层是怎么反向操作的？</li>
+<li><strong>Task 5: 理解特殊的优化细节</strong> —— 为什么只取最后一个 token？</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>✅ Task 1: 理解“切蛋糕”的概念 (Context)</h4>
+<p>在大模型中，词表（Vocabulary）通常很大（比如 32,000 个词或更多）。
+*   <strong>普通做法</strong>：一张显卡存下整个 <code>32000 x 4096</code> 的矩阵。
+*   <strong>并行做法（本文做法）</strong>：如果有 2 张显卡，每张卡只存 <code>16000 x 4096</code>。
+    *   显卡 0 负责词 ID：0 ~ 15999
+    *   显卡 1 负责词 ID：16000 ~ 31999</p>
+<p><strong>文中关键变量：</strong>
+*   <code>tp_rank</code>: 当前显卡的编号（我是老几？）。
+*   <code>tp_size</code>: 总共有几张显卡。</p>
+<hr />
+<h4>✅ Task 2: <code>VocabParallelEmbedding</code> 的初始化</h4>
+<p>我们先看第一个类 <code>VocabParallelEmbedding</code> 的 <code>__init__</code> 部分。它的核心任务是<strong>计算自己该管哪一段数据</strong>。</p>
+<blockquote>
+<p><strong>代码对应：</strong>
+<code>python
+self.num_embeddings_per_partition = self.num_embeddings // self.tp_size
+self.vocab_start_idx = self.num_embeddings_per_partition * self.tp_rank
+self.vocab_end_idx = self.vocab_start_idx + self.num_embeddings_per_partition</code></p>
+</blockquote>
+<p><strong>白话解释：</strong>
+假设一共 100 个词，2 张卡。
+*   <strong>显卡 0</strong>：<code>start_idx</code> = 0, <code>end_idx</code> = 50。它只创建大小为 50 的权重矩阵。
+*   <strong>显卡 1</strong>：<code>start_idx</code> = 50, <code>end_idx</code> = 100。它也只创建大小为 50 的权重矩阵。</p>
+<p><strong>注意</strong>：<code>self.weight</code> 在这里只有完整大小的 <code>1/tp_size</code>。这就是省显存的关键。</p>
+<hr />
+<h4>✅ Task 3: Embedding 的 <code>forward</code> 过程 (核心难点)</h4>
+<p>现在输入来了一句话，比如 token ID 是 <code>[5, 80]</code>（假设词表一共100，两张卡分）。
+显卡 0 负责 0-49，显卡 1 负责 50-99。</p>
+<p><strong>代码逻辑拆解：</strong></p>
+<ol>
+<li>
+<p><strong>判断归属 (Masking)</strong>:
+    <code>python
+    mask = (x &gt;= self.vocab_start_idx) &amp; (x &lt; self.vocab_end_idx)
+    x = mask * (x - self.vocab_start_idx)</code></p>
+<ul>
+<li><strong>显卡 0 看到 <code>[5, 80]</code></strong>：<ul>
+<li>5 在它的范围内 -&gt; 保留。</li>
+<li>80 不在范围内 -&gt; <code>mask</code> 设为 0，把 80 变成 0（为了防止报错，因为它的表里只有50个词）。</li>
+</ul>
+</li>
+<li><strong>显卡 1 看到 <code>[5, 80]</code></strong>：<ul>
+<li>5 不在范围内 -&gt; 变成 0。</li>
+<li>80 在范围内 -&gt; 减去偏移量 50，变成 30（因为它只查自己那张表里的第30行）。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>查表 (Lookup)</strong>:
+    <code>python
+    y = F.embedding(x, self.weight)</code></p>
+<ul>
+<li>大家各自去查自己的小本本。</li>
+<li>显卡 0 查到了 5 的向量，但在 80 的位置查出来的是“假数据”（或者是0）。</li>
+<li>显卡 1 查到了 80 的向量，但在 5 的位置查出来的是“假数据”。</li>
+</ul>
+</li>
+<li>
+<p><strong>修正与合并 (All Reduce)</strong>:
+    <code>python
+    y = mask.unsqueeze(1) * y  # 把不归自己管的位置彻底清零
+    dist.all_reduce(y)         # 关键一步！</code></p>
+<ul>
+<li><code>dist.all_reduce(y)</code> 的意思是：把所有显卡上的 <code>y</code> 加起来，然后同步给所有人。</li>
+<li><strong>位置 1 (Token 5)</strong>: 显卡0的真值 + 显卡1的0 = <strong>真值</strong>。</li>
+<li><strong>位置 2 (Token 80)</strong>: 显卡0的0 + 显卡1的真值 = <strong>真值</strong>。</li>
+<li><strong>结果</strong>：所有显卡都拿到了完整的、正确的向量表示。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 4: 进阶到 <code>ParallelLMHead</code></h4>
+<p>这个类是 LLM 的最后一层。它的作用是把向量变回词的概率（Logits）。它继承了上面的类，但方向是反的。</p>
+<p><strong>区别在于：</strong>
+Embedding 是 <code>输入 ID -&gt; 查向量</code>。
+LMHead 是 <code>输入向量 -&gt; 算每个词的得分</code>。</p>
+<p><strong>代码逻辑：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">logits</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">linear</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li>因为权重被切分了，<strong>显卡 0</strong> 只能算出前 16000 个词的得分；<strong>显卡 1</strong> 只能算出后 16000 个词的得分。</li>
+<li>现在的 <code>logits</code> 是不完整的（只有一半词表）。</li>
+</ul>
+<p><strong>收集结果 (Gather):</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+    <span class="c1"># 准备一个列表来接收大家的结果</span>
+    <span class="n">all_logits</span> <span class="o">=</span> <span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">empty_like</span><span class="p">(</span><span class="n">logits</span><span class="p">)</span> <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span><span class="p">)]</span> <span class="o">...</span>
+    <span class="c1"># 把大家的碎片收集到 rank 0 (主显卡)</span>
+    <span class="n">dist</span><span class="o">.</span><span class="n">gather</span><span class="p">(</span><span class="n">logits</span><span class="p">,</span> <span class="n">all_logits</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+    <span class="c1"># 拼起来</span>
+    <span class="n">logits</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">all_logits</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li>主显卡（Rank 0）把大家算出来的半截结果拼在一起，得到了完整的 32000 个词的得分，用于后续生成文字。</li>
+</ul>
+<hr />
+<h4>✅ Task 5: 理解特殊的优化细节 (Optimization)</h4>
+<p>在 <code>ParallelLMHead</code> 中有一段奇怪的代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">context</span> <span class="o">=</span> <span class="n">get_context</span><span class="p">()</span>
+<span class="k">if</span> <span class="n">context</span><span class="o">.</span><span class="n">is_prefill</span><span class="p">:</span>
+    <span class="n">last_indices</span> <span class="o">=</span> <span class="n">context</span><span class="o">.</span><span class="n">cu_seqlens_q</span><span class="p">[</span><span class="mi">1</span><span class="p">:]</span> <span class="o">-</span> <span class="mi">1</span>
+    <span class="n">x</span> <span class="o">=</span> <span class="n">x</span><span class="p">[</span><span class="n">last_indices</span><span class="p">]</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+</code></pre></div>
+
+<p><strong>这是在干什么？</strong>
+这是为了<strong>推理加速</strong>。</p>
+<ul>
+<li><strong>场景</strong>：你发给 ChatGPT 一段话：“今天天气不错，适合去...”</li>
+<li><strong>Prefill (预填充阶段)</strong>：模型在读你的问题。此时，我们其实只需要模型预测<strong>最后一个字</strong>（“去”）后面接什么（比如“公园”）。</li>
+<li><strong>优化</strong>：虽然输入了 10 个字，但我不需要把这 10 个字的下一个词都算一遍。我只把<strong>最后一个字</strong>的向量挑出来 (<code>x[last_indices]</code>)，扔给全连接层算 Logits。</li>
+<li>这样大大减少了计算量。</li>
+</ul>
+<hr />
+<h3>💡 总结</h3>
+<p>这个文件其实就讲了两件事：</p>
+<ol>
+<li><strong>怎么省显存</strong>：把巨大的词表矩阵切成几块，分给不同的显卡存（<code>VocabParallelEmbedding</code> 的 <code>__init__</code>）。</li>
+<li><strong>怎么协同计算</strong>：<ul>
+<li><strong>输入层</strong>：大家各查各的，查不到的填0，最后相加（<code>all_reduce</code>）。</li>
+<li><strong>输出层</strong>：大家各算各的（算出自己负责的那部分词的得分），最后拼起来（<code>gather</code> + <code>cat</code>）。</li>
+</ul>
+</li>
+</ol>
+<p>希望能帮你把这个文件看懂！</p>

@@ -1,0 +1,129 @@
+<h1>nanovllm/layers/embed_head.py</h1>
+<p>这份代码确实涉及到了<strong>大模型（LLM）底层最核心、但也最晦涩的部分</strong>：<strong>分布式计算（Distributed Computing）</strong>和<strong>张量并行（Tensor Parallelism）</strong>。</p>
+<p>简单来说，这段代码是为了解决一个问题：<strong>当模型的词表（Vocabulary）太大，一张显卡放不下，或者计算太慢时，怎么把词表切开，分给多张显卡一起算。</strong></p>
+<p>别担心，我们按照你要求的 <strong>List / To-Do Task</strong> 模式，把它拆解成 5 个小任务，一步步通关。</p>
+<hr />
+<h3>🚀 任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1: 理解基本概念（什么是 Embedding 和 Head？）</strong></li>
+<li><strong>Task 2: 理解核心策略（什么叫“按词表切分”？）</strong></li>
+<li><strong>Task 3: 拆解代码 <code>VocabParallelEmbedding</code>（输入层怎么并行？）</strong></li>
+<li><strong>Task 4: 拆解代码 <code>ParallelLMHead</code>（输出层怎么并行？）</strong></li>
+<li><strong>Task 5: 理解那个奇怪的 <code>context.is_prefill</code>（性能优化）</strong></li>
+</ol>
+<hr />
+<h3>✅ Task 1: 理解基本概念（什么是 Embedding 和 Head？）</h3>
+<p>在看代码前，先建立两个直觉：</p>
+<ul>
+<li><strong>Embedding (入口):</strong> 相当于<strong>字典查询</strong>。你给模型输入一个词的 ID（比如 <code>10086</code>），模型要把这个 ID 变成一个<strong>向量（Vector）</strong>（比如一串数字 <code>[0.1, -0.5, ...]</code>）。</li>
+<li><strong>LM Head (出口):</strong> 相当于<strong>打分器</strong>。模型算完后，手里拿着一个向量，它要看看这个向量最像词表里的哪个词。它会给词表里几万个词每一个都打分（Logits），分数最高的那个就是预测的下一个词。</li>
+</ul>
+<p><strong>这份代码就是实现了这两个组件，但是是“多显卡并行版”的。</strong></p>
+<hr />
+<h3>✅ Task 2: 理解核心策略（什么叫“按词表切分”？）</h3>
+<p>假设你的词表有 10 个词（0~9），每个词对应的向量长度是 4。
+现在你有 <strong>2 张显卡 (GPU)</strong>。</p>
+<p>如果不切分，每张卡都要存完整的 10 个词的向量。
+<strong>VocabParallel（按词表切分）的做法是：</strong>
+*   <strong>GPU 0</strong> 负责存词 ID：<strong>0 ~ 4</strong>
+*   <strong>GPU 1</strong> 负责存词 ID：<strong>5 ~ 9</strong></p>
+<p>这样每张卡只存一半的参数，这就叫 <strong>Vocab Parallelism</strong>。</p>
+<hr />
+<h3>✅ Task 3: 拆解代码 <code>VocabParallelEmbedding</code>（输入层怎么并行？）</h3>
+<p>这个类负责把输入的 Token ID 变成向量。</p>
+<p><strong>步骤拆解：</strong></p>
+<ol>
+<li>
+<p><strong><code>__init__</code> (初始化):</strong></p>
+<ul>
+<li>代码：<code>self.num_embeddings // self.tp_size</code></li>
+<li><strong>解释：</strong> 计算每张卡分到多少个词。比如总共 10 个词，2 张卡，每张卡分 5 个。</li>
+<li>代码：<code>self.vocab_start_idx</code> 和 <code>self.vocab_end_idx</code></li>
+<li><strong>解释：</strong> 认领地盘。GPU 0 记下“我负责 0-5”，GPU 1 记下“我负责 5-10”。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>forward</code> (前向传播 - 最难懂的部分):</strong></p>
+<ul>
+<li><strong>场景：</strong> 用户输入了 ID <code>3</code>。</li>
+<li><strong>GPU 0 (负责 0-4):</strong><ul>
+<li><code>mask</code> 判断：3 在我的范围内吗？<strong>在</strong>。</li>
+<li><code>x - self.vocab_start_idx</code>：计算相对位置。</li>
+<li><code>F.embedding</code>：查表，得到了 ID 3 的向量 <code>[0.1, 0.2, ...]</code>。</li>
+</ul>
+</li>
+<li><strong>GPU 1 (负责 5-9):</strong><ul>
+<li><code>mask</code> 判断：3 在我的范围内吗？<strong>不在</strong>。</li>
+<li><code>y = mask * y</code>：因为不在我的地盘，所以我查出来的结果强制变成 <strong>全 0 向量</strong> <code>[0.0, 0.0, ...]</code>。</li>
+</ul>
+</li>
+<li><strong>关键一步 <code>dist.all_reduce(y)</code>:</strong><ul>
+<li>现在 GPU 0 手里是 <code>[有数值]</code>，GPU 1 手里是 <code>[全0]</code>。</li>
+<li><code>all_reduce</code> 的作用是把所有卡的结果<strong>加起来</strong>，然后同步给所有人。</li>
+<li>结果：<code>[有数值] + [全0] = [有数值]</code>。</li>
+<li><strong>结论：</strong> 无论词 ID 在哪张卡上，经过这一步，所有卡都拿到了正确的向量。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 4: 拆解代码 <code>ParallelLMHead</code>（输出层怎么并行？）</h3>
+<p>这个类负责根据向量预测下一个词。它继承了上面的 Embedding 类，但逻辑有点不同。</p>
+<p><strong>步骤拆解：</strong></p>
+<ol>
+<li>
+<p><strong><code>forward</code> 中的 <code>F.linear</code>:</strong></p>
+<ul>
+<li>手里拿着一个隐向量（Hidden State）。</li>
+<li><strong>GPU 0</strong> 算出：这个向量像不像词 0~4？（得到 5 个打分）。</li>
+<li><strong>GPU 1</strong> 算出：这个向量像不像词 5~9？（得到 5 个打分）。</li>
+<li><em>注意：此时每张卡只有一半词表的打分。</em></li>
+</ul>
+</li>
+<li>
+<p><strong><code>dist.gather</code> (收集结果):</strong></p>
+<ul>
+<li>代码：<code>dist.gather(logits, all_logits, 0)</code></li>
+<li><strong>解释：</strong> 这行代码的意思是，“大家把手里的分数的碎片都交上来，交给老大（Rank 0）”。</li>
+<li><strong>Rank 0 (主卡):</strong> 收到了 GPU 0 的 5 个分，和 GPU 1 的 5 个分。</li>
+<li>代码：<code>torch.cat(all_logits, -1)</code></li>
+<li><strong>解释：</strong> 拼起来！现在 Rank 0 拥有了完整的 0~9 所有词的打分，可以决定下一个词是谁了。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 5: 理解那个奇怪的 <code>context.is_prefill</code>（性能优化）</h3>
+<p>在 <code>ParallelLMHead</code> 的 <code>forward</code> 里有一段看起来很突兀的代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">context</span><span class="o">.</span><span class="n">is_prefill</span><span class="p">:</span>
+    <span class="n">last_indices</span> <span class="o">=</span> <span class="n">context</span><span class="o">.</span><span class="n">cu_seqlens_q</span><span class="p">[</span><span class="mi">1</span><span class="p">:]</span> <span class="o">-</span> <span class="mi">1</span>
+    <span class="n">x</span> <span class="o">=</span> <span class="n">x</span><span class="p">[</span><span class="n">last_indices</span><span class="p">]</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+</code></pre></div>
+
+<p><strong>这是干嘛的？</strong></p>
+<ul>
+<li>
+<p><strong>背景：</strong> LLM 推理分两个阶段：</p>
+<ol>
+<li><strong>Prefill (预填充/阅读阶段):</strong> 一次性读入你写的整个 Prompt。</li>
+<li><strong>Decode (生成阶段):</strong> 一个字一个字往外蹦。</li>
+</ol>
+</li>
+<li>
+<p><strong>问题：</strong> 在 Prefill 阶段，假设你输入了 "我爱吃"，模型读这 3 个字。但我们真正需要的只是根据 "吃" 字预测下一个字（比如 "饭"）。我们<strong>不需要</strong>根据 "我" 预测 "爱"，也不需要根据 "爱" 预测 "吃"（因为这些已经是已知的了）。</p>
+</li>
+<li><strong>优化：</strong><ul>
+<li>这段代码的意思是：如果现在是 Prefill 阶段，<strong>别傻乎乎地把所有 Token 都拿去算一遍输出概率</strong>。</li>
+<li><code>last_indices</code>: 只要每个句子的<strong>最后一个词</strong>。</li>
+<li><strong>省流：</strong> 这样可以节省巨大的计算量，因为算几万个词的概率是很贵的，只算最后一个词就够了。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📝 总结 (Summary)</h3>
+<p>把这个文件看作一个<strong>分工合作的图书管理员</strong>：</p>
+<ol>
+<li><strong>VocabParallelEmbedding (查书):</strong> 每个人只管一部分书架。你要查 ID，大家一起查。查到的人拿出书，没查到的人拿空盒子。最后大家把手里的东西汇聚一下，你就拿到了书。</li>
+<li><strong>ParallelLMHead (打分):</strong> 每个人只给一部分候选词打分。大家打完分，把分数单子汇总给组长（Rank 0），组长拼成一张完整的成绩单，选出第一名。</li>
+<li><strong>Context 优化:</strong> 组长很聪明，只检查最后一个字的作业，前面的字就不浪费时间批改了。</li>
+</ol>

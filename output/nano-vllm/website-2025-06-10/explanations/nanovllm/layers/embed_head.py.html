@@ -1,0 +1,89 @@
+<h1>nanovllm/layers/embed_head.py</h1>
+<p>这份代码确实涉及到了大模型推理中比较硬核的概念——<strong>张量并行 (Tensor Parallelism, TP)</strong>。如果没有分布式训练/推理的背景，确实很难看懂。</p>
+<p>别担心，我们把它拆解成一个<strong>学习任务清单 (To-Do List)</strong>。我们不一行行死磕代码，而是通过这几个步骤，搞清楚它到底想干什么。</p>
+<h3>核心背景</h3>
+<p>这段代码的主要目的是：<strong>当模型的词表（Vocabulary）太大，一张显卡放不下，或者为了计算更快时，我们把词表切成好几份，分给不同的显卡去处理。</strong></p>
+<hr />
+<h3>任务清单 (To-Do List)</h3>
+<h4>✅ Task 1: 理解“分家产” (切分词表)</h4>
+<p>首先，你要明白这段代码的基础设定。假设我们的词表有 10,000 个单词。
+*   如果只有 1 张卡 (<code>tp_size=1</code>)：这张卡存 0-9999 号单词。
+*   如果有 2 张卡 (<code>tp_size=2</code>)：
+    *   显卡 0 (<code>tp_rank=0</code>) 负责存 0-4999 号单词。
+    *   显卡 1 (<code>tp_rank=1</code>) 负责存 5000-9999 号单词。</p>
+<p><strong>代码对应：</strong>
+在 <code>__init__</code> 方法中：</p>
+<div class="codehilite"><pre><span></span><code><span class="bp">self</span><span class="o">.</span><span class="n">num_embeddings_per_partition</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_embeddings</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">vocab_start_idx</span> <span class="o">=</span> <span class="o">...</span> <span class="c1"># 我这张卡负责的起始单词ID</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">vocab_end_idx</span> <span class="o">=</span> <span class="o">...</span>   <span class="c1"># 我这张卡负责的结束单词ID</span>
+</code></pre></div>
+
+<p>这部分就是在算“我这张卡该管哪一段”。</p>
+<hr />
+<h4>✅ Task 2: 理解“各管各的” (Embedding 层的前向传播)</h4>
+<p><code>VocabParallelEmbedding</code> 是把输入的 Token ID 变成向量。
+如果是多卡并行，输入进来一串 ID（比如 <code>[10, 5005]</code>），显卡们该怎么工作？</p>
+<ul>
+<li><strong>显卡 0 (管 0-4999)</strong>：<ul>
+<li>看到 ID <code>10</code>：这是我的辖区！查表，返回向量。</li>
+<li>看到 ID <code>5005</code>：这不是我的辖区！<strong>把它变成 0 (mask)</strong>。</li>
+</ul>
+</li>
+<li><strong>显卡 1 (管 5000-9999)</strong>：<ul>
+<li>看到 ID <code>10</code>：不归我管，<strong>变成 0</strong>。</li>
+<li>看到 ID <code>5005</code>：归我管！查表（注意要减去偏移量），返回向量。</li>
+</ul>
+</li>
+</ul>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 判断哪些ID归我管</span>
+<span class="n">mask</span> <span class="o">=</span> <span class="p">(</span><span class="n">x</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">vocab_start_idx</span><span class="p">)</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">x</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">vocab_end_idx</span><span class="p">)</span>
+<span class="c1"># 2. 减去起始位置（因为我的本地权重是从0开始索引的）</span>
+<span class="n">x</span> <span class="o">=</span> <span class="n">mask</span> <span class="o">*</span> <span class="p">(</span><span class="n">x</span> <span class="o">-</span> <span class="bp">self</span><span class="o">.</span><span class="n">vocab_start_idx</span><span class="p">)</span>
+<span class="c1"># 3. 查表</span>
+<span class="n">y</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">embedding</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="p">)</span>
+<span class="c1"># 4. 把不归我管的那些位置的结果抹零</span>
+<span class="n">y</span> <span class="o">=</span> <span class="n">mask</span> <span class="o">*</span> <span class="n">y</span>
+</code></pre></div>
+
+<hr />
+<h4>✅ Task 3: 理解“汇总结果” (All-Reduce)</h4>
+<p>接上一步，现在显卡 0 手里有 <code>[向量A, 0]</code>，显卡 1 手里有 <code>[0, 向量B]</code>。
+我们需要的是 <code>[向量A, 向量B]</code>。</p>
+<p>怎么办？大家把手里的结果加起来！
+<code>[向量A, 0] + [0, 向量B] = [向量A, 向量B]</code></p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">dist</span><span class="o">.</span><span class="n">all_reduce</span><span class="p">(</span><span class="n">y</span><span class="p">)</span> <span class="c1"># 分布式通信：把所有卡的结果加在一起，同步给所有人</span>
+</code></pre></div>
+
+<hr />
+<h4>✅ Task 4: 理解“最后一步” (LM Head)</h4>
+<p><code>ParallelLMHead</code> 是模型的最后一层。它的作用和 Embedding 相反：<strong>把向量变回单词的概率（Logits）</strong>。
+它继承了上面的类，也用了同样的切分逻辑。</p>
+<p><strong>重点优化 (Prefill 阶段)：</strong>
+在大模型推理中，当我们在处理 Prompt（提问）时，其实我们只需要<strong>最后一个 Token</strong> 的输出，因为只有最后一个 Token 才能预测“下一个字”是什么。前面的 Token 预测出什么我们并不关心。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">context</span><span class="o">.</span><span class="n">is_prefill</span><span class="p">:</span>
+    <span class="c1"># 比如输入是 &quot;我爱吃&quot;，长度为3</span>
+    <span class="c1"># 我们只取第3个位置的向量去计算，不用算&quot;我&quot;和&quot;爱&quot;的输出</span>
+    <span class="n">last_indices</span> <span class="o">=</span> <span class="n">context</span><span class="o">.</span><span class="n">cu_seqlens_q</span><span class="p">[</span><span class="mi">1</span><span class="p">:]</span> <span class="o">-</span> <span class="mi">1</span>
+    <span class="n">x</span> <span class="o">=</span> <span class="n">x</span><span class="p">[</span><span class="n">last_indices</span><span class="p">]</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+</code></pre></div>
+
+<p>这是一种极大的性能优化，避免了计算无用的数据。</p>
+<hr />
+<h4>✅ Task 5: 发现代码中的“猫腻” (硬编码)</h4>
+<p>虽然这个类写得很热闹，支持分布式，但请注意这一行：</p>
+<div class="codehilite"><pre><span></span><code><span class="bp">self</span><span class="o">.</span><span class="n">tp_rank</span> <span class="o">=</span> <span class="mi">0</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">=</span> <span class="mi">1</span>
+</code></pre></div>
+
+<p>在这份特定的代码里，作者<strong>把并行度写死成了 1</strong>。
+这意味着：<strong>虽然它写了并行的逻辑，但在这个版本里，它实际上就是当成普通的单卡 Embedding 和 Linear 层在用。</strong> 那些 <code>if self.tp_size &gt; 1:</code> 的代码块根本不会执行。</p>
+<h3>总结 (大白话版)</h3>
+<ol>
+<li><strong>VocabParallelEmbedding</strong>: 是个输入层。本来设计成能让多张显卡一人存一部分字典。如果我要查的字在你那，你给向量；在他那，他给向量。最后大家拼起来。</li>
+<li><strong>ParallelLMHead</strong>: 是个输出层。把向量算回分数的。</li>
+<li><strong>Context 优化</strong>: 也就是代码里的 <code>is_prefill</code>，意思是“别傻乎乎地把整个句子的预测结果都算出来，我只要最后一个字的预测结果用来生成下一个字”。</li>
+</ol>
+<p>现在再回去看代码，是不是稍微清晰一点了？核心就是：<strong>切分数据 -&gt; 各算各的 -&gt; 结果合并</strong>。</p>

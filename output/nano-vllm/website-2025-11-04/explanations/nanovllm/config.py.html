@@ -1,0 +1,44 @@
+<h1>nanovllm/config.py</h1>
+<p>这份代码其实就是一个<strong>“设置菜单”</strong>或者<strong>“配置清单”</strong>。</p>
+<p>想象一下，你要启动一台超级复杂的机器（比如一个大语言模型推理引擎，类似 ChatGPT 的后台服务），在按下启动键之前，你必须先填好一张表格，告诉机器：用哪块显卡？一次接待多少个用户？内存怎么分配？</p>
+<p>这个文件 <code>config.py</code> 就是定义这张表格长什么样，以及负责检查你填的数据对不对。</p>
+<p>为了让你更容易理解，我把理解这份代码的过程拆分成一个 <strong>6步走的 Task List（任务清单）</strong>。</p>
+<hr />
+<h3>📋 学习任务清单</h3>
+<h4>✅ Task 1: 理解“容器”的概念 (<code>@dataclass</code>)</h4>
+<p>首先看代码最上面的 <code>@dataclass</code> 和 <code>class Config</code>。
+*   <strong>通俗解释</strong>：这就像在定义一个“结构体”或者一张“表单”。它的作用仅仅是用来<strong>存数据</strong>的，不是用来写复杂算法的。
+*   <strong>代码对应</strong>：
+    *   <code>class Config:</code>：定义了这个表单的名字叫 Config。
+    *   下面的每一行（如 <code>model: str</code>）都是表单里的一个填空项。</p>
+<h4>✅ Task 2: 基础设置——我们要跑什么模型？</h4>
+<p>我们要告诉系统模型在哪里，以及它的一些基本属性。
+*   <strong><code>model: str</code></strong>: 模型的路径。比如你的电脑上下载了一个 Llama-3 模型，这里就填它的文件夹路径。
+*   <strong><code>hf_config</code></strong>: 这是 HuggingFace 的配置。你不需要手动填，代码会自动去模型文件夹里读取“说明书”存到这里。
+*   <strong><code>eos</code></strong>: "End of String"。告诉模型遇到哪个数字（token ID）就代表“话说完了”。</p>
+<h4>✅ Task 3: 流量控制——我们要接待多少客人？</h4>
+<p>这是做推理服务（Serving）最关键的部分。显卡显存是有限的，不能无限接待用户。
+*   <strong><code>max_num_seqs</code> (默认 512)</strong>: <strong>最大并发数</strong>。也就是同一时刻，最多允许 512 个人（或 512 个句子）同时在排队或生成。
+*   <strong><code>max_model_len</code> (默认 4096)</strong>: <strong>最长上下文</strong>。每个用户发给你的话 + 模型回复的话，加起来不能超过这个长度。
+*   <strong><code>max_num_batched_tokens</code> (默认 16384)</strong>: <strong>最大吞吐量</strong>。因为每个用户句子的长短不一样，这个参数限制的是“所有用户当前正在处理的字数总和”不能超过这个数，防止显存爆掉。</p>
+<h4>✅ Task 4: 硬件与显存——怎么压榨显卡性能？</h4>
+<p>这部分决定了系统怎么使用你的 GPU。
+*   <strong><code>gpu_memory_utilization</code> (默认 0.9)</strong>: <strong>显存占用率</strong>。意思是“我要占用这块显卡 90% 的显存”。剩下的 10% 留给 PyTorch 框架自己或者其他程序用，防止系统卡死。
+*   <strong><code>tensor_parallel_size</code> (默认 1)</strong>: <strong>多卡并行</strong>。你有几张显卡？如果是 1，就是单卡跑；如果是 2，模型就会被切开放在两张卡上一起跑。</p>
+<h4>✅ Task 5: 高级优化——KV Cache（显存管理的核心）</h4>
+<p>这是这段代码里最“硬核”的部分，也是现代大模型推理加速的关键（类似 vLLM 的技术）。
+*   <strong>背景</strong>：大模型生成文字时，需要记住之前说过的话，这些记忆叫 KV Cache。
+*   <strong><code>kvcache_block_size</code> (默认 256)</strong>: <strong>分页大小</strong>。为了不浪费显存，系统把显存切成一块一块的小方格（Block），每块存 256 个字的记忆。这就像操作系统的内存分页一样，用多少拿多少，不浪费。
+*   <strong><code>num_kvcache_blocks</code></strong>: <strong>总块数</strong>。系统启动后会自动计算显卡能塞下多少个这样的块，初始化为 -1 是因为还没算出来。</p>
+<h4>✅ Task 6: 安全检查——<code>__post_init__</code></h4>
+<p>当你填完表单后，需要一个“审核员”来检查有没有填错。<code>__post_init__</code> 这个函数就是审核员，它在类初始化后自动运行。
+*   <strong>检查逻辑</strong>：
+    1.  <code>assert os.path.isdir(self.model)</code>: 检查你填的模型路径是不是真实存在的文件夹？
+    2.  <code>assert self.kvcache_block_size % 256 == 0</code>: 检查块大小是不是 256 的倍数（为了硬件对齐）。
+    3.  <code>self.hf_config = AutoConfig...</code>: 自动去读模型的 <code>config.json</code> 文件。
+    4.  <code>self.max_model_len = min(...)</code>: 如果你填的长度（4096）比模型原本支持的长度还要大，那就强行把你的配置改小，以模型原本的限制为准。
+    5.  <code>assert self.max_num_batched_tokens &gt;= self.max_model_len</code>: 这是一个逻辑检查。如果你允许一个句子长达 4096，但总吞吐量限制却只有 2000，那最坏情况下连一个句子都跑不起来，这肯定是不对的。</p>
+<hr />
+<h3>总结</h3>
+<p><strong>一句话概括：</strong>
+这个文件定义了一个<strong>配置类</strong>，用来管理大模型推理时的<strong>显存分配、并发数量、模型路径以及硬件参数</strong>，并且在启动前会自动检查这些参数是否合理。</p>

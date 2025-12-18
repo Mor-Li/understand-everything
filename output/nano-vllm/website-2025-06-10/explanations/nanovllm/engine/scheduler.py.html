@@ -1,0 +1,105 @@
+<h1>nanovllm/engine/scheduler.py</h1>
+<p>没问题。这段代码其实是在写一个 <strong>LLM（大语言模型）的调度器（Scheduler）</strong>。</p>
+<p>你可以把这个调度器想象成一个 <strong>“餐厅经理”</strong>，他的工作是安排客人（用户的提问 Sequence）入座、点菜、吃饭，并在桌子（显存 Block）不够的时候把人请出去排队。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“餐厅经理的一天”</strong> 的 To-Do List。我们将按照代码的执行逻辑，一步步来看。</p>
+<hr />
+<h3>📋 任务清单：调度器的工作流程</h3>
+<h4>1. 任务一：开店准备 (初始化 <code>__init__</code>)</h4>
+<p><strong>目标</strong>：设定餐厅的规矩，准备好桌椅。</p>
+<ul>
+<li><strong>代码逻辑</strong>：<ul>
+<li><code>self.max_num_seqs</code>: 设定餐厅最多能同时坐几桌客人。</li>
+<li><code>self.block_manager</code>: 这是一个“桌椅管理员”，负责管理显存（KV Cache）。</li>
+<li><code>self.waiting</code>: <strong>等位区</strong>。新来的客人先在这里排队。</li>
+<li><code>self.running</code>: <strong>用餐区</strong>。正在吃饭（生成token）的客人。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 任务二：接待新客人 (<code>add</code>)</h4>
+<p><strong>目标</strong>：当有用户发来新的 Prompt 时，把它记下来。</p>
+<ul>
+<li><strong>代码逻辑</strong>：<ul>
+<li><code>self.waiting.append(seq)</code>: 经理不废话，直接把新来的 <code>seq</code>（序列）扔到 <strong>等位区</strong> (<code>waiting</code>) 排队。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 任务三：核心调度 (<code>schedule</code>) —— 最复杂的部分</h4>
+<p><strong>目标</strong>：决定下一时刻谁能使用 GPU（厨房）。这部分代码分两步走：</p>
+<p><strong>Step 3.1: 优先处理新订单 (Prefill 阶段)</strong></p>
+<blockquote>
+<p><em>代码中 <code># prefill</code> 下面的部分</em></p>
+</blockquote>
+<ul>
+<li><strong>情景</strong>：经理先看等位区有没有人。</li>
+<li><strong>判断</strong>：<ol>
+<li>还有空桌子吗？(<code>num_seqs &lt; self.max_num_seqs</code>)</li>
+<li>厨房一下子做得过来这么多菜吗？(<code>num_batched_tokens ...</code>)</li>
+<li><strong>关键点</strong>：显存够不够分配给这个新客人的 Prompt？(<code>self.block_manager.can_allocate(seq)</code>)</li>
+</ol>
+</li>
+<li><strong>动作</strong>：<ul>
+<li>如果条件都满足：<code>allocate</code>（分配显存），把客人从 <code>waiting</code> 移到 <code>running</code>，状态设为 <code>RUNNING</code>。</li>
+<li>如果显存不够：停止接客，跳出循环。</li>
+</ul>
+</li>
+<li><strong>返回值</strong>：如果有新客人被安排了，直接返回这些客人，并标记为 <code>True</code>（代表这是 Prefill 阶段）。</li>
+</ul>
+<p><strong>Step 3.2: 照顾正在吃饭的客人 (Decode 阶段)</strong></p>
+<blockquote>
+<p><em>代码中 <code># decode</code> 下面的部分</em></p>
+</blockquote>
+<ul>
+<li><strong>情景</strong>：如果没有新客人要处理，经理就去巡视正在吃饭（正在生成回复）的客人。</li>
+<li><strong>核心冲突</strong>：生成每一个新字（Token），都需要一点点新的显存。如果显存满了怎么办？</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li>遍历 <code>running</code> 队列里的客人。</li>
+<li><strong>生死攸关的检查</strong>：<code>while not self.block_manager.can_append():</code><ul>
+<li>意思是：我想给这位客人加个菜（分配新 Token 的显存），但是桌子不够拼了！</li>
+<li><strong>抢占机制 (Preempt)</strong>：既然没地儿了，必须把一个人赶出去！<ul>
+<li>如果有其他人在吃，先把最后那个人赶走 (<code>self.preempt(self.running.pop())</code>)。</li>
+<li>如果只剩眼前这个人，也没地儿了，那把他赶走 (<code>self.preempt(seq)</code>)。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>正常情况</strong>：如果显存够 (<code>else</code> 分支)，就允许他继续吃 (<code>may_append</code>)，把他加入 <code>scheduled_seqs</code> 准备送去 GPU 计算。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 任务四：紧急情况处理 (<code>preempt</code>)</h4>
+<p><strong>目标</strong>：显存不够时，把正在运行的任务暂停，腾出空间。</p>
+<ul>
+<li><strong>代码逻辑</strong>：<ul>
+<li><code>seq.status = SequenceStatus.WAITING</code>: 把客人状态改回“等位”。</li>
+<li><code>self.block_manager.deallocate(seq)</code>: <strong>关键！</strong> 把他占用的桌子（显存）全部收回、清空。</li>
+<li><code>self.waiting.appendleft(seq)</code>: 把他请回等位区的<strong>最前面</strong>（插队），下次有资源了优先让他接着吃。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 任务五：吃完一口后的处理 (<code>postprocess</code>)</h4>
+<p><strong>目标</strong>：GPU 算完了一个 Token，经理要更新账单，并检查是不是吃完了。</p>
+<ul>
+<li><strong>代码逻辑</strong>：<ul>
+<li><code>seq.append_token(token_id)</code>: 把新生成的字加到句子里。</li>
+<li><strong>判断结束</strong>：<ul>
+<li>如果生成了 <code>eos</code> (End of Sentence，结束符) 或者 达到了 <code>max_tokens</code> (字数上限)。</li>
+</ul>
+</li>
+<li><strong>结账走人</strong>：<ul>
+<li><code>self.block_manager.deallocate(seq)</code>: 彻底释放显存。</li>
+<li><code>self.running.remove(seq)</code>: 从用餐区移除。</li>
+<li><code>seq.status = FINISHED</code>: 标记结束。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结一下文中的核心观点</h3>
+<p>如果不看代码细节，这个文件其实就在表达以下三个核心逻辑：</p>
+<ol>
+<li><strong>显存是核心瓶颈</strong>：调度器的所有决策（能不能接新客、能不能继续生成），核心判断标准都是 <strong>BlockManager（显存管理器）</strong> 点头没点头。</li>
+<li><strong>Prefill（预处理）优先</strong>：在 <code>schedule</code> 函数里，代码先尝试处理 <code>waiting</code> 队列（新来的 Prompt），只有当没处理新任务时，才去处理 <code>running</code> 队列（生成后续 Token）。这是一种策略。</li>
+<li><strong>抢占式调度 (Preemption)</strong>：这是最“高级”的功能。当显存耗尽时，系统不会崩溃（OOM），而是选择牺牲（暂停）一部分任务，回收它们的资源，保全其他任务。被牺牲的任务之后会重新排队。</li>
+</ol>
+<p>现在再回头看代码，是不是清晰很多了？</p>

@@ -1,0 +1,127 @@
+<h1>nanovllm/layers/rotary_embedding.py</h1>
+<p>这份代码实现的是 <strong>RoPE (Rotary Positional Embedding，旋转位置编码)</strong>。这是目前大模型（如 Llama 3, Mistral, Qwen）中最主流的位置编码方式。</p>
+<p>它的核心思想是：<strong>通过“旋转”向量的角度来表示“位置”信息</strong>，而不是像以前那样简单地把位置向量加在词向量上。</p>
+<p>既然你觉得难懂，我们把它拆解成一个 <strong>5步的学习清单 (To-Do List)</strong>，从概念到代码逐个击破。</p>
+<hr />
+<h3>📋 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 01：搞懂核心概念</strong> —— 为什么要“旋转”？</li>
+<li><strong>Task 02：准备工作 (<code>__init__</code>)</strong> —— 预先算好“旋转角度表”。</li>
+<li><strong>Task 03：核心数学 (<code>apply_rotary_emb</code>)</strong> —— 怎么实施旋转？</li>
+<li><strong>Task 04：应用流程 (<code>forward</code>)</strong> —— 查表并旋转 Query 和 Key。</li>
+<li><strong>Task 05：封装 (<code>get_rope</code>)</strong> —— 方便调用的外壳。</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>✅ Task 01：搞懂核心概念 —— 为什么要“旋转”？</h4>
+<p>在 Transformer 里，模型需要知道“我爱你”和“你爱我”的区别，这就需要<strong>位置编码</strong>。
+RoPE 的做法很巧妙：
+*   它把词向量想象成二维平面上的箭头。
+*   <strong>第 1 个词</strong>，把箭头逆时针转 <strong>$\theta$</strong> 度。
+*   <strong>第 2 个词</strong>，把箭头逆时针转 <strong>$2\theta$</strong> 度。
+*   <strong>第 m 个词</strong>，把箭头逆时针转 <strong>$m\theta$</strong> 度。</p>
+<p>这样，两个词之间的相对位置，就变成了它们之间夹角的差值。代码里所有的 <code>sin</code> 和 <code>cos</code> 都是为了算这个旋转。</p>
+<hr />
+<h4>✅ Task 02：准备工作 (<code>__init__</code>) —— 预先算好“旋转角度表”</h4>
+<p>既然每个位置旋转的角度是固定的，我们不需要每次运行都算一遍，可以在模型初始化时算好存起来。</p>
+<p>看 <code>RotaryEmbedding</code> 类的 <code>__init__</code> 部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 计算频率 (inv_freq)</span>
+<span class="c1"># 这里虽然看着复杂，其实就是在算不同维度对应的“转速”</span>
+<span class="c1"># 有的维度转得快，有的维度转得慢 (为了捕捉长距离和短距离依赖)</span>
+<span class="n">inv_freq</span> <span class="o">=</span> <span class="mf">1.0</span> <span class="o">/</span> <span class="p">(</span><span class="n">base</span><span class="o">**</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">rotary_dim</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float</span><span class="p">)</span> <span class="o">/</span> <span class="bp">self</span><span class="o">.</span><span class="n">rotary_dim</span><span class="p">))</span>
+
+<span class="c1"># 2. 生成位置序列 (t)</span>
+<span class="c1"># 比如 max_position_embeddings=100，这里就是 [0, 1, 2, ..., 99]</span>
+<span class="n">t</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float</span><span class="p">)</span>
+
+<span class="c1"># 3. 计算所有位置的角度 (freqs)</span>
+<span class="c1"># 外积运算：位置 * 频率 = 最终的角度</span>
+<span class="n">freqs</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">einsum</span><span class="p">(</span><span class="s2">&quot;i,j -&gt; ij&quot;</span><span class="p">,</span> <span class="n">t</span><span class="p">,</span> <span class="n">inv_freq</span><span class="p">)</span>
+
+<span class="c1"># 4. 算出 cos 和 sin 并拼接缓存</span>
+<span class="c1"># 既然旋转公式里要用 cos 和 sin，干脆直接算好存起来</span>
+<span class="n">cos</span> <span class="o">=</span> <span class="n">freqs</span><span class="o">.</span><span class="n">cos</span><span class="p">()</span>
+<span class="n">sin</span> <span class="o">=</span> <span class="n">freqs</span><span class="o">.</span><span class="n">sin</span><span class="p">()</span>
+<span class="n">cache</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">((</span><span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">),</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+
+<span class="c1"># 5. 存入 buffer (类似存入硬盘，不会被当做模型参数更新)</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">register_buffer</span><span class="p">(</span><span class="s2">&quot;cos_sin_cache&quot;</span><span class="p">,</span> <span class="n">cache</span><span class="p">,</span> <span class="n">persistent</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>总结：</strong> 这一步就是造了一张巨大的“查表单”，告诉我“第 50 个词在第 4 个维度应该转多少度（对应的 cos/sin 是多少）”。</p>
+<hr />
+<h4>✅ Task 03：核心数学 (<code>apply_rotary_emb</code>) —— 怎么实施旋转？</h4>
+<p>这是文件中最上面的函数，也是最让初学者头大的数学部分。它实现了二维向量的旋转公式：
+$$x' = x \cos\theta - y \sin\theta$$
+$$y' = x \sin\theta + y \cos\theta$$</p>
+<p>看代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">apply_rotary_emb</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">):</span>
+    <span class="c1"># 调整 cos/sin 的形状以便广播机制运算</span>
+    <span class="n">cos</span> <span class="o">=</span> <span class="n">cos</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">)</span>
+    <span class="n">sin</span> <span class="o">=</span> <span class="n">sin</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">2</span><span class="p">)</span>
+
+    <span class="c1"># 【关键步骤】把向量 x 切成两半：x1 和 x2</span>
+    <span class="c1"># 比如向量是 [a, b, c, d]，切成 x1=[a, b], x2=[c, d]</span>
+    <span class="c1"># RoPE 是把向量两两配对进行旋转的</span>
+    <span class="n">x1</span><span class="p">,</span> <span class="n">x2</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">chunk</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">float32</span><span class="p">),</span> <span class="mi">2</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+
+    <span class="c1"># 套用旋转公式：</span>
+    <span class="c1"># 新的第一半 = x1 * cos - x2 * sin</span>
+    <span class="n">y1</span> <span class="o">=</span> <span class="n">x1</span> <span class="o">*</span> <span class="n">cos</span> <span class="o">-</span> <span class="n">x2</span> <span class="o">*</span> <span class="n">sin</span>
+    <span class="c1"># 新的第二半 = x2 * cos + x1 * sin</span>
+    <span class="n">y2</span> <span class="o">=</span> <span class="n">x2</span> <span class="o">*</span> <span class="n">cos</span> <span class="o">+</span> <span class="n">x1</span> <span class="o">*</span> <span class="n">sin</span>
+
+    <span class="c1"># 把旋转后的两半拼回去</span>
+    <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">((</span><span class="n">y1</span><span class="p">,</span> <span class="n">y2</span><span class="p">),</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>总结：</strong> 这个函数不管你是谁，只负责执行“旋转”这个动作。它把向量劈成两半，混合一下（乘以 sin/cos），再拼回去。</p>
+<hr />
+<h4>✅ Task 04：应用流程 (<code>forward</code>) —— 查表并旋转 Query 和 Key</h4>
+<p>这一步是模型真正跑起来时调用的地方。RoPE 只作用于 Attention 里的 <strong>Query (Q)</strong> 和 <strong>Key (K)</strong>，不作用于 Value (V)。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">positions</span><span class="p">,</span> <span class="n">query</span><span class="p">,</span> <span class="n">key</span><span class="p">):</span>
+    <span class="c1"># 1. 拿到当前这批数据的位置 ID (比如 [0, 1, 2...])</span>
+    <span class="n">positions</span> <span class="o">=</span> <span class="n">positions</span><span class="o">.</span><span class="n">flatten</span><span class="p">()</span>
+
+    <span class="c1"># 2. 【查表】</span>
+    <span class="c1"># 根据位置 ID，从刚才 init 里算好的 cache 中取出对应的 cos 和 sin</span>
+    <span class="n">cos_sin</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">cos_sin_cache</span><span class="p">[</span><span class="n">positions</span><span class="p">]</span>
+    <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span> <span class="o">=</span> <span class="n">cos_sin</span><span class="o">.</span><span class="n">chunk</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span> <span class="c1"># 把 cos 和 sin 分开</span>
+
+    <span class="c1"># 3. 调整 Query 的形状以便计算</span>
+    <span class="n">query_shape</span> <span class="o">=</span> <span class="n">query</span><span class="o">.</span><span class="n">shape</span>
+    <span class="n">query</span> <span class="o">=</span> <span class="n">query</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">num_tokens</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">head_size</span><span class="p">)</span>
+
+    <span class="c1"># 4. 【执行旋转】 调用 Task 03 的函数</span>
+    <span class="c1"># 把 Query 转一下</span>
+    <span class="n">query</span> <span class="o">=</span> <span class="n">apply_rotary_emb</span><span class="p">(</span><span class="n">query</span><span class="p">,</span> <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">query_shape</span><span class="p">)</span>
+
+    <span class="c1"># 5. 【执行旋转】 </span>
+    <span class="c1"># 把 Key 也转一下</span>
+    <span class="n">key_shape</span> <span class="o">=</span> <span class="n">key</span><span class="o">.</span><span class="n">shape</span>
+    <span class="n">key</span> <span class="o">=</span> <span class="n">key</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">num_tokens</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">head_size</span><span class="p">)</span>
+    <span class="n">key</span> <span class="o">=</span> <span class="n">apply_rotary_emb</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">)</span><span class="o">.</span><span class="n">view</span><span class="p">(</span><span class="n">key_shape</span><span class="p">)</span>
+
+    <span class="c1"># 6. 返回旋转后的 Q 和 K</span>
+    <span class="k">return</span> <span class="n">query</span><span class="p">,</span> <span class="n">key</span>
+</code></pre></div>
+
+<p><strong>总结：</strong>
+1.  你给我 Q 和 K，以及它们的位置。
+2.  我去表里查一下这个位置对应的旋转参数。
+3.  把 Q 和 K 转一下。
+4.  交还给你去算 Attention。</p>
+<hr />
+<h4>✅ Task 05：封装 (<code>get_rope</code>) —— 方便调用的外壳</h4>
+<p>最后这个函数只是一个工厂函数，用了 <code>@lru_cache</code> 装饰器。</p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@lru_cache</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">get_rope</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="c1"># 如果参数一样，就直接返回之前创建好的对象，不用重复创建</span>
+    <span class="c1"># 这是一个单例模式的变种，为了节省内存和初始化时间</span>
+    <span class="n">rotary_emb</span> <span class="o">=</span> <span class="n">RotaryEmbedding</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">rotary_emb</span>
+</code></pre></div>
+
+<hr />
+<h3>💡 一句话总结全篇</h3>
+<p>这个文件定义了一个<strong>给向量加位置信息的组件</strong>。它不像以前那样做“加法”（Vector + Position），而是做“乘法/旋转”（Vector $\times$ Rotation Matrix），<strong>就像给钟表的指针根据时间拨动角度一样</strong>，这样模型就能更精准地理解词语的顺序了。</p>

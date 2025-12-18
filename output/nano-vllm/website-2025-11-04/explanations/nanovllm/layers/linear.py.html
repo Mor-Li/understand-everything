@@ -1,0 +1,120 @@
+<h1>nanovllm/layers/linear.py</h1>
+<p>这份代码的核心主题是<strong>张量并行（Tensor Parallelism, TP）</strong>。</p>
+<p>简单来说，就是模型（比如 Llama 3）的矩阵（权重）太大了，一张显卡装不下，或者算得太慢。我们需要把一个大矩阵“切”成好几块，分给不同的显卡（GPU）去算，最后再把结果拼起来。</p>
+<p>这份代码就是定义了“怎么切”、“怎么算”、“怎么拼”的规则。</p>
+<p>为了让你看懂，我给你列了一个 <strong>5步走的 Task List</strong>，我们一步步来拆解。</p>
+<hr />
+<h3>Task 1: 建立直觉 —— 为什么要切？(不看代码)</h3>
+<p>在看代码前，先建立一个心理模型。
+假设全连接层（Linear Layer）的计算是：<strong>输入 x 权重 = 输出</strong> ($Y = X \times W$)。</p>
+<ul>
+<li><strong>现状</strong>：权重矩阵 $W$ 特别大（比如 $4096 \times 4096$）。</li>
+<li><strong>目标</strong>：要把 $W$ 切开放在 2 张显卡上（TP Size = 2）。</li>
+<li><strong>两种切法</strong>：<ol>
+<li><strong>竖着切（按列切，Column Parallel）</strong>：每张卡存一半的<strong>输出</strong>特征。</li>
+<li><strong>横着切（按行切，Row Parallel）</strong>：每张卡处理一半的<strong>输入</strong>特征。</li>
+</ol>
+</li>
+</ul>
+<p><strong>你的任务：</strong> 记住这两个方向。竖着切影响输出维度，横着切影响输入维度。</p>
+<hr />
+<h3>Task 2: 搞懂基建 —— <code>LinearBase</code> 类</h3>
+<p>现在看代码的前半部分。<code>LinearBase</code> 是所有切分方式的“爸爸”（父类）。</p>
+<p><strong>重点看 <code>__init__</code> 方法：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">LinearBase</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+        <span class="c1"># ...</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tp_rank</span> <span class="o">=</span> <span class="n">dist</span><span class="o">.</span><span class="n">get_rank</span><span class="p">()</span>      <span class="c1"># 我是第几号显卡？(比如 0号 或 1号)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">=</span> <span class="n">dist</span><span class="o">.</span><span class="n">get_world_size</span><span class="p">()</span> <span class="c1"># 总共有几张显卡？</span>
+
+        <span class="c1"># 定义权重，注意这里只是初始化，还没有真正加载切分后的数据</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">weight</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Parameter</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="n">output_size</span><span class="p">,</span> <span class="n">input_size</span><span class="p">))</span>
+
+        <span class="c1"># 这是一个钩子函数，用来定义“如何从完整的模型文件里，只加载属于我的那一块权重”</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="o">.</span><span class="n">weight_loader</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">weight_loader</span> 
+</code></pre></div>
+
+<p><strong>观点总结：</strong>
+*   这个类不干活（<code>forward</code> 报错），它只负责记录“我是谁（Rank）”以及“我要多大的坑（Shape）”。
+*   它引入了一个概念 <code>weight_loader</code>，这是为了解决“大模型文件是完整的，但我只需要加载一小块”的问题。</p>
+<hr />
+<h3>Task 3: 最简单的切分 —— <code>ColumnParallelLinear</code> (竖着切)</h3>
+<p>这是代码中最直观的并行方式。</p>
+<p><strong>1. 看构造函数 <code>__init__</code>：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">input_size</span><span class="p">,</span> <span class="n">divide</span><span class="p">(</span><span class="n">output_size</span><span class="p">,</span> <span class="n">tp_size</span><span class="p">),</span> <span class="n">bias</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>核心逻辑</strong>：<code>input_size</code> 没变，但 <code>output_size</code> 被除以了 <code>tp_size</code>。</li>
+<li><strong>解释</strong>：如果你有 2 张卡，原本输出 4096 维，现在每张卡只负责输出 2048 维。</li>
+</ul>
+<p><strong>2. 看 <code>weight_loader</code> (怎么加载权重)：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">start_idx</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tp_rank</span> <span class="o">*</span> <span class="n">shard_size</span>
+<span class="n">loaded_weight</span> <span class="o">=</span> <span class="n">loaded_weight</span><span class="o">.</span><span class="n">narrow</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">tp_dim</span><span class="p">,</span> <span class="n">start_idx</span><span class="p">,</span> <span class="n">shard_size</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：假如我是 1号卡。我就从完整权重的中间开始，切出属于我的一条（<code>narrow</code> 就是切片操作）。</li>
+</ul>
+<p><strong>3. 看 <code>forward</code> (怎么算)：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">return</span> <span class="n">F</span><span class="o">.</span><span class="n">linear</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">bias</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：计算逻辑居然没变！因为每张卡虽然只算出了一部分结果，但不需要和其他卡通信。</li>
+<li><strong>结果</strong>：卡0 算出结果的左半边，卡1 算出结果的右半边。它们合起来才是完整的输出。</li>
+</ul>
+<hr />
+<h3>Task 4: 稍微难点的切分 —— <code>RowParallelLinear</code> (横着切)</h3>
+<p>这个类通常接在 <code>ColumnParallel</code> 后面使用。</p>
+<p><strong>1. 看构造函数 <code>__init__</code>：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">divide</span><span class="p">(</span><span class="n">input_size</span><span class="p">,</span> <span class="n">tp_size</span><span class="p">),</span> <span class="n">output_size</span><span class="p">,</span> <span class="n">bias</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>核心逻辑</strong>：这次是 <code>input_size</code> 被除以了 <code>tp_size</code>。</li>
+<li><strong>解释</strong>：每张卡只接受一部分输入特征进行计算。</li>
+</ul>
+<p><strong>2. 看 <code>forward</code> (最关键的区别！)：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+    <span class="c1"># 1. 算出局部结果</span>
+    <span class="n">y</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">linear</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">bias</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">tp_rank</span> <span class="o">==</span> <span class="mi">0</span> <span class="k">else</span> <span class="kc">None</span><span class="p">)</span>
+
+    <span class="c1"># 2. 通信！All-Reduce</span>
+    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">tp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+        <span class="n">dist</span><span class="o">.</span><span class="n">all_reduce</span><span class="p">(</span><span class="n">y</span><span class="p">)</span> <span class="c1"># 把所有卡的结果加起来</span>
+    <span class="k">return</span> <span class="n">y</span>
+</code></pre></div>
+
+<ul>
+<li><strong>核心观点</strong>：<ul>
+<li>因为大家是横着切输入计算的，卡0算了一部分和，卡1算了另一部分和。数学上 $Y = X_1 W_1 + X_2 W_2$。</li>
+<li><strong>必须通信</strong>：<code>dist.all_reduce(y)</code> 的作用是让所有显卡把手里的 <code>y</code> 加在一起，同步给所有人。</li>
+<li><strong>Bias 的细节</strong>：代码里写了 <code>bias if self.tp_rank == 0 else None</code>。意思是 Bias 只能加一次！如果每张卡都加 bias，最后求和时 bias 就被加了 N 次，结果就错了。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 5: LLM 专属定制 —— <code>QKV</code> 和 <code>Merged</code></h3>
+<p>LLM（特别是 Transformer 架构）有一些特殊的层，不能简单地切一刀，这两个类就是为了处理这些特殊情况。它们本质上都是 <code>ColumnParallelLinear</code> 的变体。</p>
+<p><strong>1. <code>QKVParallelLinear</code> (处理注意力机制的 Q, K, V)</strong>
+*   <strong>背景</strong>：Attention 层需要三个矩阵 Q、K、V。通常它们在模型文件里是拼在一起的大矩阵，或者分开存放。
+*   <strong>难点</strong>：如果你直接按列切，可能会把 Q 切断，或者把 K 切断。我们需要的是：每张卡都分到“完整的几个头（Heads）”的 Q、K、V。
+*   <strong>代码解读</strong>：
+    *   它计算了 <code>num_heads</code> (Q的头数) 和 <code>num_kv_heads</code> (K/V的头数)。
+    *   <code>weight_loader</code> 极其复杂：它根据你是加载 "q"、"k" 还是 "v"，计算出复杂的偏移量（offset），确保每张卡拿到的数据是逻辑上正确的（比如卡0拿到 Q的第0-4头，K的第0头...）。</p>
+<p><strong>2. <code>MergedColumnParallelLinear</code> (处理 MLP 层)</strong>
+*   <strong>背景</strong>：像 Llama 这样的模型，MLP 层有 Gate_proj 和 Up_proj，这两个通常并行执行。
+*   <strong>做法</strong>：把这两个层拼成一个大的 Column Parallel 层。
+*   <strong>代码解读</strong>：<code>output_sizes</code> 是一个列表（比如 <code>[4096, 4096]</code>）。<code>weight_loader</code> 负责把这两个不同的矩阵块切好分给不同的卡。</p>
+<hr />
+<h3>总结回顾</h3>
+<p>把这份文件看作是 <strong>“切披萨指南”</strong>：</p>
+<ol>
+<li><strong><code>LinearBase</code></strong>: 披萨店老板，定义了谁负责吃哪块。</li>
+<li><strong><code>ReplicatedLinear</code></strong>: 每个人都吃一整块披萨（不切，显存占用大）。</li>
+<li><strong><code>ColumnParallelLinear</code></strong>: 竖着切披萨。每个人拿一长条。大家吃完放在桌上拼起来就是完整的披萨。</li>
+<li><strong><code>RowParallelLinear</code></strong>: 横着切披萨（通常因为面饼是分层的）。大家吃进肚子里后，需要互相通气（<code>all_reduce</code>）才能消化。</li>
+<li><strong><code>QKV...</code> / <code>Merged...</code></strong>: 拼盘披萨。上面有香肠(Q)、蘑菇(K)、洋葱(V)。切的时候要小心，不能把香肠切碎了，要保证每个人盘子里都有完整的香肠片。</li>
+</ol>
+<p>现在的你再回去看代码，重点看 <code>__init__</code> 里的除法（切哪里），和 <code>forward</code> 里的 <code>all_reduce</code>（要不要通信），应该就能看懂了。</p>

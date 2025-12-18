@@ -1,0 +1,107 @@
+<h1>nanovllm/layers/rotary_embedding.py</h1>
+<p>这段代码实现的是目前大语言模型（如 LLaMA）中最核心的位置编码技术：<strong>旋转位置编码（Rotary Positional Embedding，简称 RoPE）</strong>。</p>
+<p>如果不理解背后的数学，这段代码确实像天书。为了帮你理解，我制定了一个 <strong>5步学习 Task List</strong>。我们不谈复杂的数学公式，只谈它是怎么运作的。</p>
+<hr />
+<h3>📋 你的学习 Task List</h3>
+<ol>
+<li><strong>Task 1：理解核心概念</strong> —— 为什么要“旋转”？</li>
+<li><strong>Task 2：理解准备工作 (<code>__init__</code>)</strong> —— 制造“角度表”。</li>
+<li><strong>Task 3：理解核心操作 (<code>apply_rotary_emb</code>)</strong> —— 执行“旋转”动作。</li>
+<li><strong>Task 4：理解流程整合 (<code>forward</code>)</strong> —— 查表并应用。</li>
+<li><strong>Task 5：理解辅助功能 (<code>get_rope</code>)</strong> —— 避免重复造轮子。</li>
+</ol>
+<hr />
+<h3>🟢 Task 1：理解核心概念 —— 为什么要“旋转”？</h3>
+<p>在 Transformer 模型中，文字本身变成了向量（一串数字）。但是，“我爱你”和“你爱我”，字是一样的，顺序不同意思就变了。模型必须知道每个字的位置。</p>
+<ul>
+<li><strong>以前的方法</strong>：直接给向量<strong>加</strong>上一个代表位置的数字。</li>
+<li><strong>RoPE的方法</strong>：通过<strong>旋转</strong>向量的角度来表示位置。</li>
+</ul>
+<p><strong>想象一下：</strong>
+把向量看作钟表上的指针。
+*   第1个字，把指针顺时针转 10 度。
+*   第2个字，把指针顺时针转 20 度。
+*   通过指针旋转的角度，模型就能知道这个字在第几个位置。</p>
+<p><strong>代码目的：</strong> 就是算出每个位置该转多少度，然后把输入的向量（Query 和 Key）转一下。</p>
+<hr />
+<h3>🟢 Task 2：理解准备工作 (<code>__init__</code>)</h3>
+<p>在 <code>RotaryEmbedding</code> 类的 <code>__init__</code> 函数里，代码在做“预计算”。因为旋转角度是固定的，没必要每次算，先算好存起来（缓存）。</p>
+<p><strong>代码片段：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">inv_freq</span> <span class="o">=</span> <span class="mf">1.0</span> <span class="o">/</span> <span class="p">(</span><span class="n">base</span><span class="o">**</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">rotary_dim</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float</span><span class="p">)</span> <span class="o">/</span> <span class="n">rotary_dim</span><span class="p">))</span>
+<span class="n">t</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">max_position_embeddings</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">float</span><span class="p">)</span>
+<span class="n">freqs</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">einsum</span><span class="p">(</span><span class="s2">&quot;i,j -&gt; ij&quot;</span><span class="p">,</span> <span class="n">t</span><span class="p">,</span> <span class="n">inv_freq</span><span class="p">)</span>
+<span class="n">cos</span> <span class="o">=</span> <span class="n">freqs</span><span class="o">.</span><span class="n">cos</span><span class="p">()</span>
+<span class="n">sin</span> <span class="o">=</span> <span class="n">freqs</span><span class="o">.</span><span class="n">sin</span><span class="p">()</span>
+<span class="n">cache</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">((</span><span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">),</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">unsqueeze_</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">register_buffer</span><span class="p">(</span><span class="s2">&quot;cos_sin_cache&quot;</span><span class="p">,</span> <span class="n">cache</span><span class="p">,</span> <span class="n">persistent</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>人话解释：</strong>
+1.  <strong><code>inv_freq</code> (频率)</strong>：定义旋转的速度。向量的不同维度旋转速度不一样（有的转得快，有的转得慢，为了捕捉不同距离的关系）。
+2.  <strong><code>t</code> (位置)</strong>：生成一个序列 <code>[0, 1, 2, ..., max_pos]</code>，代表第0个字、第1个字……
+3.  <strong><code>freqs</code> (角度)</strong>：用“位置”乘以“频率”，算出来每个位置、每个维度具体的<strong>角度</strong>（Theta）。
+4.  <strong><code>cos</code> / <code>sin</code></strong>：为了做旋转操作，我们需要角度的余弦值和正弦值。这里直接算好存起来。
+5.  <strong><code>register_buffer</code></strong>：把算好的这张巨大的“正余弦表”存进显存里，这就叫 <code>cos_sin_cache</code>。</p>
+<p><strong>总结</strong>：这一步造了一张巨大的“查阅表”，告诉我们在第 N 个位置，向量该转多少度。</p>
+<hr />
+<h3>🟢 Task 3：理解核心操作 (<code>apply_rotary_emb</code>)</h3>
+<p>这是整个文件最核心的函数，它执行真正的数学“旋转”。</p>
+<p><strong>代码片段：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">apply_rotary_emb</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">):</span>
+    <span class="n">x1</span><span class="p">,</span> <span class="n">x2</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">chunk</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">float</span><span class="p">(),</span> <span class="mi">2</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span> <span class="c1"># 把向量劈成两半</span>
+    <span class="n">y1</span> <span class="o">=</span> <span class="n">x1</span> <span class="o">*</span> <span class="n">cos</span> <span class="o">-</span> <span class="n">x2</span> <span class="o">*</span> <span class="n">sin</span>
+    <span class="n">y2</span> <span class="o">=</span> <span class="n">x2</span> <span class="o">*</span> <span class="n">cos</span> <span class="o">+</span> <span class="n">x1</span> <span class="o">*</span> <span class="n">sin</span>
+    <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">((</span><span class="n">y1</span><span class="p">,</span> <span class="n">y2</span><span class="p">),</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">dtype</span><span class="p">)</span> <span class="c1"># 拼回去</span>
+</code></pre></div>
+
+<p><strong>人话解释：</strong>
+如何在二维平面旋转一个点 $(x_1, x_2)$？初中/高中数学公式是：
+*   新 $x = x_1 \cos(\theta) - x_2 \sin(\theta)$
+*   新 $y = x_2 \cos(\theta) + x_1 \sin(\theta)$</p>
+<p><strong>代码对应：</strong>
+1.  <strong><code>torch.chunk(x, 2)</code></strong>：RoPE 把向量两两配对。比如向量长度是128，它把它切成两个长度64的向量 <code>x1</code> 和 <code>x2</code>。这就好比把它们看作 64 个 $(x, y)$ 坐标点。
+2.  <strong><code>y1 = ...</code> 和 <code>y2 = ...</code></strong>：这就是上面那个数学公式的直接翻译！
+    *   <code>y1</code> 对应 $x_1 \cos - x_2 \sin$
+    *   <code>y2</code> 对应 $x_2 \cos + x_1 \sin$
+3.  <strong><code>torch.cat</code></strong>：旋转完之后，再把它们拼回原来的形状。</p>
+<p><strong>总结</strong>：这个函数就是拿着 Task 2 算好的 <code>cos</code> 和 <code>sin</code>，把输入向量 <code>x</code> 强行扭转了一个角度。</p>
+<hr />
+<h3>🟢 Task 4：理解流程整合 (<code>forward</code>)</h3>
+<p>这是模型运行时真正调用的地方。</p>
+<p><strong>代码片段：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">positions</span><span class="p">,</span> <span class="n">query</span><span class="p">,</span> <span class="n">key</span><span class="p">):</span>
+    <span class="n">cos_sin</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">cos_sin_cache</span><span class="p">[</span><span class="n">positions</span><span class="p">]</span> <span class="c1"># 1. 查表</span>
+    <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span> <span class="o">=</span> <span class="n">cos_sin</span><span class="o">.</span><span class="n">chunk</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>     <span class="c1"># 2. 拆分 Cos 和 Sin</span>
+    <span class="n">query</span> <span class="o">=</span> <span class="n">apply_rotary_emb</span><span class="p">(</span><span class="n">query</span><span class="p">,</span> <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">)</span> <span class="c1"># 3. 旋转 Query</span>
+    <span class="n">key</span> <span class="o">=</span> <span class="n">apply_rotary_emb</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">cos</span><span class="p">,</span> <span class="n">sin</span><span class="p">)</span>     <span class="c1"># 4. 旋转 Key</span>
+    <span class="k">return</span> <span class="n">query</span><span class="p">,</span> <span class="n">key</span>
+</code></pre></div>
+
+<p><strong>人话解释：</strong>
+1.  <strong>输入</strong>：
+    *   <code>positions</code>：当前处理的是第几个字？（比如 <code>[0, 1, 2]</code>）。
+    *   <code>query</code>, <code>key</code>：注意力机制需要的两个核心向量。
+2.  <strong>查表 (<code>self.cos_sin_cache[positions]</code>)</strong>：根据位置索引，从 Task 2 里的那个大表里取出对应的 <code>cos</code> 和 <code>sin</code> 值。
+3.  <strong>应用</strong>：调用 Task 3 的函数，把 <code>query</code> 和 <code>key</code> 都转一下。
+4.  <strong>返回</strong>：把转好的向量还给模型，拿去算注意力分数。</p>
+<hr />
+<h3>🟢 Task 5：理解辅助功能 (<code>get_rope</code>)</h3>
+<p>这只是一个外壳函数。</p>
+<p><strong>代码片段：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@lru_cache</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">get_rope</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="o">...</span>
+    <span class="k">return</span> <span class="n">RotaryEmbedding</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>人话解释：</strong>
+*   <strong><code>@lru_cache(1)</code></strong>：这是一个装饰器。意思是“如果参数没变，就直接返回上次创建好的对象，不要重新创建”。
+*   作用：防止每次模型跑的时候都重复创建 <code>RotaryEmbedding</code> 类，节省一点点开销。</p>
+<hr />
+<h3>🏁 全文总结</h3>
+<p>这段代码其实只做了一件事：</p>
+<ol>
+<li><strong>预习 (<code>__init__</code>)</strong>：根据数学规则，算出所有位置对应的旋转角度（Cos/Sin值）。</li>
+<li><strong>考试 (<code>forward</code> / <code>apply</code>)</strong>：当数据进来时，根据它是第几个字，查表拿到角度，然后用旋转公式（$x\cos - y\sin$）把向量转一下。</li>
+</ol>
+<p>这就完成了“把位置信息注入到向量里”的任务。</p>

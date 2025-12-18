@@ -1,0 +1,155 @@
+<h1>nanovllm/layers/linear.py</h1>
+<p>这份代码确实涉及了大模型（LLM）推理中最核心、也是最硬核的底层技术：<strong>张量并行（Tensor Parallelism, 简称 TP）</strong>。</p>
+<p>简单来说，当一个模型（比如 Llama-3-70B）太大了，一张显卡装不下，我们需要把它“切开”放在多张显卡上运行。这个文件就是在定义<strong>“怎么切这个蛋糕（矩阵）”</strong>以及<strong>“切完之后怎么算”</strong>。</p>
+<p>为了让你读懂，我制定了一个 <strong>5步走的学习 Task List</strong>。我们一步步拆解，不要试图一下子看完。</p>
+<hr />
+<h3>📋 学习任务清单 (Task List)</h3>
+<ul>
+<li><strong>Task 1: 搞懂基础</strong> —— <code>LinearBase</code> 和 <code>ReplicatedLinear</code> 是什么？</li>
+<li><strong>Task 2: 核心概念</strong> —— 为什么要切？什么叫“列并行” (<code>ColumnParallel</code>)？</li>
+<li><strong>Task 3: 进阶概念</strong> —— 什么叫“行并行” (<code>RowParallel</code>) 及其代价？</li>
+<li><strong>Task 4: 业务场景</strong> —— <code>QKV</code> 和 <code>Merged</code> 是为了解决什么具体问题？</li>
+<li><strong>Task 5: 后勤保障</strong> —— <code>weight_loader</code> 是干嘛的？</li>
+</ul>
+<hr />
+<h3>🟢 Task 1: 搞懂基础 (Base &amp; Replicated)</h3>
+<p><strong>目标</strong>：理解最普通的线性层在多卡环境下的状态。</p>
+<p><strong>代码对应</strong>：<code>LinearBase</code>, <code>ReplicatedLinear</code></p>
+<ol>
+<li>
+<p><strong><code>LinearBase</code></strong>:</p>
+<ul>
+<li>这只是一个父类（基类）。</li>
+<li>它定义了所有线性层共有的属性：输入大小、输出大小。</li>
+<li><strong>关键点</strong>：注意 <code>self.tp_rank</code> (我是第几张卡) 和 <code>self.tp_size</code> (总共有几张卡)。虽然代码里暂时写死了 <code>1</code>，但在实际运行中，比如 8 卡运行，<code>tp_size</code> 就是 8。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>ReplicatedLinear</code> (复制线性层)</strong>:</p>
+<ul>
+<li><strong>含义</strong>：这就是普通的 <code>nn.Linear</code>。</li>
+<li><strong>为什么叫 Replicated（复制）？</strong> 意思是每一张显卡上都持有<strong>完整</strong>的权重（没有切分）。</li>
+<li><strong>用途</strong>：通常用于模型中比较小的层（比如最后的分类头有时候不切），或者在不需要并行的时候。</li>
+<li><strong>操作</strong>：<code>F.linear(x, self.weight, self.bias)</code>，就是最标准的矩阵乘法 $Y = XW^T + b$。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🟡 Task 2: 核心概念 (Column Parallel)</h3>
+<p><strong>目标</strong>：理解怎么把矩阵“竖着切”。</p>
+<p><strong>代码对应</strong>：<code>ColumnParallelLinear</code></p>
+<p><strong>场景</strong>：
+假设权重的形状是 <code>[输出维度, 输入维度]</code>，比如 <code>[100, 50]</code>。现在你有 2 张显卡。</p>
+<ol>
+<li>
+<p><strong>怎么切？</strong></p>
+<ul>
+<li><strong>列并行 (Column Parallel)</strong> 意味着我们将输出维度（Output Features）切分。</li>
+<li>显卡 A 拿 <code>[0~49, 50]</code> 的权重。</li>
+<li>显卡 B 拿 <code>[50~99, 50]</code> 的权重。</li>
+<li><strong>代码体现</strong>：<code>divide(output_size, self.tp_size)</code>。它计算每张卡只负责一小部分的输出。</li>
+</ul>
+</li>
+<li>
+<p><strong>前向传播 (Forward)</strong>：</p>
+<ul>
+<li>输入 <code>x</code> 是完整的（所有卡都一样）。</li>
+<li>每张卡用自己那一小块权重进行计算。</li>
+<li><strong>结果</strong>：显卡 A 算出结果的前半部分，显卡 B 算出结果的后半部分。大家手里的结果是不完整的，拼起来才是完整的。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>tp_dim=0</code></strong>:</p>
+<ul>
+<li>构造函数里传了 <code>0</code>，意思是在第 0 维度（行，对应输出维度）上进行切分。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🟠 Task 3: 进阶概念 (Row Parallel)</h3>
+<p><strong>目标</strong>：理解怎么把矩阵“横着切”以及随之而来的通信问题。</p>
+<p><strong>代码对应</strong>：<code>RowParallelLinear</code></p>
+<p><strong>场景</strong>：
+通常在 Transformer 结构中，<code>ColumnParallel</code> 后面会接一个 <code>RowParallel</code>。</p>
+<ol>
+<li>
+<p><strong>怎么切？</strong></p>
+<ul>
+<li><strong>行并行 (Row Parallel)</strong> 意味着我们将输入维度（Input Features）切分。</li>
+<li>权重形状 <code>[100, 50]</code>，2 张卡。</li>
+<li>显卡 A 拿 <code>[100, 0~24]</code>。</li>
+<li>显卡 B 拿 <code>[100, 25~49]</code>。</li>
+<li><strong>代码体现</strong>：<code>divide(input_size, self.tp_size)</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>前向传播 (Forward) 的特殊性</strong>：</p>
+<ul>
+<li><strong>输入也是切分的</strong>：因为上一层通常是 Column Parallel，显卡 A 手里只有前半部分输入，显卡 B 只有后半部分。</li>
+<li><strong>计算</strong>：显卡 A 用“前半部分输入”乘“前半部分权重”，得到一个部分结果。</li>
+<li><strong>All-Reduce (关键点)</strong>：<ul>
+<li>代码最后有一句 <code>if self.tp_size &gt; 1: dist.all_reduce(y)</code>。</li>
+<li>因为矩阵乘法是行乘列求和。显卡 A 算了一半的和，显卡 B 算了另一半的和。</li>
+<li><strong>必须通信！</strong> 大家把手里的结果加起来，同步给所有人。这样每张卡最终都得到了<strong>完整</strong>的输出结果。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🔵 Task 4: 业务场景 (QKV &amp; Merged)</h3>
+<p><strong>目标</strong>：了解针对 Transformer (LLM) 的特殊优化。</p>
+<p><strong>代码对应</strong>：<code>MergedColumnParallelLinear</code>, <code>QKVParallelLinear</code></p>
+<p>这俩其实都是 <strong>ColumnParallel</strong> 的变种，只是切分逻辑更复杂。</p>
+<ol>
+<li>
+<p><strong><code>MergedColumnParallelLinear</code> (合并列并行)</strong>：</p>
+<ul>
+<li><strong>场景</strong>：在 Llama 等模型的 MLP 层（前馈网络），通常有 <code>Gate_proj</code> 和 <code>Up_proj</code> 两个线性层。</li>
+<li><strong>优化</strong>：为了效率，我们把这两个层拼成一个大矩阵一次算完。</li>
+<li><strong>逻辑</strong>：构造函数接受 <code>output_sizes</code> 列表（比如 <code>[4096, 4096]</code>）。它负责算出每张卡应该从第一层拿多少，从第二层拿多少，拼在一起。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>QKVParallelLinear</code> (注意力层并行)</strong>：</p>
+<ul>
+<li><strong>场景</strong>：Transformer 的 Attention 机制需要计算 Query (Q), Key (K), Value (V)。</li>
+<li><strong>难点</strong>：Q 的头数 (Heads) 可能和 K, V 不一样（比如 Grouped Query Attention）。</li>
+<li><strong>逻辑</strong>：<ul>
+<li>它计算 Q, K, V 分别有多少个 Head。</li>
+<li>然后根据卡数，计算每张卡分到几个 Q Head，几个 K/V Head。</li>
+<li><code>weight_loader</code> 里有大量的 <code>if loaded_shard_id == "q"</code>，就是在精准地从完整权重文件中，把属于当前显卡的那几块肉（Head）割下来填进去。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🟣 Task 5: 后勤保障 (Weight Loader)</h3>
+<p><strong>目标</strong>：理解如何把模型权重文件加载进这些切碎的层里。</p>
+<p><strong>代码对应</strong>：每个类里的 <code>weight_loader</code> 方法</p>
+<p>你下载的模型文件（比如 <code>pytorch_model.bin</code>）通常是完整的。但是现在的代码把层切碎了。</p>
+<ul>
+<li><strong>问题</strong>：显卡 A 说：“我只需要矩阵的前半截，别给我整个文件。”</li>
+<li><strong>解决</strong>：<ul>
+<li><code>narrow(dim, start, length)</code>：这是 PyTorch 的切片操作。</li>
+<li><strong>逻辑</strong>：<ol>
+<li><code>param.data</code> 是当前显卡上的（切分后的）小权重容器。</li>
+<li><code>loaded_weight</code> 是外部传进来的完整大权重。</li>
+<li><code>start_idx = self.tp_rank * shard_size</code>：计算当前显卡该从哪里开始读。</li>
+<li><code>copy_</code>：把切出来的那一小条数据，复制进参数里。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>看完这个 List，你再回头看代码，就会发现它其实只干了一件事：</p>
+<p><strong>为了让大模型在多张卡上跑起来，我们把矩阵乘法拆解了。</strong></p>
+<ul>
+<li><strong>ColumnParallel</strong>：把结果拆了，一人算一部分输出。</li>
+<li><strong>RowParallel</strong>：把输入拆了，一人算一部分和，最后大家 <code>All-Reduce</code> 加在一起。</li>
+<li><strong>QKV / Merged</strong>：是为了适配 Transformer 结构的特殊切分方式。</li>
+</ul>
+<p>建议你先只看 <code>ColumnParallelLinear</code> 的 <code>__init__</code> 和 <code>weight_loader</code>，弄懂了“切分”和“加载”，其他的就都通了。</p>

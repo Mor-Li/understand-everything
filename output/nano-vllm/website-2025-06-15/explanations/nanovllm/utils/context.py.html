@@ -1,0 +1,96 @@
+<h1>nanovllm/utils/context.py</h1>
+<p>这份代码看起来全是变量定义，确实容易让人摸不着头脑。</p>
+<p>简单来说，<strong>这个文件的作用就是造一个“全局背包”</strong>。在 LLM（大模型）运行的过程中，有一些非常重要的数据（比如当前是在阅读提问，还是在生成回答？显存存在哪里？），需要在大模型的各个层级之间传递。为了不把这些参数在每个函数里写一遍，作者搞了这个全局变量来存储。</p>
+<p>为了让你彻底搞懂，我制定了一个 <strong>4步走的 Task List（学习清单）</strong>，我们一步步来拆解：</p>
+<hr />
+<h3>📋 学习清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1：理解“场景” (为什么要存这些变量？)</strong></li>
+<li><strong>Task 2：拆解“背包” (dataclass 里装了啥？)</strong></li>
+<li><strong>Task 3：搞懂“传送门” (Global 变量的魔法)</strong></li>
+<li><strong>Task 4：模拟“流程” (这代码是怎么跑起来的？)</strong></li>
+</ol>
+<hr />
+<h3>✅ Task 1：理解“场景” (为什么要存这些变量？)</h3>
+<p>首先，你得知道 <code>nanovllm</code> 是一个推理框架（让模型跑起来的程序）。大模型推理时，底层计算（特别是 Attention 注意力机制）需要很多<strong>元数据（Metadata）</strong>。</p>
+<p>想象你在考场写作文：
+*   <strong>is_prefill</strong>: 你现在是在<strong>读题目</strong>（Prefill阶段），还是在<strong>写作文</strong>（Decode阶段）？这两种状态下，大脑（GPU）的运作方式完全不同。
+*   <strong>block_tables / slot_mapping</strong>: 你的草稿纸（显存/KV Cache）放在哪一页、哪一行？</p>
+<p><strong>痛点：</strong> 如果没有这个文件，你的代码里每个函数都得带着这堆参数，像这样：
+<code>Layer1(input, is_prefill, block_tables, ...)</code> -&gt; <code>Layer2(input, is_prefill, block_tables, ...)</code>
+这太麻烦了！</p>
+<p><strong>解决方案：</strong> 我们把这些公共信息放在一个“上下文（Context）”里，谁需要谁就去拿。</p>
+<hr />
+<h3>✅ Task 2：拆解“背包” (dataclass 里装了啥？)</h3>
+<p>看代码中的 <code>@dataclass class Context:</code> 部分。这就像是定义了一个结构体或者字典，用来打包数据。</p>
+<ul>
+<li><strong><code>is_prefill: bool</code></strong>:<ul>
+<li>开关。<code>True</code> 代表正在“预填充”（处理用户的输入 Prompt），<code>False</code> 代表正在“解码”（一个字一个字蹦答案）。</li>
+</ul>
+</li>
+<li><strong><code>cu_seqlens_q</code> / <code>cu_seqlens_k</code></strong>:<ul>
+<li>这是给 <strong>FlashAttention</strong> 用的。如果一次处理多句话，我们需要知道每句话的长度是多少，起始位置在哪里。</li>
+</ul>
+</li>
+<li><strong><code>max_seqlen_q</code> / <code>max_seqlen_k</code></strong>:<ul>
+<li>这一批数据里，最长的那句话有多长。</li>
+</ul>
+</li>
+<li><strong><code>slot_mapping</code> / <code>block_tables</code> / <code>context_lens</code></strong>:<ul>
+<li>这是给 <strong>PagedAttention</strong> (vLLM的核心技术) 用的。简单理解为<strong>显存的索引表</strong>。它告诉 GPU：“这句话之前的记忆（KV Cache）存在显存的第几号格子里”。</li>
+</ul>
+</li>
+</ul>
+<p><strong>总结 Task 2：</strong> <code>Context</code> 就是一个数据包，里面装的全是<strong>GPU计算注意力时需要的“坐标”和“状态”信息</strong>。</p>
+<hr />
+<h3>✅ Task 3：搞懂“传送门” (Global 变量的魔法)</h3>
+<p>看这几行代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">_CONTEXT</span> <span class="o">=</span> <span class="n">Context</span><span class="p">()</span> <span class="c1"># 1. 初始化一个空背包</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">get_context</span><span class="p">():</span>   <span class="c1"># 2. 获取背包</span>
+    <span class="k">return</span> <span class="n">_CONTEXT</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">set_context</span><span class="p">(</span><span class="o">...</span><span class="p">):</span> <span class="c1"># 3. 往背包里装东西</span>
+    <span class="k">global</span> <span class="n">_CONTEXT</span>
+    <span class="n">_CONTEXT</span> <span class="o">=</span> <span class="n">Context</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p>这是 Python 中一种实现 <strong>单例模式 (Singleton)</strong> 或者 <strong>全局状态管理</strong> 的简易写法。</p>
+<ul>
+<li><strong><code>_CONTEXT</code></strong>: 这是一个全局变量。不管你在代码的哪个角落，只要 <code>import</code> 了这个文件，大家看到的 <code>_CONTEXT</code> 都是同一个。</li>
+<li><strong><code>get_context()</code></strong>: 此时此刻，模型里的第 10 层 Transformer 想知道“现在的最大序列长度是多少？”，它调用这个函数就能拿到数据，不需要上层函数传给它。</li>
+</ul>
+<hr />
+<h3>✅ Task 4：模拟“流程” (这代码是怎么跑起来的？)</h3>
+<p>让我们把这个文件放在整个 <code>nanovllm</code> 的运行流程中，看它怎么一步步工作：</p>
+<ol>
+<li>
+<p><strong>步骤一：准备阶段 (Controller)</strong>
+    主控程序收到了你的一段话。它计算出这句话的长度、分配好了显存位置。
+    此时，主控程序调用：
+    <code>python
+    # 把计算好的元数据存入全局变量
+    set_context(is_prefill=True, max_seqlen_q=10, block_tables=...)</code></p>
+</li>
+<li>
+<p><strong>步骤二：模型计算 (Model Forward)</strong>
+    模型开始跑了。模型里有几十层 Attention 层。
+    在深处的某一层代码里（不需要主控程序传参）：
+    <code>python
+    # 某一层 Attention 的代码
+    ctx = get_context() # 拿到全局变量
+    if ctx.is_prefill:
+        # 用 FlashAttention 狂算
+    else:
+        # 用 PagedAttention 查表 ctx.block_tables 慢慢算</code></p>
+</li>
+<li>
+<p><strong>步骤三：清理 (Reset)</strong>
+    这一次计算结束了，为了防止下一次计算用到旧数据：
+    <code>python
+    reset_context() # 重置为空</code></p>
+</li>
+</ol>
+<h3>总结</h3>
+<p><strong>这个文件就是 <code>nanovllm</code> 的“大喇叭”</strong>。</p>
+<p>主控程序通过 <code>set_context</code> 对着大喇叭喊：“现在的任务是 Prefill，显存地址在 X，长度是 Y！”。然后模型内部的所有组件，通过 <code>get_context</code> 听到这个广播，根据这些信息去干活。</p>

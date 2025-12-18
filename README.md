@@ -11,7 +11,8 @@
 [📖 verl Demo](https://mor-li.github.io/understand-everything/output/verl/index.html) |
 [🔥 Megatron-LM Demo](https://mor-li.github.io/understand-everything/output/Megatron-LM/index.html) |
 [🦙 LLaMA-Factory Demo](https://mor-li.github.io/understand-everything/output/LLaMA-Factory/index.html) |
-[✏️ EasyEdit Demo](https://mor-li.github.io/understand-everything/output/EasyEdit/index.html)
+[✏️ EasyEdit Demo](https://mor-li.github.io/understand-everything/output/EasyEdit/index.html) |
+[🚀 nano-vllm Demo](https://mor-li.github.io/understand-everything/output/nano-vllm/index.html)
 
 English | [简体中文](assets/README_zh.md)
 
@@ -193,6 +194,7 @@ Successfully analyzed open source projects:
 - **[Megatron-LM](https://github.com/NVIDIA/Megatron-LM)** (1330+ files) - NVIDIA's large-scale Transformer training framework
 - **[LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory)** (405 files) - One-stop LLM fine-tuning framework supporting 100+ models
 - **[EasyEdit](https://github.com/zjunlp/EasyEdit)** (834 files) - Knowledge editing framework with 28+ editing methods
+- **[nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)** (26 files) - Lightweight vLLM implementation with PagedAttention & Continuous Batching
 
 ## Tech Stack
 
