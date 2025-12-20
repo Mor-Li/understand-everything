@@ -1,0 +1,109 @@
+<h1>tests/core/test_llama.py</h1>
+<p>这份代码其实是一个 <strong>“迷你版的大模型推理引擎” (MiniSGL)</strong> 的测试脚本。</p>
+<p>它的核心逻辑不是简单的“调用模型”，而是展示了<strong>如何从底层搭建一个让大模型（LLM）高效运行的环境</strong>。这通常涉及到显存管理、模型加载、注意力机制优化等底层操作。</p>
+<p>为了让你看懂，我把你（作为一个开发者）需要做的事情列成了一个 <strong>To-Do List</strong>。我们按照这个清单，一步步拆解代码。</p>
+<hr />
+<h3>📝 任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>【环境准备】</strong>：设定我们要用几张显卡，用什么精度（BF16/FP16）。</li>
+<li><strong>【模型搭建】</strong>：把 Llama-3 的骨架搭起来，并填入权重（也就是模型的“脑子”）。</li>
+<li><strong>【内存规划】</strong>：开辟一块专用显存（KV Cache），用来存放对话的历史记忆。</li>
+<li><strong>【引擎组装】</strong>：配置计算核心（Attention Backend），把模型和内存连起来。</li>
+<li><strong>【请求打包】</strong>：把用户的输入（"Hello..."）打包成引擎能听懂的格式（Request）。</li>
+<li><strong>【执行计算】</strong>：让模型跑一次，算出下一个字的概率（Logits）。</li>
+</ol>
+<hr />
+<h3>🔍 逐步详解</h3>
+<h4>第一步：【环境准备】设定显卡和精度</h4>
+<p><strong>目标</strong>：告诉程序我们要用单卡跑，还是多卡跑，以及用哪块 GPU。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    set_tp_info(0, 1)  # 设置张量并行信息：我是第0号卡，一共只用1张卡
+    device = torch.device("cuda:0") # 指定用第0号GPU
+    dtype = torch.bfloat16          # 使用 bfloat16 精度（省显存）
+    torch.cuda.set_device(device)   # 锁定设备</code></li>
+<li><strong>白话解释</strong>：就像在开工前，先确认只有你一个人干活（单卡），并且准备好你的工作台（GPU 0）。</li>
+</ul>
+<h4>第二步：【模型搭建】加载 Llama-3</h4>
+<p><strong>目标</strong>：读取 HuggingFace 的配置，创建模型结构，并加载权重文件。</p>
+<ul>
+<li>
+<p><strong>代码对应</strong>：
+    ```python
+    model_path = "meta-llama/Llama-3.1-8B-Instruct"
+    config: Any = AutoConfig.from_pretrained(model_path) # 下载/读取配置文件
+    model_config = ModelConfig.from_hf(config)           # 转换成 MiniSGL 内部的配置格式</p>
+<p>with torch_dtype(dtype), device:
+    model = LlamaForCausalLM(model_config)           # 按图纸搭建空模型（骨架）</p>
+<p>model.load_state_dict(load_hf_weight(model_path, device)) # 填入权重（注入灵魂）
+```
+*   <strong>白话解释</strong>：这步就像组装一台电脑。先看说明书（Config），把主板插好（Model Init），最后把操作系统装进去（Load Weights）。</p>
+</li>
+</ul>
+<h4>第三步：【内存规划】创建 KV Cache (关键点)</h4>
+<p><strong>目标</strong>：这是推理引擎和普通 PyTorch 代码最大的区别。我们需要预先开辟一块显存，专门用来存“过去说过的话”（Key-Value Cache），避免重复计算。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    kv_cache = create_kvcache(
+        num_layers=..., 
+        num_pages=65536,  # 预留了能存 6万多页内容的显存空间
+        ...
+    )
+    page_table = Context.create_page_table(...) # 创建页表，用来管理这些内存页</code></li>
+<li><strong>白话解释</strong>：大模型聊天时需要“记笔记”才能记得上文。这里我们买了一个巨大的笔记本（KV Cache），并准备了一个目录（Page Table）来管理哪一页写了什么。</li>
+</ul>
+<h4>第四步：【引擎组装】配置 Attention Backend</h4>
+<p><strong>目标</strong>：将模型、显存、计算方法绑定在一起，形成一个全局的上下文（Context）。</p>
+<ul>
+<li>
+<p><strong>代码对应</strong>：
+    ```python
+    # 创建注意力后端，这里指定用 "fa3" (FlashAttention-3) 来加速计算
+    attn_backend = create_attention_backend(model_config, kv_cache, "fa3", page_table)</p>
+<h1>把所有东西打包成一个 Context</h1>
+<p>ctx = Context(..., attn_backend=attn_backend)
+set_global_ctx(ctx) # 设为全局变量，让程序到处都能用
+```
+*   <strong>白话解释</strong>：这是给模型装上“涡轮增压”。普通的计算太慢，我们指定用 FlashAttention 这种高级算法，并告诉它：“嘿，计算的时候去刚才那个笔记本（KV Cache）里找数据。”</p>
+</li>
+</ul>
+<h4>第五步：【请求打包】处理用户输入</h4>
+<p><strong>目标</strong>：把人类的自然语言，转换成引擎内部的 <code>Req</code> (Request) 对象。</p>
+<ul>
+<li>
+<p><strong>代码对应</strong>：
+    ```python
+    input_str = "Hello, what's your name?"
+    tokenizer = AutoTokenizer.from_pretrained(model_path) # 也就是把字变成数字</p>
+<h1>创建一个 Batch（批次），里面包含一个 Req（请求）</h1>
+<p>batch = Batch(
+    reqs=[
+        Req(
+            input_ids=tokenizer.encode(input_str), # 输入的数字编码
+            page_table_idx=1, # 告诉引擎，把这个请求的记忆写在笔记本的第1页
+            output_len=10,    # 预计输出10个字
+            ...
+        )
+    ],
+)
+```
+*   <strong>白话解释</strong>：就像去餐厅点菜。你不能直接对厨师喊，你要填一张单子（Req），上面写着你要吃什么（Input IDs），坐哪桌（Page Table Index）。</p>
+</li>
+</ul>
+<h4>第六步：【执行计算】Forward Pass</h4>
+<p><strong>目标</strong>：真正运行模型，计算结果。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    attn_backend.prepare_metadata(batch, allow_graph=False) # 预处理，准备好计算图
+    logits = model.forward_batch(batch) # 模型向前跑一次
+    logger.info(logits) # 打印结果（输出的是概率值）</code></li>
+<li><strong>白话解释</strong>：厨师（模型）拿到单子，开火炒菜。<code>logits</code> 就是炒出来的菜（实际上是模型预测的下一个字的概率分布）。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件的核心观点是演示 <strong>“如何手动控制一个高性能 LLM 推理流程”</strong>。</p>
+<p>普通的 <code>model.generate()</code> 把这些步骤都封装死了。而这个脚本把<strong>显存分配（KV Cache）</strong>、<strong>注意力计算（FlashAttention）</strong>、<strong>请求调度（Batch/Req）</strong> 全部拆开给你看。</p>
+<p>这通常是用来测试 <strong>MiniSGL</strong> 这个框架的底层功能是否正常的。</p>

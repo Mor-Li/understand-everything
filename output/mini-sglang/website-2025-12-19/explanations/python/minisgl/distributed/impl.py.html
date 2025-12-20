@@ -1,0 +1,59 @@
+<h1>python/minisgl/distributed/impl.py</h1>
+<p>这段代码看起来很抽象，是因为它使用了一种<strong>设计模式（策略模式 + 插件机制）</strong>来处理多显卡（多GPU）之间的通信。</p>
+<p>简单来说，这段代码是为了解决<strong>“多个GPU之间如何交换数据”</strong>这个问题的。</p>
+<p>为了让你更容易理解，我制定了一个 <strong>6步的学习任务清单 (To-Do List)</strong>。我们将从最基础的概念开始，一步步拆解这段代码。</p>
+<hr />
+<h3>📋 任务清单 (To-Do List)</h3>
+<h4>✅ Task 1: 理解核心概念 —— 为什么需要“通信”？</h4>
+<p>在深度学习（特别是大模型）中，一张显卡放不下模型，或者算得太慢，我们需要多张显卡一起算（这叫张量并行 Tensor Parallelism）。
+既然大家一起算，就必须互相通气。这里定义了两个最核心的动作：
+1.  <strong><code>all_reduce</code> (大家汇总)</strong>: 比如每张卡算了一部分结果，现在要把所有人的结果<strong>加起来</strong>，让每张卡都拿到最终的总和。
+2.  <strong><code>all_gather</code> (大家凑齐)</strong>: 比如每张卡手里有一小块数据，现在要把所有人的碎片<strong>拼起来</strong>，让每张卡都拿到完整的数据。</p>
+<h4>✅ Task 2: 定义“标准” (The Interface)</h4>
+<p><strong>代码对应部分：</strong> <code>class DistributedImpl(ABC)</code>
+*   <strong>解读</strong>：
+    *   这是一个<strong>抽象基类</strong>（相当于一份“合同”或“规范”）。
+    *   它不干实事，只是规定：不管你是用什么技术（PyTorch原生的，还是自定义的），你必须得有 <code>all_reduce</code> 和 <code>all_gather</code> 这两个功能。
+    *   这样上层代码就不需要关心底层到底是用什么技术通信的。</p>
+<h4>✅ Task 3: 看看“普通版”实现 (The Default Way)</h4>
+<p><strong>代码对应部分：</strong> <code>class TorchDistributedImpl(DistributedImpl)</code>
+*   <strong>解读</strong>：
+    *   这是基于 PyTorch 官方自带工具 (<code>torch.distributed</code>) 的实现。
+    *   <strong><code>all_reduce</code></strong>: 调用 <code>dist.all_reduce</code>，把所有卡的数据加起来 (<code>ReduceOp.SUM</code>)。
+    *   <strong><code>all_gather</code></strong>: 调用 <code>dist.all_gather_into_tensor</code>。注意看代码里有 <code>shape[0] = shape[0] * tp_size</code>，意思是收集完数据后，第一维度会变长（因为大家的数据拼在一起了）。
+    *   <em>特点</em>：通用，稳，但在某些极速场景下可能不够快。</p>
+<h4>✅ Task 4: 看看“专业版”实现 (The Advanced Way)</h4>
+<p><strong>代码对应部分：</strong> <code>class PyNCCLDistributedImpl(DistributedImpl)</code>
+*   <strong>解读</strong>：
+    *   这是为了追求极致性能，使用了一个自定义的 <code>PyNCCLCommunicator</code>（通常直接调用 NVIDIA 的 NCCL 库，绕过 PyTorch 的一些开销）。
+    *   它也遵守了 Task 2 中的“合同”，实现了 <code>all_reduce</code> 和 <code>all_gather</code>。
+    *   <em>特点</em>：这是 <code>minisgl</code> 这个库特有的优化版实现。</p>
+<h4>✅ Task 5: 理解“大管家” (The Manager)</h4>
+<p><strong>代码对应部分：</strong> <code>class DistributedCommunicator</code>
+*   <strong>解读</strong>：
+    *   这个类是真正对外干活的“大管家”。
+    *   <strong>关键点</strong>：<code>plugins: List[DistributedImpl] = [TorchDistributedImpl()]</code>
+        *   它维护了一个<strong>插件列表</strong>。默认情况下，列表里装的是“普通版”。
+    *   <strong>核心逻辑</strong>：
+        <code>python
+        def all_reduce(self, x):
+            return self.plugins[-1].all_reduce(x)</code>
+        注意这个 <code>[-1]</code>。它的意思是：<strong>永远使用列表里“最新”的那个插件</strong>。
+    *   这允许我们在程序运行时，随时把“普通版”替换成“专业版”，而不用修改调用者的代码。</p>
+<h4>✅ Task 6: 激活“专业版” (The Switch)</h4>
+<p><strong>代码对应部分：</strong> <code>def enable_pynccl_distributed(...)</code>
+*   <strong>解读</strong>：
+    *   这个函数的作用是<strong>开启加速模式</strong>。
+    *   它做了两件事：
+        1.  初始化 <code>PyNCCL</code> 通信器（建立连接）。
+        2.  <code>DistributedCommunicator.plugins.append(...)</code>：<strong>把“专业版”插件加到大管家的列表末尾</strong>。
+    *   结合 Task 5 的逻辑，一旦执行了这个函数，<code>plugins[-1]</code> 就变成了专业版。以后所有的通信都会自动走专业版通道。</p>
+<hr />
+<h3>总结：这段代码到底在讲啥？</h3>
+<p>这段代码构建了一个<strong>可插拔的通信系统</strong>：</p>
+<ol>
+<li><strong>定义规则</strong>：大家都得会 <code>all_reduce</code> 和 <code>all_gather</code>。</li>
+<li><strong>默认方案</strong>：先给你一个基于 PyTorch 的默认实现，保证能跑。</li>
+<li><strong>优化方案</strong>：准备了一个基于 PyNCCL 的高性能实现，跑得更快。</li>
+<li><strong>热切换机制</strong>：通过 <code>DistributedCommunicator</code> 和 <code>enable_pynccl_distributed</code>，可以在程序运行时，无缝地将通信后端从“默认方案”切换到“优化方案”，从而加速大模型的推理或训练。</li>
+</ol>

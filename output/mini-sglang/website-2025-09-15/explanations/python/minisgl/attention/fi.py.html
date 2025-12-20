@@ -1,0 +1,60 @@
+<h1>python/minisgl/attention/fi.py</h1>
+<p>这个文件 <code>python/minisgl/attention/fi.py</code> 的核心作用是 <strong>作为 MiniSGL 框架和 FlashInfer（一个高性能 Attention 算子库）之间的“适配器”或“驱动程序”</strong>。</p>
+<p>它的工作就是把 MiniSGL 里的请求（Batch, Req）翻译成 FlashInfer 能听懂的语言（Tensors, Pointers），然后指挥 FlashInfer 去计算 Attention。</p>
+<p>为了让你更容易理解，我把它想象成一个 <strong>“厨师长（Backend）”</strong> 的工作清单（Todo List）。我们按照处理一个 AI 请求的生命周期来一步步看。</p>
+<hr />
+<h3>📋 厨师长（FlashInferBackend）的工作清单</h3>
+<h4>Task 1: 开张准备（初始化）</h4>
+<p><strong>对应代码：</strong> <code>__init__</code> 方法
+*   <strong>目标</strong>：准备好做饭的工具和场地。
+*   <strong>具体步骤</strong>：
+    1.  <strong>准备缓存区 (<code>workspace_buffer</code>)</strong>：向 GPU 申请一块 128MB 的内存，作为 FlashInfer 计算时的临时草稿纸。
+    2.  <strong>准备计算器 (<code>wrappers</code>)</strong>：初始化两个核心工具：
+        *   <code>prefill_wrapper</code>：专门用来处理刚进来的长文本（Prompt 阶段）。
+        *   <code>decode_wrappers</code>：专门用来处理后续一个字一个字生成的阶段（Decode 阶段）。
+    3.  <strong>准备菜单 (<code>page_table</code>)</strong>：拿到全局的页表，知道显存里哪块地放了什么数据。</p>
+<h4>Task 2: 整理点单（准备元数据）</h4>
+<p><strong>对应代码：</strong> <code>prepare_metadata</code> 方法 &amp; <code>FIMetadata</code> 类
+*   <strong>目标</strong>：客人（Batch）来了，把他们的需求整理成 FlashInfer 能读懂的格式。这是最繁琐的一步。
+*   <strong>具体步骤</strong>：
+    1.  <strong>统计长度</strong>：看这一批里每个请求（Req）有多长（<code>seqlens_q</code>, <code>seqlens_k</code>）。
+    2.  <strong>计算指针 (<code>indptr/cu_seqlens</code>)</strong>：FlashInfer 需要把所有请求拼在一起算，所以需要计算“累积长度”。比如请求A长10，请求B长20，累积长度就是 <code>[0, 10, 30]</code>。这告诉 GPU：0-10 是 A 的数据，10-30 是 B 的数据。
+        *   <em>注：代码里分别计算了 Query (q) 和 Key/Value (k) 的累积长度。</em>
+    3.  <strong>查找页表 (<code>indices/out_loc</code>)</strong>：
+        *   <strong>KV Cache 位置</strong>：找到之前的历史记录（Key/Value）存在显存的哪个位置。
+        *   <strong>输出位置</strong>：计算出的新结果应该填到哪里。
+    4.  <strong>打包 (<code>FIMetadata</code>)</strong>：把上面算好的所有 Tensor 打包成一个 <code>FIMetadata</code> 对象。
+        *   <em>比喻</em>：这就像把客人的点单写成一张标准的后厨施工单，上面写着“第3桌，用5号锅，原料在A柜，炒好放B盘”。</p>
+<h4>Task 3: 开始做菜（前向计算）</h4>
+<p><strong>对应代码：</strong> <code>forward</code> 方法 &amp; <code>_initialize_once</code>
+*   <strong>目标</strong>：真正执行 Attention 计算。
+*   <strong>具体步骤</strong>：
+    1.  <strong>最后确认 (<code>_initialize_once</code>)</strong>：拿到 <code>FIMetadata</code> 后，调用 FlashInfer 的 <code>plan</code> 方法。这一步是让 FlashInfer 内部预处理一下辅助数据结构。
+    2.  <strong>存新货 (<code>kvcache.store_kv</code>)</strong>：把当前这一步新生成的 Key 和 Value 存入显存（KV Cache），方便下一步使用。
+    3.  <strong>开火炒菜 (<code>wrapper.forward</code>)</strong>：
+        *   输入：Q (Query), K, V 缓存。
+        *   动作：调用 FlashInfer 的底层算子（FA3 或其他 kernel）。
+        *   输出：Attention 的结果。</p>
+<h4>Task 4: 进阶技巧——图模式（CUDA Graph 优化）</h4>
+<p><strong>对应代码：</strong> <code>init_capture_graph</code>, <code>prepare_for_capture</code>, <code>prepare_for_replay</code>
+*   <strong>目标</strong>：对于重复性的工作（比如解码阶段，每次只生成一个词，形状固定），不要每次都重新安排流程，直接“录像”回放，速度更快。
+*   <strong>具体步骤</strong>：
+    1.  <strong>彩排 (<code>init_capture_graph</code>)</strong>：预先分配好固定的内存空间（静态 Buffer），用来存放将来可能变化的数据（如 input_ids, positions）。
+    2.  <strong>录像 (<code>prepare_for_capture</code>)</strong>：在第一次运行时，开启“录制模式”。GPU 会记住这一连串的操作（Kernel launch sequence）。
+    3.  <strong>回放 (<code>prepare_for_replay</code>)</strong>：
+        *   下次再来同样大小的 Batch 时，不再重新申请内存或重新下发指令。
+        *   直接把新数据（metadata）拷贝到之前预分配的静态 Buffer 里 (<code>_copy_metadata</code>)。
+        *   告诉 GPU：“按刚才那个录像再跑一遍”。</p>
+<hr />
+<h3>总结文中的关键观点（Key Takeaways）</h3>
+<ol>
+<li><strong>FlashInfer 是核心引擎</strong>：MiniSGL 自身不写 Attention CUDA 代码，而是完全依赖 <code>flashinfer</code> 库。</li>
+<li><strong>元数据（Metadata）是关键</strong>：代码的一大半逻辑都在处理 <code>FIMetadata</code>。这是因为 Paged Attention（分页注意力）机制非常复杂，需要精确地告诉 GPU 每一页 KV Cache 在哪里，而不是简单地传一个大张量。</li>
+<li><strong>区分 Prefill 和 Decode</strong>：<ul>
+<li><strong>Prefill</strong>（预填充）：一次处理很多 Token，用 <code>BatchPrefillWithPagedKVCacheWrapper</code>。</li>
+<li><strong>Decode</strong>（解码）：一次处理一个 Token，用 <code>BatchDecodeWithPagedKVCacheWrapper</code>。</li>
+</ul>
+</li>
+<li><strong>CUDA Graph 加速</strong>：针对 Decode 阶段的小 Batch，CPU 发射指令的开销很大。代码显式地实现了 CUDA Graph 的捕获（Capture）和重放（Replay）逻辑，这是高性能推理框架的标配。</li>
+</ol>
+<p><strong>简单一句话：</strong> 这个文件就是把 MiniSGL 的业务数据，“翻译”并“搬运”给 FlashInfer 去做数学题。</p>

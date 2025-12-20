@@ -1,0 +1,80 @@
+<h1>python/minisgl/scheduler/table.py</h1>
+<p>这段代码确实非常底层，它是大模型推理系统（比如 SGLang, vLLM）中<strong>显存管理</strong>的一个核心小组件。</p>
+<p>为了让你听懂，我们不需要一上来就讲代码，我们来列一个 <strong>“学习任务清单” (Todo List)</strong>。我们把这个复杂的计算机概念，还原成一个<strong>“餐厅领位员”</strong>的工作。</p>
+<p>这是你的 5 个步骤任务清单：</p>
+<h3>Task 1：建立场景——“餐厅领位员”</h3>
+<p><strong>目标</strong>：理解什么是 <code>Slot</code>（卡槽/位置）和 <code>Request</code>（请求）。</p>
+<p>想象你经营一家非常火爆的餐厅（这就相当于显卡 GPU），但是你的桌子数量是有限的。
+*   <strong>Request (请求)</strong>：就是一个进店吃饭的客人（或者一组对话）。
+*   <strong>Max Running Reqs (最大并发数)</strong>：你的餐厅一共只有 100 张桌子，编号从 0 到 99。
+*   <strong>Free Slots (空闲位置)</strong>：你手里拿着一个小本本，记录着哪些桌子现在是空的。</p>
+<p><strong>对应代码：</strong>
+<code>PageTableManager</code> 就是你这个<strong>领位员</strong>。你的工作不是做饭（计算），而是<strong>分配桌号</strong>。</p>
+<hr />
+<h3>Task 2：初始化——开门营业 (<code>__init__</code>)</h3>
+<p><strong>目标</strong>：看懂代码初始化时做了什么。</p>
+<p>当系统刚启动时，就像餐厅刚开门：
+1.  <strong>设定容量</strong>：老板告诉你，今天最多能接待多少桌客人 (<code>max_running_reqs</code>)。
+2.  <strong>准备空位表</strong>：刚开门时，所有桌子都是空的。
+3.  <strong>拿到登记簿</strong>：你手里有一个巨大的表格（<code>page_table</code>），用来记录每桌客人点了什么菜（在显存里的位置），但在这个类里，你只负责分配<strong>这一行给谁用</strong>。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">max_running_reqs</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">page_table</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">max_running_reqs</span> <span class="o">=</span> <span class="n">max_running_reqs</span>
+    <span class="c1"># 比如 max=5，那 free_slots 就是 [0, 1, 2, 3, 4]</span>
+    <span class="c1"># 一开始所有位置都是空的，都在列表里</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">free_slots</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">max_running_reqs</span><span class="p">))</span> 
+
+    <span class="bp">self</span><span class="o">.</span><span class="n">page_table</span> <span class="o">=</span> <span class="n">page_table</span> <span class="c1"># 这是一个 GPU 上的大表格</span>
+</code></pre></div>
+
+<hr />
+<h3>Task 3：客人进店——分配桌号 (<code>allocate</code>)</h3>
+<p><strong>目标</strong>：理解如何从空闲列表中拿出一个位置。</p>
+<p>当一个新的请求（Request）发过来要进行推理时：
+1.  你需要给它分配一个唯一的 ID，也就是给它安排一张桌子。
+2.  你的做法是：从 <code>free_slots</code>（空闲列表）里<strong>拿走</strong>最后一个数字。
+3.  把这个数字返回给系统，系统就知道：“好，第 5 号桌现在归这个客人了”。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">allocate</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+    <span class="c1"># pop() 会移除并返回列表的最后一个元素</span>
+    <span class="c1"># 比如列表是 [0, 1, 2]，pop 之后变成 [0, 1]，返回 2</span>
+    <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">free_slots</span><span class="o">.</span><span class="n">pop</span><span class="p">()</span>
+</code></pre></div>
+
+<hr />
+<h3>Task 4：客人结账——回收桌号 (<code>free</code>)</h3>
+<p><strong>目标</strong>：理解资源回收。</p>
+<p>当一个请求处理完了（客人吃完走了）：
+1.  这个桌号（<code>slot</code>）就空出来了。
+2.  你需要把这个号码<strong>加回</strong>到 <code>free_slots</code> 列表中。
+3.  这样下一个客人来的时候，这个桌号就可以再次被使用了。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">free</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="c1"># 比如 slot 是 2，把它加回 free_slots 列表末尾</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">free_slots</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">slot</span><span class="p">)</span>
+</code></pre></div>
+
+<hr />
+<h3>Task 5：宏观理解——这到底是在管什么？</h3>
+<p><strong>目标</strong>：理解 <code>page_table</code> 的意义。</p>
+<p>你可能会问：<em>“代码里传进来了 <code>page_table</code> 这个 Tensor，但为什么 <code>allocate</code> 和 <code>free</code> 都没有去修改这个 Tensor 里的数据呢？”</em></p>
+<p>这就是这个类的精髓：<strong>它只管“索引”（Index），不管“内容”。</strong></p>
+<ul>
+<li><strong>背景知识</strong>：在大模型推理中，我们需要一个巨大的表格（Page Table）来记录每个请求的 KV Cache（记忆）存在显存的哪个物理块里。这个表格通常在 GPU 上。</li>
+<li><strong>这个类的作用</strong>：它只是管理<strong>“哪一行归谁用”</strong>。<ul>
+<li>它说：“第 3 行给你用”。</li>
+<li>然后其他的代码（比如模型推理的 Kernel）会拿着“第 3 行”这个 ID，去 GPU 的那个大表格里填入真正的显存地址。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件 <code>table.py</code> 其实写了一个<strong>非常简单的整数资源池管理器</strong>。</p>
+<ul>
+<li><strong>输入</strong>：一堆整数（0 到 N-1）。</li>
+<li><strong>动作</strong>：<ul>
+<li><strong>借出 (<code>allocate</code>)</strong>：给我一个没用的整数。</li>
+<li><strong>归还 (<code>free</code>)</strong>：这个整数我用完了，还给你。</li>
+</ul>
+</li>
+<li><strong>目的</strong>：确保每个正在运行的 AI 任务（Request）都有一个独一无二的编号（Slot ID），用来在显存的大表格中找到属于自己的位置。</li>
+</ul>

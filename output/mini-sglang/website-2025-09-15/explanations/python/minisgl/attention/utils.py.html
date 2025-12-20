@@ -1,0 +1,65 @@
+<h1>python/minisgl/attention/utils.py</h1>
+<p>这段代码之所以看起来像“天书”，是因为它是<strong>大模型推理（LLM Inference）底层加速</strong>中最核心的数据结构定义。</p>
+<p>简单来说，这个 <code>CaptureData</code> 类是一个<strong>“数据包裹”</strong>。当我们要让显卡（GPU）快速计算注意力（Attention）时，不能只给它文本，必须把所有关于内存地址、句子长度、位置索引的元数据打包好，一次性扔给 GPU。</p>
+<p>这个文件通常出现在像 <strong>SGLang</strong> 或 <strong>vLLM</strong> 这样高性能推理框架的源码中。</p>
+<p>为了让你听懂，我把理解这个类拆解成 <strong>4 个 Task（任务阶段）</strong>，我们一步步来通关：</p>
+<hr />
+<h3>Task 1: 理解最基础的输入 (Text -&gt; Numbers)</h3>
+<p>首先，大模型看不懂中文或英文，它只看懂数字。</p>
+<ul>
+<li><strong>场景</strong>：你发给 ChatGPT 一句话：“你好”。</li>
+<li><strong>对应代码</strong>：<ul>
+<li><strong><code>input_ids</code></strong>: 这就是“你好”对应的数字编码（Token IDs）。比如 <code>[101, 253, 309...]</code>。这是最原始的原材料。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 2: 解决“长短不一”的问题 (Batching)</h3>
+<p>为了快，我们通常一次处理好几个人的提问（Batching）。但是，A 问了 3 个字，B 问了 1000 个字。它们长度不一样，怎么把它们拼在一起塞给 GPU 算？</p>
+<ul>
+<li><strong>场景</strong>：把长短不一的句子拼成一条长龙（Flatten），而不是填补成一样长的矩阵（Padding，这很浪费显存）。我们需要告诉 GPU 哪里是第一句话的结尾，哪里是第二句话的开头。</li>
+<li><strong>对应代码</strong>：<ul>
+<li><strong><code>seq_lens</code></strong>: 一个列表，记录每一句话有多长。比如 <code>[3, 1000]</code>。</li>
+<li><strong><code>cu_seqlens_q</code> / <code>cu_seqlens_k</code></strong>: 全称是 <strong>Cumulative Sequence Lengths</strong>（累积序列长度）。<ul>
+<li>这就是“路标”。比如第一句话长 3，第二句长 5。累积长度就是 <code>[0, 3, 8]</code>。</li>
+<li><strong>Q</strong> 代表 Query（当前提问），<strong>K</strong> 代表 Key（历史记忆）。这通常用于 <strong>FlashAttention</strong> 算法，告诉 GPU：“嘿，第 0 到第 3 个数属于第一个人，第 3 到第 8 个数属于第二个人，别搞混了。”</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 3: 核心难点——显存管理 (PagedAttention)</h3>
+<p>这是这段代码最“高级”的地方。大模型的记忆（KV Cache）非常占内存。传统的做法是给每个人预留一大块连续内存，但这样很浪费（碎片化）。</p>
+<p>现在的做法（也就是 <strong>PagedAttention</strong> 技术）模仿了操作系统的<strong>虚拟内存</strong>：把显存切成一块一块的小“页（Page）”，句子写满了这一页，就随便找个空的下一页继续写，不需要连续。</p>
+<ul>
+<li><strong>场景</strong>：你需要一张“地图”，告诉 GPU：“逻辑上这句话的第 1 页，实际上存在物理显存的第 5 号格子里”。</li>
+<li><strong>对应代码</strong>：<ul>
+<li><strong><code>page_table</code></strong>: 这就是那张<strong>“寻址地图”</strong>（页表）。它记录了逻辑块到物理显存块的映射关系。没有它，GPU 就找不到之前聊过的内容存在哪了。</li>
+<li><strong><code>positions</code></strong>: 告诉模型，当前的字是句子里的第几个字（比如第 5 个字），这样模型才能理解语序。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 4: 告诉 GPU 结果放哪</h3>
+<p>计算完了，总得把结果存下来。</p>
+<ul>
+<li><strong>对应代码</strong>：<ul>
+<li><strong><code>out_loc</code></strong>: 输出位置（Output Location）。告诉 GPU 算出来的结果（新的 Token 或者 Attention 分数）应该写到显存的哪个地址去。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：<code>CaptureData</code> 到底是什么？</h3>
+<p>现在回头看这个类，你可以把它想象成一个给 GPU 厨师的<strong>“配菜篮子”</strong>：</p>
+<ol>
+<li><strong><code>input_ids</code></strong>: 原材料（要把什么菜炒熟）。</li>
+<li><strong><code>seq_lens</code> / <code>cu_seqlens...</code></strong>: 切菜指南（哪些菜属于第一桌客人，哪些属于第二桌，别炒混了）。</li>
+<li><strong><code>page_table</code></strong>: 冰箱索引（去哪里找之前的剩菜/历史记忆）。</li>
+<li><strong><code>positions</code></strong>: 摆盘顺序（这道菜是第几道工序）。</li>
+<li><strong><code>out_loc</code></strong>: 上菜位置（炒好了放哪个盘子里）。</li>
+</ol>
+<p><strong>为什么叫 <code>Capture</code>？</strong>
+通常在 CUDA Graph（一种 GPU 加速技术）中，我们会把这些参数的内存地址固定下来（Capture/捕获），这样下次再推理时，只需要往这些固定的篮子里换新菜，而不需要重新买篮子，速度会更快。</p>
+<p><strong>你需要做什么？</strong>
+如果你不是在开发推理框架内核，<strong>你不需要修改这个文件</strong>。你只需要知道：这是 SGLang 为了让大模型跑得飞快，用来管理内存和并行计算的一个底层数据包。</p>

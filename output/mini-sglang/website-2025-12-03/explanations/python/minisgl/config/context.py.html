@@ -1,0 +1,98 @@
+<h1>python/minisgl/config/context.py</h1>
+<p>这份代码是一个<strong>迷你版的大语言模型（LLM）推理框架的核心状态管理模块</strong>。</p>
+<p>简单来说，它的作用是管理：“现在有哪些用户请求（Request）？它们进行到了哪一步？显存（KV Cache）里存了什么？现在GPU该算什么？”</p>
+<p>为了让你看懂，我把它拆解成 <strong>5个学习任务 (To-Do List)</strong>，我们一步步来通关。</p>
+<hr />
+<h3>✅ Task 1: 理解最小单位 —— <code>Req</code> (Request)</h3>
+<p><strong>目标</strong>：搞懂怎么描述一个用户的提问。</p>
+<p>想象你在经营一家餐厅（LLM服务），<code>Req</code> 就是一张<strong>顾客的点单</strong>。</p>
+<ul>
+<li><strong>它的核心数据</strong>：<ul>
+<li><code>input_ids</code>: 顾客说了啥（比如 "你好" 对应的数字编码）。</li>
+<li><code>uid</code>: 订单号。</li>
+<li><code>device_ids</code> vs <code>host_ids</code>: 为了速度，数据要放在GPU（Device）上，但为了备份或处理，CPU（Host）上也存一份。</li>
+</ul>
+</li>
+<li><strong>它的关键逻辑</strong>：<ul>
+<li><strong><code>cached_len</code> (已缓存长度)</strong>: 比如顾客之前说了10个字，我们已经做好了这10个字的“预制菜”（KV Cache），下次就不用重做了。</li>
+<li><strong><code>extend_len</code> (新增长度)</strong>: 这次需要新处理多少个字？<ul>
+<li>如果是刚来的新订单，全是新的。</li>
+<li>如果是正在生成的订单，通常是 1（刚生成了一个字，要算下一个）。</li>
+</ul>
+</li>
+<li><strong><code>append</code></strong>: 当模型吐出一个新字（token）时，把它加到订单末尾，准备算下一个。</li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<p><strong>代码对应点</strong>：看 <code>class Req</code> 部分，特别是 <code>__init__</code> 里的各种 id 初始化，以及 <code>append</code> 方法。</p>
+</blockquote>
+<hr />
+<h3>✅ Task 2: 理解两种模式 —— <code>Phase</code> (阶段)</h3>
+<p><strong>目标</strong>：搞懂 LLM 推理的两个截然不同的动作。</p>
+<p>LLM 工作时只有两种状态，代码里叫 <code>Phase</code>：</p>
+<ol>
+<li><strong><code>prefill</code> (预填充/阅读阶段)</strong>:<ul>
+<li>这是刚收到用户很长一段话时，模型需要一口气把这段话“读”完，算出所有 KV Cache。</li>
+<li>特征：一次处理很多个 Token。</li>
+</ul>
+</li>
+<li><strong><code>decode</code> (解码/生成阶段)</strong>:<ul>
+<li>这是模型读完了，开始一个字一个字往外蹦的时候。</li>
+<li>特征：一次只处理 1 个 Token（基于之前的历史）。</li>
+</ul>
+</li>
+</ol>
+<blockquote>
+<p><strong>代码对应点</strong>：看 <code>class Phase</code> 和 <code>Batch</code> 里的 <code>_auto_phase</code> 方法。逻辑是：如果所有请求的新增长度 (<code>extend_len</code>) 都是 1，那就是 <code>decode</code>，否则就是 <code>prefill</code>。</p>
+</blockquote>
+<hr />
+<h3>✅ Task 3: 理解打包处理 —— <code>Batch</code> (批次)</h3>
+<p><strong>目标</strong>：搞懂为了利用 GPU 并行能力，怎么把订单捆在一起。</p>
+<p>GPU 不喜欢一次做一个订单，它喜欢一次做一堆。<code>Batch</code> 就是把一堆 <code>Req</code>（订单）捆在一起的一个<strong>大托盘</strong>。</p>
+<ul>
+<li><strong>自动判断阶段</strong>: 当你把一堆 <code>Req</code> 塞进来，<code>Batch</code> 会自动判断这盘菜是该“阅读”还是该“生成”（调用上面的 <code>_auto_phase</code>）。</li>
+<li><strong>元数据</strong>: 它不仅存了请求列表 <code>reqs</code>，之后还会被填入 <code>attn_metadata</code>（注意力机制需要的元数据，比如这批数据在显存的哪个位置）。</li>
+</ul>
+<blockquote>
+<p><strong>代码对应点</strong>：看 <code>class Batch</code>。它继承自 <code>Phase</code>，因为它有了请求列表，自然就确定了当前的阶段。</p>
+</blockquote>
+<hr />
+<h3>✅ Task 4: 理解全局管家 —— <code>Context</code> (上下文)</h3>
+<p><strong>目标</strong>：搞懂谁在管理显存、页表和全局状态。</p>
+<p>这是整个文件的核心，<code>Context</code> 就像<strong>餐厅经理</strong>。</p>
+<ul>
+<li><strong>核心资产</strong>:<ul>
+<li><code>page_table</code>: <strong>这是最重要的</strong>。因为这是 <code>minisgl</code>（类似 vLLM 的 PagedAttention 技术），显存不是连续的，而是分页的。这个表记录了“逻辑上的第几个字”存在“物理显存的哪个格子里”。</li>
+<li><code>kv_cache</code>: 实际存放数据的仓库（显存对象）。</li>
+<li><code>attn_backend</code>: 负责计算注意力的引擎（后端）。</li>
+</ul>
+</li>
+<li><strong>管理当前工作</strong>:<ul>
+<li><code>set_batch</code> / <code>reset_batch</code>: 经理手里拿着当前正在处理的那一盘菜（Batch）。</li>
+<li><code>forward_batch</code>: 这是一个上下文管理器（<code>with context.forward_batch(batch): ...</code>），意思是“在这一段代码执行期间，我们专注于处理这个 Batch”。</li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<p><strong>代码对应点</strong>：看 <code>class Context</code>。注意 <code>create_page_table</code> 创建了一个巨大的映射表。</p>
+</blockquote>
+<hr />
+<h3>✅ Task 5: 全局单例 —— Global Context</h3>
+<p><strong>目标</strong>：搞懂如何在代码的任何地方找到经理。</p>
+<p>为了方便，代码最后弄了个全局变量 <code>_GLOBAL_CTX</code>。这就像在餐厅墙上贴了经理电话，谁（代码的任何角落）需要查显存表，直接打这个电话（调用 <code>get_global_ctx</code>）就行，不用把 <code>ctx</code> 对象到处传参。</p>
+<blockquote>
+<p><strong>代码对应点</strong>：文件末尾的 <code>set_global_ctx</code> 和 <code>get_global_ctx</code>。</p>
+</blockquote>
+<hr />
+<h3>总结：这段代码描述了什么流程？</h3>
+<p>把这些 Task 串起来，这段代码定义了这样一个流程的基础设施：</p>
+<ol>
+<li>用户发来一个 <strong><code>Req</code></strong>（包含输入文字）。</li>
+<li>调度器把几个 <strong><code>Req</code></strong> 打包成一个 <strong><code>Batch</code></strong>。</li>
+<li><strong><code>Batch</code></strong> 自动识别是该“阅读”还是“生成” (<strong><code>Phase</code></strong>)。</li>
+<li>系统初始化一个 <strong><code>Context</code></strong>（经理），手里拿着 <strong><code>page_table</code></strong>（显存账本）。</li>
+<li>在计算时，通过 <strong><code>set_global_ctx</code></strong> 让所有人都能访问经理。</li>
+<li>开始计算前，调用 <strong><code>forward_batch</code></strong> 告诉经理：“现在处理这批数据，请准备好相关的显存映射”。</li>
+</ol>
+<p>这就是一个现代、支持 PagedAttention 的 LLM 推理引擎的<strong>骨架</strong>。</p>

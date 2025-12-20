@@ -1,0 +1,78 @@
+<h1>python/minisgl/engine/graph.py</h1>
+<p>这份代码的核心功能是利用 <strong>CUDA Graph（CUDA 图）</strong> 技术来加速大模型（LLM）的推理过程。</p>
+<p>简单来说，通常我们指挥 GPU 干活是 CPU 发一条指令，GPU 干一下。但在大模型生成文本（Decode 阶段）时，每次只生成一个 token，计算量很小，CPU 发号施令的时间可能比 GPU 真正算的时间还长。</p>
+<p><strong>CUDA Graph 就像是“录制宏”或“预制菜”</strong>。我们把一整套 GPU 的操作流程提前录制下来，下次要用时，直接按一下“播放键”，GPU 就自动把这一套全做完，不需要 CPU 啰里啰嗦地一步步指挥了。</p>
+<p>下面我列一个 <strong>Task Todo List</strong>，带你一步步看懂这个 <code>GraphWorker</code> 类在干什么：</p>
+<h3>Task List: 打造 GPU 的“自动驾驶”系统</h3>
+<h4>1. 【规划】决定要录制哪些规格的“宏”</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>_determine_cuda_graph_bs</code> 函数。</li>
+<li><strong>任务</strong>: 我们不可能为所有可能的 Batch Size（比如 1 到 256）都录制一遍，那样太占显存。</li>
+<li><strong>逻辑</strong>:<ul>
+<li>通常选取几个关键档位，比如 <code>[1, 2, 4, 8, 16, 24, ...]</code>。</li>
+<li>如果显存很大（比如 H200），就把最大档位设高点（256）；显存小就设低点（160）。</li>
+<li><strong>目的</strong>: 以后如果来了 3 个请求，我们就套用 Batch=4 的那个“宏”（多出来的 1 个位置空着就行），这样能覆盖大多数情况。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 【准备】初始化录制现场</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>GraphWorker.__init__</code> 的前半部分。</li>
+<li><strong>任务</strong>:<ul>
+<li><strong>申请显存</strong>: <code>self.logits = torch.empty(...)</code>。这是为了给模型的输出结果（Logits）预留位置。</li>
+<li><strong>通知后端</strong>: <code>attn_backend.init_capture_graph(...)</code>。告诉负责注意力机制（Attention）的模块：“我要开始录像了，你准备好静态的显存地址”。</li>
+<li><strong>清理现场</strong>: <code>torch.cuda.empty_cache()</code>。清空垃圾显存，确保录制时有足够空间。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 【热身】先跑一遍流程</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>__init__</code> 中 <code># warm up</code> 下方的代码。</li>
+<li><strong>任务</strong>: 先假装录制一次，然后删掉。</li>
+<li><strong>目的</strong>: GPU 和 PyTorch 在第一次运行时往往会有一些初始化的开销或内存分配动作。为了保证正式录制的“宏”是纯净、高效的，必须先热身跑一遍。</li>
+</ul>
+<h4>4. 【录制】正式录制所有档位的 CUDA Graph (核心步骤)</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>__init__</code> 中的 <code>for bs in pbar:</code> 循环。</li>
+<li><strong>任务</strong>: 针对列表里的每一个 Batch Size（比如 1, 2, 4...），进行录制。</li>
+<li><strong>步骤</strong>:<ol>
+<li><strong>准备数据</strong>: <code>attn_backend.prepare_for_capture(bs)</code>。设置好假的输入数据。</li>
+<li><strong>架设摄像机</strong>: <code>g = torch.cuda.CUDAGraph()</code>。</li>
+<li><strong>Action (开机)</strong>: <code>with torch.cuda.graph(g, ...):</code>。</li>
+<li><strong>表演</strong>: <code>model.forward()</code>。模型真正跑了一次前向传播。</li>
+<li><strong>Cut (停机)</strong>: <code>with</code> 语句结束，录制的内容保存在了变量 <code>g</code> 里面。</li>
+<li><strong>显存共享 (优化点)</strong>: 注意代码里的 <code>pool=pool</code>。因为不同 Batch Size 的图不会同时运行，所以它们可以共用同一块显存池（Memory Pool），极大地节省显存。</li>
+</ol>
+</li>
+</ul>
+<h4>5. 【归档】整理录像带</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>self.graph_list = sorted(...)</code>。</li>
+<li><strong>任务</strong>: 把录好的图（<code>g</code>）和对应的 Batch Size 存到一个列表里。</li>
+<li><strong>逻辑</strong>: 按 Batch Size 从小到大排序，方便以后查找。比如来了 3 个请求，我从前往后找，找到第一个大于等于 3 的档位（比如 4）。</li>
+</ul>
+<h4>6. 【检查】判断当前请求能不能用“宏”</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>can_use_cuda_graph</code> 方法。</li>
+<li><strong>任务</strong>: 运行时检查。</li>
+<li><strong>逻辑</strong>:<ul>
+<li>必须是 <strong>Decode 阶段</strong>（生成阶段）。因为 Prefill（首字生成）阶段计算量大且长度不固定，不适合用 Graph。</li>
+<li>Batch Size 不能超过我们录制的最大档位。</li>
+</ul>
+</li>
+</ul>
+<h4>7. 【播放】回放录像 (Replay)</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>replay</code> 方法。</li>
+<li><strong>任务</strong>: 真正处理用户请求。</li>
+<li><strong>逻辑</strong>:<ol>
+<li><strong>找录像带</strong>: 根据当前请求数量（比如 3），找到对应的“补齐后”的档位（<code>padded_bs</code>，比如 4）。</li>
+<li><strong>数据就位</strong>: <code>attn_backend.prepare_for_replay(batch)</code>。这是一个关键点。虽然图是录死的，但输入数据的指针（地址）是可以换的。这一步是把当前真实的 KV Cache 地址填入图中。</li>
+<li><strong>一键播放</strong>: <code>g.replay()</code>。GPU 瞬间执行完所有操作。</li>
+<li><strong>返回结果</strong>: 把算出来的结果（<code>logits</code>）切片返回（只取前 3 个，丢掉补齐的第 4 个）。</li>
+</ol>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件的作用就是 <strong>“用空间换时间”</strong>。
+它在模型启动时，花一点时间（<code>__init__</code>）和显存，把各种 Batch Size 的运算过程录制成 CUDA Graph。在模型服务时，直接回放这些 Graph，从而消除 Python 和 CPU 的调度开销，让推理速度飞快。</p>

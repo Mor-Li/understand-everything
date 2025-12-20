@@ -1,0 +1,80 @@
+<h1>python/minisgl/kernel/radix.py</h1>
+<p>这段代码看起来非常简短，但它实际上是一个<strong>“桥梁”</strong>。它本身不做繁重的计算，而是负责指挥更底层的 C++ 代码去干活。</p>
+<p>这在高性能计算（比如大模型推理）中非常常见：<strong>用 Python 写逻辑，用 C++ 跑速度。</strong></p>
+<p>为了让你彻底看懂，我为你列了一个 <strong>4步走的 Task List</strong>，我们一步步拆解：</p>
+<h3>📝 学习路线图 (Todo List)</h3>
+<ol>
+<li><strong>Task 1：搞懂背景（为什么要写这个文件？）</strong> —— 理解 Python 的慢与 C++ 的快。</li>
+<li><strong>Task 2：搞懂核心魔法（<code>load_aot</code> 是啥？）</strong> —— 理解 Python 如何调用 C++。</li>
+<li><strong>Task 3：搞懂性能优化（<code>@lru_cache</code> 是啥？）</strong> —— 理解如何避免重复劳动。</li>
+<li><strong>Task 4：搞懂具体功能（<code>fast_compare_key</code> 干了啥？）</strong> —— 理解最终的业务逻辑。</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>✅ Task 1：搞懂背景（为什么要写这个文件？）</h4>
+<p><strong>背景：</strong>
+这个文件叫 <code>radix.py</code>，属于 <code>minisgl</code>（Mini SGLang）。SGLang 是一个大模型推理框架，专门用来加速 LLM（如 Llama, GPT）的生成速度。
+在推理过程中，我们需要频繁地比较两个“Token 序列”（也就是这里的 Key）是否相同，以便复用之前的计算结果（KV Cache）。</p>
+<p><strong>问题：</strong>
+如果你用 Python 的 <code>for</code> 循环去比较两个长数组，速度非常慢。</p>
+<p><strong>解决方案：</strong>
+把“比较数组”这个动作，交给 C++ 去做。这个 Python 文件就是用来<strong>加载</strong>那个 C++ 程序的。</p>
+<hr />
+<h4>✅ Task 2：搞懂核心魔法（<code>load_aot</code> 是啥？）</h4>
+<p>看这行代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">_load_radix_module</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">Module</span><span class="p">:</span>
+    <span class="k">return</span> <span class="n">load_aot</span><span class="p">(</span><span class="s2">&quot;radix&quot;</span><span class="p">,</span> <span class="n">cpp_files</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;radix.cpp&quot;</span><span class="p">])</span>
+</code></pre></div>
+
+<ul>
+<li><strong>AOT (Ahead Of Time):</strong> 意思是“提前编译”。</li>
+<li><strong>发生了什么：</strong> 当 Python 运行到这里时，它会去寻找一个叫 <code>radix.cpp</code> 的 C++ 文件，把它编译成机器码（或者加载已经编译好的库）。</li>
+<li><strong>返回值：</strong> 它返回一个 <code>Module</code> 对象。你可以把这个对象想象成一个<strong>“遥控器”</strong>。通过这个遥控器，Python 就可以按下按钮，执行 C++ 里写好的函数。</li>
+</ul>
+<p><strong>简单说：</strong> 这行代码是把 C++ 写的“外援”请进场。</p>
+<hr />
+<h4>✅ Task 3：搞懂性能优化（<code>@lru_cache</code> 是啥？）</h4>
+<p>看这个装饰器：</p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@lru_cache</span><span class="p">(</span><span class="n">maxsize</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_load_radix_module</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">Module</span><span class="p">:</span>
+    <span class="o">...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>痛点：</strong> 编译 C++ 或者加载 C++ 库是很耗时的（比如需要 0.1 秒）。如果我们每比较一次数组，都要重新加载一次 C++ 库，那就太慢了。</li>
+<li><strong>LRU Cache (Least Recently Used Cache):</strong> 这是一个缓存机制。</li>
+<li><strong>作用：</strong><ol>
+<li>第一次调用 <code>_load_radix_module()</code> 时，它会真的去加载 C++ 文件（耗时）。</li>
+<li><strong>第二次、第三次...第 N 次调用时</strong>，Python 会直接从内存里拿出第一次加载好的那个“遥控器”给你，<strong>耗时几乎为 0</strong>。</li>
+</ol>
+</li>
+</ul>
+<p><strong>简单说：</strong> 确保“外援”只请一次，然后一直留在场上干活，别反复进出场。</p>
+<hr />
+<h4>✅ Task 4：搞懂具体功能（<code>fast_compare_key</code> 干了啥？）</h4>
+<p>看最后的主函数：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">fast_compare_key</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">y</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+    <span class="c1"># compare 2 1-D int cpu tensors for equality</span>
+    <span class="k">return</span> <span class="n">_load_radix_module</span><span class="p">()</span><span class="o">.</span><span class="n">fast_compare_key</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">y</span><span class="p">)</span>
+</code></pre></div>
+
+<p>这是我们在外部真正会调用的函数。</p>
+<ol>
+<li><strong>输入：</strong> 两个 PyTorch 的 Tensor（张量/数组），<code>x</code> 和 <code>y</code>。注释里说是 <code>1-D int cpu tensors</code>（一维的整数数组，且在 CPU 上）。</li>
+<li><strong>动作：</strong><ul>
+<li><code>_load_radix_module()</code>：先拿到那个 C++ “遥控器”。</li>
+<li><code>.fast_compare_key(x, y)</code>：按下遥控器上的 <code>fast_compare_key</code> 按钮，把 <code>x</code> 和 <code>y</code> 传给底层 C++。</li>
+</ul>
+</li>
+<li><strong>输出：</strong> 返回一个 <code>int</code>。根据注释，这是在比较相等性（Equality）。<ul>
+<li><em>推测：</em> 如果完全相等可能返回 1，不相等返回 0；或者在 Radix Tree 场景下，它可能返回<strong>匹配的长度</strong>（即两个数组前缀有多少个是一样的）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>💡 总结</h3>
+<p><strong>这一整段代码只干了一件事：</strong></p>
+<blockquote>
+<p>“我嫌 Python 比较数组太慢了，所以我写了个 C++ 文件（<code>radix.cpp</code>）来做这件事。这个 Python 文件负责<strong>把那个 C++ 模块加载进来</strong>，并包装成一个 Python 函数 <code>fast_compare_key</code> 供大家使用。”</p>
+</blockquote>
+<p>现在你看懂了吗？它就是一个<strong>高性能插件的加载器</strong>。</p>

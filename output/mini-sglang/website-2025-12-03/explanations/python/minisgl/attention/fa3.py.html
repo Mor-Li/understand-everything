@@ -1,0 +1,68 @@
+<h1>python/minisgl/attention/fa3.py</h1>
+<p>这份代码确实比较硬核，因为它处于 <strong>大模型推理框架（Inference Framework）</strong> 的底层，专门负责调度 GPU 进行 <strong>FlashAttention-3 (FA3)</strong> 的计算。</p>
+<p>简单来说，这个文件的作用是：<strong>把高层的用户请求（比如“生成下一个字”），翻译成底层 GPU 核心（Kernel）能听懂的参数，并指挥 GPU 算出来。</strong></p>
+<p>按照你的要求，我列一个 <strong>学习/理解 Task List</strong>，一步步拆解这段代码的逻辑：</p>
+<hr />
+<h3>📝 Task List: 理解 FA3 Attention 后端</h3>
+<h4>✅ Task 1: 搞清楚角色的定位 (Context)</h4>
+<p>首先要明白这个脚本在整个系统里是干嘛的。
+*   <strong>场景</strong>：大模型推理（生成文字）。
+*   <strong>问题</strong>：推理时，显存里的 KV Cache（历史对话记忆）是分散存储的（Paged Attention 技术），不是连续的一整块内存。
+*   <strong>本文件作用</strong>：它是一个“中间人”。
+    *   左手接：<code>minisgl</code> 框架传来的一个个零散的用户请求（Batch）。
+    *   右手接：底层的 C++/CUDA 加速代码（<code>sgl_kernel</code>）。
+    *   <strong>工作</strong>：整理数据，告诉底层“去显存的哪里找数据”，然后按 FA3 的方式算注意力。</p>
+<h4>✅ Task 2: 理解“数据包” (Metadata)</h4>
+<p>看代码里的 <code>class FA3Metadata</code>。这是 GPU 计算所需要的所有“路标”。
+想象 GPU 是个送外卖的，它需要知道去哪取货、送货。
+*   <strong><code>cu_seqlens_q/k</code></strong>: "Cumulative Sequence Lengths"。因为 GPU 喜欢并行处理，我们把好几个用户的请求拼成一条长龙。这个变量告诉 GPU：第 0 到 10 个字是张三的，第 11 到 20 个字是李四的。
+*   <strong><code>page_table</code></strong>: <strong>这是核心</strong>。因为显存是分页管理的（像操作系统的虚拟内存），这个表记录了“逻辑上的第几页数据”实际存在“显存物理地址的哪里”。
+*   <strong><code>out_loc</code></strong>: 告诉 GPU，算出来的新 K/V 数据，应该写到显存的哪个格子里。</p>
+<h4>✅ Task 3: 核心调度员 (Backend Class)</h4>
+<p>看 <code>class FlashAttentionBackend</code>。这是主控类。
+*   <strong><code>__init__</code></strong>: 初始化。拿到了 <code>kvcache</code>（管理显存的对象）和 <code>page_table</code>（查页表）。
+*   <strong><code>forward</code> (重要)</strong>: 这是每次模型跑一层网络时都会调用的函数。
+    1.  <strong>存数据</strong>：<code>self.kvcache.store_kv(...)</code> —— 先把当前这一步生成的 K 和 V 存进显存。
+    2.  <strong>算注意力</strong>：调用 <code>_fa3_sgl_impl(...)</code> —— 真正开始做矩阵乘法和 Softmax。</p>
+<h4>✅ Task 4: 最繁琐的苦力活 (Prepare Metadata)</h4>
+<p>看 <code>prepare_metadata</code> 方法。这是代码最长、逻辑最绕的地方。
+<strong>目标</strong>：把人类视角的 <code>Batch</code>（一堆请求），转换成 Task 2 里说的 GPU 视角的 <code>Metadata</code>。</p>
+<ul>
+<li><strong>步骤拆解</strong>：<ol>
+<li><strong>Padding (CUDA Graph)</strong>: 如果开启了图模式（为了加速），需要把请求补齐到固定的 Batch Size（比如补几个假的请求 <code>dummy_req</code>）。</li>
+<li><strong>计算长度</strong>: 算出每个请求现在有多少字 (<code>seqlens_q</code>)，历史缓存了多少字 (<code>seqlens_k</code>)。</li>
+<li><strong>生成 <code>cu_seqlens</code></strong>: 用 <code>cumsum</code> (累加) 算出每个请求在拼合长龙里的起止位置。</li>
+<li><strong>处理 <code>page_table</code></strong>:<ul>
+<li>如果是 <strong>Prefill (首字生成)</strong>：一次要处理很多字，查表稍微简单点。</li>
+<li>如果是 <strong>Decode (后续生成)</strong>：每次只生成 1 个字 (<code>max_seqlen_q == 1</code>)。代码里用了 <code>load_decode_indices</code> 来快速找到这个字对应的物理显存位置 (<code>out_loc</code>)。</li>
+</ul>
+</li>
+<li><strong>搬运数据</strong>: 把这些算好的索引数据从 CPU 搬到 GPU (<code>.to(device)</code>).</li>
+</ol>
+</li>
+</ul>
+<h4>✅ Task 5: 极速模式 (CUDA Graph Capture)</h4>
+<p>看 <code>init_capture_graph</code>, <code>prepare_for_capture</code>, <code>_copy_metadata</code>。
+*   <strong>背景</strong>：在 Decode 阶段（一个字一个字蹦），CPU 发射指令的速度可能比 GPU 算的还慢。
+*   <strong>解决方案</strong>：<strong>CUDA Graph</strong>。相当于“录像”。
+    *   <strong>录制 (<code>init</code>)</strong>: 先录制好一套固定的 GPU 操作流程（显存地址是固定的占位符）。
+    *   <strong>回放 (<code>replay</code>)</strong>: 每次推理时，直接把新数据填进那个占位符里 (<code>_copy_metadata</code>)，然后让 GPU 快速回放录像，省去了 CPU 每次重新分配显存和下发指令的时间。</p>
+<h4>✅ Task 6: 真正的引擎 (Implementation)</h4>
+<p>看最后的函数 <code>_fa3_sgl_impl</code>。
+*   这就很简单了，它基本不做逻辑，只是把上面准备好的所有张量（Tensor），传给 <code>torch.ops.sgl_kernel.fwd.default</code>。
+*   这个 <code>sgl_kernel</code> 是用 C++/CUDA 写的底层库，里面跑的就是 NVIDIA 优化过的 FlashAttention-3 算法。</p>
+<hr />
+<h3>总结：这段代码在讲一个什么故事？</h3>
+<p>想象你在经营一个图书馆（GPU）：</p>
+<ol>
+<li><strong>顾客来了 (<code>Batch</code>)</strong>：有一堆人同时来借书，有的是刚开始看（Prefill），有的是看到一半接着看（Decode）。</li>
+<li><strong>图书管理员整理单据 (<code>prepare_metadata</code>)</strong>：<ul>
+<li>管理员要把这些人的需求合并成一张大单子。</li>
+<li>管理员要查阅《索引目录》（<code>page_table</code>），找出这些书实际上放在哪个书架的第几层（KV Cache 物理地址）。</li>
+<li>如果是老顾客（Decode），管理员会启动“快速通道”（CUDA Graph），直接把新书单填进复印好的模板里，不用每次都手写。</li>
+</ul>
+</li>
+<li><strong>入库 (<code>store_kv</code>)</strong>：把顾客带来的新书（当前的 K/V）放到指定的书架位置。</li>
+<li><strong>阅读理解 (<code>_fa3_sgl_impl</code>)</strong>：启动超级计算机（FA3 Kernel），根据书架上的内容，帮顾客计算出他们想看的内容关联度（Attention Score）。</li>
+</ol>
+<p><strong>你需要重点关注的是 <code>prepare_metadata</code> 里的逻辑，它是连接“应用层数据”和“底层硬件地址”的桥梁。</strong></p>

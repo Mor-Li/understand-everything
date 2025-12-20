@@ -1,0 +1,110 @@
+<h1>python/minisgl/llm/llm.py</h1>
+<p>这段代码确实写得比较抽象，因为它是一个 <strong>Mini-SGLang</strong>（一个简化的的大语言模型推理框架）的“调度器”外壳。</p>
+<p>简单来说，这个 <code>LLM</code> 类的作用是：<strong>把复杂的模型推理过程封装成一个简单的函数调用，让你在本地（Offline）批量跑数据。</strong></p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“任务清单（To-Do List）”</strong>。我们假设你开了个餐馆（推理服务），这个 <code>LLM</code> 类就是你的<strong>大堂经理</strong>。</p>
+<p>以下是我们需要完成的 5 个步骤，我会结合代码一步步讲：</p>
+<hr />
+<h3>Task 1: 准备开张（初始化）</h3>
+<p><strong>代码位置：</strong> <code>__init__</code> 方法
+<strong>目标：</strong> 加载模型，准备好记账本。</p>
+<ul>
+<li><strong>观点：</strong> 你需要一个管理者（Scheduler）来统筹资源。</li>
+<li><strong>代码解读：</strong><ul>
+<li><code>super().__init__(config)</code>: 初始化父类 <code>Scheduler</code>。注意这里设置了 <code>offline_mode=True</code>，这很关键，表示我们不是在搞即时聊天的服务器，而是在搞<strong>离线批量处理</strong>（比如一次性翻译1000句话）。</li>
+<li><code>self.pending_requests</code>: 这是一个<strong>排队区</strong>。客人的点单（Prompt）先放这里。</li>
+<li><code>self.status_map</code>: 这是<strong>记账本</strong>。记录每个客人的ID，他们点了啥（Input），以及厨师做好了啥（Output）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 2: 接待客人（接收输入）</h3>
+<p><strong>代码位置：</strong> <code>generate</code> 方法的前半部分
+<strong>目标：</strong> 把用户给的一堆文本（Prompts），整理好放进排队区。</p>
+<ul>
+<li><strong>观点：</strong> 用户只管扔进来一堆句子，剩下的经理来处理。</li>
+<li><strong>代码解读：</strong><ul>
+<li>用户调用 <code>llm.generate(["你好", "讲个故事"])</code>。</li>
+<li>代码通过 <code>zip(prompts, sampling_params)</code> 把每个句子和它的生成参数（比如温度、最大长度）打包。</li>
+<li><code>self.pending_requests.append(...)</code>: 全部扔进 Task 1 提到的“排队区”。</li>
+<li><strong>此时机器还没开始转，只是把单子接了。</strong></li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 3: 启动流水线（核心循环）</h3>
+<p><strong>代码位置：</strong> <code>generate</code> 中调用的 <code>self.run_forever()</code>
+<strong>目标：</strong> 让厨房开始干活，直到所有菜都上齐。</p>
+<ul>
+<li><strong>观点：</strong> 这里用了一个“死循环”机制（<code>run_forever</code>），它是父类 <code>Scheduler</code> 提供的。</li>
+<li><strong>逻辑流向：</strong><ul>
+<li>这个循环会不断地问你两个问题：<ol>
+<li>“还有新单子要下锅吗？” -&gt; 调用 <code>offline_receive_msg</code></li>
+<li>“刚才那个单子做好了吗？” -&gt; 调用 <code>offline_send_result</code></li>
+</ol>
+</li>
+<li>当所有单子都做完了，循环会被 <code>RequestAllFinished</code> 异常打断，停止工作。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 4: 喂给模型数据（模拟收发消息）</h3>
+<p><strong>这是最难懂的部分，涉及两个核心方法的重写。</strong></p>
+<h4>4.1 既然是离线，怎么假装像服务器一样接单？</h4>
+<p><strong>代码位置：</strong> <code>offline_receive_msg</code>
+<strong>目标：</strong> 从“排队区”拿出一部分单子，喂给计算引擎。</p>
+<ul>
+<li><strong>观点：</strong> 显存是有限的，不能一次把1万个请求都塞进去。要看 <code>prefill_budget</code>（预算/显存容量）。</li>
+<li><strong>代码解读：</strong><ul>
+<li><code>if len(self.pending_requests) == 0</code>: 如果排队区空了，说明活干完了，抛出 <code>RequestAllFinished</code> 异常，告诉 Task 3 的循环“可以下班了”。</li>
+<li><code>_tokenize_one</code>: 把文字变成数字（Token ID）。</li>
+<li><code>UserMsg(...)</code>: 把请求打包成系统能懂的消息格式。</li>
+<li><strong>关键点</strong>：它会从 <code>pending_requests</code> 里切片取出一部分请求，直到填满预算（<code>sum_input_len &gt;= self.prefill_budget</code>），剩下的下次循环再取。</li>
+</ul>
+</li>
+</ul>
+<h4>4.2 收集模型吐出来的字</h4>
+<p><strong>代码位置：</strong> <code>offline_send_result</code>
+<strong>目标：</strong> 每次模型生成一个新的字（Token），就把它记在账本上。</p>
+<ul>
+<li><strong>观点：</strong> LLM 是一个字一个字往外蹦的。</li>
+<li><strong>代码解读：</strong><ul>
+<li><code>reply</code> 是模型计算完一轮后的返回结果。</li>
+<li><code>status = self.status_map[msg.uid]</code>: 根据 ID 找到是哪桌客人的菜。</li>
+<li><code>status.output_ids.append(msg.next_token)</code>: 把新生成的这个字（Token ID）追加到这桌的账单上。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 5: 结账走人（返回结果）</h3>
+<p><strong>代码位置：</strong> <code>generate</code> 方法的后半部分（<code>try...except</code> 之后）
+<strong>目标：</strong> 把数字（Token IDs）翻译回人类语言，返回给用户。</p>
+<ul>
+<li><strong>观点：</strong> 循环结束了，说明所有任务都跑完了。</li>
+<li><strong>代码解读：</strong><ul>
+<li>程序运行到这里，说明 <code>run_forever</code> 已经因为没任务抛出异常而停止了。</li>
+<li><code>self.tokenizer.decode(status.output_ids)</code>: 把之前在 Task 4.2 里辛苦收集的一串数字，翻译回中文/英文。</li>
+<li><code>return results</code>: 打包返回给用户。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结一下全流程</h3>
+<p>如果你作为用户调用这个代码，流程是这样的：</p>
+<ol>
+<li><strong>你</strong>：<code>llm = LLM(...)</code> (招募经理，建好账本)</li>
+<li><strong>你</strong>：<code>llm.generate(["你好"])</code> (你把单子给经理)</li>
+<li><strong>经理</strong>：<ul>
+<li>把"你好"放进排队列表。</li>
+<li>开始死循环 <code>run_forever</code>：<ul>
+<li><strong>问</strong>：有新单子吗？ -&gt; <strong>答</strong>：有，把"你好"拿出来，转成数字，发给显卡。</li>
+<li><strong>显卡</strong>：算好了，下一个字是"！"。</li>
+<li><strong>问</strong>：有结果吗？ -&gt; <strong>答</strong>：有，把"！"记在账本上。</li>
+<li>(重复无数次...)</li>
+<li><strong>问</strong>：有新单子吗？ -&gt; <strong>答</strong>：没了。 -&gt; <strong>经理</strong>：下班！(抛出异常，跳出循环)</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>经理</strong>：把账本里的数字翻译成 "你好！"，打包<strong>返回给你</strong>。</li>
+</ol>
+<p><strong>看不懂的原因通常是：</strong> 这个类虽然叫 <code>LLM</code>，但它实际上是在<strong>模拟</strong>一个服务器的收发包过程（<code>receive_msg</code>, <code>send_result</code>），把线性的代码拆成了基于事件的碎片。按照上面的 Task List 顺序看，应该就清晰多了。</p>

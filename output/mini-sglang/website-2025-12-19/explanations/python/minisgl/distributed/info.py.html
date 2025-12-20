@@ -1,0 +1,108 @@
+<h1>python/minisgl/distributed/info.py</h1>
+<p>没问题，这段代码看起来很抽象，但它的核心逻辑其实非常简单。它是在为<strong>多显卡（或多进程）并行计算</strong>做一个“身份登记”系统。</p>
+<p>你可以把这段代码想象成是在管理一个<strong>施工队</strong>，每个工人都需要知道两个信息：
+1.  <strong>我是几号工人？</strong> (Rank)
+2.  <strong>我们队一共几个人？</strong> (Size)</p>
+<p>为了帮你彻底理解，我制定了一个 <strong>5步走的 Task List</strong>，我们一步步来拆解：</p>
+<hr />
+<h3>✅ Task 1: 理解核心概念 —— "Rank" 和 "Size"</h3>
+<p>在分布式计算（比如用 4 张显卡跑大模型）中，每一张显卡（或进程）都需要有个编号。</p>
+<ul>
+<li><strong><code>rank</code> (排名/编号)</strong>: 当前显卡的 ID。从 0 开始。<ul>
+<li>如果你有 4 张卡，编号就是 0, 1, 2, 3。</li>
+</ul>
+</li>
+<li><strong><code>size</code> (大小/总数)</strong>: 一共有多少张卡。<ul>
+<li>上面那个例子，size 就是 4。</li>
+</ul>
+</li>
+</ul>
+<p><strong>代码对应部分：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">DistributedInfo</span><span class="p">:</span>
+    <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span>  <span class="c1"># 我是几号</span>
+    <span class="n">size</span><span class="p">:</span> <span class="nb">int</span>  <span class="c1"># 咱们一共几个人</span>
+</code></pre></div>
+
+<blockquote>
+<p><strong>注</strong>：<code>@dataclass(frozen=True)</code> 意思就是这个“工牌”一旦发给你，上面的字就不能改了（只读）。</p>
+</blockquote>
+<hr />
+<h3>✅ Task 2: 理解“自我检查”与“我是不是队长”</h3>
+<p>拿到工牌后，代码里做了两个小动作。</p>
+<ol>
+<li><strong>检查数据对不对 (<code>__post_init__</code>)</strong>:<ul>
+<li>逻辑：如果一共 4 个人，我的编号不可能是 5，也不能是 -1。</li>
+<li>代码：<code>assert 0 &lt;= self.rank &lt; self.size</code> (编号必须在 0 到 总数-1 之间)。</li>
+</ul>
+</li>
+<li><strong>我是不是队长 (<code>is_primary</code>)</strong>:<ul>
+<li>逻辑：通常规定 0 号是队长，负责打印日志或者保存模型。</li>
+<li>代码：<code>return self.rank == 0</code>。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 3: 理解“全局变量” —— 只有一块黑板</h3>
+<p>这个文件最关键的地方在于它定义了一个<strong>全局变量</strong>。</p>
+<p><strong>代码对应部分：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">_TP_INFO</span><span class="p">:</span> <span class="n">DistributedInfo</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+</code></pre></div>
+
+<ul>
+<li><code>TP</code> 通常指 Tensor Parallel (张量并行)。</li>
+<li>这行代码的意思是：我在办公室墙上挂了一块<strong>黑板</strong>（<code>_TP_INFO</code>）。</li>
+<li>刚开始，黑板是空的 (<code>None</code>)。</li>
+</ul>
+<p><strong>为什么要用全局变量？</strong>
+因为在这个项目中，任何一个角落的代码可能都需要随时知道“我是几号显卡”。如果不弄个全局变量，你就得把 <code>rank</code> 这个参数在几百个函数之间传以此来，非常麻烦。</p>
+<hr />
+<h3>✅ Task 4: 理解“写入”操作 —— 只能写一次</h3>
+<p>现在我们要往黑板上写字了。</p>
+<p><strong>代码对应部分：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">set_tp_info</span><span class="p">(</span><span class="n">rank</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">global</span> <span class="n">_TP_INFO</span>
+    <span class="c1"># 如果黑板上已经有字了，报错！不能重复登记！</span>
+    <span class="k">if</span> <span class="n">_TP_INFO</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="s2">&quot;TP info has been set&quot;</span><span class="p">)</span>
+    <span class="c1"># 把 Rank 和 Size 写到黑板上</span>
+    <span class="n">_TP_INFO</span> <span class="o">=</span> <span class="n">DistributedInfo</span><span class="p">(</span><span class="n">rank</span><span class="p">,</span> <span class="n">size</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>规则</strong>：这个函数在程序启动时只能调用一次。就好比你出生只有一次，不能重新出生。</li>
+</ul>
+<hr />
+<h3>✅ Task 5: 理解“读取”操作 —— 两种读法</h3>
+<p>其他代码想看黑板上的字，有两种方法：</p>
+<p><strong>方法 A：必须读到 (<code>get_tp_info</code>)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">get_tp_info</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">DistributedInfo</span><span class="p">:</span>
+    <span class="c1"># 如果黑板是空的，说明程序还没初始化好，直接报错崩溃</span>
+    <span class="k">if</span> <span class="n">_TP_INFO</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="s2">&quot;TP info has not been set&quot;</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">_TP_INFO</span>
+</code></pre></div>
+
+<ul>
+<li><strong>场景</strong>：正在进行核心计算时，必须知道我是谁。如果不知道，程序没法跑。</li>
+</ul>
+<p><strong>方法 B：尝试读一下 (<code>try_get_tp_info</code>)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">try_get_tp_info</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">DistributedInfo</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="c1"># 直接把黑板给你，哪怕是空的也没关系</span>
+    <span class="k">return</span> <span class="n">_TP_INFO</span>
+</code></pre></div>
+
+<ul>
+<li><strong>场景</strong>：比如打印日志的时候，我想看看有没有设置并行信息。如果有就打印出来，没有就算了，不要报错。</li>
+</ul>
+<hr />
+<h3>📝 总结 (Summary)</h3>
+<p>把这 5 个 Task 串起来，这个文件的完整故事是：</p>
+<ol>
+<li><strong>定义了一张“工牌”</strong> (<code>DistributedInfo</code>)，上面写着编号和总人数。</li>
+<li><strong>准备了一个“全局存放处”</strong> (<code>_TP_INFO</code>)，一开始是空的。</li>
+<li><strong>提供了“发工牌”的函数</strong> (<code>set_tp_info</code>)，程序启动时调用，且只能调用一次。</li>
+<li><strong>提供了“查工牌”的函数</strong> (<code>get_tp_info</code>)，供程序的其他部分随时调用，以确定自己在分布式系统中的位置。</li>
+</ol>
+<p><strong>一句话概括：</strong>
+这是一个<strong>全局单例（Global Singleton）</strong>模式的实现，用来存储和获取当前进程的分布式并行配置信息（我是几号，一共几个）。</p>

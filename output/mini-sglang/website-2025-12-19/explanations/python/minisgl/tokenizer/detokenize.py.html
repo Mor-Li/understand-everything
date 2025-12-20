@@ -1,0 +1,99 @@
+<h1>python/minisgl/tokenizer/detokenize.py</h1>
+<p>这份代码确实涉及很多底层细节，看起来比较晦涩。它的核心功能是<strong>流式解词（Streaming Detokenization）</strong>。</p>
+<p>简单来说，大模型吐出来的是一串数字（Token IDs），我们需要把这些数字实时变成文字（String）展示给用户。</p>
+<p>为了让你听懂，我把这个过程拆解成一个 <strong>“任务清单（Todo List）”</strong>，我们一步步来完成这个任务，就能看懂代码了。</p>
+<hr />
+<h3>任务清单：如何实现一个流式解码器？</h3>
+<h4>✅ Task 1: 理解核心难题 —— “话没说完怎么办？”</h4>
+<p><strong>背景</strong>：
+大模型是一个字一个字往外蹦的。
+比如英文单词 "Apple"，模型可能先吐出 "App" 的Token，下一秒才吐出 "le" 的Token。
+如果你直接把 "App" 显示给用户，万一下一个Token是 "ly" (Apply) 怎么办？或者如果是中文，一个汉字占3个字节，只来了2个字节时，强行显示会变成乱码（）。</p>
+<p><strong>代码对应</strong>：
+这就是为什么代码里有 <code>find_printable_text</code> 和 ``（乱码符号）的判断逻辑。
+*   <strong>目标</strong>：我们需要判断当前生成的文字是不是“完整”的。如果不完整，就先存着（Buffer），等下一个Token来了拼完整了再显示。</p>
+<h4>✅ Task 2: 识别中文 —— “中文不需要空格”</h4>
+<p><strong>背景</strong>：
+英文习惯是按单词显示，通常遇到空格才算一个词结束。但中文、日文（CJK字符）是紧挨着的，没有空格。
+如果我们在等待“空格”才显示文字，那中文用户就要等很久才能看到一句话。</p>
+<p><strong>代码对应</strong>：
+*   函数 <code>_is_chinese_char(cp)</code>：这是一个辅助工具。
+*   <strong>逻辑</strong>：它检查一个字符的 Unicode 编码（ID号），判断它是不是中日韩（CJK）字符。
+*   <strong>作用</strong>：如果是中文，我们就不必傻傻地等空格，可以直接显示出来。</p>
+<h4>✅ Task 3: 记账 —— “每个用户读到哪了？”</h4>
+<p><strong>背景</strong>：
+这个服务可能同时给几百个人用。张三读到了第10个字，李四读到了第5个字。我们需要给每个人记个账。</p>
+<p><strong>代码对应</strong>：
+*   类 <code>DecodeStatus</code>：这就是<strong>账本</strong>。
+    *   <code>decoded_ids</code>: 存下该用户目前为止生成的所有数字ID。
+    *   <code>decoded_str</code>: 存下目前为止确定的完整文字。
+    *   <code>read_offset</code>: 读到了哪个位置。
+    *   <code>sent_offset</code>: <strong>最关键的字段</strong>。记录“已经发给用户的文字长度”。因为是流式输出，我们要算增量（这次比上次多输出了啥），不能把以前发过的再发一遍。</p>
+<h4>✅ Task 4: 核心处理流程 —— “新货到了，拆箱检查”</h4>
+<p><strong>背景</strong>：
+这是最复杂的 <code>DetokenizeManager</code> 类里的 <code>detokenize</code> 函数。它负责处理一批新的Token。</p>
+<p><strong>代码逻辑拆解（一步步看 <code>detokenize</code> 函数）</strong>：</p>
+<ol>
+<li>
+<p><strong>收集新Token</strong>：</p>
+<ul>
+<li>代码遍历 <code>msgs</code>（新消息），把新生成的 <code>next_token</code> 加到用户的 <code>decoded_ids</code> 列表里。</li>
+<li><em>注意</em>：这里它准备了两份数据 <code>read_ids</code>（当前的全部ID）和 <code>surr_ids</code>（上一次确定的ID位置）。</li>
+</ul>
+</li>
+<li>
+<p><strong>批量翻译（Batch Decode）</strong>：</p>
+<ul>
+<li><code>self.tokenizer.batch_decode(...)</code></li>
+<li>把数字 ID 翻译成文字。</li>
+</ul>
+</li>
+<li>
+<p><strong>计算增量（Diff）</strong>：</p>
+<ul>
+<li><code>new_text = read_str[len(surr_str) :]</code></li>
+<li>逻辑是：<code>现在的全文</code> - <code>之前的全文</code> = <code>新生成的文字</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>乱码检查（核心难点）</strong>：</p>
+<ul>
+<li><code>if ... not new_text.endswith("")</code>:</li>
+<li><strong>情况A（完美）</strong>：如果新文字里没有乱码符号（），说明这次生成的Token构成了完整的字。<ul>
+<li>更新账本：<code>s.decoded_str += new_text</code>。</li>
+<li>推进指针：<code>s.read_offset</code> 往前移，表示这些Token已经安全处理完了。</li>
+</ul>
+</li>
+<li><strong>情况B（不完美）</strong>：如果新文字末尾是乱码（说明字节没凑齐），或者为了防止单词显示一半（比如 "App"）。<ul>
+<li>调用 <code>find_printable_text(new_text)</code>。</li>
+<li>这就用到了 <strong>Task 1</strong> 的逻辑：只把“安全”的部分拿出来。剩下的不安全的，留给下一次循环处理（不更新 <code>read_offset</code>）。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>发送增量</strong>：</p>
+<ul>
+<li><code>incremental_output = output_str[s.sent_offset :]</code></li>
+<li>算出这次到底要给用户看什么新内容。</li>
+<li>更新 <code>s.sent_offset</code>，防止下次重复发送。</li>
+</ul>
+</li>
+<li>
+<p><strong>清理</strong>：</p>
+<ul>
+<li>如果 <code>msg.finished</code>（生成结束了），就把这个用户的账本 <code>del</code> 删掉。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结：这段代码在干嘛？</h3>
+<p>想象你在看直播打字：
+1.  <strong>Input</strong>: 每次收到一个新的按键信号（Token）。
+2.  <strong>Process</strong>:
+    *   先把信号拼到之前的信号后面。
+    *   尝试翻译成文字。
+    *   <strong>检查</strong>：这行字是不是写了一半？（比如汉字缺字节，或者英文单词没写完）。
+    *   如果是完整的，就确认下来；如果不完整，就先憋着不发，等下一个信号。
+3.  <strong>Output</strong>: 计算出“刚才那一瞬间新打出了什么字”，发给前端展示。</p>
+<p><strong>一句话概括</strong>：这是一个<strong>带缓冲区的、防乱码的、支持多并发的</strong> Token 转 Text 处理器。</p>

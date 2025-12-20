@@ -1,0 +1,113 @@
+<h1>python/minisgl/kernel/indexing.py</h1>
+<p>这份代码看起来很“硬核”，因为它涉及到 Python 和底层 GPU 代码（CUDA）的交互。</p>
+<p>简单来说，这段代码的<strong>核心观点</strong>是：<strong>Python 跑得太慢了，对于这种高频、大量的数据索引（Indexing）操作，我们要绕过 PyTorch 的常规写法，直接调用写好的 C++/CUDA 底层代码来加速。</strong></p>
+<p>你可以把这段代码看作是一个<strong>“遥控器”</strong>。它本身不干苦力活，它的作用是去按底层 GPU 引擎的按钮。</p>
+<p>为了让你听懂，我把这段代码执行的逻辑拆解成一个 <strong>Task To-Do List（任务清单）</strong>，我们一步一步来勾选：</p>
+<hr />
+<h3>📋 Task To-Do List：如何完成一次极速的数据索引？</h3>
+<h4>✅ Task 1: 召唤“外援” (加载 CUDA 内核)</h4>
+<p><strong>对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">_load_index_module</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
+    <span class="k">return</span> <span class="n">load_kernel_module</span><span class="p">(</span><span class="s2">&quot;index.cu&quot;</span><span class="p">,</span> <span class="s2">&quot;indexing_kernel&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong><ul>
+<li>Python 说：“这个活儿我干太慢，我要找个专家。”</li>
+<li>这里它去加载了一个名为 <code>index.cu</code> 的文件（这是 C++/CUDA 代码，专门在显卡上跑的）。</li>
+<li><strong>观点：</strong> 这是一个<strong>JIT (Just-In-Time) 编译</strong>或者加载扩展的过程。它把底层的算子（Kernel）加载进来，准备随时调用。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 定义任务清单 (定义函数入口)</h4>
+<p><strong>对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">fused_indexing</span><span class="p">(</span>
+    <span class="nb">input</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+    <span class="n">index</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+    <span class="n">vocab_range</span><span class="p">:</span> <span class="n">Tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span>
+    <span class="o">...</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong><ul>
+<li>这是我们在 Python 里调用的主函数。</li>
+<li><strong>Input (输入)</strong>：一大本字典（原始数据张量）。</li>
+<li><strong>Index (索引)</strong>：你要查哪几页（索引张量）。</li>
+<li><strong>Vocab_range (范围)</strong>：只查字典的某一部分（比如只查第1000页到第2000页）。</li>
+<li><strong>观点：</strong> 这里的 <code>fused</code>（融合）是关键词。意思是它可能把“查找”和“筛选范围”这两个动作合并在一起做了，为了省时间。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 准备“空篮子” (分配显存)</h4>
+<p><strong>对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">if</span> <span class="n">output</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+        <span class="n">output</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span>
+            <span class="p">(</span><span class="n">index</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="nb">input</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">1</span><span class="p">)),</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="nb">input</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+            <span class="n">device</span><span class="o">=</span><span class="nb">input</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
+        <span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong><ul>
+<li>在开始干活前，得先准备好放结果的地方。</li>
+<li>如果用户没有提供 <code>output</code>（篮子），代码就自己创建一个空的 Tensor。</li>
+<li><strong>观点：</strong> 这里的 <code>torch.empty</code> 只是占个坑，里面还是乱码，等着后面填数据。这比 <code>torch.zeros</code> 快，因为它不负责把内存清零。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 按下按钮，移交控制权 (调用 CUDA)</h4>
+<p><strong>对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code>    <span class="n">module</span> <span class="o">=</span> <span class="n">_load_index_module</span><span class="p">()</span> <span class="c1"># 先拿到遥控器</span>
+
+    <span class="n">module</span><span class="o">.</span><span class="n">fused_indexing</span><span class="p">(</span>
+        <span class="n">output</span><span class="p">,</span>
+        <span class="nb">input</span><span class="p">,</span>
+        <span class="n">index</span><span class="p">,</span>
+        <span class="n">vocab_range</span><span class="p">,</span>
+        <span class="n">block_size</span><span class="p">,</span>
+        <span class="n">strict</span><span class="p">,</span>
+    <span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong><ul>
+<li>这是最关键的一步！</li>
+<li>Python 把刚才准备好的所有数据（输入数据、索引、空篮子、范围参数）一股脑塞给 Task 1 里加载的那个 <code>module</code>。</li>
+<li>此时，CPU 告诉 GPU：“按这个规则跑，把结果填到 <code>output</code> 那个篮子里。”</li>
+<li><strong>观点：</strong> <code>block_size=256</code> 是给 GPU 的参数（线程块大小），用来微调并行计算的效率。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 任务完成，交货 (返回结果)</h4>
+<p><strong>对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">return</span> <span class="n">output</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读：</strong><ul>
+<li>GPU 瞬间填完了数据，Python 把装满结果的 <code>output</code> 拿回来给你用。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结一下文中的核心观点</h3>
+<p>如果不看代码细节，这个文件其实就讲了三件事：</p>
+<ol>
+<li>
+<p><strong>性能至上 (Performance)</strong>：
+    普通的写法可能是 <code>y = x[index]</code>。但这在处理大模型（LLM）时可能不够快，或者显存读写效率不高。这个文件通过 <code>fused_indexing</code> 实现了一种<strong>定制化</strong>的索引操作。</p>
+</li>
+<li>
+<p><strong>原地操作 (In-place Operation)</strong>：
+    注意代码里的注释 <em>"The output tensor is modified in place"</em>。它直接往显存的特定位置写数据，而不是像普通 Python 代码那样频繁创建新的临时变量，这样能节省显存带宽。</p>
+</li>
+<li>
+<p><strong>Python 只是个外壳 (Wrapper)</strong>：
+    你看不懂是因为真正的逻辑不在 Python 里，而在那个 <code>index.cu</code> 文件里。这个 Python 文件只是负责<strong>倒腾数据</strong>和<strong>发号施令</strong>。</p>
+</li>
+</ol>
+<p><strong>一句话概括：</strong>
+这就好比你要去图书馆借书（索引数据），你自己找太慢了（Python原生速度），所以你雇了一个超音速机器人（CUDA Kernel），你只需要给它一张书单（Index），它就直接把书扔到你桌子上（Output）。</p>

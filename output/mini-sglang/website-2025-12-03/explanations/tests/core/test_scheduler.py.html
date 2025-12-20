@@ -1,0 +1,86 @@
+<h1>tests/core/test_scheduler.py</h1>
+<p>这份代码其实是一个<strong>测试脚本</strong>，它的目的是模拟一个“用户”如何向一个“大模型推理引擎（MiniSGL）”发送请求并获取结果的过程。</p>
+<p>为了让你看懂，我们可以把这段代码想象成<strong>“你在餐厅点餐”</strong>的过程。代码被分成了两个平行的世界（两个进程）：一个是<strong>顾客（Main函数）</strong>，一个是<strong>厨房（Scheduler函数）</strong>。</p>
+<p>我为你列了一个 <strong>7步走的 Task List（任务清单）</strong>，带你一步步拆解这段代码的逻辑：</p>
+<hr />
+<h3>Task 1: 理解“分身术” —— 启动后台服务</h3>
+<p><strong>概念：</strong> 大模型运行很重，通常需要独立运行。代码使用了 <code>multiprocessing</code>（多进程）把“厨房”和“前台”分开。</p>
+<ul>
+<li><strong>代码对应：</strong><ul>
+<li><code>def scheduler(...)</code>: 这是<strong>厨房</strong>。里面运行着 <code>Scheduler</code>（调度器），负责管理显卡、模型和推理计算。</li>
+<li><code>def main()</code>: 这是<strong>前台/顾客</strong>。负责发指令和收结果。</li>
+<li><code>mp.Process(target=scheduler, ...)</code>: 这一行代码启动了厨房进程。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 2: 配置“厨房” —— 初始化调度器</h3>
+<p><strong>概念：</strong> 在开火做饭前，需要告诉厨房：我们要用什么模型（菜谱）、用几张显卡（炉灶）、最大允许多少人同时点餐。</p>
+<ul>
+<li><strong>代码对应：</strong><ul>
+<li><code>SchedulerConfig(...)</code>: 这是配置单。<ul>
+<li><code>model_path</code>: 用 Llama-3.1-8B 模型。</li>
+<li><code>tp_info</code>: 分布式信息（这里是用第0号卡）。</li>
+<li><code>max_running_req=4</code>: 最多同时处理4个请求。</li>
+</ul>
+</li>
+<li><code>queue.get()</code>: 这是一个同步信号。主程序在这里卡住，直到厨房发信号说“我准备好了”，主程序才继续往下跑。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 3: 架设“电话线” —— 建立通信管道</h3>
+<p><strong>概念：</strong> 顾客和厨房是隔离的，需要专门的通道来传话。这里用了 ZMQ（一种消息队列技术）作为电话线。</p>
+<ul>
+<li><strong>代码对应：</strong><ul>
+<li><code>send_backend = ZmqPushQueue(...)</code>: <strong>传菜口（进）</strong>。顾客通过这个把“点菜单”塞给厨房。</li>
+<li><code>recv_backend = ZmqPullQueue(...)</code>: <strong>出菜口（出）</strong>。顾客通过这个从厨房拿“做好的菜（生成的字）”。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 4: 把话变成数字 —— Tokenizer 预处理</h3>
+<p><strong>概念：</strong> 模型看不懂英文 "What's the answer..."，它只认识数字。我们需要把问题翻译成数字编号（Token IDs）。</p>
+<ul>
+<li><strong>代码对应：</strong><ul>
+<li><code>tokenizer = AutoTokenizer...</code>: 加载翻译器。</li>
+<li><code>tokenizer.encode(...)</code>: 把 "What's the answer..." 变成了类似 <code>[1284, 392, ...]</code> 的一串数字。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 5: 提交订单 —— 发送 UserMsg</h3>
+<p><strong>概念：</strong> 把翻译好的数字、请求ID、想要生成的长度打包成一个“订单”，扔进传菜口。</p>
+<ul>
+<li><strong>代码对应：</strong><ul>
+<li><code>UserMsg(...)</code>: 这是一个数据包，包含：<ul>
+<li><code>uid=0</code>: 订单号。</li>
+<li><code>input_ids</code>: 问题对应的数字。</li>
+<li><code>output_len=100</code>: 告诉厨房“给我再续写100个字”。</li>
+</ul>
+</li>
+<li><code>send_backend.put(...)</code>: 把订单发送给 Scheduler（厨房）。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 6: 盯着出菜口 —— 循环接收结果</h3>
+<p><strong>概念：</strong> 大模型不是一下子把整段话吐出来的，而是<strong>一个字一个字</strong>蹦出来的（流式输出）。所以顾客需要在一个循环里不停地接这一连串的字，直到厨房说“做完了”。</p>
+<ul>
+<li><strong>代码对应：</strong><ul>
+<li><code>while True</code>: 开始死循环等待。</li>
+<li><code>msg = recv_backend.get()</code>: 阻塞等待，直到接到一个新字。</li>
+<li><code>assert isinstance(msg, DetokenizeMsg)</code>: 确认收到的是“解码消息”。</li>
+<li><code>ids = torch.cat(...)</code>: 把新收到的这个字（<code>msg.next_token</code>）拼接到之前的句子里。</li>
+<li><code>if msg.finished: break</code>: 如果厨房说“结束了”，就跳出循环。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 7: 翻译回人话并关门 —— 后处理与退出</h3>
+<p><strong>概念：</strong> 把收到的一大串数字再翻译回人类能读懂的文本，打印出来，然后通知厨房下班。</p>
+<ul>
+<li><strong>代码对应：</strong><ul>
+<li><code>tokenizer.decode(ids.tolist())</code>: 把最终的一长串数字变回英文文本并打印。</li>
+<li><code>send_backend.put(ExitMsg())</code>: 给厨房发一个“关门”信号，让后台进程安全退出。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这段代码的核心观点是演示 <strong>MiniSGL 框架的架构模式</strong>：
+<strong>Frontend（前端/用户）</strong> 与 <strong>Backend（后端/调度器）</strong> 分离，通过 <strong>消息队列（ZMQ）</strong> 进行异步通信。用户发 Token IDs 过去，后端流式地把生成的 Token ID 一个个发回来。</p>

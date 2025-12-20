@@ -1,0 +1,120 @@
+<h1>python/minisgl/scheduler/prefill.py</h1>
+<p>这段代码实现了一个 <strong>PrefillManager（预填充管理器）</strong>。</p>
+<p>在 LLM（大语言模型）推理中，"Prefill" 指的是处理用户输入的 Prompt（提示词）的阶段。这个阶段通常计算量很大，需要一次性算很多 Token。</p>
+<p>为了让你看懂，我们可以把这个 <code>PrefillManager</code> 想象成一个 <strong>“餐厅领班”</strong>。他的工作是看着门口排队的顾客（Requests），根据餐厅现在的空桌子（显存 Cache）和厨师的忙碌程度（计算预算 Budget），决定让谁进来吃饭。</p>
+<p>下面我列一个 <strong>Task Todo List</strong>，带你一步步走完这个领班的工作流程。</p>
+<hr />
+<h3>📋 领班的工作清单 (Task Todo List)</h3>
+<h4>1. 准备工作 (初始化)</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>__init__</code></li>
+<li><strong>任务</strong>: 上岗打卡，认识一下另外三个部门的经理。<ul>
+<li><code>cache_manager</code>: <strong>库房经理</strong>。管显存（KV Cache）够不够用。</li>
+<li><code>table_manager</code>: <strong>座位经理</strong>。管这就餐记录表（Page Table），记录谁坐在哪。</li>
+<li><code>decode_manager</code>: <strong>甜点部经理</strong>。管生成阶段（Decode），因为生成阶段也会占内存，得防着点。</li>
+<li><code>pending_list</code>: <strong>排号单</strong>。手里拿个小本本，用来记排队的顾客。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 接待顾客 (接收请求)</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>add_raw_req</code></li>
+<li><strong>任务</strong>: 门口来了个新顾客（UserMsg）。</li>
+<li><strong>动作</strong>:<ol>
+<li>把顾客的 ID、想吃什么（<code>input_ids</code>）、预计吃多久（<code>output_len</code>）记在小本本（<code>pending_list</code>）的最后一行。</li>
+<li>此时不安排座位，只是记下来。</li>
+</ol>
+</li>
+</ul>
+<h4>3. 核心调度 (安排这一批谁能进)</h4>
+<p>这是最复杂的 <strong><code>schedule_next_batch</code></strong> 方法。领班每隔一小会儿就要做一次这个任务。</p>
+<ul>
+<li>
+<p><strong>Task 3.1: 检查有没有人排队</strong></p>
+<ul>
+<li>如果 <code>pending_list</code> 是空的，直接休息 (<code>return None</code>)。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 3.2: 盘点资源 (算算家底)</strong></p>
+<ul>
+<li>看看座位表 (<code>page_table</code>) 还在吗。</li>
+<li><strong>关键点</strong>: 问问甜点部（Decode）现在占了多少资源 (<code>offset</code>)。因为显存是共享的，必须把那边正在用的或者即将用的预留出来。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 3.3: 遍历排队的人 (FIFO 先来后到)</strong></p>
+<ul>
+<li>开始从 <code>pending_list</code> 第一个人开始看。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 3.4: 决定能不能接待这个人 (资源硬性检查)</strong></p>
+<ul>
+<li><strong>检查</strong>: 计算预算 (<code>prefill_budget</code>)、库房剩余空间 (<code>available_size</code>)、座位表剩余行数。</li>
+<li><strong>判断</strong>: 如果任何一个资源 <code>&lt;= 0</code>，说明餐厅爆满或者厨师累趴了，<strong>停止接客 (<code>break</code>)</strong>。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 3.5: 查查老黄历 (缓存匹配 / Radix Attention)</strong></p>
+<ul>
+<li><strong>代码</strong>: <code>handle, match_indices = self.cache_manager.match_req(req)</code></li>
+<li><strong>解释</strong>: 这是高级功能。看看这个顾客点的菜（Prompt），是不是跟以前某个顾客点的一样？比如大家都用了同样的“系统提示词”。</li>
+<li>如果一样，<strong>直接复用</strong>以前算好的结果（<code>match_indices</code>），这就省力了。</li>
+<li><code>cached_len</code>: 已经做好的菜的数量。</li>
+<li><code>extend_len</code>: 需要厨师新做的菜的数量（总输入 - 已缓存）。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 3.6: 估算风险 (能不能塞得下)</strong></p>
+<ul>
+<li><strong>代码</strong>: <code>estimated_len = extend_len + req.output_len</code></li>
+<li><strong>解释</strong>: 估算这个顾客吃完饭（Input + Output）总共要占多少内存。</li>
+<li><strong>判断 1</strong>: <code>if extend_len &gt; prefill_budget</code>: 如果新做的菜太多，超过了这一批的计算预算，<strong>这批先不接了，下一批再说 (<code>break</code>)</strong>。</li>
+<li><strong>判断 2</strong>: <code>if estimated_len &gt; ...</code>: 如果库房剩下的空间不够他吃完全程，<strong>为了防止吃到一半没内存报错，现在就拒绝 (<code>break</code>)</strong>。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 3.7: 锁定资源 (Locking)</strong></p>
+<ul>
+<li><strong>代码</strong>: <code>self.cache_manager.lock(handle)</code></li>
+<li><strong>解释</strong>: 既然决定复用之前的缓存，先把那部分缓存锁住，别被别人清空了。</li>
+<li><strong>再次检查</strong>: 锁住之后再检查一遍内存够不够（防止并发情况下的资源竞争）。如果不够，解锁并放弃。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 3.8: 正式分配 (Allocation)</strong></p>
+<ul>
+<li><strong>分配显存</strong>: <code>cache_manager.allocate(extend_len)</code>。给新做的菜分配空间。</li>
+<li><strong>分配座位</strong>: <code>table_manager.allocate()</code>。给这个顾客开一个新的座位号（Page Table Index）。</li>
+<li><strong>扣除预算</strong>: <code>prefill_budget -= extend_len</code>。厨师的精力减少了。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 3.9: 填表 (Update Page Table)</strong></p>
+<ul>
+<li>把“复用的旧缓存位置”和“新分配的位置”都填到这个顾客的座位表里 (<code>page_entry</code>)。这样模型就知道去哪读取数据了。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 3.10: 打包任务 (Create Req)</strong></p>
+<ul>
+<li>把所有准备好的信息（ID、输入、座位号、缓存句柄等）打包成一个 <code>Req</code> 对象，放到 <code>result</code> 列表里。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 3.11: 善后 (Cleanup)</strong></p>
+<ul>
+<li>如果 <code>result</code> 里有人，把这些人从排队小本本 (<code>pending_list</code>) 里划掉。</li>
+<li>把 <code>result</code> 交给下一道工序（模型计算）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结文中的核心观点</h3>
+<ol>
+<li><strong>先来后到 (FIFO)</strong>: 严格按照排队顺序处理请求。</li>
+<li><strong>前缀缓存 (Prefix Caching / Radix Attention)</strong>: 这是代码里 <code>match_req</code> 的部分。它极大地优化了性能，如果你的 Prompt 前半部分和以前一样，它就不重新算了，直接复用。</li>
+<li><strong>资源预留</strong>: 在接客之前，必须算清楚这个顾客未来（生成 Output 时）需要的总内存，如果内存不够，为了安全起见，现在就不让他开始运行。</li>
+<li><strong>计算预算控制</strong>: 也就是 <code>prefill_budget</code>。不能一次性把所有排队的人都放进去，否则计算量太大，显卡会卡死（Latency 变高）。每次只处理一定数量的 Token。</li>
+</ol>

@@ -1,0 +1,97 @@
+<h1>python/minisgl/server/launch.py</h1>
+<p>没问题。这份代码文件 <code>launch.py</code> 的核心作用就是<strong>启动整个 MiniSGL 推理服务</strong>。</p>
+<p>你可以把它想象成一个<strong>“工头”</strong>或者<strong>“总指挥”</strong>。它的工作不是自己去搬砖（做具体的矩阵乘法或模型推理），而是负责把队伍拉起来，分配任务，确保所有人都就位了，然后对外开张营业。</p>
+<p>为了让你更容易理解，我把它拆解成一个 <strong>Task List (任务清单)</strong>，我们按顺序一步步把这个“工程”启动起来。</p>
+<hr />
+<h3>🚀 Task List: 启动 MiniSGL 服务</h3>
+<h4>✅ Task 1: 宏观理解——这是什么？</h4>
+<ul>
+<li><strong>概念</strong>：这是程序的入口脚本（Entry Point）。</li>
+<li><strong>类比</strong>：这就像是餐厅的经理。经理早上来上班，负责打开店门，检查食材，把厨师（GPU计算进程）和服务员（API接口、分词器）都叫醒，确认大家都准备好了，最后才允许顾客进门点菜。</li>
+<li><strong>代码对应</strong>：<code>launch_server</code> 函数是主入口，<code>if __name__ == "__main__": launch_server()</code> 是按下启动按钮。</li>
+</ul>
+<h4>✅ Task 2: 准备工作——读取配置</h4>
+<ul>
+<li><strong>概念</strong>：解析命令行参数（Arguments Parsing）。</li>
+<li><strong>解释</strong>：用户启动服务时会带很多参数（比如用几个 GPU、模型路径在哪、端口是多少）。这一步就是把这些参数读进来，存到 <code>server_args</code> 里供后续使用。</li>
+<li><strong>代码对应</strong>：
+    <code>python
+    server_args = parse_args(sys.argv[1:])</code></li>
+</ul>
+<h4>✅ Task 3: 启动门面——API Server</h4>
+<ul>
+<li><strong>概念</strong>：启动 HTTP 服务器（通常是 FastAPI）。</li>
+<li><strong>解释</strong>：这是服务与外界交互的窗口。它负责接收用户的 HTTP 请求（比如“请帮我写首诗”）。</li>
+<li><strong>关键点</strong>：注意代码最后一行调用了 <code>run_api_server</code>。你会发现它把 <code>start_subprocess</code> 这个函数作为参数传进去了。这意味着：API Server 启动后，会由 API Server 去调用“启动子进程”的逻辑。</li>
+<li><strong>代码对应</strong>：
+    <code>python
+    run_api_server(server_args, start_subprocess, run_shell=run_shell)</code></li>
+</ul>
+<h4>✅ Task 4: 组建核心团队——多进程管理</h4>
+<ul>
+<li><strong>概念</strong>：多进程（Multiprocessing）与 GPU 并行。</li>
+<li><strong>解释</strong>：这是最复杂也是最重要的一步。因为 Python 的全局解释器锁（GIL）限制，为了充分利用多张显卡（GPU），必须启动<strong>多个独立的进程</strong>。</li>
+<li><strong>代码细节</strong>：<ul>
+<li><code>mp.set_start_method("spawn", force=True)</code>: 这是 PyTorch/CUDA 环境下的强制要求，必须用 <code>spawn</code> 方式启动进程，否则会报错。</li>
+<li><code>ack_queue</code>: 这是一个“确认信箱”。子进程启动成功后，会往里面丢一封信说“我好了”。主进程盯着这个信箱，收齐了信才算启动成功。</li>
+</ul>
+</li>
+<li><strong>代码对应</strong>：<code>def start_subprocess() -&gt; None:</code> 内部的逻辑。</li>
+</ul>
+<h4>✅ Task 5: 唤醒厨师——启动 Scheduler (GPU 推理)</h4>
+<ul>
+<li><strong>概念</strong>：模型并行（Tensor Parallelism）与调度器。</li>
+<li><strong>解释</strong>：<ul>
+<li>如果你的电脑有 4 张显卡（<code>world_size = 4</code>），这里就会启动 4 个 <code>_run_scheduler</code> 进程。</li>
+<li>每个进程负责管理一张显卡。</li>
+<li><code>Scheduler</code> 是真正的大脑，负责把模型加载到显存里，并进行计算。</li>
+<li>代码中用了一个循环 <code>for i in range(world_size)</code> 来给每张卡启动一个进程。</li>
+</ul>
+</li>
+<li><strong>代码对应</strong>：
+    <code>python
+    mp.Process(target=_run_scheduler, ...).start()</code></li>
+</ul>
+<h4>✅ Task 6: 唤醒翻译官——启动 Tokenizer (分词器)</h4>
+<ul>
+<li><strong>概念</strong>：文本处理进程。</li>
+<li><strong>解释</strong>：大模型看不懂中文或英文，它只认识数字。<ul>
+<li><strong>Tokenizer (分词器)</strong>：把用户输入的“你好”变成数字 <code>[101, 2999]</code>。</li>
+<li><strong>DeTokenizer (反分词器)</strong>：把模型输出的数字 <code>[3000]</code> 变回文字“世界”。</li>
+<li>为了不让文本处理卡住 GPU 的计算，这里专门开了几个 CPU 进程来做这事。</li>
+<li>代码里启动了 <strong>1 个 DeTokenizer</strong> 和 <strong>N 个 Tokenizer</strong>。</li>
+</ul>
+</li>
+<li><strong>代码对应</strong>：
+    <code>python
+    mp.Process(target=tokenize_worker, ...).start()</code></li>
+</ul>
+<h4>✅ Task 7: 最终确认——同步等待 (ACK)</h4>
+<ul>
+<li><strong>概念</strong>：进程同步。</li>
+<li><strong>解释</strong>：主进程（经理）不能刚把人叫醒就开门营业，必须等所有人都穿好制服站好岗。<ul>
+<li>需要等待的人数 = 1 个 Scheduler (主卡) + Tokenizer 数量 + 1 个 DeTokenizer。</li>
+<li><code>ack_queue.get()</code> 是一个<strong>阻塞</strong>操作。如果子进程没启动好，主程序就会卡在这里一直等，直到收到所有人的“Ready”信号。</li>
+</ul>
+</li>
+<li><strong>代码对应</strong>：
+    <code>python
+    for _ in range(num_tokenizers + 2):
+        logger.info(ack_queue.get())</code></li>
+</ul>
+<hr />
+<h3>总结一下流程图</h3>
+<ol>
+<li><strong>用户运行脚本</strong> (<code>launch_server</code>)</li>
+<li><strong>解析参数</strong> (<code>parse_args</code>)</li>
+<li><strong>启动 API Server</strong> (<code>run_api_server</code>) -&gt; 调用回调函数 <code>start_subprocess</code></li>
+<li><strong><code>start_subprocess</code> 开始干活</strong>:<ul>
+<li>👉 启动 N 个 <strong>GPU 进程</strong> (运行 <code>_run_scheduler</code>) -&gt; 加载模型</li>
+<li>👉 启动 1 个 <strong>反分词进程</strong> (运行 <code>tokenize_worker</code>)</li>
+<li>👉 启动 M 个 <strong>分词进程</strong> (运行 <code>tokenize_worker</code>)</li>
+</ul>
+</li>
+<li><strong>主进程等待</strong>: 盯着 <code>ack_queue</code>，直到收到所有进程发来的 "Ready"。</li>
+<li><strong>服务正式可用</strong>: 此时用户可以通过 API 发送请求了。</li>
+</ol>
+<p>现在再看代码，是不是清晰很多了？</p>

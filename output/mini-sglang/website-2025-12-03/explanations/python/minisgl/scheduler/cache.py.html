@@ -1,0 +1,155 @@
+<h1>python/minisgl/scheduler/cache.py</h1>
+<p>这段代码确实比较抽象，因为它涉及到了 <strong>显存管理（Memory Management）</strong> 和 <strong>KV Cache（键值缓存）</strong> 的复用逻辑。</p>
+<p>你可以把这个类 <code>CacheManager</code> 想象成一个 <strong>“图书馆管理员”</strong>。他的工作是管理有限的 <strong>“空白笔记本” (Page/Slot)</strong>。</p>
+<p>为了让你看懂，我为你列了一个 <strong>学习任务清单 (TODO List)</strong>。我们可以按照这个顺序，一步步解锁代码的含义。</p>
+<hr />
+<h3>📋 学习任务清单 (Roadmap)</h3>
+<ol>
+<li><strong>Task 1：搞懂“家底”</strong> —— 理解 <code>__init__</code> 和 <code>free_slots</code>（管理员手里有多少空本子）。</li>
+<li><strong>Task 2：理解“借本子”的逻辑</strong> —— 深度解析 <code>allocate</code>（当有人要写字时，怎么分配本子？不够了怎么办？）。</li>
+<li><strong>Task 3：理解“查重”</strong> —— 解析 <code>match_req</code>（如果有人想抄作业，怎么复用以前写好的本子？）。</li>
+<li><strong>Task 4：理解“归还与存档”</strong> —— 解析 <code>free_and_cache_finished_req</code>（写完了怎么存起来，把多余的空本子还回来）。</li>
+<li><strong>Task 5：理解“保护现场”</strong> —— 解析 <code>lock/unlock</code>（正在读的本子不能被扔掉）。</li>
+</ol>
+<hr />
+<h3>🚀 逐步执行任务</h3>
+<h4>✅ Task 1：搞懂“家底” (<code>__init__</code>)</h4>
+<p>首先看管理员手里有什么资源。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">num_pages</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">type</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+    <span class="c1"># self.free_slots 就是“空闲页池”。</span>
+    <span class="c1"># 比如 num_pages=100，这里就是一个包含 [0, 1, ..., 99] 的列表。</span>
+    <span class="c1"># 每一个数字代表显存里的一页（Page）的 ID。</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">free_slots</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">num_pages</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+
+    <span class="bp">self</span><span class="o">.</span><span class="n">device</span> <span class="o">=</span> <span class="n">device</span>
+    <span class="c1"># self.manager 是一个更高级的“档案室”，用来存放已经写过内容的页（用于前缀缓存复用）。</span>
+    <span class="c1"># 这里我们不用管它是怎么实现的，只知道它可以存取历史数据。</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">manager</span> <span class="o">=</span> <span class="n">create_cache_manager</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span> <span class="nb">type</span><span class="o">=</span><span class="nb">type</span><span class="p">)</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">num_pages</span> <span class="o">=</span> <span class="n">num_pages</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点 1：</strong> 这个类的核心资产是 <code>free_slots</code>。只要你需要显存，就得从这里拿 ID。</li>
+</ul>
+<hr />
+<h4>✅ Task 2：理解“借本子”的逻辑 (<code>allocate</code>)</h4>
+<p>这是全篇最难也是最重要的部分。当模型需要生成新 token 时，需要申请显存。</p>
+<p><strong>场景：</strong> 此时有人来要 <code>needed_len</code> 个本子。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">allocate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">needed_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+    <span class="k">if</span> <span class="n">needed_len</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+
+    <span class="c1"># === 情况 A：家底够用 ===</span>
+    <span class="c1"># free_len 是当前手里空闲本子的数量</span>
+    <span class="k">if</span> <span class="n">needed_len</span> <span class="o">&lt;=</span> <span class="p">(</span><span class="n">free_len</span> <span class="o">:=</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">free_slots</span><span class="p">)):</span>
+        <span class="c1"># 直接从 free_slots 拿走前 needed_len 个</span>
+        <span class="n">allocated</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">free_slots</span><span class="p">[:</span><span class="n">needed_len</span><span class="p">]</span>
+        <span class="c1"># 更新 free_slots，剩下的留着</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">free_slots</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">free_slots</span><span class="p">[</span><span class="n">needed_len</span><span class="p">:]</span>
+        <span class="k">return</span> <span class="n">allocated</span>
+
+    <span class="c1"># === 情况 B：家底不够，需要“清理旧档案” ===</span>
+    <span class="c1"># 说明空闲的不够了，需要去 manager (档案室) 踢掉一些很久没用的旧缓存 (Evict)</span>
+    <span class="c1"># 我们需要踢掉多少？ (需要的 - 手里有的) = 还缺的</span>
+    <span class="n">evicted</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">manager</span><span class="o">.</span><span class="n">evict</span><span class="p">(</span><span class="n">needed_len</span> <span class="o">-</span> <span class="n">free_len</span><span class="p">)</span>
+
+    <span class="c1"># === 情况 B1：踢掉旧档案后，加上手里的，刚好够或者多了 ===</span>
+    <span class="k">if</span> <span class="n">needed_len</span> <span class="o">&lt;=</span> <span class="nb">len</span><span class="p">(</span><span class="n">evicted</span><span class="p">):</span>
+        <span class="c1"># 注意：这里的逻辑稍微有点绕。</span>
+        <span class="c1"># 作者没有混合使用 free_slots 和 evicted，而是优先用了 evicted 的空间（可能是为了减少内存碎片整理的开销，或者代码逻辑简化）。</span>
+        <span class="c1"># 把 evicted 切分，一部分拿去用 (allocated)</span>
+        <span class="n">allocated</span> <span class="o">=</span> <span class="n">evicted</span><span class="p">[:</span><span class="n">needed_len</span><span class="p">]</span>
+        <span class="c1"># 剩下的 evicted 和原本的 free_slots 合并，变成新的 free_slots</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">free_slots</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="bp">self</span><span class="o">.</span><span class="n">free_slots</span><span class="p">,</span> <span class="n">evicted</span><span class="p">[</span><span class="n">needed_len</span><span class="p">:]])</span>
+        <span class="k">return</span> <span class="n">allocated</span>
+
+    <span class="c1"># === 情况 B2：踢出来的加上手里的，必须混合在一起才够用 ===</span>
+    <span class="n">merged</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="bp">self</span><span class="o">.</span><span class="n">free_slots</span><span class="p">,</span> <span class="n">evicted</span><span class="p">])</span>
+    <span class="n">merged_len</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">merged</span><span class="p">)</span>
+    <span class="k">assert</span> <span class="n">merged_len</span> <span class="o">&gt;=</span> <span class="n">needed_len</span><span class="p">,</span> <span class="s2">&quot;Eviction did not free enough space.&quot;</span>
+
+    <span class="k">if</span> <span class="n">merged_len</span> <span class="o">==</span> <span class="n">needed_len</span><span class="p">:</span>
+        <span class="c1"># 刚好用光所有资源</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">free_slots</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">merged</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="c1"># 混合后切分</span>
+        <span class="n">allocated</span> <span class="o">=</span> <span class="n">merged</span><span class="p">[:</span><span class="n">needed_len</span><span class="p">]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">free_slots</span> <span class="o">=</span> <span class="n">merged</span><span class="p">[</span><span class="n">needed_len</span><span class="p">:]</span>
+        <span class="k">return</span> <span class="n">allocated</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点 2：</strong> 分配内存不仅仅是“拿”，还包含了“抢”。如果空闲不够，就要强行从缓存池（<code>self.manager</code>）里驱逐旧数据（Evict）来腾位置。</li>
+</ul>
+<hr />
+<h4>✅ Task 3：理解“查重” (<code>match_req</code>)</h4>
+<p>在大模型推理中，如果你的提问（Prompt）和之前某人的提问前半部分一样，我们不需要重新计算，直接把之前存好的拿出来用。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">match_req</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">PendingReq</span><span class="p">):</span>
+    <span class="n">input_len</span> <span class="o">=</span> <span class="n">req</span><span class="o">.</span><span class="n">input_len</span>
+    <span class="c1"># 问档案室 (manager)：</span>
+    <span class="c1"># “有没有以前的请求，它的内容和我这个请求的前缀（input_ids）是一样的？”</span>
+    <span class="c1"># 如果有，返回已经计算好的缓存句柄（Handle）。</span>
+    <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">manager</span><span class="o">.</span><span class="n">match_prefix</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">input_ids</span><span class="p">[:</span> <span class="n">input_len</span> <span class="o">-</span> <span class="mi">1</span><span class="p">])</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点 3：</strong> 这就是所谓的 <strong>Prefix Caching (前缀缓存)</strong>。这能极大加速推理。</li>
+</ul>
+<hr />
+<h4>✅ Task 4：理解“归还与存档” (<code>free_and_cache_finished_req</code>)</h4>
+<p>当一个请求处理完了，它占用的显存页（Pages）有两种命运：
+1.  变成“档案”，存入 <code>manager</code> 供未来复用。
+2.  变成“垃圾”，扔回 <code>free_slots</code> 供当下复用。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">free_and_cache_finished_req</span><span class="p">(</span>
+    <span class="bp">self</span><span class="p">,</span>
+    <span class="n">old_handle</span><span class="p">:</span> <span class="n">BaseCacheHandle</span><span class="p">,</span>
+    <span class="n">input_ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+    <span class="n">indices</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="c1"># 1. 解锁旧句柄（允许被系统回收）</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">unlock</span><span class="p">(</span><span class="n">old_handle</span><span class="p">)</span>
+
+    <span class="n">old_cache_len</span> <span class="o">=</span> <span class="n">old_handle</span><span class="o">.</span><span class="n">cached_len</span>
+    <span class="c1"># 2. 将新的内容插入到档案室 (Radix Tree / Prefix Tree)</span>
+    <span class="c1"># insert_prefix 会返回一个新的长度 new_cache_len。</span>
+    <span class="c1"># 这步操作会自动识别：哪些是新生成的 unique 内容，哪些可以合并到树里。</span>
+    <span class="n">new_cache_len</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">manager</span><span class="o">.</span><span class="n">insert_prefix</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">indices</span><span class="p">)</span>
+
+    <span class="c1"># 3. 关键点：为什么要把一部分 indices 加回 free_slots？</span>
+    <span class="c1"># indices 是这个请求当前占用的所有物理页 ID。</span>
+    <span class="c1"># insert_prefix 可能会发现：indices 里的某些数据已经在档案室里存过一份了（重复了）。</span>
+    <span class="c1"># 或者 insert_prefix 只需要前 new_cache_len 个页作为档案。</span>
+    <span class="c1"># 那么，从 new_cache_len 到结尾的这部分页，就不需要作为档案保留了，</span>
+    <span class="c1"># 既然不需要保留，就把它们扔回 free_slots，让别的请求可以用。</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">free_slots</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="bp">self</span><span class="o">.</span><span class="n">free_slots</span><span class="p">,</span> <span class="n">indices</span><span class="p">[</span><span class="n">old_cache_len</span><span class="p">:</span><span class="n">new_cache_len</span><span class="p">]])</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点 4：</strong> 这里的逻辑有点反直觉。通常我们认为“用完就还”。但这里是“用完后，试着存进档案室，存不进去或者多余的部分，才还给空闲池”。注意：代码最后一行切片逻辑看起来像是只回收了一部分，这通常涉及到具体的 Radix Tree 实现细节（即物理页的去重）。</li>
+</ul>
+<hr />
+<h4>✅ Task 5：理解“保护现场” (<code>lock</code> / <code>unlock</code>)</h4>
+<p>如果一个缓存页正在被当前的 GPU 计算使用，或者被某个请求引用，绝对不能被 <code>allocate</code> 函数里的 <code>evict</code> 给踢掉。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">lock</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">handle</span><span class="p">:</span> <span class="n">BaseCacheHandle</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="c1"># 告诉档案室：这个句柄正在用，引用计数 +1，千万别删。</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">manager</span><span class="o">.</span><span class="n">lock_handle</span><span class="p">(</span><span class="n">handle</span><span class="p">,</span> <span class="n">unlock</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">unlock</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">handle</span><span class="p">:</span> <span class="n">BaseCacheHandle</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="c1"># 用完了，引用计数 -1。如果没人用了，下次内存不够时可以踢掉它。</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">manager</span><span class="o">.</span><span class="n">lock_handle</span><span class="p">(</span><span class="n">handle</span><span class="p">,</span> <span class="n">unlock</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点 5：</strong> 这是一个引用计数机制（Reference Counting）。<code>available_size</code> 属性里计算的 <code>evictable_size</code> 指的就是那些“虽然存着数据，但当前没人锁定”的页面大小。</li>
+</ul>
+<hr />
+<h3>💡 总结</h3>
+<p>这个文件的核心故事是：</p>
+<ol>
+<li><strong>资源是有限的</strong> (<code>num_pages</code> 显存页)。</li>
+<li><strong>优先复用</strong>：新请求来了，先看能不能用旧的 (<code>match_req</code>)。</li>
+<li><strong>按需分配</strong>：需要新页时，先看空闲池 (<code>free_slots</code>)，没有就去抢那些没人锁定的旧缓存 (<code>evict</code>)。</li>
+<li><strong>智能回收</strong>：请求结束时，把数据试图合并进全局缓存树 (<code>manager.insert_prefix</code>)，合并后多余的物理页才释放回空闲池。</li>
+</ol>
+<p>现在再回头看代码，是不是清晰一些了？</p>

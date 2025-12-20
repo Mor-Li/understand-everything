@@ -1,0 +1,69 @@
+<h1>tests/kernel/test_tensor.py</h1>
+<p>这段代码虽然很短，但它是一个非常典型的<strong>底层系统测试脚本</strong>。它不是用来跑AI模型的，而是用来<strong>测试PyTorch和底层C++/CUDA代码之间的数据传输和内存管理是否正确</strong>。</p>
+<p>我们可以把它想象成一个“质检员”的任务清单。为了让你看懂，我把它拆解成一个 <strong>5步走的 Todo List</strong>，我们一步步来执行并理解。</p>
+<hr />
+<h3>📋 任务清单：解剖 <code>test_tensor.py</code></h3>
+<h4>✅ Task 1: 准备工具箱 (导入库)</h4>
+<p><strong>代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">minisgl.kernel_v2</span><span class="w"> </span><span class="kn">import</span> <span class="n">test_tensor</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+*   <strong><code>torch</code></strong>: 这是 PyTorch，是我们操作数据的核心工具。
+*   <strong><code>minisgl</code></strong>: 这是这个项目自定义的一个库（看起来像是一个高性能的图形/计算库）。
+*   <strong><code>test_tensor</code></strong>: 这是我们要测试的核心函数。它通常是用 C++ 或 CUDA 写好的底层代码，被封装成了 Python 可以调用的函数。
+*   <strong>目的</strong>：这一步就是把“Python世界”的工具（PyTorch）和“底层世界”的接口（minisgl）都拿出来。</p>
+<h4>✅ Task 2: 制造一个“特殊的” CPU 数据块 (变量 x)</h4>
+<p><strong>代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">x</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">((</span><span class="mi">12</span><span class="p">,</span> <span class="mi">2048</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">&quot;cpu&quot;</span><span class="p">)[:,</span> <span class="p">:</span><span class="mi">1024</span><span class="p">]</span>
+</code></pre></div>
+
+<p><strong>解读 (最关键的一步)：</strong>
+这里做了三件事，目的是制造一个<strong>“刁钻”</strong>的测试用例：
+1.  <strong>创建大块内存</strong>：<code>torch.empty((12, 2048)...)</code> 申请了一个 12行 x 2048列 的大表格。数据类型是 <code>int32</code>（整数），放在 <strong>CPU 内存</strong>里。
+2.  <strong>切片（Slicing）</strong>：注意后面的 <code>[:, :1024]</code>。这表示：“我只要前 1024 列”。
+3.  <strong>为什么要切片？</strong> 这就是测试的核心！
+    *   在计算机内存里，原本申请的是 2048 列宽度的连续空间。
+    *   当你只取前 1024 列时，数据在逻辑上变小了，但在物理内存里，每一行之间其实是有“空隙”的（跳过了后 1024 列）。
+    *   <strong>目的</strong>：测试底层的 <code>test_tensor</code> 函数能不能处理这种<strong>不连续（Strided）</strong>的内存布局。如果底层写得烂，读完第一行可能会直接读到被切掉的垃圾数据，而不是跳到第二行的开头。</p>
+<h4>✅ Task 3: 制造一个“跨界”的 GPU 数据块 (变量 y)</h4>
+<p><strong>代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">y</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">((</span><span class="mi">12</span><span class="p">,</span> <span class="mi">1024</span><span class="p">),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int64</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">&quot;cuda:1&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+这里制造了第二个测试对象，也有三个特殊点：
+1.  <strong>形状匹配</strong>：大小是 <code>(12, 1024)</code>，刚好能和切片后的 <code>x</code> 对应上。
+2.  <strong>数据类型不同</strong>：这里用的是 <code>int64</code>（长整型），而 <code>x</code> 是 <code>int32</code>。
+3.  <strong>设备不同</strong>：这里指定了 <code>device="cuda:1"</code>。注意是 <strong>1号显卡</strong>，不是默认的 0号，也不是 CPU。
+4.  <strong>目的</strong>：测试底层函数能不能处理<strong>跨设备</strong>（CPU vs GPU）以及<strong>特定显卡编号</strong>（GPU 1）的指针传递。</p>
+<h4>✅ Task 4: 执行“握手”测试 (调用函数)</h4>
+<p><strong>代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">test_tensor</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">y</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+*   这是整个脚本的终极动作。
+*   它把 <strong>CPU上的切片数据 <code>x</code></strong> 和 <strong>1号显卡上的数据 <code>y</code></strong> 同时扔给了底层的 C++ 函数。
+*   <strong>它在验证什么？</strong>
+    *   底层代码能不能正确读取 CPU 内存？
+    *   底层代码能不能正确识别 GPU 内存地址？
+    *   底层代码能不能处理 <code>x</code> 那种“切过一刀”的内存步长（Stride）？
+    *   底层代码会不会因为数据类型不同（int32 vs int64）而报错？</p>
+<h4>✅ Task 5: 启动开关 (主函数入口)</h4>
+<p><strong>代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@call_if_main</span><span class="p">()</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+    <span class="o">...</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+*   这只是一个类似 <code>if __name__ == "__main__":</code> 的写法。
+*   意思是：如果你直接运行这个文件，就执行 <code>main()</code> 里面的测试逻辑；如果是别的程序导入这个文件，就不执行。</p>
+<hr />
+<h3>💡 总结：这个文件到底在讲啥？</h3>
+<p><strong>用一句话说：</strong>
+这是一个<strong>压力测试</strong>，用来验证底层 C++ 内核函数 (<code>test_tensor</code>) 是否足够健壮，能够处理 <strong>“CPU切片内存”</strong> 和 <strong>“指定GPU内存”</strong> 混合输入的复杂情况。</p>
+<p><strong>它想证明的观点（隐含）：</strong>
+“我们的底层 <code>minisgl</code> 库很强，哪怕你给我的数据是切过的（内存不连续）、类型不一样的、放在不同设备（CPU/GPU）上的，我也能正确识别并处理，不会崩溃。”</p>

@@ -1,0 +1,85 @@
+<h1>python/minisgl/kernel/store.py</h1>
+<p>这段代码确实看起来有点“高深”，因为它处于 <strong>Python（上层逻辑）</strong> 和 <strong>CUDA/C++（底层高性能计算）</strong> 的交界处。它的主要作用是<strong>为了加速大模型推理，把计算好的 Key 和 Value 数据（KV）高效地存入显存缓存（Cache）中</strong>。</p>
+<p>为了让你彻底搞懂，我为你设计了一个由浅入深的 <strong>“学习任务清单 (To-Do List)”</strong>。我们一步步来拆解它。</p>
+<hr />
+<h3>学习清单：一步步读懂 <code>store.py</code></h3>
+<h4>✅ Task 1: 搞懂业务目标 —— 我们在做什么？</h4>
+<p><strong>核心观点：</strong> 这段代码不是在做数学计算，而是在做“搬运工”。</p>
+<ul>
+<li><strong>背景：</strong> 在大语言模型（LLM）推理时，我们需要把每一步生成的 Token 对应的 Key (<code>k</code>) 和 Value (<code>v</code>) 存起来，这样下一步就不用重算了。这叫做 <strong>KV Cache</strong>。</li>
+<li><strong>代码对应：</strong> 看最下面的函数 <code>store_cache</code>。<ul>
+<li><code>k_cache</code>, <code>v_cache</code>: 这是<strong>仓库</strong>（显存里已经开辟好的一大块空间）。</li>
+<li><code>k</code>, <code>v</code>: 这是<strong>新货物</strong>（当前这一步刚刚算出来的数据）。</li>
+<li><code>indices</code>: 这是<strong>货架号</strong>（告诉程序，新货物应该放在仓库的第几行）。</li>
+</ul>
+</li>
+<li><strong>结论：</strong> 这个文件的唯一目的，就是把 <code>k</code> 和 <code>v</code> 里的数据，按照 <code>indices</code> 指定的位置，极速拷贝到 <code>k_cache</code> 和 <code>v_cache</code> 里。</li>
+</ul>
+<h4>✅ Task 2: 搞懂数据预处理 —— 为什么要变形？</h4>
+<p><strong>核心观点：</strong> C++/CUDA 喜欢“扁平”和“字节”，不喜欢复杂的形状。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>store_cache</code> 函数的前几行。
+    <code>python
+    num_tokens = k_cache.shape[0]
+    k_cache = k_cache.view(num_tokens, -1)  # 1. 压扁
+    v_cache = v_cache.view(num_tokens, -1)
+    element_size = k_cache.shape[1] * k_cache.element_size() # 2. 算字节大小</code></li>
+<li><strong>解释 1 (压扁)：</strong> <code>view(num_tokens, -1)</code> 把原本可能形状很复杂的张量（比如 <code>[Batch, Head, Dim]</code>）强行变成二维的 <code>[行数, 这一行所有数据的总长度]</code>。这就像把立体拼图拆开铺平，为了方便底层代码一行一行地拷贝。</li>
+<li><strong>解释 2 (算大小)：</strong> <code>element_size</code> 计算的是“一行数据到底占多少个字节”。<ul>
+<li>底层 CUDA 核函数通常不关心你是 float16 还是 float32，它只关心：“我要搬运多少个字节？”。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 搞懂 JIT (Just-In-Time) —— 为什么要“现编现用”？</h4>
+<p><strong>核心观点：</strong> Python 太慢，我们需要现场编译一段 C++ 代码来跑。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>_jit_store_module</code> 函数 和 <code>@lru_cache</code> 装饰器。
+    <code>python
+    @lru_cache(maxsize=None)
+    def _jit_store_module(element_size: int, ...):
+        # ...
+        return load_jit("store", ...)</code></li>
+<li><strong>解释 1 (JIT)：</strong> <code>load_jit</code> 是一个魔法函数（来自同目录下的 utils）。它会读取 <code>store.cu</code>（一个写满 CUDA C++ 代码的文件），并在程序运行时把它编译成机器码。</li>
+<li><strong>解释 2 (为什么要传 element_size)：</strong> C++ 需要知道内存布局。这里通过 <code>make_cpp_args</code> 把数据的字节宽度传给 C++ 模板，生成一个专门处理这种宽度数据的“专用搬运工”。</li>
+<li><strong>解释 3 (LRU Cache)：</strong> 编译 C++ 是很慢的（可能要几秒）。<code>@lru_cache</code> 的作用是：如果下次来的 <code>element_size</code> 和上次一样，就直接用上次编译好的，别再重新编译了。</li>
+</ul>
+<h4>✅ Task 4: 搞懂“启动” —— 怎么让显卡干活？</h4>
+<p><strong>核心观点：</strong> Python 只是发号施令的指挥官，显卡（GPU）才是苦力。</p>
+<ul>
+<li><strong>代码对应：</strong> <code>store_cache</code> 的最后两行。
+    <code>python
+    module = _jit_store_module(element_size) # 1. 拿到指挥棒
+    module.launch(k_cache, v_cache, indices, k, v) # 2. 发射！</code></li>
+<li><strong>解释 1：</strong> <code>module</code> 就是刚才编译好的那个高性能 C++ 模块。</li>
+<li><strong>解释 2：</strong> <code>module.launch(...)</code> 是 Python 调用 C++ 的接口。它把 Python 的 Tensor（张量）的内存地址传给 C++，C++ 代码会在 GPU 上启动成百上千个线程，并行地把数据“搬”到指定位置。</li>
+</ul>
+<hr />
+<h3>总结：整个流程图解</h3>
+<p>如果你要把这段代码讲给别人听，可以按这个顺序：</p>
+<ol>
+<li>
+<p><strong>准备阶段 (<code>store_cache</code>)</strong>：</p>
+<ul>
+<li>拿到仓库 (<code>k_cache</code>) 和货物 (<code>k</code>)。</li>
+<li>把它们想象成平铺的二维表格。</li>
+<li>算出每一行有多宽（字节数）。</li>
+</ul>
+</li>
+<li>
+<p><strong>找工具阶段 (<code>_jit_store_module</code>)</strong>：</p>
+<ul>
+<li>问系统：有没有处理这种宽度数据的搬运工？</li>
+<li>如果有（缓存里有），直接拿来用。</li>
+<li>如果没有，赶紧现场根据 <code>store.cu</code> 编译一个（JIT），并记住它。</li>
+</ul>
+</li>
+<li>
+<p><strong>执行阶段 (<code>launch</code>)</strong>：</p>
+<ul>
+<li>把仓库地址、货物地址、货架号 (<code>indices</code>) 交给这个搬运工。</li>
+<li>搬运工在 GPU 上飞快地把货物塞进仓库。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话总结：</strong>
+这是一个<strong>Python 包装器</strong>，它负责计算数据的大小和形状，然后<strong>动态编译并调用</strong>底层的 <strong>CUDA C++ 代码</strong>，以便<strong>极速地</strong>将 KV Cache 数据存入显存。</p>

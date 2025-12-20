@@ -1,0 +1,108 @@
+<h1>python/minisgl/server/launch.py</h1>
+<p>这份代码文件 <code>launch.py</code> 其实就是整个 <strong>MiniSGL 系统的“总启动器”</strong>。它的作用就像是一个工厂的<strong>开工电闸</strong>。</p>
+<p>为了让你更容易理解，我把这个代码执行的过程想象成<strong>开一家餐厅（AI推理服务）</strong>。下面是一个按时间顺序排列的 <strong>Task Todo List（任务清单）</strong>，系统会一步步勾选这些任务来完成启动。</p>
+<hr />
+<h3>📋 任务清单：启动 MiniSGL 服务</h3>
+<h4>Task 1: 阅读“开店指南” (解析参数)</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>launch_server</code> 函数开头 -&gt; <code>parse_args(sys.argv[1:], run_shell)</code></li>
+<li><strong>在干什么</strong>:
+    系统首先看你输入的命令（比如 <code>python launch.py --model llama3 --port 8000</code>）。它需要弄清楚：<ul>
+<li>我们要加载哪个模型？</li>
+<li>用几张显卡（TP size）？</li>
+<li>监听哪个端口？</li>
+</ul>
+</li>
+<li><strong>观点</strong>: 一切始于配置。没有配置，系统不知道该干嘛。</li>
+</ul>
+<h4>Task 2: 制定“招工计划” (定义 <code>start_subprocess</code>)</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>launch_server</code> 函数内部定义的 <code>def start_subprocess(): ...</code></li>
+<li><strong>在干什么</strong>:
+    这里<strong>并没有立刻启动</strong>进程，而是写好了一份“计划书”。这份计划书规定了需要招聘哪些后台工人（子进程）来干活。<ul>
+<li><strong>工人A (Scheduler)</strong>: 负责控制显卡进行计算（这是最核心的大脑）。</li>
+<li><strong>工人B (Detokenizer)</strong>: 负责把模型算出的数字转回成文字（解码）。</li>
+<li><strong>工人C (Tokenizer)</strong>: 负责把用户输入的文字转成数字（编码）。</li>
+</ul>
+</li>
+<li><strong>观点</strong>: Python 的 GIL 锁限制了多线程性能，所以 AI 推理通常使用 <strong>多进程 (Multiprocessing)</strong>。这里准备用 <code>spawn</code> 方式启动多个独立的进程。</li>
+</ul>
+<h4>Task 3: 启动“前台接待” (运行 API Server)</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>launch_server</code> 函数末尾 -&gt; <code>run_api_server(..., start_subprocess, ...)</code></li>
+<li><strong>在干什么</strong>:
+    系统先启动 Web 服务器（比如 FastAPI），这就是餐厅的“前台”，准备接收用户的 HTTP 请求。<ul>
+<li><strong>关键点</strong>: <code>run_api_server</code> 内部会调用我们在 Task 2 中制定的 <code>start_subprocess</code> 计划。也就是说，前台就位后，才开始呼叫后台厨师就位。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 执行招工，后台各就各位 (启动子进程)</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>start_subprocess</code> 函数内部</li>
+<li><strong>在干什么</strong>:
+    现在真正开始创建进程了（<code>mp.Process(...).start()</code>）。<ol>
+<li><strong>启动 Scheduler (调度器)</strong>:<ul>
+<li>如果有 4 张显卡，就会启动 4 个 Scheduler 进程，每个对应一张卡（<code>minisgl-TP{i}-scheduler</code>）。</li>
+</ul>
+</li>
+<li><strong>启动 De-tokenizer (解码器)</strong>:<ul>
+<li>启动 1 个进程专门处理输出文本。</li>
+</ul>
+</li>
+<li><strong>启动 Tokenizer (编码器)</strong>:<ul>
+<li>启动 N 个进程处理输入文本（根据 <code>server_args.num_tokenizer</code> 决定）。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>Task 5: 全员点名确认 (ACK Queue 同步)</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>ack_queue.get()</code> 和 <code>ack_queue.put("Scheduler is ready")</code></li>
+<li><strong>在干什么</strong>:
+    这是一个非常重要的<strong>同步机制</strong>。<ul>
+<li>主进程（前台）创建了一个队列 <code>ack_queue</code>。</li>
+<li>它会卡在这里死等（<code>ack_queue.get()</code>），直到所有子进程（Scheduler, Tokenizer 等）都加载完模型，并往队列里发送一句 "I'm ready"。</li>
+<li>只有收到 <strong>Scheduler + Tokenizers + Detokenizer</strong> 所有人的确认，系统才会打印 "Ready"，正式对外服务。</li>
+<li><strong>观点</strong>: 防止模型还没加载进显存，用户的请求就进来了，导致报错。这叫“优雅启动”。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 6: 核心大脑开始运转 (Scheduler 逻辑)</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>_run_scheduler</code> 函数</li>
+<li><strong>在干什么</strong>:
+    这是显卡进程（Scheduler）内部执行的逻辑：<ol>
+<li><code>import torch</code>: 导入 PyTorch。</li>
+<li><code>Scheduler(args)</code>: 加载模型权重到 GPU。</li>
+<li><code>scheduler.sync_all_ranks()</code>: 如果有多张显卡，大家对个表，确保步调一致。</li>
+<li><code>ack_queue.put(...)</code>: 告诉主进程“我准备好了”。</li>
+<li><code>scheduler.run_forever()</code>: <strong>进入死循环</strong>。<ul>
+<li>这个死循环会不断检查有没有新的推理请求进来，有就算，没有就等。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结一下这段代码的逻辑架构</h3>
+<p>这个文件其实构建了一个 <strong>"1 + N"</strong> 的架构：</p>
+<ol>
+<li>
+<p><strong>1 个主进程 (API Server)</strong>:</p>
+<ul>
+<li>负责和用户说话（HTTP 请求）。</li>
+<li>负责管理所有子进程的生杀大权。</li>
+</ul>
+</li>
+<li>
+<p><strong>N 个后台子进程 (Workers)</strong>:</p>
+<ul>
+<li><strong>Scheduler 进程</strong>: 扛着沉重的模型（显存），负责最繁重的矩阵计算。</li>
+<li><strong>Tokenizer 进程</strong>: 负责文本处理的脏活累活。</li>
+</ul>
+</li>
+</ol>
+<p><strong>为什么你看不懂？</strong>
+因为它混合了 <strong>Web服务启动</strong> 和 <strong>多进程管理</strong>。
+最核心的一行代码其实是 <code>mp.Process(target=_run_scheduler, ...).start()</code>，这行代码把 <code>_run_scheduler</code> 这个函数扔到了另一个独立的进程里去跑，让它在那边独自控制显卡，不干扰主进程处理网络请求。</p>

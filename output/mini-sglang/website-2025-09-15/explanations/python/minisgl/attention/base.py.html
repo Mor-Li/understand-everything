@@ -1,0 +1,118 @@
+<h1>python/minisgl/attention/base.py</h1>
+<p>这段代码确实比较抽象，因为它属于<strong>底层架构代码</strong>。它写的不是“具体的算法”，而是“算法应该长什么样”的<strong>标准（接口/Interface）</strong>。</p>
+<p>你可以把它想象成在制定<strong>USB接口标准</strong>：这段代码规定了“如果你想造一个可以在我这里用的Attention（注意力机制）计算器，你的插头必须长什么样，必须有哪些功能”。</p>
+<p>为了让你看懂，我为你制定了一个 <strong>6步学习 Task List</strong>，我们一步步来拆解。</p>
+<hr />
+<h3>📋 学习任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1：理解核心概念——什么是“接口/基类” (The Blueprint)</strong></li>
+<li><strong>Task 2：理解数据容器——<code>BaseAttnMetadata</code></strong></li>
+<li><strong>Task 3：理解核心计算器——<code>BaseAttnBackend</code></strong></li>
+<li><strong>Task 4：补充背景知识——LLM的两个阶段 (Prefill vs Decode)</strong></li>
+<li><strong>Task 5：理解混合管理器——<code>HybridBackend</code></strong></li>
+<li><strong>Task 6：理解高级优化——CUDA Graph (Capture/Replay)</strong></li>
+</ol>
+<hr />
+<h3>💡 逐步讲解</h3>
+<h4>✅ Task 1：理解核心概念——什么是“接口/基类”</h4>
+<p><strong>代码对应：</strong> <code>class BaseAttnMetadata(ABC)</code> 和 <code>class BaseAttnBackend(ABC)</code></p>
+<ul>
+<li><strong>观点：</strong> 这两个类都继承自 <code>ABC</code> (Abstract Base Class)。这意味着它们是<strong>虚的</strong>，不能直接用。</li>
+<li><strong>白话解释：</strong> 这就像是<strong>“岗位职责说明书”</strong>。<ul>
+<li>老板（Minisgl框架）说：“我需要招一个负责算注意力的员工（Backend），不管你是用 FlashAttention 还是 PagedAttention 算法，你入职必须会做这几件事：<code>forward</code>（计算）、<code>prepare_metadata</code>（准备数据）。”</li>
+<li>如果某个具体的算法类不包含这些方法，程序就会报错。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2：理解数据容器——<code>BaseAttnMetadata</code></h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">BaseAttnMetadata</span><span class="p">(</span><span class="n">ABC</span><span class="p">):</span>
+    <span class="nd">@abstractmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_positions</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span> <span class="o">...</span>
+    <span class="c1"># ...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点：</strong> 计算注意力需要一些辅助信息（元数据）。</li>
+<li><strong>白话解释：</strong> 这是一个<strong>“数据包”</strong>。<ul>
+<li>在计算大模型时，光有 Q/K/V（查询/键/值）向量是不够的。我们还需要知道：</li>
+<li><code>get_positions()</code>: 当前处理的词在句子里的位置是第几个？</li>
+<li><code>get_last_indices()</code>: 这个批次（Batch）里，每句话的结尾在哪里？</li>
+<li>这个类就是规定：不管你怎么存数据，你必须给我提供方法能拿到这俩信息。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3：理解核心计算器——<code>BaseAttnBackend</code></h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">BaseAttnBackend</span><span class="p">(</span><span class="n">ABC</span><span class="p">):</span>
+    <span class="nd">@abstractmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">layer_id</span><span class="p">,</span> <span class="n">batch</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span> <span class="o">...</span>
+
+    <span class="nd">@abstractmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">prepare_metadata</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">batch</span><span class="p">,</span> <span class="n">allow_graph</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span> <span class="o">...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点：</strong> 这是所有注意力计算实现的父类。</li>
+<li><strong>白话解释：</strong> 这是<strong>“计算器”的标准</strong>。<ul>
+<li><code>forward</code>: <strong>这是最重要的函数</strong>。给它 Q, K, V，它负责算出结果。这是大模型推理的核心数学运算发生的地方。</li>
+<li><code>prepare_metadata</code>: 在开始算之前，先把辅助数据整理好（比如把数据搬到 GPU 上，或者计算一下内存偏移量）。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4：补充背景知识——LLM的两个阶段</h4>
+<p><strong>这是理解后续代码的关键背景！</strong></p>
+<p>大模型生成文字分为两个截然不同的阶段：
+1.  <strong>Prefill (预填充/首字生成)：</strong> 把你输入的提示词（Prompt）一次性读进去，算出第一个字。这步计算量极大，是<strong>并行</strong>的。
+2.  <strong>Decode (解码/后续生成)：</strong> 根据上一个字，生成下一个字，一个接一个蹦。这步计算量小，是<strong>串行</strong>的。</p>
+<p><strong>为什么要分？</strong> 因为这两个阶段的计算特性完全不同，通常需要用<strong>两套不同的算法</strong>（Backend）来优化速度。</p>
+<h4>✅ Task 5：理解混合管理器——<code>HybridBackend</code></h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">HybridBackend</span><span class="p">(</span><span class="n">BaseAttnBackend</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">prefill_backend</span><span class="p">,</span> <span class="n">decode_backend</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">prefill_backend</span> <span class="o">=</span> <span class="n">prefill_backend</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">decode_backend</span> <span class="o">=</span> <span class="n">decode_backend</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">batch</span><span class="o">.</span><span class="n">is_prefill</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">prefill_backend</span><span class="o">.</span><span class="n">forward</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">decode_backend</span><span class="o">.</span><span class="n">forward</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点：</strong> 这是一个包装器（Wrapper），它包含了两个子后端。</li>
+<li><strong>白话解释：</strong> 这是一个<strong>“包工头”</strong>。<ul>
+<li>它手里有两个工人：<code>prefill_backend</code>（专门干重活，处理长文章）和 <code>decode_backend</code>（专门干细活，一个字一个字蹦）。</li>
+<li>当任务来了（<code>forward</code> 被调用），它会看一眼工单 <code>batch.is_prefill</code>：<ul>
+<li>如果是刚开始读文章，就派 <code>prefill_backend</code> 上。</li>
+<li>如果是正在生成文字，就派 <code>decode_backend</code> 上。</li>
+</ul>
+</li>
+<li><strong>这就是这个文件的核心逻辑：根据阶段动态切换算法。</strong></li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 6：理解高级优化——CUDA Graph (Capture/Replay)</h4>
+<p><strong>代码对应：</strong> <code>init_capture_graph</code>, <code>prepare_for_capture</code>, <code>prepare_for_replay</code></p>
+<ul>
+<li><strong>观点：</strong> 这些是为了加速 Python 在 GPU 上的运行速度。</li>
+<li><strong>白话解释：</strong> 这是一个<strong>“录像回放”机制</strong>。<ul>
+<li>在 Decode 阶段，因为每次只算一个字，Python 频繁给 GPU 发指令的开销（Overhead）可能比 GPU 算数的时间还长。</li>
+<li><strong>Capture (录制)：</strong> 我们让 GPU 假装跑一次，把所有的指令路径“录”下来。</li>
+<li><strong>Replay (回放)：</strong> 下次再跑时，直接按“播放键”，跳过 Python 的指令解析，直接让 GPU 跑。</li>
+<li>你会发现 <code>HybridBackend</code> 里，这些跟 Graph 有关的方法<strong>只调用了 decode_backend</strong>。</li>
+<li><strong>为什么？</strong> 因为 Prefill 阶段一次算很多数据，本身就慢，不需要这种微小的优化；而 Decode 阶段非常需要这种优化来降低延迟。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🚀 总结 (Summary)</h3>
+<p>把这个文件看作一个<strong>团队架构图</strong>：</p>
+<ol>
+<li><strong><code>BaseAttnMetadata</code></strong>: 规定了<strong>档案员</strong>必须怎么存取数据。</li>
+<li><strong><code>BaseAttnBackend</code></strong>: 规定了<strong>计算员</strong>必须会算数(<code>forward</code>)和准备工作(<code>prepare</code>)。</li>
+<li><strong><code>HybridBackend</code></strong>: 是<strong>项目经理</strong>。他不懂具体怎么算，但他招了两个计算员（一个擅长读长文，一个擅长写短句），根据当前任务是“读”还是“写”，指挥对应的员工去干活。</li>
+</ol>
+<p>这样是不是清晰多了？</p>

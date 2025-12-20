@@ -1,0 +1,73 @@
+<h1>tests/kernel/test_index.py</h1>
+<p>这份代码其实是一个<strong>测试脚本</strong>。它的核心目的是为了验证一个自定义的、高性能的底层函数（在这个代码里叫 <code>indexing</code>）是否写对了，并且跑得够不够快。</p>
+<p>这个底层函数做的事情叫 <strong>Embedding Lookup（词嵌入查找）</strong>。简单说，就是给一堆数字 ID（比如单词的编号），从一个巨大的表格（权重矩阵）里把对应的向量行取出来。</p>
+<p>为了让你更容易理解，我把它拆解成一个 <strong>5步走的 Todo List</strong>，一步步带你读懂它：</p>
+<h3>📝 Task List: 读懂 <code>test_index.py</code></h3>
+<h4>✅ Task 1: 理解“标准答案”是什么 (<code>ref_indexing</code>)</h4>
+<p>首先，我们要知道“正确的结果”应该长什么样。代码里定义了一个 <code>ref_indexing</code> 函数，这就是<strong>参照组（Reference）</strong>。</p>
+<ul>
+<li><strong>普通模式 (<code>else</code> 分支):</strong><ul>
+<li>直接调用 PyTorch 自带的 <code>F.embedding</code>。</li>
+<li><strong>比喻：</strong> 老师手里有一本完整的字典。你报第 5 页，老师直接翻到第 5 页给你看。这是最基础的操作。</li>
+</ul>
+</li>
+<li><strong>复杂模式 (<code>if vocab_range</code> 分支):</strong><ul>
+<li>这是为了<strong>多显卡并行（Tensor Parallelism）</strong>准备的。</li>
+<li><strong>比喻：</strong> 字典太厚了，被撕成了 4 本，分别给 4 个人拿。你手里拿的是第 2 本（比如包含第 1000 到 2000 页）。</li>
+<li><strong>逻辑：</strong><ol>
+<li>如果有人问你要第 500 页，这页不在你手里，你就返回全是 0 的白纸（<code>result[indices_mask] = 0</code>）。</li>
+<li>如果有人问你要第 1005 页，这页在你手里。但对于你这本分册来说，它是你的第 5 页（<code>indices = indices - start</code>），所以你翻到你的第 5 页给他。</li>
+</ol>
+</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 准备考场 (<code>test_indexing</code> 的前半部分)</h4>
+<p>现在开始第一个测试函数 <code>test_indexing</code>。</p>
+<ul>
+<li><strong>造数据：</strong><ul>
+<li><code>EMBED_SIZE = 4096</code>: 每个单词对应的向量长度。</li>
+<li><code>NUM_TOKENS = 131072</code>: 字典里总共有这么多单词。</li>
+<li><code>weights</code>: 随机生成一个巨大的字典（权重矩阵）。</li>
+</ul>
+</li>
+<li><strong>设置难度：</strong><ul>
+<li>用一个循环 <code>for bs in ...</code>，测试不同的<strong>Batch Size（一次查多少个词）</strong>。从查 1 个词一直测到查 32768 ($2^{15}$) 个词。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 验证准确性 (Correctness Check)</h4>
+<p>在 <code>test_indexing</code> 循环内部，这是最关键的一步：<strong>对答案</strong>。</p>
+<ol>
+<li><strong>跑一遍我们的新代码：</strong> <code>result = indexing(...)</code> （这是 <code>minisgl</code> 库里自己写的加速版函数）。</li>
+<li><strong>跑一遍标准代码：</strong> <code>expected = ref_indexing(...)</code> （这是 Task 1 里的标准做法）。</li>
+<li><strong>对比：</strong> <code>assert torch.all(result == expected)</code>。<ul>
+<li><strong>含义：</strong> 如果两者结果完全一样，说明新写的加速代码逻辑是对的；如果不一样，程序报错，测试失败。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 4: 验证速度 (Performance Check)</h4>
+<p>如果答案对上了，下一步就是看谁跑得快。</p>
+<ul>
+<li><strong>代码：</strong> <code>compare_memory_kernel_perf(...)</code></li>
+<li><strong>含义：</strong> 这是一个性能测试工具。它会反复运行你的新函数和标准函数，计算显存带宽（Memory Footprint），看你的新函数是不是比 PyTorch 原生的更快。</li>
+</ul>
+<h4>✅ Task 5: 进阶测试——分块查找 (<code>test_indexing_with_mask</code>)</h4>
+<p>代码的最后一部分 <code>test_indexing_with_mask</code> 是一个更难的考试。</p>
+<ul>
+<li><strong>背景：</strong> 模拟 <strong>TP (Tensor Parallelism)</strong> 环境，也就是 Task 1 提到的“把字典撕成几份”。</li>
+<li><strong>设置：</strong><ul>
+<li><code>TP = 4</code>: 假设有 4 张显卡。</li>
+<li><code>MASK_RANGE</code>: 设定当前只关注字典的某一部分（比如第 2 部分）。</li>
+</ul>
+</li>
+<li><strong>测试逻辑：</strong><ul>
+<li>再次运行 <code>indexing</code> 和 <code>ref_indexing</code>，但这次传入了 <code>vocab_range</code> 参数。</li>
+<li><strong>目的：</strong> 验证那个“超出范围填 0，在范围内做减法偏移”的逻辑在加速版内核里是否也写对了。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>💡 总结</h3>
+<p>这个文件的逻辑其实就一句话：</p>
+<p><strong>“我写了一个新的、跑得更快的查字典函数（<code>indexing</code>），我现在要造一堆随机数据，分别在‘整本字典’和‘分册字典’两种情况下，跟 PyTorch 原生的查字典函数比对结果。如果结果一致，就顺便测测它到底有多快。”</strong></p>

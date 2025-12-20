@@ -1,0 +1,87 @@
+<h1>python/minisgl/scheduler/table.py</h1>
+<p>这段代码看起来很抽象，是因为它是一个<strong>资源管理器</strong>的底层实现。要看懂它，你得先建立一个心理模型。</p>
+<p>我们可以把 <code>TableManager</code> 想象成一个<strong>餐厅的领班</strong>，而 GPU 显存就是餐厅里的<strong>座位</strong>。</p>
+<p>为了让你一步步理解，我为你列了一个 <strong>“学习任务清单 (Todo List)”</strong>。我们按照这个顺序，把代码拆解开来看。</p>
+<h3>任务清单 (Todo List)</h3>
+<ol>
+<li><strong>Task 1: 理解“槽位 (Slot)”的概念</strong> —— 搞懂我们到底在管理什么。</li>
+<li><strong>Task 2: 盘点家底 (<code>__init__</code>)</strong> —— 看看餐厅刚开业时有什么资源。</li>
+<li><strong>Task 3: 安排座位 (<code>allocate</code>)</strong> —— 有客人（新请求）来了怎么处理。</li>
+<li><strong>Task 4: 清理座位 (<code>free</code>)</strong> —— 客人走了（请求结束）怎么处理。</li>
+<li><strong>Task 5: 理解两本“账簿” (<code>page_table</code> &amp; <code>token_pool</code>)</strong> —— 领班手里的记录本是干嘛的。</li>
+</ol>
+<hr />
+<h3>逐步讲解</h3>
+<h4>Task 1: 理解“槽位 (Slot)”的概念</h4>
+<p>在大模型推理（SGLang/vLLM 等框架）中，我们通常会同时处理多个请求（Batching）。
+假设我们允许同时处理 <code>max_running_reqs</code> 个请求（比如 10 个）。
+这就意味着，我们需要在显存里预留 10 行空间。
+*   <strong>Slot (槽位)</strong>：就是这 10 行空间里的“行号”（0, 1, 2 ... 9）。
+*   这个类的核心目的，就是<strong>分配这几个数字（0-9）给进来的请求</strong>。</p>
+<h4>Task 2: 盘点家底 (<code>__init__</code>)</h4>
+<p>看代码的初始化部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">max_running_reqs</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">page_table</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">_max_running_reqs</span> <span class="o">=</span> <span class="n">max_running_reqs</span>
+    <span class="c1"># 重点：初始化空闲列表</span>
+    <span class="c1"># 如果 max_running_reqs 是 5，这就生成了 [0, 1, 2, 3, 4]</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">_free_slots</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">max_running_reqs</span><span class="p">))</span> 
+
+    <span class="bp">self</span><span class="o">.</span><span class="n">page_table</span> <span class="o">=</span> <span class="n">page_table</span>
+    <span class="c1"># 创建一个和 page_table 一样大的空表，用来存 Token</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">token_pool</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty_like</span><span class="p">(</span><span class="n">page_table</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>领班视角</strong>：餐厅刚开门，有 5 张桌子。</li>
+<li><strong>动作</strong>：领班拿出一张纸 (<code>_free_slots</code>)，写上：<code>[0, 1, 2, 3, 4]</code>。表示这 5 张桌子全是空的，都可以坐人。</li>
+</ul>
+<h4>Task 3: 安排座位 (<code>allocate</code>)</h4>
+<p>当一个新的推理请求（Request）进来时，我们需要给它分配一个位置。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">allocate</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+    <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_free_slots</span><span class="o">.</span><span class="n">pop</span><span class="p">()</span>
+</code></pre></div>
+
+<ul>
+<li><strong>领班视角</strong>：客人 A 来了。</li>
+<li><strong>动作</strong>：领班看了一眼纸上的 <code>[0, 1, 2, 3, 4]</code>。</li>
+<li><strong>执行</strong>：使用 <code>pop()</code> 把最后一个数字 <code>4</code> 拿走，告诉客人 A：“你坐 4 号桌”。</li>
+<li><strong>结果</strong>：现在空闲列表变成了 <code>[0, 1, 2, 3]</code>。</li>
+</ul>
+<h4>Task 4: 清理座位 (<code>free</code>)</h4>
+<p>当一个请求生成完毕（Finished），它占用的位置需要释放，给别人用。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">free</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">_free_slots</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">slot</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>领班视角</strong>：坐在 4 号桌的客人 A 吃完了，走了。</li>
+<li><strong>动作</strong>：领班把 <code>4</code> 这个数字写回纸上。</li>
+<li><strong>执行</strong>：<code>append(4)</code>。</li>
+<li><strong>结果</strong>：空闲列表变回了 <code>[0, 1, 2, 3, 4]</code>（顺序可能不同，但这不重要，只要知道 4 号又空了就行）。</li>
+</ul>
+<h4>Task 5: 理解两本“账簿” (<code>page_table</code> &amp; <code>token_pool</code>)</h4>
+<p>这部分涉及 GPU 显存的具体管理，是这个类除了“分桌子”以外持有的数据。</p>
+<div class="codehilite"><pre><span></span><code><span class="bp">self</span><span class="o">.</span><span class="n">page_table</span> <span class="o">=</span> <span class="n">page_table</span>
+<span class="bp">self</span><span class="o">.</span><span class="n">token_pool</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty_like</span><span class="p">(</span><span class="n">page_table</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong><code>page_table</code> (页表)</strong>：<ul>
+<li>这是用来做 <strong>PagedAttention</strong> 的核心数据结构。</li>
+<li>你可以理解为：虽然客人坐在“4 号桌”，但他产生的数据（KV Cache）实际上是散落在仓库（显存）的不同角落的。这张表记录了“4 号桌的数据在仓库的哪些柜子里”。</li>
+</ul>
+</li>
+<li><strong><code>token_pool</code> (Token 池)</strong>：<ul>
+<li>这是用来存大模型生成的具体的词（Token ID）的。</li>
+<li>比如 4 号桌的客人生成了“你好”，对应的 Token ID 就会被填入 <code>token_pool</code> 的第 4 行里。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个 <code>TableManager</code> 实际上就是一个<strong>简单的 ID 分配器</strong>，外加持有了两个大的 Tensor（数据表）。</p>
+<ol>
+<li>它维护一个 <code>[0, 1, ... N]</code> 的列表。</li>
+<li>来一个请求，给一个 ID（<code>allocate</code>）。</li>
+<li>走一个请求，回收一个 ID（<code>free</code>）。</li>
+<li>这个 ID 对应着 <code>page_table</code> 和 <code>token_pool</code> 中的<strong>行号</strong>，确保每个正在运行的请求都有自己独立的数据存放区，互不干扰。</li>
+</ol>

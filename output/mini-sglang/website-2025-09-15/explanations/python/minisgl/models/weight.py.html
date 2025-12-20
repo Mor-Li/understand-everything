@@ -1,0 +1,88 @@
+<h1>python/minisgl/models/weight.py</h1>
+<p>这份代码确实涉及到了大模型推理中最核心、但也最晦涩的<strong>“权重加载”</strong>和<strong>“分布式切分”</strong>逻辑。</p>
+<p>简单来说，这个文件的任务就是：<strong>把模型文件从网上下载下来，根据你有几张显卡把模型切成几块（切蛋糕），然后重新打包一下格式，最后放到显卡里准备干活。</strong></p>
+<p>为了让你听懂，我把这个过程拆解成一个 <strong>Task Todo List (待办事项清单)</strong>，咱们一步一步来划钩。</p>
+<hr />
+<h3>📋 任务清单 (Task Todo List)</h3>
+<ol>
+<li><strong>[准备工作] 下载与读取</strong>：从 HuggingFace 下载模型文件，并把它们读到内存里。</li>
+<li><strong>[核心难点] 模型切分 (Sharding)</strong>：因为模型太大或者为了加速，要把模型的参数“切”开，分给不同的显卡（GPU）。</li>
+<li><strong>[搬运] 转移阵地</strong>：把处理好的数据从 CPU 内存搬运到 GPU 显存。</li>
+<li><strong>[优化] 权重合并 (Merging)</strong>：为了计算更快，把原本分散的几个矩阵拼成一个大矩阵（比如 Q、K、V 拼在一起）。</li>
+</ol>
+<hr />
+<h3>💡 详细步骤讲解</h3>
+<h4>Task 1: 下载与读取 (Getting the Raw Data)</h4>
+<p><strong>对应代码函数：</strong> <code>load_hf_weight</code> 的前半部分</p>
+<ul>
+<li><strong>这是啥？</strong>
+    这就好比你要做饭，得先去超市（HuggingFace）买菜，然后把菜拿回家放在桌子（CPU 内存）上。</li>
+<li><strong>代码干了啥？</strong><ol>
+<li><code>snapshot_download</code>: 自动去 HuggingFace 网站下载模型文件（通常是 <code>.safetensors</code> 格式，比旧的 <code>.bin</code> 更快更安全）。</li>
+<li><code>safetensors.safe_open</code>: 把下载好的文件打开，把里面的“张量”（其实就是一堆数字矩阵）读到一个字典 <code>state_dict</code> 里。此时，模型还在 CPU 内存里，是一个完整的、没被动过的原始模型。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 2: 模型切分 (Sharding / Tensor Parallelism)</h4>
+<p><strong>对应代码函数：</strong> <code>_shard_state_dict</code> (这是最难懂的部分)</p>
+<ul>
+<li><strong>这是啥？</strong>
+    假设你买了一个巨型蛋糕（模型权重），如果你只有一张显卡，你就直接吃。但如果你有 2 张或 4 张显卡（TP, Tensor Parallelism），你需要把蛋糕<strong>切开</strong>，每张卡只拿属于它的那一块。这就叫 <strong>TP 切分</strong>。</li>
+<li><strong>为什么要切？</strong><ol>
+<li><strong>显存不够</strong>：单卡放不下。</li>
+<li><strong>速度更快</strong>：大家一起算，比一个人算要快。</li>
+</ol>
+</li>
+<li><strong>代码怎么切的？</strong> (根据矩阵的名字来决定横着切还是竖着切)<ul>
+<li><strong>竖着切 (Column Split)</strong>: <code>q_proj</code>, <code>k_proj</code>, <code>v_proj</code>, <code>gate_proj</code>, <code>up_proj</code>。<ul>
+<li><em>解释</em>：这些层通常负责把输入数据的维度变大，所以按输出维度（列）切分，每张卡算出一部分结果。</li>
+</ul>
+</li>
+<li><strong>横着切 (Row Split)</strong>: <code>o_proj</code>, <code>down_proj</code>。<ul>
+<li><em>解释</em>：这些层通常负责把数据汇总，所以按输入维度（行）切分。</li>
+</ul>
+</li>
+<li><strong>切词表 (Vocab Split)</strong>: <code>lm_head</code>, <code>embed_tokens</code>。<ul>
+<li><em>解释</em>：词表太大了（比如几万个词），每张卡只负责管理一部分单词的权重。</li>
+</ul>
+</li>
+<li><strong>不切</strong>: 其他参数（比如 LayerNorm），每张卡都复制一份完整的。</li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<p><strong>代码解读</strong>: <code>value.chunk(n, dim=0)[r]</code> 的意思就是：把这个矩阵按行切成 <code>n</code> 份，我是第 <code>r</code> 号显卡，我拿第 <code>r</code> 份。</p>
+</blockquote>
+<h4>Task 3: 转移阵地 (Move to Device)</h4>
+<p><strong>对应代码函数：</strong> <code>load_hf_weight</code> 的倒数第二行</p>
+<ul>
+<li><strong>这是啥？</strong>
+    菜切好了，现在要下锅了。CPU 计算太慢，我们要把数据搬到 GPU 上。</li>
+<li><strong>代码干了啥？</strong>
+    <code>v.to(device)</code>：把刚才切好的、属于这张显卡的权重，从 CPU 内存移动到 GPU 显存。</li>
+</ul>
+<h4>Task 4: 权重合并 (Merging / Fusion)</h4>
+<p><strong>对应代码函数：</strong> <code>_merge_state_dict</code></p>
+<ul>
+<li><strong>这是啥？</strong>
+    这是为了<strong>计算加速</strong>。
+    在原始模型里，Q（查询）、K（键）、V（值）是三个独立的矩阵，计算时要启动三次内核。
+    但在推理引擎（如 vLLM 或这里的 minisgl）里，我们喜欢把它们拼成一个大矩阵 <code>QKV</code>。这样一次计算就能把 Q、K、V 都算出来，效率更高。</li>
+<li><strong>代码干了啥？</strong><ol>
+<li><strong>QKV 合并</strong>: 找到 <code>q_proj</code>, <code>k_proj</code>, <code>v_proj</code>，用 <code>torch.cat</code> 把它们拼起来，变成一个新的 <code>qkv_proj</code>。</li>
+<li><strong>GateUp 合并</strong>: 同理，把 Llama 架构中的 <code>gate_proj</code> 和 <code>up_proj</code> 拼成 <code>gate_up_proj</code>。</li>
+<li><strong>清理</strong>: 拼完之后，把原来独立的旧权重删掉，节省空间。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结 (Recap)</h3>
+<p>整个文件的逻辑流向是这样的：</p>
+<ol>
+<li><strong>下载</strong> (Download) -&gt; 拿到原始文件。</li>
+<li><strong>读取</strong> (Load) -&gt; 变成内存里的字典。</li>
+<li><strong>切分</strong> (Shard) -&gt; 如果有多张卡，我是第几号卡，我就只保留我那一份蛋糕，其他的扔掉。</li>
+<li><strong>上卡</strong> (To GPU) -&gt; 搬进显卡。</li>
+<li><strong>融合</strong> (Merge) -&gt; 为了跑得快，把零散的小矩阵拼成大矩阵。</li>
+</ol>
+<p>现在再回去看代码，是不是稍微清晰一点了？重点就看 <code>_shard_state_dict</code> (怎么切) 和 <code>_merge_state_dict</code> (怎么拼)。</p>

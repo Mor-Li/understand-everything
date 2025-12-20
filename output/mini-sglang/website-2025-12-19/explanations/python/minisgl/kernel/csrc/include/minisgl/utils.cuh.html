@@ -1,0 +1,89 @@
+<h1>python/minisgl/kernel/csrc/include/minisgl/utils.cuh</h1>
+<p>这份代码确实包含了很多 CUDA 编程中比较“底层”和“工程化”的细节，特别是涉及到 TVM 集成和一种叫 PDL (Programmatic Dependent Launch) 的高级特性，所以乍一看很难懂。</p>
+<p>你可以把这个文件想象成一个 <strong>“CUDA 编程瑞士军刀（工具箱）”</strong>。它不是具体的算法，而是为了让写算法的人更方便、更安全地操作 GPU。</p>
+<p>为了帮你理解，我把它拆解成一个 <strong>“从零开始构建一个 GPU 任务管理系统”</strong> 的 Todo List。我们一步步把这些功能加上去。</p>
+<hr />
+<h3>任务清单 (Todo List)</h3>
+<h4>✅ Task 1: 搞定 GPU 上的基础算术题 (Device 侧辅助)</h4>
+<p><strong>目标</strong>：GPU 里的线程（Thread）成千上万，我们需要算清楚怎么分配任务，怎么移动指针。
+<strong>代码对应</strong>：<code>namespace device</code> 里的内容。</p>
+<ol>
+<li><strong><code>kWarpThreads = 32u</code></strong>:<ul>
+<li><strong>解释</strong>：这是常识设定。GPU 执行指令的最小单位叫 Warp，通常包含 32 个线程。写在这里是为了方便后面引用。</li>
+</ul>
+</li>
+<li><strong><code>div_ceil</code> (向上取整除法)</strong>:<ul>
+<li><strong>场景</strong>：你有 100 个任务，每个线程块（Block）能处理 32 个。你需要几个块？$100/32 = 3$ 余 $4$，所以你需要 4 个块。</li>
+<li><strong>代码含义</strong>：<code>(a + b - 1) / b</code> 是经典的整数向上取整写法。</li>
+</ul>
+</li>
+<li><strong><code>pointer::offset</code> (安全的指针偏移)</strong>:<ul>
+<li><strong>场景</strong>：在 CUDA 里操作内存地址时，直接加减有时会因为数据类型大小不同而出错。</li>
+<li><strong>代码含义</strong>：这个函数强制把指针转成 <code>char*</code> (1字节)，然后按字节移动。这就像是说：“不管你是什么数据，我都按‘字节’为单位来移动地址”，确保内存操作的绝对精确。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 2: 出了事要能报警 (Host 侧报错机制)</h4>
+<p><strong>目标</strong>：GPU 也是会报错的，但它往往是“静默失败”。我们需要在 CPU 端检查 GPU 有没有干完活，或者有没有崩掉。
+<strong>代码对应</strong>：<code>namespace host</code> 里的 <code>CUDA_CHECK</code>。</p>
+<ol>
+<li><strong><code>CUDA_CHECK</code></strong>:<ul>
+<li><strong>场景</strong>：你调用了一个 CUDA 函数，比如“分配显存”。如果显存满了，函数会返回一个错误码。</li>
+<li><strong>代码含义</strong>：这个宏/函数包裹了 CUDA 的调用。如果返回的不是 <code>cudaSuccess</code>（成功），它就会利用 C++20 的 <code>std::source_location</code>（自动获取当前文件名和行号）抛出一个恐慌（Panic），告诉你：“嘿，第几行代码出错了，错误原因是xxx”。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 3: 提前申请“高速缓存” (Shared Memory 配置)</h4>
+<p><strong>目标</strong>：GPU 里有一种非常快但很小的内存叫 Shared Memory（共享内存）。有些内核（Kernel）需要的共享内存大小是不固定的，需要在运行时告诉驱动。
+<strong>代码对应</strong>：<code>set_smem_once</code>。</p>
+<ol>
+<li><strong><code>set_smem_once</code></strong>:<ul>
+<li><strong>场景</strong>：你的算法这次跑需要 10KB 高速缓存，下次可能需要 20KB。你得告诉 CUDA 驱动：“给我留这么大的地盘”。</li>
+<li><strong>代码含义</strong>：它调用 <code>cudaFuncSetAttribute</code> 来设置最大动态共享内存。</li>
+<li><strong>亮点</strong>：它用了一个 <code>static</code> 变量做检查。如果你第一次设了 20KB，第二次想设 10KB，可以；但如果你想设 30KB（超过了之前的最大值），它可能会报错或警告。这是为了防止运行时内存分配不足。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 4: 实现“接力跑” (PDL - 高级特性)</h4>
+<p><strong>目标</strong>：这是这个文件最难懂的部分。通常，GPU 跑完一个任务要告诉 CPU，CPU 再发下一个任务。这会有延迟。我们希望 GPU 任务像接力跑一样，前一个刚跑完，后一个立马接上，不用问 CPU。
+<strong>代码对应</strong>：<code>namespace PDL</code> (Programmatic Dependent Launch)。</p>
+<ol>
+<li><strong><code>PDL::wait</code> 和 <code>PDL::launch</code></strong>:<ul>
+<li><strong>概念</strong>：这是 NVIDIA 较新的技术。</li>
+<li><strong><code>wait</code></strong>: 就像接力赛里的下一棒选手，在那儿伸手等着（汇编指令 <code>griddepcontrol.wait</code>）。</li>
+<li><strong><code>launch</code></strong>: 就像上一棒选手，跑到了就递棒子（汇编指令 <code>griddepcontrol.launch_dependents</code>）。</li>
+<li><strong>作用</strong>：极大减少了微小任务之间的启动延迟。这在高性能图计算或大模型推理中非常重要。</li>
+</ul>
+</li>
+</ol>
+<h4>✅ Task 5: 也就是最重要的——启动器 (Kernel Launcher)</h4>
+<p><strong>目标</strong>：前面都是铺垫，现在我们要造一个“发射台”，把配置好的 Kernel 发射到 GPU 上去执行。
+<strong>代码对应</strong>：<code>struct LaunchKernel</code>。</p>
+<p>这个结构体是一个<strong>包装器（Wrapper）</strong>，它把复杂的 CUDA 启动参数封装起来，让你用起来更简单。</p>
+<ol>
+<li><strong>构造函数 (<code>LaunchKernel(...)</code>)</strong>:<ul>
+<li>它接收 <code>grid_dim</code> (多少个组), <code>block_dim</code> (每组多少人), <code>device</code> (哪个显卡/流)。</li>
+<li>它特别处理了 <code>TVM</code> 的环境，通过 <code>TVMFFIEnvGetStream</code> 拿到当前的计算流（Stream）。</li>
+</ul>
+</li>
+<li><strong><code>with_attr</code> (启用 PDL)</strong>:<ul>
+<li>如果你想用 Task 4 里的“接力跑”功能，调用这个函数。它会设置 <code>cudaLaunchAttributeProgrammaticStreamSerialization</code>，告诉驱动：“我们要搞接力了，注意配合”。</li>
+</ul>
+</li>
+<li><strong><code>operator()</code> (真正的发射按钮)</strong>:<ul>
+<li>当你像函数一样调用这个对象时（例如 <code>launcher(kernel_func, arg1, arg2)</code>），它内部会调用 <code>cudaLaunchKernelEx</code>。</li>
+<li>这是一个比传统的 <code>&lt;&lt;&lt;grid, block&gt;&gt;&gt;</code> 更底层的启动 API，因为它允许传入额外的属性（比如上面的 PDL 属性）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结：这个文件讲了什么？</h3>
+<p>如果把写 CUDA 代码比作<strong>做菜</strong>：</p>
+<ol>
+<li><strong><code>device</code> 里的函数</strong>：是切菜刀法指南（怎么切得准，怎么算分量）。</li>
+<li><strong><code>host::CUDA_CHECK</code></strong>：是厨房烟雾报警器（出事了立马叫）。</li>
+<li><strong><code>set_smem_once</code></strong>：是准备案板大小（根据食材多少准备多大的操作空间）。</li>
+<li><strong><code>PDL</code></strong>：是流水线操作守则（洗菜的洗完直接扔给切菜的，不用等厨师长下令）。</li>
+<li><strong><code>LaunchKernel</code></strong>：是全自动炒菜机（你把参数输进去，按下按钮，它负责协调一切并开始炒菜）。</li>
+</ol>
+<p><strong>一句话概括</strong>：这是一个<strong>集成了 TVM 环境、支持高级任务调度（PDL）的 CUDA 内核启动工具库</strong>。</p>

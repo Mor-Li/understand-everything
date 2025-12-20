@@ -1,0 +1,70 @@
+<h1>python/minisgl/benchmark/utils.py</h1>
+<p>这份代码其实是一个<strong>针对大语言模型（LLM）服务的压力测试（Benchmark）工具库</strong>。</p>
+<p>它的核心作用是：模拟很多用户向 LLM 发送请求，记录下每个请求的响应速度，最后算出一份详细的性能报告（比如首字延迟、吞吐量等）。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“开发这个压测工具的 To-Do List”</strong>，我们一步步来看每个任务在代码里是怎么实现的。</p>
+<hr />
+<h3>📝 任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>定义数据结构</strong>：规定好“测试题目”长什么样，“测试结果”存什么。</li>
+<li><strong>搭建监控台 (Console)</strong>：为了不瞎跑，得有个进度条显示当前测到哪了。</li>
+<li><strong>核心功能：测这一个请求 (Benchmark One)</strong>：实现发送一个请求并记录时间。</li>
+<li><strong>核心功能：批量轰炸 (Benchmark Batch/Trace)</strong>：并发发送一堆请求，或者按真实时间轴回放请求。</li>
+<li><strong>数据分析 (Process Results)</strong>：把记录的时间变成能看懂的指标（TTFT, TPOT, 吞吐量）。</li>
+<li><strong>辅助功能</strong>：生成假数据或读取真日志。</li>
+</ol>
+<hr />
+<h3>逐步讲解</h3>
+<h4>1. 定义数据结构 (Data Structures)</h4>
+<p>在开始写逻辑前，先定义好数据包。
+*   <strong><code>BenchmarkTrace</code></strong>: 代表<strong>一条测试输入</strong>。包含时间戳（什么时候发）、Prompt内容、希望输出多长。
+*   <strong><code>BenchOneResult</code></strong>: 代表<strong>一条精简的测试结果</strong>。只存输入长度、输出长度和一串时间点。
+*   <strong><code>RawResult</code></strong>: 代表<strong>一条详细的原始结果</strong>。包含完整的输入消息、时间点列表 (<code>tics</code>)。
+    *   <em>代码细节</em>：<code>get_input_len</code> 方法用来检查实际输入的 Token 数量是否和预期一致。</p>
+<h4>2. 搭建监控台 (Console &amp; Progress Bars)</h4>
+<p>压测时如果不看进度条会很慌。代码里的 <code>Console</code> 类和 <code>make_console</code> 函数就是做这个的。
+它使用了 <code>tqdm</code> 库来画进度条，而且分得很细：
+*   <strong>Input Pbar</strong>: 发送了多少请求。
+*   <strong>Output Pbar</strong>: 完成了多少请求。
+*   <strong>Prefill Pbar</strong>: <strong>预填充（处理输入）</strong> 阶段处理了多少 Token。
+*   <strong>Decode Pbar</strong>: <strong>解码（生成输出）</strong> 阶段生成了多少 Token。</p>
+<ul>
+<li><em>代码细节</em>：<code>Counter</code> 类用来统计当前有多少请求正在天上飞（In-flight），方便监控并发量。</li>
+</ul>
+<h4>3. 核心功能：测这一个请求 (Benchmark One)</h4>
+<p>这是最关键的函数：<code>benchmark_one</code>。
+*   <strong>动作</strong>：它使用 <code>OpenAI</code> 的异步客户端 (<code>AsyncOpenAI</code>) 发送一个请求。
+*   <strong>关键点</strong>：<code>stream=True</code>。为什么要流式？因为我们要测 <strong>“首字延迟”</strong>。
+*   <strong>计时逻辑</strong>：
+    1.  发请求前记录时间 <code>t0</code>。
+    2.  收到第一个 Token (chunk) 时，记录时间 <code>t1</code>。<code>t1 - t0</code> 就是 <strong>TTFT (Time To First Token)</strong>。
+    3.  之后每收到一个 Token 都记录时间。
+    4.  根据收到 Token 的次数，更新 <code>console</code> 里的进度条（是正在 Prefill 还是在 Decode）。</p>
+<h4>4. 核心功能：批量轰炸 (Batch &amp; Trace)</h4>
+<p>有了测单个请求的能力，现在要测并发能力。
+*   <strong><code>benchmark_batch</code></strong>: 简单粗暴。给你一堆消息，用 <code>asyncio.gather</code> <strong>同时也</strong> 发出去。这是为了测系统在极高并发下的极限。
+*   <strong><code>benchmark_trace</code></strong>: 模拟真实场景。
+    *   比如真实日志里，用户A在 10:00 发请求，用户B在 10:05 发。
+    *   这个函数会读取 <code>BenchmarkTrace</code> 里的 <code>timestamp</code>，计算出需要 <code>asyncio.sleep</code> 等待多久再发送。
+    *   这就叫 <strong>“流量回放” (Replay)</strong>。</p>
+<h4>5. 数据分析 (Process Results)</h4>
+<p>测试跑完了，得到了一堆 <code>tics</code> (时间点列表)，老板要看报表。<code>process_benchmark_results</code> 负责算数：
+*   <strong>TTFT (首字延迟)</strong>: 第一个 Token 出来花的时间。越低越好，代表用户感觉“响应很快”。
+*   <strong>TPOT (Time Per Output Token)</strong>: 生成后续每个 Token 的平均耗时。代表生成速度。
+*   <strong>E2E (End-to-End)</strong>: 从发出请求到整个回答结束的总时间。
+*   <strong>Throughput (吞吐量)</strong>: 每秒处理多少 Token (token/s) 或每秒处理多少请求 (req/s)。
+*   <strong>P50/P90/P99</strong>: 统计学术语。比如 P99 TTFT 是 100ms，意思是 99% 的请求首字延迟都小于 100ms（排除掉极个别的慢请求）。</p>
+<h4>6. 辅助功能 (Utils)</h4>
+<ul>
+<li><strong><code>generate_message</code></strong>: 如果没有真实数据，就用 Tokenizer 随机拼凑一些乱码生成指定长度的文本，用来做假数据压测。</li>
+<li><strong><code>read_qwen_trace</code> / <code>read_mooncake_trace</code></strong>: 如果有真实日志（JSON格式），就解析它们，转换成 <code>BenchmarkTrace</code> 对象，准备给 <code>benchmark_trace</code> 跑回放。</li>
+<li><strong><code>scale_traces</code></strong>: 可以压缩或拉长时间轴。比如把一天的流量压缩在1小时内回放，测试高压情况。</li>
+</ul>
+<hr />
+<h3>总结：这段代码讲了啥？</h3>
+<p>这段代码就是一个<strong>由 Python 编写的、基于 OpenAI 接口标准的 LLM 性能压测器</strong>。</p>
+<p><strong>它的工作流是：</strong>
+1.  <strong>准备数据</strong>（读日志或随机生成）。
+2.  <strong>建立连接</strong>（初始化 OpenAI Client）。
+3.  <strong>发起攻击</strong>（按时间轴或并发发送请求，同时用 tqdm 显示进度）。
+4.  <strong>搜集弹壳</strong>（记录每个 Token 的到达时间）。
+5.  <strong>输出战报</strong>（计算 P99 延迟、吞吐量等核心指标并打印日志）。</p>

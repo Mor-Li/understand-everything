@@ -1,0 +1,100 @@
+<h1>python/minisgl/layers/norm.py</h1>
+<p>这段代码确实涉及到了深度学习底层（特别是大模型推理）的一些核心概念。如果直接看代码，很容易被 <code>sgl_kernel</code>、<code>fused</code> 这种术语绕晕。</p>
+<p>别担心，我们把它拆解成一个 <strong>“6步学习清单” (Todo List)</strong>。我们不谈复杂的数学公式，而是用通俗的逻辑一步步攻克它。</p>
+<p>这是你的学习任务列表：</p>
+<ul>
+<li><strong>Task 1：</strong> 理解背景 —— 为什么要搞“归一化” (Norm)？</li>
+<li><strong>Task 2：</strong> 认识主角 —— RMSNorm 是个什么简易版？</li>
+<li><strong>Task 3：</strong> 基础代码 —— <code>RMSNorm</code> 类在做什么？</li>
+<li><strong>Task 4：</strong> 节省内存 —— 什么是“原地操作” (In-place)？</li>
+<li><strong>Task 5：</strong> 进阶概念 —— 什么是“残差连接” (Residual)？</li>
+<li><strong>Task 6：</strong> 速度优化 —— 什么是“算子融合” (Fused)？</li>
+</ul>
+<hr />
+<h3>Task 1: 理解背景 —— 为什么要搞“归一化” (Norm)？</h3>
+<p>想象你在教一个小孩子（神经网络）做数学题。如果输入的数字一会儿是 0.001，一会儿是 100000，小孩子会很难适应，学得很慢，甚至直接崩溃。</p>
+<p><strong>Normalization (归一化)</strong> 的作用就是：<strong>把数据强行拉回到一个标准的范围内</strong>（比如让大家都在 0 附近波动，方差为 1）。这样神经网络学起来最快、最稳定。</p>
+<h3>Task 2: 认识主角 —— RMSNorm 是个什么简易版？</h3>
+<p>在深度学习里，最经典的是 LayerNorm。但现在的 LLM（比如 LLaMA）更喜欢用 <strong>RMSNorm</strong>。</p>
+<ul>
+<li><strong>区别：</strong> LayerNorm 要先减去平均值，再除以标准差。RMSNorm 觉得“减去平均值”这一步太啰嗦了，没啥用，直接<strong>除以均方根</strong>（Root Mean Square）就行。</li>
+<li><strong>结论：</strong> RMSNorm 计算量更小，速度更快，效果却差不多。</li>
+<li><strong>代码对应：</strong><ul>
+<li><code>eps</code> (epsilon)：防止除以 0 的一个小数值（比如 0.00001）。</li>
+<li><code>weight</code>：虽然我们要把数据归一化，但为了保留模型的表达能力，最后会乘上一个<strong>可学习的缩放参数</strong>，这就是 <code>weight</code>。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 3: 基础代码 —— <code>RMSNorm</code> 类在做什么？</h3>
+<p>现在看代码的第一部分：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">RMSNorm</span><span class="p">(</span><span class="n">BaseOP</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">eps</span><span class="p">:</span> <span class="nb">float</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">eps</span> <span class="o">=</span> <span class="n">eps</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">weight</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="n">size</span><span class="p">)</span> <span class="c1"># 创建那个“缩放参数”</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+        <span class="c1"># 调用底层的 rmsnorm 函数进行计算</span>
+        <span class="k">return</span> <span class="n">rmsnorm</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">eps</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解释：</strong> 这是一个标准的 PyTorch 模块。输入一个张量 <code>x</code>，它调用底层的 <code>rmsnorm</code> 函数（来自 <code>sgl_kernel</code>），把 <code>x</code> 归一化，乘上 <code>weight</code>，然后返回结果。</li>
+</ul>
+<h3>Task 4: 节省内存 —— 什么是“原地操作” (In-place)？</h3>
+<p>看这个函数：</p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">def</span><span class="w"> </span><span class="nf">forward_</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+        <span class="c1"># 注意最后的 out=x</span>
+        <span class="k">return</span> <span class="n">rmsnorm</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">eps</span><span class="p">,</span> <span class="n">out</span><span class="o">=</span><span class="n">x</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>背景：</strong> 正常计算 <code>y = norm(x)</code> 会生成一个新的 <code>y</code>，此时内存里同时有 <code>x</code> 和 <code>y</code>。显存很贵！</li>
+<li><strong>解释：</strong> <code>forward_</code> (注意有个下划线，PyTorch 惯例表示原地修改) 告诉程序：<strong>“直接在 x 的内存地址上改写数据，不要创建新变量”</strong>。这能省下一半的显存。</li>
+</ul>
+<h3>Task 5: 进阶概念 —— 什么是“残差连接” (Residual)？</h3>
+<p>这部分是为了解释 <code>RMSNormFused</code> 类的。</p>
+<p>在大模型（Transformer）里，有一个经典的结构叫 <strong>Residual Connection (残差连接)</strong>。
+它的公式通常是：<code>输出 = Norm(x + residual)</code>。</p>
+<ul>
+<li><code>x</code>：当前层的计算结果。</li>
+<li><code>residual</code>：上一层传下来的“老本”（为了防止网络太深导致信息丢失，直接把旧信息加过来）。</li>
+<li><strong>传统做法：</strong> 分两步走。<ol>
+<li>先算加法：<code>temp = x + residual</code></li>
+<li>再算归一化：<code>out = Norm(temp)</code></li>
+</ol>
+</li>
+</ul>
+<p>这需要读取内存两次，写入内存两次。<strong>慢！</strong></p>
+<h3>Task 6: 速度优化 —— 什么是“算子融合” (Fused)？</h3>
+<p>现在看最难懂的第二部分代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">RMSNormFused</span><span class="p">(</span><span class="n">RMSNorm</span><span class="p">):</span>
+    <span class="c1"># ...</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_forward_fused</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">residual</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
+        <span class="c1"># 这是一个“融合”函数：它同时做了 加法 和 归一化</span>
+        <span class="n">fused_add_rmsnorm</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">residual</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">weight</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">eps</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">x</span><span class="p">,</span> <span class="n">residual</span>
+</code></pre></div>
+
+<ul>
+<li><strong>核心逻辑：</strong> <code>Fused</code> (融合) 的意思是，既然我要做“先加后归一化”，不如写一个专门的 C++/CUDA 内核（<code>fused_add_rmsnorm</code>），<strong>一次性把数据读进来，算完加法紧接着算归一化，然后再写回内存</strong>。</li>
+<li><strong>好处：</strong> 减少了显存读写次数（IO瓶颈），速度极大提升。</li>
+</ul>
+<p>再看它的 <code>forward</code> 逻辑：</p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">residual</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+        <span class="c1"># 如果没有残差（residual is None），就当普通 Norm 用</span>
+        <span class="k">if</span> <span class="n">residual</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">forward</span><span class="p">(</span><span class="n">x</span><span class="p">),</span> <span class="n">x</span>
+
+        <span class="c1"># 如果有残差，就调用那个极速的融合版本</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_forward_fused</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">residual</span><span class="p">)</span>
+</code></pre></div>
+
+<hr />
+<h3>总结：这个文件讲了啥？</h3>
+<p>如果你把这个文件翻译成大白话，它在说：</p>
+<ol>
+<li><strong>我定义了一个工具叫 RMSNorm</strong>：它是给大模型做数据“整形”的。</li>
+<li><strong>我提供了一个省内存模式</strong>：直接在原数据上改 (<code>forward_</code>)。</li>
+<li><strong>我提供了一个极速模式 (<code>RMSNormFused</code>)</strong>：专门针对 Transformer 结构优化。当遇到“残差连接”时，我能把“加法”和“归一化”合并成一步做完，以此来榨干显卡的性能。</li>
+</ol>
+<p>这里的 <code>sgl_kernel</code> 是一个外部的高性能计算库（通常是写好的 CUDA 代码），这个 Python 文件只是一个<strong>接口（Wrapper）</strong>，方便你在 Python 里调用那些高性能的底层代码。</p>

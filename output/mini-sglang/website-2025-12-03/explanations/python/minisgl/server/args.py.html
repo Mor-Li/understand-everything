@@ -1,0 +1,91 @@
+<h1>python/minisgl/server/args.py</h1>
+<p>这段代码确实包含了很多底层系统设计（分布式、显存管理、网络通信）的概念，如果不是专门做大模型推理系统的，看起来会很晕。</p>
+<p>你可以把这个文件理解为整个系统的 <strong>“控制面板”</strong> 或者 <strong>“配置中心”</strong>。它的核心作用就是：<strong>读取用户输入的命令，整理成系统能读懂的配置单。</strong></p>
+<p>为了让你逐步理解，我为你制定了一个 <strong>5步学习 Task List</strong>。我们一步步来拆解。</p>
+<hr />
+<h3>📝 学习 Task List (任务清单)</h3>
+<ol>
+<li><strong>Task 1: 理解文件的核心目的</strong> —— 它是干什么的？</li>
+<li><strong>Task 2: 看看有哪些“旋钮” (基础参数)</strong> —— 我们能控制什么？</li>
+<li><strong>Task 3: 理解显卡与性能相关参数 (进阶参数)</strong> —— 怎么让模型跑得快？</li>
+<li><strong>Task 4: 理解架构设计 (Tokenizer 分离)</strong> —— 为什么会有 ZMQ 和 Tokenizer 的逻辑？</li>
+<li><strong>Task 5: 代码实现逻辑 (Python 技巧)</strong> —— <code>parse_args</code> 是怎么把命令变成对象的？</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 1: 理解文件的核心目的</h4>
+<p><strong>观点：</strong> 这个文件 (<code>args.py</code>) 定义了一个类 <code>ServerArgs</code> 和一个函数 <code>parse_args</code>。
+<strong>比喻：</strong>
+想象你要开一家餐厅（启动一个大模型服务）。
+*   <code>ServerArgs</code> 就是一张<strong>“开店清单”</strong>表格（比如：店名、厨师人数、桌子数量）。
+*   <code>parse_args</code> 就是<strong>“填表员”</strong>。当你对外喊一嗓子（在命令行输入指令）时，填表员把你的要求记在表格里，交给厨房（系统后台）。</p>
+<h4>Task 2: 看看有哪些“旋钮” (基础参数)</h4>
+<p>我们在命令行启动服务时，通常会输入：
+<code>python -m minisgl.server --model Llama-2-7b --port 8080</code></p>
+<p>代码里的 <code>parse_args</code> 函数就在处理这些东西：</p>
+<ul>
+<li><strong><code>--model-path</code></strong>: 模型权重的路径。告诉系统去哪里加载“大脑”。</li>
+<li><strong><code>--host</code> / <code>--port</code></strong>: 服务器开在哪个 IP 和端口。比如 <code>127.0.0.1:1919</code>，这样别人才能通过网络访问你的模型。</li>
+<li><strong><code>--dtype</code></strong>: 数据类型（float16, bfloat16）。决定了模型的精度，通常用 <code>auto</code> 让系统自己决定。</li>
+</ul>
+<h4>Task 3: 理解显卡与性能相关参数 (进阶参数)</h4>
+<p>这是大模型推理引擎最关键的部分，代码里有几个看起来很复杂的参数：</p>
+<ul>
+<li><strong><code>--tensor-parallel-size</code> (tp-size)</strong>:<ul>
+<li><strong>含义：</strong> 张量并行度。</li>
+<li><strong>解释：</strong> 如果模型太大，一张显卡装不下，需要把模型切开放在几张卡上。比如设为 2，就是用 2 张显卡一起跑这个模型。</li>
+</ul>
+</li>
+<li><strong><code>--memory-ratio</code></strong>:<ul>
+<li><strong>含义：</strong> 显存占用比例。</li>
+<li><strong>解释：</strong> 比如设为 0.8，意思是：“把显卡里 80% 的空间留给我存 KV Cache（上下文记忆），剩下的给操作系统或其他程序。”</li>
+</ul>
+</li>
+<li><strong><code>--max-running-requests</code></strong>:<ul>
+<li><strong>含义：</strong> 最大并发请求数。</li>
+<li><strong>解释：</strong> 餐厅同时能接待多少桌客人。设太高可能会爆显存，设太低显卡会闲置。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 理解架构设计 (Tokenizer 分离)</h4>
+<p>这是代码里最难懂的部分（涉及 <code>ServerArgs</code> 类里那些带 <code>zmq</code> 和 <code>tokenizer</code> 的属性）。</p>
+<p><strong>背景知识：</strong>
+大模型服务分两步：
+1.  <strong>Tokenizer（分词）：</strong> 把文字 "Hello" 变成数字 <code>[101, 234]</code>。这主要用 CPU。
+2.  <strong>Model Inference（推理）：</strong> 把数字算成新的数字。这主要用 GPU。</p>
+<p><strong>代码逻辑解读：</strong>
+*   <strong><code>num_tokenizer</code></strong>:
+    *   如果是 <code>0</code>：表示 Tokenizer 和模型推理在同一个进程里（省事，适合小并发）。
+    *   如果是 <code>&gt;0</code>：表示启动专门的进程只做分词（为了在大并发下不拖累 GPU）。
+*   <strong><code>share_tokenizer</code> (属性)</strong>:
+    *   这就是在判断 <code>num_tokenizer == 0</code>。如果是 True，说明大家住在一起。
+*   <strong><code>_zmq_..._link</code></strong>:
+    *   <strong>ZMQ</strong> 是一种极其快速的消息队列（管道）。
+    *   如果 Tokenizer 和 模型是分开的进程，它们怎么传数据？就通过这个 ZMQ 管道（IPC 协议）来喊话。
+    *   代码里的 <code>zmq_frontend_addr</code> 之类的属性，就是在计算这些管道的“地址”，确保前台和后台能连通。</p>
+<h4>Task 5: 代码实现逻辑 (Python 技巧)</h4>
+<p>最后看 <code>parse_args</code> 函数的结尾部分：</p>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># 1. 解析 dtype</span>
+    <span class="k">if</span> <span class="p">(</span><span class="n">dtype_str</span> <span class="o">:=</span> <span class="n">kwargs</span><span class="p">[</span><span class="s2">&quot;dtype&quot;</span><span class="p">])</span> <span class="o">!=</span> <span class="s2">&quot;auto&quot;</span><span class="p">:</span>
+        <span class="n">kwargs</span><span class="p">[</span><span class="s2">&quot;dtype&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">DTYPE_MAP</span><span class="p">[</span><span class="n">dtype_str</span><span class="p">]</span>
+    <span class="c1"># ...</span>
+
+    <span class="c1"># 2. 处理 TP (Tensor Parallel) 信息</span>
+    <span class="n">kwargs</span><span class="p">[</span><span class="s2">&quot;tp_info&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">DistributedInfo</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">kwargs</span><span class="p">[</span><span class="s2">&quot;tensor_parallel_size&quot;</span><span class="p">])</span>
+    <span class="k">del</span> <span class="n">kwargs</span><span class="p">[</span><span class="s2">&quot;tensor_parallel_size&quot;</span><span class="p">]</span> <span class="c1"># 删掉旧的键，换成新的对象</span>
+
+    <span class="c1"># 3. 打包成对象</span>
+    <span class="n">result</span> <span class="o">=</span> <span class="n">ServerArgs</span><span class="p">(</span><span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+1.  它把用户输入的字符串（比如 "float16"）转换成 PyTorch 真正的数据类型对象。
+2.  它把简单的数字（比如 TP=2）封装成一个更复杂的分布式信息对象 <code>DistributedInfo</code>。
+3.  最后用 <code>**kwargs</code> 技巧，把字典里的所有数据一股脑塞进 <code>ServerArgs</code> 这个数据类里，生成最终的配置对象。</p>
+<h3>总结</h3>
+<p>这个文件其实没有做任何“实际的计算”，它只是在<strong>准备工作环境</strong>。</p>
+<ul>
+<li><strong>输入：</strong> 杂乱的命令行参数。</li>
+<li><strong>处理：</strong> 验证参数合法性、计算通信地址（ZMQ）、设置默认值。</li>
+<li><strong>输出：</strong> 一个整洁的 <code>ServerArgs</code> 对象，供后续的服务器启动代码使用。</li>
+</ul>

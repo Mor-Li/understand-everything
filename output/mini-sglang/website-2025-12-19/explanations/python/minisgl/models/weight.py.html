@@ -1,0 +1,91 @@
+<h1>python/minisgl/models/weight.py</h1>
+<p>这个文件 <code>weight.py</code> 的核心作用就是：<strong>把大语言模型（LLM）的权重文件从硬盘里读出来，处理好，然后放到显存（GPU）里去，准备给模型推理使用。</strong></p>
+<p>你可以把它想象成是一个<strong>“搬运工 + 厨师”</strong>：它不仅要把食材（权重）搬进厨房（GPU），还要负责切菜（切分权重以适应多卡并行）和配菜（合并权重以优化计算）。</p>
+<p>为了让你看懂，我列一个 <strong>“加载模型权重的任务清单 (To-Do List)”</strong>，然后一步一步解释代码是怎么完成这些任务的。</p>
+<hr />
+<h3>📋 任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>准备食材</strong>：找到模型文件在哪，如果本地没有，就去 HuggingFace 下载。</li>
+<li><strong>开箱验货</strong>：打开 <code>.safetensors</code> 格式的权重文件，把里面的数据读到内存（CPU）里。</li>
+<li><strong>切分食材 (关键步骤)</strong>：如果你有多张显卡（比如2张），需要把一个大的权重矩阵切成几份，每张卡只拿自己那一份（这叫 Tensor Parallelism / 张量并行）。</li>
+<li><strong>搬进厨房</strong>：把处理好的权重数据从内存（CPU）移动到显存（GPU）。</li>
+<li><strong>优化配菜</strong>：为了算得更快，把某些独立的权重矩阵合并成一个大矩阵（比如把 Q、K、V 合并成 QKV）。</li>
+</ol>
+<hr />
+<h3>🧐 逐步详细讲解</h3>
+<p>下面我们对应代码，一步步看它是怎么做上面这 5 件事的。</p>
+<h4>1. 准备食材 (下载或定位模型)</h4>
+<p><strong>对应代码：</strong> <code>load_hf_weight</code> 函数的开头部分。</p>
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li>代码检查你给的 <code>model_path</code> 是不是一个本地文件夹。</li>
+<li>如果是文件夹，直接用。</li>
+<li>如果不是，它假设这是一个 HuggingFace 的模型 ID（比如 <code>meta-llama/Llama-2-7b</code>），然后调用 <code>snapshot_download</code> 自动帮你下载下来。</li>
+<li><em>小细节</em>：<code>DisabledTqdm</code> 类只是为了下载时不显示那个进度条，怕刷屏，没啥深意。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 开箱验货 (读取 Safetensors)</h4>
+<p><strong>对应代码：</strong> <code>load_hf_weight</code> 中间读取 <code>files</code> 的循环。</p>
+<ul>
+<li><strong>逻辑</strong>：<ul>
+<li>它会找到文件夹里所有的 <code>*.safetensors</code> 文件（这是一种比 <code>.bin</code> 更快更安全的权重存储格式）。</li>
+<li>使用 <code>safetensors.safe_open</code> 打开文件。</li>
+<li>把里面的张量（Tensor）一个个读出来，存到一个叫 <code>state_dict</code> 的大字典里。</li>
+<li><strong>注意</strong>：这时候数据还在 <strong>CPU</strong> 上。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 切分食材 (处理多卡并行 / Sharding)</h4>
+<p><strong>对应代码：</strong> <code>_shard_state_dict</code> 函数。</p>
+<p>这是整个文件最复杂的地方。假设你有 2 张显卡（TP Size = 2），模型的一个权重矩阵很大，不能全塞进一张卡，或者为了算得更快，我们需要把矩阵切开。</p>
+<ul>
+<li><strong>怎么切？</strong><ul>
+<li><strong>获取身份</strong>：<code>get_tp_info()</code> 告诉程序：“我是第几号显卡（rank）？总共有几张卡（size）？”</li>
+<li><strong>横着切 (dim=0)</strong>：代码里的 <code>SPLIT_DIM_0_LIST</code> (比如 <code>q_proj</code>, <code>up_proj</code>)。<ul>
+<li><em>例子</em>：一个 <code>[100, 50]</code> 的矩阵，卡0拿 <code>[0:50, :]</code>，卡1拿 <code>[50:100, :]</code>。</li>
+</ul>
+</li>
+<li><strong>竖着切 (dim=1)</strong>：代码里的 <code>SPLIT_DIM_1_LIST</code> (比如 <code>o_proj</code>, <code>down_proj</code>)。<ul>
+<li><em>例子</em>：一个 <code>[100, 50]</code> 的矩阵，卡0拿 <code>[:, 0:25]</code>，卡1拿 <code>[:, 25:50]</code>。</li>
+</ul>
+</li>
+<li><strong>切词表 (Embeddings)</strong>：代码里的 <code>lm_head</code> 和 <code>embed_tokens</code>。<ul>
+<li>词表很大（比如 32000 个词），卡0负责前 16000 个词的向量，卡1负责后 16000 个。</li>
+</ul>
+</li>
+<li><strong>结果</strong>：函数返回的 <code>shard_state_dict</code> 里面，只包含当前这张显卡需要的那一部分数据。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 搬进厨房 (移动到 GPU)</h4>
+<p><strong>对应代码：</strong> <code>load_hf_weight</code> 倒数第二行。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">state_dict</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">state_dict</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
+</code></pre></div>
+
+<ul>
+<li><strong>逻辑</strong>：非常简单，遍历所有权重，执行 <code>.to(device)</code>。这时候数据才真正进入显存。</li>
+</ul>
+<h4>5. 优化配菜 (合并权重 / Merging)</h4>
+<p><strong>对应代码：</strong> <code>_merge_state_dict</code> 函数。</p>
+<p>为了推理加速，通常会把几个分开计算的矩阵拼起来算，这样只需要启动一次计算核（Kernel Launch），效率更高。</p>
+<ul>
+<li><strong>QKV 合并</strong>：<ul>
+<li>原本模型里有 <code>q_proj</code> (查询), <code>k_proj</code> (键), <code>v_proj</code> (值) 三个独立的矩阵。</li>
+<li>代码检测到 <code>.q_proj</code> 后，会把对应的 k 和 v 找出来。</li>
+<li>用 <code>torch.cat</code> 把它们拼成一个巨大的 <code>qkv_proj</code>。</li>
+<li>删掉原来的三个小矩阵。</li>
+</ul>
+</li>
+<li><strong>Gate-Up 合并 (SwiGLU)</strong>：<ul>
+<li>Llama 等模型使用 SwiGLU 激活函数，有两个矩阵 <code>gate_proj</code> 和 <code>up_proj</code>。</li>
+<li>代码把它们拼成 <code>gate_up_proj</code>。</li>
+<li>删掉原来的两个小矩阵。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个脚本的<strong>输入</strong>是一个模型路径，<strong>输出</strong>是一个处理好的、可以直接喂给模型的权重字典（Dict）。</p>
+<p><strong>它的工作流：</strong>
+下载 -&gt; 读取(CPU) -&gt; <strong>切分(如果你有多卡)</strong> -&gt; 搬运(GPU) -&gt; <strong>合并(为了加速)</strong> -&gt; 完成。</p>

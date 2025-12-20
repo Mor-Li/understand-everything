@@ -1,0 +1,89 @@
+<h1>python/minisgl/layers/linear.py</h1>
+<p>这段代码确实涉及到了深度学习部署中比较高阶的概念——<strong>张量并行 (Tensor Parallelism, TP)</strong>。如果你不了解背景，看这段代码就像看天书一样。</p>
+<p>别担心，我们把“读懂这段代码”当成一个项目，拆分成 <strong>5 个 Todo Task</strong>。我们一步步把这些概念像剥洋葱一样剥开。</p>
+<hr />
+<h3>📋 任务列表 (Todo List)</h3>
+<ol>
+<li><strong>Task 01: 理解基础背景 (什么是 Linear 和为什么要并行？)</strong></li>
+<li><strong>Task 02: 搞懂基类 <code>_LinearTPImpl</code> (通用的搬砖工)</strong></li>
+<li><strong>Task 03: 搞懂列并行 <code>LinearColParallelMerged</code> (竖着切蛋糕)</strong></li>
+<li><strong>Task 04: 搞懂行并行 <code>LinearRowParallel</code> (横着切蛋糕 + 必须交流)</strong></li>
+<li><strong>Task 05: 搞懂特殊场景 <code>LinearQKVMerged</code> (为注意力机制定制的切法)</strong></li>
+</ol>
+<hr />
+<h3>✅ Task 01: 理解基础背景</h3>
+<p><strong>概念：</strong>
+在神经网络中，最常见的层是 <code>Linear</code> (线性层)。它的数学公式是 $Y = X \times W + b$。
+*   $X$: 输入
+*   $W$: 权重矩阵 (一个巨大的二维数组)
+*   $Y$: 输出</p>
+<p><strong>问题：</strong>
+现在的模型（比如 Llama-3, GPT-4）太大了，$W$ 这个矩阵大到一张显卡（GPU）放不下。
+<strong>解决办法：</strong>
+把 $W$ 切成几块，分给多张显卡存。这就是 <strong>Tensor Parallelism (TP)</strong>。这段代码就是在通过 PyTorch 实现“切分后”的线性层。</p>
+<hr />
+<h3>✅ Task 02: 搞懂基类 <code>_LinearTPImpl</code></h3>
+<p>请看代码中的 <code>class _LinearTPImpl(BaseOP):</code>。</p>
+<p><strong>它的角色：</strong>
+它是所有切分策略的“父亲”。它不关心你是横着切还是竖着切，它只负责<strong>存切分后的权重</strong>和<strong>做基本的乘法</strong>。</p>
+<p><strong>关键点解读：</strong>
+*   <strong><code>full_isize/osize</code> vs <code>local_isize/osize</code></strong>:
+    *   <code>full</code>: 完整的矩阵本来应该有多大（比如 4096）。
+    *   <code>local</code>: 切了一刀后，我这张显卡上只存多少（比如 2048）。
+*   <strong><code>self.weight</code></strong>:
+    *   注意看 <code>torch.empty(local_osize, local_isize)</code>。它只申请了 <strong>local (局部)</strong> 大小的内存。这就是省显存的关键。
+*   <strong><code>forward</code></strong>:
+    *   就是简单的 <code>F.linear</code>。它只负责把自己手里的这一小块数据算出来。</p>
+<hr />
+<h3>✅ Task 03: 搞懂列并行 <code>LinearColParallelMerged</code></h3>
+<p>请看代码中的 <code>class LinearColParallelMerged</code>。</p>
+<p><strong>切分逻辑：</strong>
+想象矩阵 $W$ 是一块长方形蛋糕。<strong>列并行 (Column Parallel)</strong> 就是<strong>竖着切</strong>。
+*   显卡 A 拿左半边，显卡 B 拿右半边。
+*   输入 $X$ 是一样的。
+*   输出 $Y$ 会被切分：显卡 A 算出 $Y$ 的左半部分，显卡 B 算出 $Y$ 的右半部分。</p>
+<p><strong>代码解读：</strong>
+1.  <strong><code>tp_info = get_tp_info()</code></strong>: 获取当前有几张显卡（TP size）。
+2.  <strong><code>divide_even(size, tp_info.size)</code></strong>: 这是核心。它把输出的维度 (<code>output_size</code>) 除以显卡数量。
+    *   <em>例子</em>：如果输出维度是 100，有 2 张卡，那么 <code>local_osize</code> 就是 50。
+3.  <strong>不需要通信</strong>：你会发现 <code>forward</code> 函数里没有写额外的代码（直接继承父类）。因为列并行算出来的结果，直接拼起来就是完整的输出，显卡之间暂时不需要交换数据。</p>
+<hr />
+<h3>✅ Task 04: 搞懂行并行 <code>LinearRowParallel</code></h3>
+<p>请看代码中的 <code>class LinearRowParallel</code>。</p>
+<p><strong>切分逻辑：</strong>
+这次我们把矩阵 $W$ <strong>横着切</strong>。
+*   输入 $X$ 也必须被切分（或者 $X$ 是完整的，但每个显卡只取一部分特征与自己的权重相乘）。
+*   <strong>关键问题</strong>：因为是横着切，显卡 A 算了一部分结果，显卡 B 算了一部分结果。真正的结果应该是 <strong>A + B</strong>。</p>
+<p><strong>代码解读：</strong>
+1.  <strong><code>local_input_size = divide_even(...)</code></strong>: 它是把<strong>输入维度</strong>除以显卡数量。这是行并行的特征。
+2.  <strong><code>self._comm = DistributedCommunicator()</code></strong>: 这是一个负责显卡间“打电话”的工具。
+3.  <strong><code>forward</code> 中的 <code>all_reduce</code></strong>:
+    <code>python
+    y = F.linear(x, self.weight, self.bias) # 1. 自己算自己的
+    if self._tp_size &gt; 1:
+        y = self._comm.all_reduce(y)    # 2. 这里的 all_reduce 意思是：所有人把结果加起来！</code>
+    *   <strong>重点</strong>：行并行必须要在算完后，把所有显卡的结果<strong>加在一起 (Sum)</strong>，才能得到正确的最终结果。这就是 <code>all_reduce</code> 的作用。</p>
+<hr />
+<h3>✅ Task 05: 搞懂特殊场景 <code>LinearQKVMerged</code></h3>
+<p>请看代码中的 <code>class LinearQKVMerged</code>。</p>
+<p><strong>这是啥？</strong>
+这是 Transformer 模型中最重要的 <strong>Attention (注意力)</strong> 层的计算。通常包括 Q (Query), K (Key), V (Value) 三个矩阵。为了加速，我们通常把 Q, K, V 合并成一个大矩阵来算。</p>
+<p><strong>为什么它很复杂？</strong>
+因为它不仅要切分，还要处理 <strong>GQA (Grouped Query Attention)</strong>。这是一种省显存的技巧，K 和 V 的头数（Heads）比 Q 少。</p>
+<p><strong>代码解读：</strong>
+1.  <strong>继承逻辑</strong>：它本质上是一个 <strong>列并行 (Column Parallel)</strong>。因为它是在切分输出的头（Heads）。
+2.  <strong>数学计算</strong>：
+    *   <code>GQA_ratio</code>: 计算 Q 是 K 的几倍。
+    *   <code>local_num_kv</code>: 算出当前显卡负责几个 K/V 头。
+    *   <code>local_osize</code>: 计算当前显卡总共要输出多大的向量。
+    *   <em>(GQA_ratio + 2)</em>: 这里的意思通常是 Q占大头，K占1份，V占1份。</p>
+<hr />
+<h3>总结回顾</h3>
+<p>把这个文件看作是一个<strong>“切蛋糕手册”</strong>：</p>
+<ol>
+<li><strong><code>_LinearTPImpl</code></strong>: 这是一个<strong>盘子</strong>，用来装切好的一块蛋糕。</li>
+<li><strong><code>LinearColParallelMerged</code></strong>: <strong>竖着切</strong>。每人拿一竖条，算出来的结果也是一部分，大家并排站着就是完整结果。</li>
+<li><strong><code>LinearRowParallel</code></strong> (以及 <code>LinearOProj</code>): <strong>横着切</strong>。每人拿一横条。算完之后，必须把大家手里的结果<strong>加起来 (<code>all_reduce</code>)</strong> 才是对的。</li>
+<li><strong><code>LinearQKVMerged</code></strong>: 专门为了切 Attention 层这种复杂的“千层蛋糕”设计的竖切法。</li>
+</ol>
+<p>现在再回头看代码，关注 <code>divide_even</code> 是切输入还是切输出，以及 <code>forward</code> 里有没有 <code>all_reduce</code>，你应该就能看懂了！</p>

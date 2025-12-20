@@ -1,0 +1,108 @@
+<h1>python/minisgl/tokenizer/detokenizer.py</h1>
+<p>这份代码确实看起来有点复杂，因为它处理的是大模型推理中一个非常细节但棘手的问题：<strong>流式解码（Streaming Detokenization）</strong>。</p>
+<p>简单来说，它的作用是：<strong>当大模型像挤牙膏一样一个一个吐出数字（Token ID）时，如何实时地、准确地把它们转换成人类能看的文字，同时不出现乱码。</strong></p>
+<p>为了让你看懂，我把这份代码的逻辑拆解成一个 <strong>“开发任务清单（Todo List）”</strong>，我们假设你是开发者，为了实现这个功能，你需要一步步解决以下 5 个问题：</p>
+<hr />
+<h3>Task 1: 核心任务 —— 把数字变成字</h3>
+<p><strong>目标：</strong> 模型每吐出一个 Token ID，我就要把它变成文字展示给用户。</p>
+<ul>
+<li><strong>问题：</strong> 大模型（如 Llama）输出的是一串整数（比如 <code>[1, 392, 20]</code>）。</li>
+<li><strong>基础做法：</strong> 使用 <code>tokenizer.decode()</code> 把这些整数查表变成单词。</li>
+<li><strong>代码对应：</strong> <code>DetokenizeManager</code> 类就是干这个的。它里面的 <code>detokenize</code> 方法接收一组消息（<code>msgs</code>），每个消息里包含一个新的 <code>next_token</code>（新吐出的数字）。</li>
+</ul>
+<h3>Task 2: 解决“半个字”的乱码问题 (The UTF-8 Issue)</h3>
+<p><strong>目标：</strong> 防止在屏幕上打印出 `` 这种乱码符号。</p>
+<ul>
+<li><strong>难点：</strong> 在计算机里，英文通常 1 个字节，但中文或 Emoji 可能需要 3-4 个字节。<ul>
+<li>假设“你”字的编码是 <code>[228, 189, 160]</code>。</li>
+<li>如果模型只吐出了 <code>228</code>，你直接解码，就会变成乱码 ``。</li>
+<li>你必须<strong>憋着</strong>，等到 <code>189</code> 和 <code>160</code> 都来了，凑齐了，再解码打印出来。</li>
+</ul>
+</li>
+<li><strong>代码对应：</strong><ul>
+<li>在 <code>detokenize</code> 函数里，有这样一行判断：<code>if len(new_text) &gt; 0 and not new_text.endswith(""):</code></li>
+<li><strong>逻辑：</strong> 如果解码出来的字符串结尾是 <code>`，说明最后一个字还没吐完（是半个字）。这时候代码选择**不更新**</code>read_offset`（即“已读指针”），把这个 Token 留在缓冲区里，等下一个 Token 来了凑齐再发。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 3: 优化阅读体验 —— 别把单词切两半</h3>
+<p><strong>目标：</strong> 英文单词不要只显示一半，比如 "Apple"，不要先显示 "Ap" 然后再显示 "ple"。</p>
+<ul>
+<li><strong>策略：</strong> 我们不仅要防乱码，还要防“半个词”。通常的做法是：<strong>只要没遇到空格或换行符，我就先不显示，等单词完整了再显示。</strong></li>
+<li><strong>例外：</strong> 中文不需要空格分隔，所以中文可以直接逐字显示。</li>
+<li><strong>代码对应：</strong><ul>
+<li><code>_is_chinese_char(cp)</code> 函数：专门用来判断是不是中文字符（CJK 区块）。如果是中文，就可以直接输出，不用等空格。</li>
+<li><code>find_printable_text(text)</code> 函数：这是一个<strong>过滤器</strong>。<ul>
+<li>如果是换行符结尾 -&gt; 放心打印。</li>
+<li>如果是中文结尾 -&gt; 放心打印。</li>
+<li><strong>否则（英文/数字）：</strong> 砍掉最后一个空格之后的内容，只打印到最后一个空格为止。防止打印出 "Ap" 这种残缺单词。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h3>Task 4: 记住每个用户的进度 (State Management)</h3>
+<p><strong>目标：</strong> 服务器同时服务 100 个人，不能搞混每个人的话说到哪了。</p>
+<ul>
+<li><strong>做法：</strong> 给每个请求（User ID）建一个档案，记录他已经生成了哪些 ID，已经打印了多少字。</li>
+<li><strong>代码对应：</strong><ul>
+<li><code>@dataclass class DecodeStatus</code>：这就是那个“档案”。<ul>
+<li><code>decoded_ids</code>: 目前为止所有的 Token ID。</li>
+<li><code>decoded_str</code>: 目前为止所有解码出的完整文本。</li>
+<li><code>read_offset</code>: 哪些 ID 已经确认为“安全”的（不是半个乱码字）。</li>
+<li><code>sent_offset</code>: 哪些文字已经发给用户了（用于计算增量，只发新生成的字）。</li>
+</ul>
+</li>
+<li><code>self.decode_map</code>: 一个字典，用 <code>uid</code> 查找对应的 <code>DecodeStatus</code> 档案。</li>
+</ul>
+</li>
+</ul>
+<h3>Task 5: 批量处理与增量计算 (The Logic Flow)</h3>
+<p><strong>目标：</strong> 高效地计算出“这一次”应该给前端返回什么字符串。</p>
+<ul>
+<li><strong>逻辑流程（在 <code>detokenize</code> 函数中）：</strong><ol>
+<li><strong>收集 ID</strong>：把新来的 Token 加到该用户的 <code>decoded_ids</code> 列表里。</li>
+<li><strong>切片解码</strong>：<ul>
+<li><code>read_ids</code>: 从上次确认安全的地方开始，到最新的地方。</li>
+<li><code>surr_ids</code>: 上次因为是“半个字”或“乱码”而被暂存的 ID。</li>
+</ul>
+</li>
+<li><strong>比较与拼接</strong>：<ul>
+<li><code>new_text = read_str[len(surr_str) :]</code></li>
+<li>意思就是：<code>新文本 = (包含暂存区的完整解码文本) - (上次暂存的文本)</code>。</li>
+</ul>
+</li>
+<li><strong>安全检查</strong>：<ul>
+<li>检查 <code>new_text</code> 结尾是不是乱码 ``？</li>
+<li>或者用 <code>find_printable_text</code> 检查是不是半个单词？</li>
+</ul>
+</li>
+<li><strong>更新进度</strong>：<ul>
+<li>如果是安全的，更新 <code>read_offset</code>（进度条往前走）。</li>
+<li>如果不安全，进度条不动，下次带着这次的 ID 一起重新解。</li>
+</ul>
+</li>
+<li><strong>计算增量</strong>：<ul>
+<li><code>incremental_output = output_str[s.sent_offset :]</code></li>
+<li>只返回用户还没看过的部分。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码在讲什么？</h3>
+<p>这段代码是一个<strong>带缓冲区的、防乱码的、智能断句的批量解码器</strong>。</p>
+<p>它在说：</p>
+<blockquote>
+<p>“嘿，Tokenizer，给我把这堆数字变成字。但是要注意，如果这几个数字凑不成一个完整的字（乱码），或者凑不成一个完整的词（英文），先别发给用户，<strong>先存在缓存里</strong>。等下一个数字来了，凑完整了，再一起发出去。”</p>
+</blockquote>
+<p><strong>核心流程图解：</strong></p>
+<ol>
+<li><strong>输入</strong>：Token ID <code>[..., 228]</code> (假设是汉字的第一部分)</li>
+<li><strong>解码</strong>：变成 ``</li>
+<li><strong>判断</strong>：是乱码 -&gt; <strong>Hold住！不发！</strong></li>
+<li><strong>下一轮输入</strong>：Token ID <code>[189, 160]</code> (汉字剩下的部分)</li>
+<li><strong>合并解码</strong>：<code>[228, 189, 160]</code> -&gt; 变成 "你"</li>
+<li><strong>判断</strong>：是正常字 -&gt; <strong>发送 "你"！</strong></li>
+</ol>

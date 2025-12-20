@@ -1,0 +1,93 @@
+<h1>tests/core/test_engine.py</h1>
+<p>这段代码其实是在测试一个<strong>迷你版的大语言模型推理引擎</strong>（名字叫 <code>minisgl</code>）。它的作用就是加载一个 Llama 模型，输入一个问题，然后让模型把答案生成出来。</p>
+<p>之所以看着复杂，是因为它没有封装成那种傻瓜式的 <code>model.generate()</code>，而是把<strong>底层怎么管理内存、怎么分步计算</strong>的过程都暴露出来了。</p>
+<p>为了让你听懂，我把这段代码拆解成一个 <strong>“启动并运行一台大模型机器”</strong> 的 To-Do List（任务清单）。我们一步步来完成这个任务：</p>
+<hr />
+<h3>任务清单：手动挡运行大模型</h3>
+<h4>✅ 第一步：配置机器参数 (Configuration)</h4>
+<p>在开车前，先要决定开哪辆车，装什么引擎。
+<strong>对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">config</span> <span class="o">=</span> <span class="n">EngineConfig</span><span class="p">(</span>
+    <span class="n">model_path</span><span class="o">=</span><span class="s2">&quot;meta-llama/Llama-3.1-8B-Instruct&quot;</span><span class="p">,</span> <span class="c1"># 1. 选什么模型：Llama 3</span>
+    <span class="n">tp_info</span><span class="o">=</span><span class="n">DistributedInfo</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>                 <span class="c1"># 2. 几张显卡跑：这里是单卡 (0号卡，共1卡)</span>
+    <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span>                          <span class="c1"># 3. 数据精度：用 bfloat16 省显存</span>
+    <span class="n">max_running_req</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>                             <span class="c1"># 4. 并发限制：同时最多处理4个请求</span>
+    <span class="n">cuda_graph_bs</span><span class="o">=</span><span class="p">[</span><span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">],</span>                       <span class="c1"># 5. 加速技巧：CUDA Graph 优化</span>
+    <span class="n">attention_backend</span><span class="o">=</span><span class="s2">&quot;fi&quot;</span><span class="p">,</span>                        <span class="c1"># 6. 计算后端：FlashInfer 等加速库</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解读：</strong> 这就是在写配置文件，告诉程序：“我要用 Llama-3，用一张卡跑，精度不用太高，速度要快。”</p>
+<h4>✅ 第二步：启动引擎 (Initialization)</h4>
+<p>参数配好了，现在按启动键，把模型加载到显卡里。
+<strong>对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">engine</span> <span class="o">=</span> <span class="n">Engine</span><span class="p">(</span><span class="n">config</span><span class="p">)</span> <span class="c1"># 启动引擎，模型权重加载进显存</span>
+<span class="n">tokenizer</span> <span class="o">=</span> <span class="n">AutoTokenizer</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 准备好“翻译官”（分词器）</span>
+</code></pre></div>
+
+<p><strong>解读：</strong> <code>Engine</code> 是核心控制器，<code>Tokenizer</code> 负责把人类语言变成数字。</p>
+<h4>✅ 第三步：准备输入点单 (Create Request)</h4>
+<p>客人来了，点了一道菜：“What's the answer to life...?”。我们需要把这个订单打包好。
+<strong>对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">prompt</span> <span class="o">=</span> <span class="s2">&quot;What&#39;s the answer to life, the universe, and everything?&quot;</span>
+<span class="n">req</span> <span class="o">=</span> <span class="n">Req</span><span class="p">(</span>
+    <span class="n">input_ids</span><span class="o">=</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="n">prompt</span><span class="p">),</span> <span class="c1"># 把问题变成数字列表 [128, 45, ...]</span>
+    <span class="n">page_table_idx</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>                   <span class="c1"># 给这个请求分配一个内存页表ID</span>
+    <span class="n">cached_len</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>                       <span class="c1"># 之前没聊过，缓存长度为0</span>
+    <span class="n">output_len</span><span class="o">=</span><span class="mi">10</span><span class="p">,</span>                      <span class="c1"># 限制模型最多回答10个词</span>
+    <span class="n">device</span><span class="o">=</span><span class="n">engine</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
+    <span class="n">uid</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>                              <span class="c1"># 请求的唯一编号</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解读：</strong> 这里创建了一个 <code>Req</code>（Request）对象。不同于普通的 <code>generate</code>，这里需要手动告诉引擎：这个请求的 ID 是多少，要生成多长。</p>
+<h4>✅ 第四步：手动分配显存 (Memory Allocation)</h4>
+<p><strong>这是这段代码最硬核、最不像普通代码的地方。</strong>
+普通的库会自动管理显存，但这个 <code>minisgl</code> 是为了测试底层逻辑，所以它在<strong>手动分配 KV Cache（键值缓存）的物理地址</strong>。
+<strong>对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># allocate indices for page table</span>
+<span class="n">engine</span><span class="o">.</span><span class="n">ctx</span><span class="o">.</span><span class="n">page_table</span><span class="p">[</span><span class="mi">0</span><span class="p">][:</span><span class="mi">1000</span><span class="p">]</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">1000</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">engine</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+*   大模型生成时需要记住之前说过的话（KV Cache）。
+*   这里用到了 <strong>PagedAttention</strong>（类似操作系统的虚拟内存页）。
+*   这就好比餐厅经理手动指着桌子说：“0号客人的数据，全部存在显存里的第0到第1000号格子里。”</p>
+<h4>✅ 第五步：开始循环生成 (Generation Loop)</h4>
+<p>一切准备就绪，开始让模型一个词一个词地往外蹦。
+<strong>对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">100</span><span class="p">):</span> <span class="c1"># 最多循环100次</span>
+    <span class="n">batch</span> <span class="o">=</span> <span class="n">Batch</span><span class="p">(</span><span class="n">reqs</span><span class="o">=</span><span class="p">[</span><span class="n">req</span><span class="p">])</span>      <span class="c1"># 1. 把请求打包成一个批次（Batch）</span>
+    <span class="n">engine</span><span class="o">.</span><span class="n">prepare_batch</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>    <span class="c1"># 2. 准备数据（把数据搬到 GPU）</span>
+    <span class="n">engine</span><span class="o">.</span><span class="n">forward_batch</span><span class="p">(</span><span class="n">batch</span><span class="p">)</span>    <span class="c1"># 3. 前向传播（模型大脑开始思考）</span>
+
+    <span class="n">result</span> <span class="o">=</span> <span class="n">engine</span><span class="o">.</span><span class="n">last_batch_result</span> <span class="c1"># 4. 拿到思考结果</span>
+    <span class="n">result</span><span class="o">.</span><span class="n">offload_event</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span> <span class="c1"># 等待 GPU 算完</span>
+
+    <span class="n">next_token</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">result</span><span class="o">.</span><span class="n">next_tokens_cpu</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">())</span> <span class="c1"># 5. 取出预测的下一个词的ID</span>
+
+    <span class="k">if</span> <span class="n">next_token</span> <span class="o">==</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">eos_token_id</span><span class="p">:</span> <span class="c1"># 6. 如果模型说“我说完了”(EOS)，就停止</span>
+        <span class="k">break</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+这是一个标准的<strong>自回归生成循环</strong>：
+1.  <strong>打包</strong>：把刚才的请求放进车里。
+2.  <strong>推理</strong>：模型根据当前所有内容，预测下一个字。
+3.  <strong>判断</strong>：如果预测的是结束符，就停；否则继续循环，预测下下个字。</p>
+<h4>✅ 第六步：翻译并打印结果 (Decode &amp; Print)</h4>
+<p>模型吐出来的全是数字 ID，最后要翻译回人类语言。
+<strong>对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">tokens</span> <span class="o">=</span> <span class="n">req</span><span class="o">.</span><span class="n">device_ids</span><span class="o">.</span><span class="n">cpu</span><span class="p">()</span><span class="o">.</span><span class="n">tolist</span><span class="p">()</span> <span class="c1"># 把生成的所有数字ID拿回 CPU</span>
+<span class="n">logger</span><span class="o">.</span><span class="n">info_rank0</span><span class="p">(</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="n">tokens</span><span class="p">))</span> <span class="c1"># 翻译成英文并打印</span>
+</code></pre></div>
+
+<p><strong>解读：</strong> 最终输出答案（根据《银河系漫游指南》，答案应该是 "42"）。</p>
+<hr />
+<h3>总结</h3>
+<p>你之所以看不懂，是因为这段代码是写给<strong>开发大模型推理框架的人</strong>看的，而不是给<strong>使用大模型的人</strong>看的。</p>
+<p><strong>它主要演示了：</strong>
+1.  如何手动配置推理引擎。
+2.  如何<strong>手动管理 KV Cache 的页表</strong>（这是高性能推理的核心）。
+3.  如何一步步手动执行 <code>forward</code> 来生成 Token。</p>
+<p><strong>一句话概括：</strong> 这是一个手动挡的、极简版的 Llama 推理过程演示。</p>

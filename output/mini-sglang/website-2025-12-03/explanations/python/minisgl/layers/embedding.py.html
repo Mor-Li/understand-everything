@@ -1,0 +1,132 @@
+<h1>python/minisgl/layers/embedding.py</h1>
+<p>这份代码确实涉及了大模型（LLM）底层比较核心的概念——<strong>张量并行（Tensor Parallelism）</strong>。如果不懂分布式训练的背景，看这段代码就像看天书一样。</p>
+<p>别担心，我们把它想象成<strong>几个人分工合作查字典</strong>的过程。</p>
+<p>为了让你彻底搞懂，我制定了一个 <strong>5步走的 Task List</strong>。我们一步一步来解锁这段代码的含义。</p>
+<hr />
+<h3>🗺️ 学习路线图 (Task List)</h3>
+<ul>
+<li><strong>Task 1: 理解核心概念——为什么要“切分字典”？</strong></li>
+<li><strong>Task 2: 读懂 <code>__init__</code> —— 每个人（GPU）分到了哪几页字典？</strong></li>
+<li><strong>Task 3: 读懂 <code>VocabParallelEmbedding</code> —— 怎么把输入的字变成向量？</strong></li>
+<li><strong>Task 4: 读懂 <code>ParallelLMHead</code> 的优化 —— 为什么只看最后一个字？</strong></li>
+<li><strong>Task 5: 读懂 <code>ParallelLMHead</code> 的输出 —— 怎么把大家的结果拼回来？</strong></li>
+</ul>
+<hr />
+<h3>Task 1: 理解核心概念——为什么要“切分字典”？</h3>
+<p><strong>背景：</strong> 大模型的词汇表（Vocab）很大（比如 10万个词），每个词对应的向量也很长（比如 4096维）。这导致存放这些词向量的矩阵非常大，一张显卡（GPU）可能放不下，或者计算太慢。</p>
+<p><strong>策略：</strong> 我们把这个巨大的词汇表矩阵<strong>切开</strong>，分给多张显卡存。
+*   假设有 2 张显卡（<code>tp_size=2</code>）。
+*   显卡 A (<code>rank=0</code>) 负责存第 1~50000 个词。
+*   显卡 B (<code>rank=1</code>) 负责存第 50001~100000 个词。</p>
+<p>这就是代码里 <code>VocabParallel</code>（词汇表并行）的意思。</p>
+<hr />
+<h3>Task 2: 读懂 <code>__init__</code> —— 每个人分到了哪几页字典？</h3>
+<p>不管是输入层（Embedding）还是输出层（LMHead），它们都需要先初始化。看 <code>VocabParallelEmbedding</code> 的 <code>__init__</code> 部分：</p>
+<ol>
+<li><strong>获取身份信息：</strong>
+    <code>python
+    tp_info = get_tp_info()
+    tp_rank = tp_info.rank  # 我是第几号显卡？
+    self.tp_size = tp_info.size # 总共有几张显卡？</code></li>
+<li><strong>切蛋糕（切分词表）：</strong>
+    <code>python
+    # 比如总共100个词，2张卡，每张卡分50个
+    self.num_embeddings_tp = divide_up(num_embeddings, self.tp_size)</code></li>
+<li><strong>确定负责范围：</strong>
+    <code>python
+    start_idx = self.num_embeddings_tp * tp_rank
+    # 显卡0: start=0, finish=50
+    # 显卡1: start=50, finish=100
+    self.vocab_range = (start_idx, finish_idx - start_idx)</code>
+    <strong>结论：</strong> 这段代码就是让当前这张显卡知道：“我只负责存字典里的哪一部分单词”。</li>
+</ol>
+<hr />
+<h3>Task 3: 读懂 <code>VocabParallelEmbedding</code> —— 怎么把输入的字变成向量？</h3>
+<p>这是大模型的第一层：<strong>输入层</strong>。把 token ID（比如数字 567）变成一个向量。</p>
+<p><strong><code>forward</code> 函数逻辑：</strong></p>
+<ol>
+<li>
+<p><strong>查表（Indexing）：</strong>
+    <code>python
+    y = indexing(
+        weights=self.weight,
+        indices=x,
+        vocab_range=self.vocab_range ...
+    )</code></p>
+<ul>
+<li>假设输入是单词 ID <code>567</code>。</li>
+<li><strong>显卡 A (负责 0-50000)</strong>：它一看 <code>567</code> 在我的范围内，于是返回对应的向量 <code>[0.1, 0.2, ...]</code>。</li>
+<li><strong>显卡 B (负责 50001-100000)</strong>：它一看 <code>567</code> <strong>不在</strong>我的范围内，它会返回一个<strong>全 0 的向量</strong>。</li>
+</ul>
+</li>
+<li>
+<p><strong>通信与合并（All Reduce）：</strong>
+    <code>python
+    return self._comm.all_reduce(y)</code></p>
+<ul>
+<li>现在的状况是：显卡 A 手里有数据，显卡 B 手里是 0。但它们彼此不知道。</li>
+<li><code>all_reduce</code> 的作用是：<strong>把所有显卡手里的向量加起来，然后同步给所有人</strong>。</li>
+<li>结果：<code>向量(A) + 0(B) = 正确向量</code>。两张卡都拿到了完整的输入向量。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>Task 4: 读懂 <code>ParallelLMHead</code> 的优化 —— 为什么只看最后一个字？</h3>
+<p>这是大模型的最后一层：<strong>输出层</strong>。把向量变回单词的概率（Logits）。</p>
+<p><code>ParallelLMHead</code> 继承了 <code>VocabParallelEmbedding</code>，因为它们的权重形状是一样的（都是 <code>词表大小 x 向量维度</code>），只是用法不同。</p>
+<p><strong>这里的关键优化逻辑：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">batch</span><span class="o">.</span><span class="n">is_prefill</span><span class="p">:</span>
+    <span class="n">indices</span> <span class="o">=</span> <span class="n">batch</span><span class="o">.</span><span class="n">attn_metadata</span><span class="o">.</span><span class="n">get_last_indices</span><span class="p">(</span><span class="n">bs</span><span class="p">)</span>
+    <span class="n">x</span> <span class="o">=</span> <span class="n">x</span><span class="p">[</span><span class="n">indices</span><span class="p">]</span><span class="o">.</span><span class="n">contiguous</span><span class="p">()</span>
+</code></pre></div>
+
+<ul>
+<li><strong>场景</strong>：当你在做 <strong>Prefill（预填充/处理提示词）</strong> 阶段时，比如你输入“今天天气”，你想让模型预测下一个字。</li>
+<li><strong>逻辑</strong>：虽然输入了“今天”“天气”两个词，但我们<strong>只需要</strong>根据最后一个词“气”的向量，来预测下一个字是什么。前面的词对应的输出我们不需要。</li>
+<li><strong>操作</strong>：<code>get_last_indices</code> 挑出输入序列里最后一个 token 对应的向量。这样可以节省巨大的计算量。</li>
+</ul>
+<hr />
+<h3>Task 5: 读懂 <code>ParallelLMHead</code> 的输出 —— 怎么把大家的结果拼回来？</h3>
+<p>这是最难懂的一段。现在要做矩阵乘法（<code>F.linear</code>）算出每个词的打分。</p>
+<ol>
+<li>
+<p><strong>计算局部打分：</strong>
+    <code>python
+    logits = F.linear(x, self.weight, self.bias)</code></p>
+<ul>
+<li><strong>显卡 A</strong> 算出了第 0~50000 个词的打分。</li>
+<li><strong>显卡 B</strong> 算出了第 50001~100000 个词的打分。</li>
+<li>注意：这里不需要 <code>all_reduce</code>（相加），因为大家算的词不一样，我们需要把它们<strong>拼起来</strong>（Gather）。</li>
+</ul>
+</li>
+<li>
+<p><strong>收集结果（All Gather）：</strong>
+    <code>python
+    output_tensor = self._comm.all_gather(logits)</code></p>
+<ul>
+<li><code>all_gather</code> 会把显卡 A 和显卡 B 的结果连在一起。</li>
+<li><strong>坑点</strong>：通常 <code>all_gather</code> 是沿着第0维（Batch维度）拼接的，但我们这里的切分是沿着词表维度（最后一维）。</li>
+</ul>
+</li>
+<li>
+<p><strong>复杂的维度变换（Reshape/View/Movedim）：</strong>
+    <code>python
+    output_tensor = output_tensor.view((self.tp_size,) + input_shape)
+    output_tensor = output_tensor.movedim(0, -1)
+    ...</code></p>
+<ul>
+<li>这一大坨代码的目的只有一个：<strong>调整数据的排列顺序</strong>。</li>
+<li>因为通信回来的数据是 <code>[显卡A的数据, 显卡B的数据]</code> 这样堆叠的。</li>
+<li>我们需要把它变成 <code>[ ... , 完整的大词表]</code> 的形状。</li>
+<li>最后 <code>[:, : self.num_embeddings]</code> 是为了切掉可能多出来的填充部分（padding），保证大小严格等于词表大小。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结</h3>
+<p>这段代码讲了如何在多张显卡上跑大模型：</p>
+<ol>
+<li><strong><code>VocabParallelEmbedding</code> (输入)</strong>：把字典撕开，每人拿一部分。查单词时，谁有谁拿出来，没有的拿0，最后大家把结果<strong>加</strong>起来 (<code>all_reduce</code>)。</li>
+<li><strong><code>ParallelLMHead</code> (输出)</strong>：算下一个词的概率时，每人算自己负责的那部分单词的分数。最后把大家算的分数<strong>拼</strong>起来 (<code>all_gather</code>)，组成完整的预测结果。</li>
+<li><strong>中间穿插了一个优化</strong>：如果是刚开始读题（Prefill），只算最后一个字的预测结果，省力气。</li>
+</ol>

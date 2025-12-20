@@ -1,0 +1,90 @@
+<h1>python/minisgl/kvcache/radix_manager.py</h1>
+<p>这份代码确实比较抽象，因为它涉及到了<strong>数据结构（基数树/Radix Tree）</strong>和<strong>系统设计（缓存管理/LRU Eviction）</strong>的结合。</p>
+<p>简单来说，这个文件的作用是：<strong>为大模型（LLM）管理 KV Cache（显存中的历史状态），通过“前缀树”的方式实现显存复用，越相似的 Prompt，复用的显存越多。</strong></p>
+<p>我为你列了一个 <strong>6步走的 Task List</strong>，我们一步一步拆解：</p>
+<h3>📋 学习任务清单 (Task List)</h3>
+<ol>
+<li><strong>场景理解：</strong> 为什么要用树来存显存？</li>
+<li><strong>认识积木：</strong> <code>RadixTreeNode</code> 是什么？</li>
+<li><strong>核心动作一：</strong> 顺藤摸瓜 (<code>_walk</code> 和 <code>match_prefix</code>)</li>
+<li><strong>核心动作二：</strong> 树的分裂 (<code>_split_at</code>) —— 最难理解的部分</li>
+<li><strong>核心动作三：</strong> 垃圾回收 (<code>evict</code>)</li>
+<li><strong>保护机制：</strong> 引用计数 (<code>lock_handle</code>)</li>
+</ol>
+<hr />
+<h3>Task 1: 场景理解 —— 为什么要用树？</h3>
+<p><strong>背景：</strong>
+假设你问大模型两个问题：
+1.  "请帮我翻译这句话：Hello World"
+2.  "请帮我翻译这句话：Good Morning"</p>
+<p>这两个句子的前缀 "请帮我翻译这句话：" 是一模一样的。在显存中，我们不希望把这部分前缀计算两次，存储两份。</p>
+<p><strong>观点：</strong>
+这个 <code>RadixManager</code> 就是把显存里的 Token 串组织成一棵树。
+*   <strong>根节点</strong> -&gt; "请帮我翻译这句话："
+*   <strong>子节点A</strong> -&gt; "Hello World"
+*   <strong>子节点B</strong> -&gt; "Good Morning"</p>
+<p>这样，公共前缀只存一份，节省显存，加速推理。</p>
+<hr />
+<h3>Task 2: 认识积木 —— <code>RadixTreeNode</code> 类</h3>
+<p>看代码开头的 <code>RadixTreeNode</code> 类。你可以把它想象成<strong>树枝</strong>。</p>
+<ul>
+<li><strong><code>_key</code></strong>: 这段树枝代表的 Token ID（比如 "Hello"）。</li>
+<li><strong><code>_value</code></strong>: 这些 Token 在 GPU 显存里的物理地址（索引）。</li>
+<li><strong><code>children</code></strong>: 这是一个字典。如果后面接着不同的词，就分叉去不同的子节点。</li>
+<li><strong><code>timestamp</code></strong>: 最后一次被摸到的时间。用于后面决定“谁太久没用，该删掉了”。</li>
+</ul>
+<p><strong>关键点：</strong> 每个节点存的是一段<strong>序列</strong>，而不是单个字符（这就是 Radix Tree 和普通 Trie 树的区别，它更压缩）。</p>
+<hr />
+<h3>Task 3: 核心动作一 —— 顺藤摸瓜 (<code>_walk</code>)</h3>
+<p>这是 <code>RadixCacheManager</code> 里的 <code>_walk</code> 方法。</p>
+<p><strong>任务：</strong> 当新的 Prompt 进来时（比如 "请帮我翻译这句话：你好"），我们要看树里已经存了多少。</p>
+<p><strong>流程：</strong>
+1.  从 <code>root_node</code> 开始。
+2.  拿 Prompt 的第一个字去 <code>children</code> 里找，看有没有匹配的树枝。
+3.  如果找到了，就沿着树枝往下比对（<code>fast_compare_key</code>）。
+4.  一直走到不能匹配为止。</p>
+<p><strong>结果：</strong> 返回匹配到了哪个节点，以及匹配了多长。这决定了我们能复用多少显存。</p>
+<hr />
+<h3>Task 4: 核心动作二 —— 树的分裂 (<code>_split_at</code>)</h3>
+<p>这是最容易晕的地方。Radix Tree 的特性是“节点可以存很长的一串”。</p>
+<p><strong>场景：</strong>
+假设树里有个节点存储了完整的一句话：<code>"ABCD"</code>。
+现在来了一个新请求：<code>"ABXY"</code>。</p>
+<p><strong>冲突：</strong>
+前两个字 <code>"AB"</code> 是匹配的，但后面 <code>"CD"</code> 和 <code>"XY"</code> 不一样。我们不能直接利用 <code>"ABCD"</code> 这个节点。</p>
+<p><strong>代码逻辑 (<code>_split_at</code>)：</strong>
+1.  <strong>切一刀</strong>：把 <code>"ABCD"</code> 这个节点从中间切开。
+2.  <strong>变身</strong>：
+    *   创建一个新父节点存 <code>"AB"</code>。
+    *   原来的节点变成子节点，只存 <code>"CD"</code>。
+3.  <strong>插入</strong>：现在可以在新父节点 <code>"AB"</code> 下面挂一个新的子节点 <code>"XY"</code> 了。</p>
+<p><strong>结论：</strong> 这个函数是为了在发现“部分匹配”时，动态调整树的结构，让公共前缀 <code>"AB"</code> 独立出来被复用。</p>
+<hr />
+<h3>Task 5: 核心动作三 —— 垃圾回收 (<code>evict</code>)</h3>
+<p>显存是有限的，满了怎么办？要删掉最久没用的缓存。</p>
+<p><strong>代码逻辑 (<code>evict</code>)：</strong>
+1.  <strong>收集叶子</strong>：找到所有位于树末梢的节点（<code>leave_nodes</code>）。
+2.  <strong>排序</strong>：用 <code>heapq</code>（堆排序）根据 <code>timestamp</code> 排序。时间戳越小，说明越久没用。
+3.  <strong>删除</strong>：
+    *   弹出一个最老的节点。
+    *   释放它占用的显存（<code>evicted_size += node.length</code>）。
+    *   把它的 value（显存索引）还给系统。
+    *   如果它的父节点删完孩子后也变成了光杆司令（叶子），把父节点也加入“待删除列表”。</p>
+<p><strong>观点：</strong> 这是一个典型的 <strong>LRU（Least Recently Used）</strong> 缓存淘汰策略。</p>
+<hr />
+<h3>Task 6: 保护机制 —— 引用计数 (<code>lock_handle</code>)</h3>
+<p><strong>问题：</strong> 如果一个请求正在用 <code>"ABCD"</code> 这个节点做计算，结果显存不够了，<code>evict</code> 把它删了怎么办？那程序就崩了。</p>
+<p><strong>代码逻辑：</strong>
+*   <strong><code>ref_count</code></strong>：每个节点都有个计数器。
+*   <strong><code>lock_handle</code></strong>：当一个请求选中某个节点时，把它的 <code>ref_count + 1</code>，并一路向上把所有父节点都 <code>+1</code>。
+*   <strong>保护</strong>：在 <code>evict</code> 函数里有一句 <code>if node.ref_count == 0</code>。只有没人用的节点才允许被删除。</p>
+<hr />
+<h3>总结</h3>
+<p>这段代码其实就在做一个<strong>显存文件系统</strong>：</p>
+<ol>
+<li><strong>写入</strong>：把 Prompt 变成路径存进去。</li>
+<li><strong>整理</strong>：如果路径分叉了，就分裂文件夹 (<code>split</code>)。</li>
+<li><strong>读取</strong>：新请求来了，先去文件夹里找前缀 (<code>walk</code>)。</li>
+<li><strong>清理</strong>：磁盘满了，把最久没打开过的文件夹删掉 (<code>evict</code>)，但正在读写的文件不能删 (<code>ref_count</code>)。</li>
+</ol>
+<p>希望这个 List 能帮你把代码逻辑串起来！你可以对照着代码里的 <code>_split_at</code> 和 <code>evict</code> 再看一遍，应该会清晰很多。</p>

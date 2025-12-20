@@ -12,7 +12,8 @@
 [🔥 Megatron-LM Demo](https://mor-li.github.io/understand-everything/output/Megatron-LM/index.html) |
 [🦙 LLaMA-Factory Demo](https://mor-li.github.io/understand-everything/output/LLaMA-Factory/index.html) |
 [✏️ EasyEdit Demo](https://mor-li.github.io/understand-everything/output/EasyEdit/index.html) |
-[🚀 nano-vllm Demo](https://mor-li.github.io/understand-everything/output/nano-vllm/index.html)
+[🚀 nano-vllm Demo](https://mor-li.github.io/understand-everything/output/nano-vllm/index.html) |
+[🎯 mini-sglang Demo](https://mor-li.github.io/understand-everything/output/mini-sglang/index.html)
 
 English | [简体中文](assets/README_zh.md)
 
@@ -195,6 +196,7 @@ Successfully analyzed open source projects:
 - **[LLaMA-Factory](https://github.com/hiyouga/LLaMA-Factory)** (405 files) - One-stop LLM fine-tuning framework supporting 100+ models
 - **[EasyEdit](https://github.com/zjunlp/EasyEdit)** (834 files) - Knowledge editing framework with 28+ editing methods
 - **[nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)** (26 files) - Lightweight vLLM implementation with PagedAttention & Continuous Batching
+- **[mini-sglang](https://github.com/sgl-project/mini-sglang)** (103 files) - Lightweight LLM serving framework with Tensor Parallelism & HiCache
 
 ## Tech Stack
 

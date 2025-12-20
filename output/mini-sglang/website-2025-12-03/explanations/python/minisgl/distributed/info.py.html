@@ -1,0 +1,86 @@
+<h1>python/minisgl/distributed/info.py</h1>
+<p>这份代码其实是在做一个非常基础但重要的事情：<strong>在一个多显卡（多GPU）并行的系统中，给每一个进程发一张“身份证”。</strong></p>
+<p>在深度学习框架（比如这里的 <code>minisgl</code>）中，通常会用到“张量并行”（Tensor Parallelism，简称 TP）。这意味着把一个大模型切开，分给好几张显卡一起算。每张显卡（或者说控制显卡的进程）都需要知道：“我是谁？”以及“我们要几个人一起干活？”。</p>
+<p>为了让你彻底理解，我为你制定了一个 <strong>5步学习任务清单 (To-Do List)</strong>。我们一步步把这个文件拆解开。</p>
+<hr />
+<h3>📋 学习任务清单</h3>
+<ol>
+<li><strong>Task 1: 理解背景概念（Rank 和 Size）</strong></li>
+<li><strong>Task 2: 看懂核心数据结构（身份证 <code>DistributedInfo</code>）</strong></li>
+<li><strong>Task 3: 理解全局变量的作用（公告栏 <code>_TP_INFO</code>）</strong></li>
+<li><strong>Task 4: 掌握读写规则（三个核心函数）</strong></li>
+<li><strong>Task 5: 总结——为什么要写这个文件？</strong></li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>✅ Task 1: 理解背景概念（Rank 和 Size）</h4>
+<p>想象有一个 4 人的搬家团队在搬钢琴。
+*   <strong>Size (总人数/规模)</strong>: 团队一共有 4 个人。
+*   <strong>Rank (编号/排位)</strong>: 为了分工明确，每个人都有个编号：0号、1号、2号、3号。</p>
+<p>在代码里：
+*   <code>size</code>: 代表总共有多少个 GPU 参与计算。
+*   <code>rank</code>: 代表当前这个程序跑在第几个 GPU 上（从0开始数）。</p>
+<h4>✅ Task 2: 看懂核心数据结构（身份证 <code>DistributedInfo</code>）</h4>
+<p>代码的第一部分定义了一个类 <code>DistributedInfo</code>：</p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">DistributedInfo</span><span class="p">:</span>
+    <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">size</span><span class="p">:</span> <span class="nb">int</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">assert</span> <span class="mi">0</span> <span class="o">&lt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">rank</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">size</span>  <span class="c1"># 检查编号是否合法</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">is_primary</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span>  <span class="c1"># 0号通常是队长</span>
+</code></pre></div>
+
+<ul>
+<li><strong>这是什么？</strong> 这就是一张“身份证”。</li>
+<li><strong><code>frozen=True</code> 是什么意思？</strong> 意思是这张身份证一旦打印出来（初始化），上面的字就不能改了。你不能变着变着从 1号 变成了 2号。</li>
+<li><strong><code>is_primary</code> 是干嘛的？</strong> 在并行计算中，有些活（比如打印日志、保存模型）只需要一个人干，通常由 0号（队长）来干。这个函数就是用来判断“我是不是队长”。</li>
+</ul>
+<h4>✅ Task 3: 理解全局变量的作用（公告栏 <code>_TP_INFO</code>）</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">_TP_INFO</span><span class="p">:</span> <span class="n">DistributedInfo</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+</code></pre></div>
+
+<ul>
+<li><strong>这是什么？</strong> 这是一个全局变量，你可以把它想象成公司大厅的 <strong>“公告栏”</strong>。</li>
+<li><strong>初始状态</strong>：<code>None</code>。也就是一开始公告栏是空的，大家还不知道自己的身份。</li>
+<li><strong>目的</strong>：因为程序里的任何地方（模型的哪一层、数据加载器等）可能随时都需要知道“我是谁”，我们不能把 <code>rank</code> 和 <code>size</code> 作为参数一层一层往下传（太麻烦了），所以直接贴在全局变量里，谁想看就来看。</li>
+</ul>
+<h4>✅ Task 4: 掌握读写规则（三个核心函数）</h4>
+<p>为了安全地使用这个“公告栏”，作者写了三个函数来管理它：</p>
+<p><strong>1. 贴公告 (<code>set_tp_info</code>)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">set_tp_info</span><span class="p">(</span><span class="n">rank</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">global</span> <span class="n">_TP_INFO</span>
+    <span class="k">if</span> <span class="n">_TP_INFO</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="s2">&quot;TP info has been set&quot;</span><span class="p">)</span> <span class="c1"># 报错：已经贴过了！</span>
+    <span class="n">_TP_INFO</span> <span class="o">=</span> <span class="n">DistributedInfo</span><span class="p">(</span><span class="n">rank</span><span class="p">,</span> <span class="n">size</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>逻辑</strong>：程序启动时调用。如果公告栏是空的，就把身份证贴上去。如果已经贴过了，就报错（防止有人篡改身份）。</li>
+</ul>
+<p><strong>2. 强制看公告 (<code>get_tp_info</code>)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">get_tp_info</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">DistributedInfo</span><span class="p">:</span>
+    <span class="k">if</span> <span class="n">_TP_INFO</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="s2">&quot;TP info has not been set&quot;</span><span class="p">)</span> <span class="c1"># 报错：还没贴呢！</span>
+    <span class="k">return</span> <span class="n">_TP_INFO</span>
+</code></pre></div>
+
+<ul>
+<li><strong>逻辑</strong>：当你必须知道自己身份才能干活时调用。如果公告栏是空的，说明程序初始化出问题了，直接报错崩溃。</li>
+</ul>
+<p><strong>3. 尝试看公告 (<code>try_get_tp_info</code>)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">try_get_tp_info</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">DistributedInfo</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">return</span> <span class="n">_TP_INFO</span>
+</code></pre></div>
+
+<ul>
+<li><strong>逻辑</strong>：也就是“随便看看”。如果有信息就返回，没有就返回 <code>None</code>，不会报错。这用于那些“如果有并行环境我就并行，没有我就单机跑”的灵活代码。</li>
+</ul>
+<h4>✅ Task 5: 总结——为什么要写这个文件？</h4>
+<p>这个文件的作用就是 <strong>“全局身份管理”</strong>。</p>
+<p>如果不写这个文件，你的代码里可能到处都要传递 <code>rank</code> 和 <code>size</code> 这两个参数，代码会变得非常乱。</p>
+<p><strong>一句话总结文中观点：</strong>
+这是一个<strong>单例模式</strong>的实现，用来在程序的任何地方安全地存储和获取当前进程的<strong>分布式身份信息（我是几号，共有几人）</strong>。</p>

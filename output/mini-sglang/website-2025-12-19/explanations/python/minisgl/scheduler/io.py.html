@@ -1,0 +1,101 @@
+<h1>python/minisgl/scheduler/io.py</h1>
+<p>这份代码确实涉及了<strong>分布式计算（多显卡并行）</strong>和<strong>网络通信（ZeroMQ）</strong>，如果没有相关背景，读起来会像天书。</p>
+<p>别担心，我们把它想象成一个<strong>餐厅的后厨管理系统</strong>。</p>
+<p>这个文件 <code>SchedulerIOMixin</code> 的核心作用是：<strong>负责调度器（Scheduler）的“收发室”工作——接收外部请求，分发给内部的显卡（Rank），并将结果送回去。</strong></p>
+<p>我们列一个 <strong>To-Do List</strong>，一步步拆解它的逻辑：</p>
+<h3>📝 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1: 搞懂角色定位</strong> —— 谁是老板？谁是员工？谁是顾客？</li>
+<li><strong>Task 2: 搞懂“接线”逻辑 (<code>__init__</code>)</strong> —— 不同身份的人，电话线怎么接？</li>
+<li><strong>Task 3: 搞懂“收信”流程 (<code>receive_msg</code>)</strong> —— 怎么保证所有显卡都收到了同样的任务？</li>
+<li><strong>Task 4: 搞懂“回信”流程 (<code>send_result</code>)</strong> —— 任务做完了，谁去告诉顾客？</li>
+</ol>
+<hr />
+<h3>🔍 详细讲解</h3>
+<h4>Task 1: 搞懂角色定位</h4>
+<p>在看代码前，先建立这个心理模型：</p>
+<ul>
+<li><strong>Tokenizer (外部)</strong>：相当于<strong>顾客</strong>。它发来文本（Prompt），想要模型生成回答。</li>
+<li><strong>Rank 0 (Primary)</strong>：相当于<strong>领班（主显卡）</strong>。它负责对外沟通，也负责干活。</li>
+<li><strong>Rank 1, 2... (Secondary)</strong>：相当于<strong>普通员工（其他显卡）</strong>。它们不跟顾客说话，只听领班的指挥，闷头干活。</li>
+<li><strong>SchedulerIOMixin (本代码)</strong>：相当于每个员工手里的<strong>对讲机操作手册</strong>。</li>
+</ul>
+<h4>Task 2: 搞懂“接线”逻辑 (<code>__init__</code>)</h4>
+<p>构造函数 <code>__init__</code> 是在分配对讲机频道。根据你是“领班”还是“普通员工”，你的连线方式不同。</p>
+<ul>
+<li>
+<p><strong>如果你是领班 (Rank 0)</strong>：</p>
+<ul>
+<li><code>self._recv_from_tokenizer</code>: 你需要一个接收器，专门听<strong>顾客 (Tokenizer)</strong> 的请求（用 ZmqPullQueue）。</li>
+<li><code>self._send_into_tokenizer</code>: 你需要一个发送器，专门给 <strong>顾客</strong> 回话（用 ZmqPushQueue）。</li>
+<li><code>self._send_into_ranks</code>: 你还需要一个大喇叭，把顾客的需求<strong>广播</strong>给其他员工（用 ZmqPubQueue）。</li>
+<li><strong>你的收信策略</strong>：用 <code>_recv_msg_multi_rank0</code>（既听顾客的，也告诉员工）。</li>
+</ul>
+</li>
+<li>
+<p><strong>如果你是普通员工 (Rank &gt; 0)</strong>：</p>
+<ul>
+<li>你<strong>不需要</strong>直接连顾客。</li>
+<li><code>self._recv_from_rank0</code>: 你只需要一个接收器，专门听 <strong>领班 (Rank 0)</strong> 的广播（用 ZmqSubQueue）。</li>
+<li><strong>你的收信策略</strong>：用 <code>_recv_msg_multi_rank1</code>（只听领班的）。</li>
+<li><strong>你的回信策略</strong>：用 <code>_reply_tokenizer_rank1</code>（其实就是什么都不做，闭嘴）。</li>
+</ul>
+</li>
+<li>
+<p><strong>特殊情况 (单显卡)</strong>：</p>
+<ul>
+<li>如果只有一张卡，既是领班也是唯一员工。直接收发，不需要广播。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 搞懂“收信”流程 (<code>receive_msg</code>)</h4>
+<p>这是最难懂的部分，因为涉及<strong>多显卡同步</strong>。必须保证大家拿到的任务是一模一样的。</p>
+<p><strong>场景：多显卡模式 (TP &gt; 1)</strong></p>
+<ol>
+<li>
+<p><strong>领班 (Rank 0) 的操作 (<code>_recv_msg_multi_rank0</code>)</strong>:</p>
+<ul>
+<li>先从顾客那里收信。</li>
+<li><strong>关键点</strong>：领班通过 <code>torch.distributed.broadcast</code> 告诉所有员工：“嘿，我这里收到了 <strong>N</strong> 条消息，你们准备好接收。”</li>
+<li>然后，领班通过 ZMQ 内部广播，把这 N 条消息的具体内容发给员工。</li>
+<li>最后，领班自己解码消息，准备干活。</li>
+</ul>
+</li>
+<li>
+<p><strong>普通员工 (Rank 1) 的操作 (<code>_recv_msg_multi_rank1</code>)</strong>:</p>
+<ul>
+<li>先等待。</li>
+<li><strong>关键点</strong>：收到领班的 <code>broadcast</code> 通知：“准备好，有 <strong>N</strong> 条消息来了。”</li>
+<li>循环 N 次，从 ZMQ 内部频道里把这 N 条消息收下来。</li>
+<li><strong>目的</strong>：这样保证了领班收到什么，员工就收到什么，大家的“任务列表”是完全同步的。</li>
+</ul>
+</li>
+</ol>
+<h4>Task 4: 搞懂“回信”流程 (<code>send_result</code>)</h4>
+<p>任务做完了，模型生成了结果，要发回去。</p>
+<ol>
+<li>
+<p><strong>领班 (Rank 0) 的操作 (<code>_reply_tokenizer_rank0</code>)</strong>:</p>
+<ul>
+<li>检查结果。</li>
+<li>通过 <code>_send_into_tokenizer</code> 直接把结果发给外部的 Tokenizer。</li>
+</ul>
+</li>
+<li>
+<p><strong>普通员工 (Rank 1) 的操作 (<code>_reply_tokenizer_rank1</code>)</strong>:</p>
+<ul>
+<li>代码里写着：<code>_ = reply</code>。</li>
+<li>意思就是：<strong>啥也不干</strong>。因为你是配角，不需要你对外说话，避免重复发送消息导致混乱。</li>
+</ul>
+</li>
+</ol>
+<h3>📌 总结</h3>
+<p>这个文件的核心逻辑就是：</p>
+<blockquote>
+<p><strong>“对外一个口径，对内广播同步。”</strong></p>
+</blockquote>
+<ul>
+<li><strong>Rank 0</strong> 是唯一的对外窗口（IO Gateway）。</li>
+<li><strong>Rank 1+</strong> 是默默干活的跟随者。</li>
+<li>代码中复杂的 <code>broadcast</code> 和 <code>queue</code> 操作，都是为了确保<strong>所有显卡在同一时间拿到同一份数据</strong>，这样并行计算才不会出错。</li>
+</ul>

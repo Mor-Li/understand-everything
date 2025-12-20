@@ -1,0 +1,82 @@
+<h1>python/minisgl/models/llama.py</h1>
+<p>这段代码看起来复杂，是因为它不仅实现了 <strong>Llama 模型</strong>（也就是现在最火的大模型架构），还包含了一些<strong>深度学习框架的底层优化</strong>（比如并行计算、显存优化等）。</p>
+<p>为了让你能看懂，我把它拆解成一个 <strong>“造车”</strong> 的过程。我们将任务分成 5 个步骤（Task），从零件到整车，一步步看懂它在干嘛。</p>
+<hr />
+<h3>Task 1: 搞懂“原材料”和“工具箱” (Imports &amp; Utils)</h3>
+<p>首先，我们要看代码开头引入了什么。这决定了我们是在“手搓”还是在“组装”。</p>
+<ul>
+<li><strong><code>torch</code></strong>: 深度学习的基础库。</li>
+<li><strong><code>nvtx</code></strong>: 这是 NVIDIA 的工具，用来给代码打标签的。你在代码里看到的 <code>with nvtx.range(...)</code> 就像是在工厂流水线上贴个条子：“现在开始做发动机了”、“现在开始做轮胎了”。<strong>这对模型逻辑没影响，纯粹为了性能分析。</strong></li>
+<li><strong><code>minisgl.layers...</code></strong>: 重点来了。代码没有用 PyTorch 原生的层，而是用了 <code>VocabParallelEmbedding</code>（并行词嵌入）、<code>RMSNormFused</code>（融合归一化）等。<ul>
+<li><strong>观点 1</strong>：这是一个<strong>高度优化</strong>的版本，它把很多计算步骤合并了（Fused），或者拆分到多张显卡上算（Parallel），为了跑得更快。</li>
+</ul>
+</li>
+<li><strong><code>LlamaMLP</code>, <code>LlamaAttn</code></strong>: 这是从别处引用的“发动机”和“变速箱”。我们不需要知道里面怎么写的，只需要知道：<ul>
+<li><code>Attn</code> (Attention): 让模型关注上下文关系。</li>
+<li><code>MLP</code>: 让模型思考和处理信息。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 2: 组装核心零件 —— <code>LlamaDecoderLayer</code></h3>
+<p>这是代码里最长的一个类。你可以把它理解为大模型里的<strong>“一层”</strong>。Llama 模型通常有 32 层到 80 层这样的结构堆叠起来。</p>
+<p><strong>要做的事情 (TODO):</strong>
+1.  <strong>初始化 (<code>__init__</code>)</strong>:
+    *   准备好 <code>self_attn</code> (注意力机制)。
+    *   准备好 <code>mlp</code> (前馈神经网络)。
+    *   准备好两个 <code>RMSNormFused</code> (归一化层，相当于数据清洗，防止数字过大或过小)。
+2.  <strong>前向传播 (<code>forward</code>)</strong>: 这是数据流动的过程。
+    *   <code>x, residual = self.input_layernorm.forward(x, residual)</code>: 先做归一化。注意这里它同时处理了 <code>residual</code> (残差)，这是一种高级优化技巧。
+    *   <code>x = self.self_attn.forward(x)</code>: 数据进入注意力层处理。
+    *   <code>x, residual = self.post_attention_layernorm.forward(x, residual)</code>: 再做一次归一化。
+    *   <code>x = self.mlp.forward(x)</code>: 数据进入 MLP 层处理。
+    *   <strong>核心逻辑</strong>: 这一层就是 <strong>Norm -&gt; Attention -&gt; Norm -&gt; MLP</strong> 的经典三明治结构。</p>
+<hr />
+<h3>Task 3: 组装车身 —— <code>LlamaModel</code></h3>
+<p>有了“层”（Layer），我们现在要把它们堆起来，变成一个完整的躯干。</p>
+<p><strong>要做的事情 (TODO):</strong>
+1.  <strong>词嵌入 (<code>embed_tokens</code>)</strong>:
+    *   把输入的文字 ID（比如 "你好" 对应的数字）转换成数学向量（Embedding）。
+2.  <strong>堆叠层 (<code>layers</code>)</strong>:
+    *   用 <code>OPList</code> 创建了一个列表，里面塞了 N 个 <code>LlamaDecoderLayer</code>（就是 Task 2 里的那个东西）。
+3.  <strong>最终归一化 (<code>norm</code>)</strong>:
+    *   在所有层跑完之后，最后再清洗一次数据。
+4.  <strong>跑起来 (<code>forward</code>)</strong>:
+    *   输入 ID -&gt; 变向量 -&gt; <strong>循环</strong>跑完所有的层 -&gt; 最后清洗 -&gt; 输出结果。</p>
+<hr />
+<h3>Task 4: 加上车头和方向盘 —— <code>LlamaForCausalLM</code></h3>
+<p>这是整个文件的<strong>最外层接口</strong>，也就是用户真正调用的那个类。</p>
+<p><strong>要做的事情 (TODO):</strong>
+1.  <strong>包含躯干 (<code>self.model</code>)</strong>:
+    *   就是 Task 3 里的 <code>LlamaModel</code>。
+2.  <strong>加上输出头 (<code>self.lm_head</code>)</strong>:
+    *   <code>LlamaModel</code> 输出的是一堆抽象的数学向量。
+    *   <code>lm_head</code> (Language Model Head) 的作用是把这些向量映射回<strong>词表</strong>。它会算出下一个字是“猫”、“狗”还是“人”的概率。
+3.  <strong>全流程控制 (<code>forward</code>)</strong>:
+    *   <code>ctx = get_global_ctx()</code>: 这里有个特殊的点。它从一个“全局上下文”里拿数据，而不是通过函数参数传进来。这说明这个框架是专门为服务（Serving）设计的，数据由框架统一管理。
+    *   <code>output = self.model.forward(...)</code>: 跑躯干。
+    *   <code>logits = self.lm_head.forward(...)</code>: 跑输出头，得到最终的概率分布 (logits)。</p>
+<hr />
+<h3>Task 5: 总结回顾 (Checklist)</h3>
+<p>现在如果你回头看代码，能不能对应上这几个步骤？</p>
+<ol>
+<li><strong><code>LlamaForCausalLM</code></strong>: 我是老板。<ul>
+<li>我从全局上下文拿输入数据。</li>
+<li>我让 <code>LlamaModel</code> 干活。</li>
+<li>我最后把结果翻译成单词概率 (<code>lm_head</code>)。</li>
+</ul>
+</li>
+<li><strong><code>LlamaModel</code></strong>: 我是车间主任。<ul>
+<li>我先把原料变成向量 (<code>embed_tokens</code>)。</li>
+<li>我让几十个 <code>LlamaDecoderLayer</code> 轮流加工数据。</li>
+<li>我做最后的质检 (<code>norm</code>)。</li>
+</ul>
+</li>
+<li><strong><code>LlamaDecoderLayer</code></strong>: 我是流水线工人。<ul>
+<li>我负责具体的计算：先归一化，再做注意力 (Attn)，再归一化，再做 MLP。</li>
+<li>我还负责把残差 (<code>residual</code>) 传给下一个人。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话总结文中的观点：</strong>
+这段代码定义了一个标准的 <strong>Llama 结构大模型</strong>，但为了<strong>高性能推理</strong>，它引入了自定义的并行层（Parallel）和融合算子（Fused），并使用全局上下文来管理输入数据。</p>

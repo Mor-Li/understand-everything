@@ -1,0 +1,110 @@
+<h1>tests/kernel/test_store.py</h1>
+<p>这份代码其实是一个<strong>测试脚本</strong>（Test Script）。</p>
+<p>它的核心目的是：<strong>测试一个名为 <code>store_cache</code> 的自定义函数（Kernel），看看它算得对不对，以及跑得快不快。</strong></p>
+<p>为了让你听懂，我们不需要深究代码语法，而是把这个脚本想象成一个<strong>质检员</strong>。我为你列了一个“质检员的工作清单（ToDo List）”，我们按照这个顺序一步步来看。</p>
+<h3>核心背景知识（简单的）</h3>
+<p>在像 ChatGPT 这样的大模型推理中，有一个叫 <strong>KV Cache</strong> 的东西。你可以把它想象成<strong>模型的笔记本</strong>，它要把之前算过的数据存下来，这样生成下一个字时就不用重头算了。
+这个脚本就是在测试：<strong>“把新算出来的数据（K和V）存入笔记本（Cache）”这个动作的效率。</strong></p>
+<hr />
+<h3>质检员的 ToDo List</h3>
+<ol>
+<li><strong>[准备阶段]</strong> 申请一大块显存，模拟“笔记本”的存储空间。</li>
+<li><strong>[压力测试]</strong> 设定不同的“工作量”（Batch Size），从处理 1 个数据到处理几万个数据。</li>
+<li><strong>[制造数据]</strong> 随机生成一些新数据，并随机指定要存放在“笔记本”的哪一页。</li>
+<li><strong>[执行动作]</strong> 调用我们要测试的 <code>store_cache</code> 函数，把数据存进去。</li>
+<li><strong>[查验真伪]</strong> 检查数据是不是真的存进去了，而且没存错。</li>
+<li><strong>[速度比拼]</strong> 让它和 PyTorch 原生的写法赛跑，看看谁更快。</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>1. [准备阶段] 搭建环境</h4>
+<p>代码开头部分是在造一个巨大的“空笔记本”。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">HEAD_SIZE</span> <span class="o">=</span> <span class="mi">128</span>          <span class="c1"># 每一个数据块的大小</span>
+<span class="n">NUM_TOKENS</span> <span class="o">=</span> <span class="mi">1048576</span>     <span class="c1"># 笔记本总共能存 100万个 Token</span>
+<span class="c1"># ...</span>
+<span class="c1"># 在 GPU 上申请一大块内存，叫 kv_cache</span>
+<span class="n">kv_cache</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">((</span><span class="n">NUM_TOKENS</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="n">HEAD_SIZE</span><span class="p">),</span> <span class="n">device</span><span class="o">=</span><span class="s2">&quot;cuda&quot;</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+<span class="n">k_cache</span> <span class="o">=</span> <span class="n">kv_cache</span><span class="p">[:,</span> <span class="mi">0</span><span class="p">,</span> <span class="p">:]</span> <span class="c1"># 笔记本的 K 区</span>
+<span class="n">v_cache</span> <span class="o">=</span> <span class="n">kv_cache</span><span class="p">[:,</span> <span class="mi">1</span><span class="p">,</span> <span class="p">:]</span> <span class="c1"># 笔记本的 V 区</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：这里创建了一个巨大的 GPU 张量（Tensor），用来代表显存里的 KV Cache 池子。</li>
+</ul>
+<h4>2. [压力测试] 循环测试不同负载</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">for</span> <span class="n">bs</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">2</span><span class="o">**</span><span class="n">n</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">16</span><span class="p">)]:</span>
+    <span class="c1"># bs 会变成 1, 2, 4, 8 ... 直到 32768</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：代码进入一个循环。<code>bs</code> (Batch Size) 代表这次我们要存多少个数据。从小到大测，看看这个函数在不同负载下的表现。</li>
+</ul>
+<h4>3. [制造数据] 生成随机输入</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 随机选 bs 个位置（indices），假装我们要把数据存到这几页去</span>
+<span class="n">indices</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randperm</span><span class="p">(</span><span class="n">NUM_TOKENS</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">&quot;cuda&quot;</span><span class="p">)[:</span><span class="n">bs</span><span class="p">]</span><span class="o">...</span>
+
+<span class="c1"># 随机生成一些新数据 (qkv)，假装这是模型刚算出来的</span>
+<span class="n">qkv</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">randn</span><span class="p">((</span><span class="n">bs</span><span class="p">,</span> <span class="n">HEAD_SIZE</span> <span class="o">*</span> <span class="mi">4</span><span class="p">),</span> <span class="o">...</span><span class="p">)</span>
+<span class="n">k</span> <span class="o">=</span> <span class="n">qkv</span><span class="p">[:,</span> <span class="p">:</span><span class="n">HEAD_SIZE</span><span class="p">]</span>            <span class="c1"># 切分出 K</span>
+<span class="n">v</span> <span class="o">=</span> <span class="n">qkv</span><span class="p">[:,</span> <span class="n">HEAD_SIZE</span> <span class="p">:</span> <span class="n">HEAD_SIZE</span> <span class="o">*</span> <span class="mi">2</span><span class="p">]</span> <span class="c1"># 切分出 V</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：<ul>
+<li><code>indices</code>：我们要存的目标地址（比如存到第 5 行、第 100 行...）。</li>
+<li><code>k</code> 和 <code>v</code>：我们要存的内容。</li>
+</ul>
+</li>
+</ul>
+<h4>4. [执行动作] 调用主角函数</h4>
+<div class="codehilite"><pre><span></span><code><span class="n">store_cache</span><span class="p">(</span>
+    <span class="n">k_cache</span><span class="p">,</span> <span class="c1"># 目标大池子 K</span>
+    <span class="n">v_cache</span><span class="p">,</span> <span class="c1"># 目标大池子 V</span>
+    <span class="n">indices</span><span class="p">,</span> <span class="c1"># 存哪里</span>
+    <span class="n">k</span><span class="p">,</span>       <span class="c1"># 存什么 K</span>
+    <span class="n">v</span><span class="p">,</span>       <span class="c1"># 存什么 V</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：这就是<strong>全篇的核心</strong>。调用 <code>minisgl</code> 库里写的 <code>store_cache</code> 函数。它的任务就是把 <code>k</code> 和 <code>v</code> 搬运到 <code>k_cache</code> 和 <code>v_cache</code> 里对应的 <code>indices</code> 位置。</li>
+</ul>
+<h4>5. [查验真伪] 验证正确性</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 检查：池子里 indices 位置的数据，是不是等于 k？</span>
+<span class="k">assert</span> <span class="n">torch</span><span class="o">.</span><span class="n">all</span><span class="p">(</span><span class="n">k_cache</span><span class="p">[</span><span class="n">indices</span><span class="p">]</span> <span class="o">==</span> <span class="n">k</span><span class="p">),</span> <span class="n">bs</span>
+<span class="c1"># 检查：池子里 indices 位置的数据，是不是等于 v？</span>
+<span class="k">assert</span> <span class="n">torch</span><span class="o">.</span><span class="n">all</span><span class="p">(</span><span class="n">v_cache</span><span class="p">[</span><span class="n">indices</span><span class="p">]</span> <span class="o">==</span> <span class="n">v</span><span class="p">),</span> <span class="n">bs</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：<code>assert</code> 是断言。如果 <code>store_cache</code> 写得有问题，数据没存进去或者存歪了，这里就会报错停止。如果通过了，说明功能逻辑是对的。</li>
+</ul>
+<h4>6. [速度比拼] 性能跑分</h4>
+<p>这部分是为了证明：<strong>我写的这个 Kernel 比直接用 PyTorch 写要快！</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 定义基准线（Baseline）：用 PyTorch 原生语法怎么写？</span>
+<span class="nd">@torch</span><span class="o">.</span><span class="n">compile</span><span class="p">()</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">baseline</span><span class="p">():</span>
+    <span class="n">k_cache</span><span class="p">[</span><span class="n">indices</span><span class="p">]</span> <span class="o">=</span> <span class="n">k</span>  <span class="c1"># 最普通的写法</span>
+    <span class="n">v_cache</span><span class="p">[</span><span class="n">indices</span><span class="p">]</span> <span class="o">=</span> <span class="n">v</span>
+
+<span class="c1"># 开始赛跑</span>
+<span class="n">compare_memory_kernel_perf</span><span class="p">(</span>
+    <span class="n">our_impl</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="n">store_cache</span><span class="p">(</span><span class="o">...</span><span class="p">),</span> <span class="c1"># 我们的函数</span>
+    <span class="n">baseline</span><span class="o">=</span><span class="n">baseline</span><span class="p">,</span>                 <span class="c1"># PyTorch 原生函数</span>
+    <span class="n">memory_footprint</span><span class="o">=</span><span class="n">MEM</span><span class="p">,</span>              <span class="c1"># 告诉评测器读写了多少数据</span>
+    <span class="n">description</span><span class="o">=</span><span class="sa">f</span><span class="s2">&quot;BS=</span><span class="si">{</span><span class="n">bs</span><span class="si">:</span><span class="s2">6d</span><span class="si">}</span><span class="s2"> | &quot;</span><span class="p">,</span>      <span class="c1"># 打印出来的标签</span>
+    <span class="o">...</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：<ul>
+<li><code>baseline</code> 函数用了 Python 最直观的写法 <code>cache[index] = value</code>。</li>
+<li><code>compare_memory_kernel_perf</code> 会分别运行这两个函数很多次，计算带宽（GB/s）和耗时。</li>
+<li>通常，自定义的 CUDA Kernel (<code>store_cache</code>) 会比通用的 PyTorch 写法 (<code>baseline</code>) 更快，尤其是在数据量大的时候。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这篇文章讲的观点（或者说验证的结论）是：
+<strong>“我们写了一个叫 <code>store_cache</code> 的底层加速函数，经过测试，它能正确地把 Key/Value 数据存入缓存池，并且在各种 Batch Size 下，它的运行效率（可能）比 PyTorch 原生操作要高。”</strong></p>

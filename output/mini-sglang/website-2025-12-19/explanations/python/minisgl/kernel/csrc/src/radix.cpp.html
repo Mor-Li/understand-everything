@@ -1,0 +1,93 @@
+<h1>python/minisgl/kernel/csrc/src/radix.cpp</h1>
+<p>这段代码看起来充满了C++的“方言”（比如 <code>namespace</code>, <code>static_cast</code>, <code>std::mismatch</code>），对于不常写C++的人来说确实很劝退。</p>
+<p>但其实，<strong>这段代码的核心逻辑非常简单，甚至可以说只有一行</strong>。它就是为了解决 Python 跑循环太慢的问题，专门写了一个 C++ 函数来<strong>找两个数组的“共同前缀”有多长</strong>。</p>
+<p>为了让你彻底理解，我制定了一个 <strong>6步学习 Task List</strong>，我们一步步来拆解：</p>
+<h3>📋 学习 Task List</h3>
+<ol>
+<li><strong>Task 1：搞懂背景</strong> —— 这段代码到底是给谁用的？</li>
+<li><strong>Task 2：看懂保安（辅助函数）</strong> —— <code>_is_1d_cpu_int_tensor</code> 在检查什么？</li>
+<li><strong>Task 3：看懂核心任务</strong> —— <code>fast_compare_key</code> 到底想干嘛？</li>
+<li><strong>Task 4：理解“找不同”的神器</strong> —— <code>std::mismatch</code> 是什么？</li>
+<li><strong>Task 5：理解返回结果</strong> —— 算出来的数代表什么？</li>
+<li><strong>Task 6：总结价值</strong> —— 为什么要大费周章用 C++ 写这个？</li>
+</ol>
+<hr />
+<h3>🚀 开始执行 Task</h3>
+<h4>Task 1：搞懂背景</h4>
+<p><strong>文件名叫 <code>radix.cpp</code>，属于 <code>minisgl</code>。</strong>
+*   <strong>背景</strong>：在大模型推理（比如 vLLM, SGLang）中，我们需要管理 KV Cache（缓存）。为了省显存和加速，我们需要知道：“新的 Prompt（提示词）和之前缓存过的 Prompt，前面有多少个 token 是<strong>一模一样</strong>的？”
+*   <strong>目的</strong>：这个文件就是为了<strong>极速</strong>算出两个 token 序列的<strong>最长公共前缀长度</strong>。
+*   <strong>角色</strong>：它是一个“外挂”。Python 调用它，它在底层 C++ 跑完，把结果扔回给 Python。</p>
+<h4>Task 2：看懂保安（辅助函数）</h4>
+<p>代码里有一个函数 <code>_is_1d_cpu_int_tensor</code>。你可以把它看作是一个<strong>保安</strong>。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">auto</span><span class="w"> </span><span class="n">_is_1d_cpu_int_tensor</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="n">tvm</span><span class="o">::</span><span class="n">ffi</span><span class="o">::</span><span class="n">TensorView</span><span class="w"> </span><span class="n">tensor</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="kt">bool</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">return</span><span class="w"> </span><span class="n">tensor</span><span class="p">.</span><span class="n">ndim</span><span class="p">()</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">1</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w">              </span><span class="c1">// 必须是1维数组（像个列表，不能是矩阵）</span>
+<span class="w">         </span><span class="n">tensor</span><span class="p">.</span><span class="n">is_contiguous</span><span class="p">()</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w">          </span><span class="c1">// 内存必须是连续的（中间不能断开）</span>
+<span class="w">         </span><span class="n">tensor</span><span class="p">.</span><span class="n">device</span><span class="p">().</span><span class="n">device_type</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">kDLCPU</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="c1">// 数据必须在 CPU 内存里（不能在显卡上）</span>
+<span class="w">         </span><span class="p">(</span><span class="n">tensor</span><span class="p">.</span><span class="n">dtype</span><span class="p">().</span><span class="n">code</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">kDLInt</span><span class="p">)</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="c1">// 必须是整数（Token ID 都是整数）</span>
+<span class="w">         </span><span class="p">(</span><span class="n">tensor</span><span class="p">.</span><span class="n">dtype</span><span class="p">().</span><span class="n">bits</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">32</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">tensor</span><span class="p">.</span><span class="n">dtype</span><span class="p">().</span><span class="n">bits</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">64</span><span class="p">);</span><span class="w"> </span><span class="c1">// 必须是32位或64位整数</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：
+如果不满足这些条件，保安就会拦住，防止后面的代码出错。因为这个算法只针对 CPU 上的整数列表设计。</p>
+<h4>Task 3：看懂核心任务</h4>
+<p>主函数是 <code>fast_compare_key(a, b)</code>。
+它的逻辑是：给我两个数组 <code>a</code> 和 <code>b</code>，我来比比看。</p>
+<ol>
+<li><strong>安检</strong>：
+    <code>cpp
+    host::RuntimeCheck(_is_1d_cpu_int_tensor(a) &amp;&amp; ...); // 两个都得过安检
+    host::RuntimeCheck(a.dtype() == b.dtype());          // 两个的数据类型得一样</code></li>
+<li><strong>拿数据指针</strong>：
+    <code>cpp
+    const auto a_ptr = a.data_ptr(); // 拿到数组 a 的内存起始地址
+    const auto b_ptr = b.data_ptr(); // 拿到数组 b 的内存起始地址</code></li>
+<li><strong>定长度</strong>：
+    <code>cpp
+    const auto common_len = std::min(a.size(0), b.size(0));</code>
+    比如 <code>a</code> 长 100，<code>b</code> 长 50。那我们最多只能比前 50 个。多出来的没法比。</li>
+</ol>
+<h4>Task 4：理解“找不同”的神器（重点！）</h4>
+<p>这是全篇最核心的一句代码：<strong><code>std::mismatch</code></strong>。</p>
+<p>代码根据是 64位 还是 32位 分了两个分支，逻辑是一样的，我们看 64位 的：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1">// 在 a 和 b 的范围内，找出第一个“不匹配”的位置</span>
+<span class="k">const</span><span class="w"> </span><span class="k">auto</span><span class="w"> </span><span class="n">diff_pos</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">mismatch</span><span class="p">(</span><span class="n">a_ptr_64</span><span class="p">,</span><span class="w"> </span><span class="n">a_ptr_64</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">common_len</span><span class="p">,</span><span class="w"> </span><span class="n">b_ptr_64</span><span class="p">);</span>
+</code></pre></div>
+
+<p><strong>形象解释</strong>：
+想象你有两条拉链（数组 A 和 数组 B）。
+*   <code>std::mismatch</code> 就像是你<strong>拉拉链</strong>的动作。
+*   它从头开始，一个齿一个齿地比对。
+*   只要两个齿咬合（数字相同），就继续往后拉。
+*   一旦遇到两个齿不一样（数字不同），或者拉到了尽头，<strong>立刻停下</strong>。
+*   它返回停下的那个位置的指针。</p>
+<h4>Task 5：理解返回结果</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">return</span><span class="w"> </span><span class="k">static_cast</span><span class="o">&lt;</span><span class="kt">size_t</span><span class="o">&gt;</span><span class="p">(</span><span class="n">diff_pos</span><span class="p">.</span><span class="n">first</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">a_ptr_64</span><span class="p">);</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：
+*   <code>diff_pos.first</code> 是拉链<strong>卡住的位置</strong>（指针地址）。
+*   <code>a_ptr_64</code> 是拉链的<strong>起始位置</strong>（指针地址）。
+*   两者相减（地址相减），得到的就是<strong>中间隔了多少个数字</strong>。</p>
+<p><strong>举例</strong>：
+*   数组 A: <code>[1, 2, 3, 4, 9, 9]</code>
+*   数组 B: <code>[1, 2, 3, 4, 5, 6]</code>
+*   程序对比：1对，2对，3对，4对，<strong>9和5不对！停！</strong>
+*   停在第 5 个位置（索引为 4）。
+*   相减得到结果：<strong>4</strong>。
+*   含义：这两个数组，<strong>前 4 个元素是一模一样的</strong>。</p>
+<h4>Task 6：总结价值</h4>
+<p>你可能会问：<em>“这在 Python 里写个 <code>for</code> 循环不也行吗？”</em></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># Python 写法</span>
+<span class="n">i</span> <span class="o">=</span> <span class="mi">0</span>
+<span class="k">while</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">a</span><span class="p">)</span> <span class="ow">and</span> <span class="n">i</span> <span class="o">&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">b</span><span class="p">)</span> <span class="ow">and</span> <span class="n">a</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">==</span> <span class="n">b</span><span class="p">[</span><span class="n">i</span><span class="p">]:</span>
+    <span class="n">i</span> <span class="o">+=</span> <span class="mi">1</span>
+<span class="k">return</span> <span class="n">i</span>
+</code></pre></div>
+
+<p><strong>为什么要用 C++？</strong>
+1.  <strong>速度</strong>：在大模型推理中，Token 序列可能很长（几千甚至几万）。Python 的 <code>while</code> 循环非常慢，因为每一步都要做类型检查和解释器开销。C++ 的 <code>std::mismatch</code> 编译后是直接的机器码指令，甚至会利用 CPU 的 SIMD（单指令多数据）指令集并行比对，速度快几十倍甚至几百倍。
+2.  <strong>Radix Attention</strong>：这个文件名叫 <code>radix</code>，是因为它被用于一种叫 RadixAttention 的技术。这种技术把 KV Cache 组织成一棵前缀树。为了在树上找到当前 Prompt 能复用哪个节点，必须极快地计算“最长公共前缀”。</p>
+<h3>💡 最终总结（一句话人话版）</h3>
+<p><strong>这个文件就是定义了一个 C++ 函数，它接收两个整数列表，用最快的速度从头开始比对，告诉你它们前面有多少个数字是一模一样的。</strong></p>

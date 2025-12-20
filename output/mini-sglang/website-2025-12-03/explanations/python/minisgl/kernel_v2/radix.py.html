@@ -1,0 +1,77 @@
+<h1>python/minisgl/kernel_v2/radix.py</h1>
+<p>这代码看起来虽然短，但它涉及了 <strong>“Python 调用 C++ 高性能代码”</strong> 的底层逻辑，所以如果你不了解背景，确实会一头雾水。</p>
+<p>这段代码的核心作用是：<strong>为了快，把繁重的计算任务甩给 C++ 去做，Python 只负责发号施令。</strong></p>
+<p>为了让你彻底理解，我为你列了一个 <strong>“学习任务清单 (To-Do List)”</strong>，我们一步一步来解锁这段代码的含义。</p>
+<hr />
+<h3>🟢 任务 1：理解业务背景 (Context)</h3>
+<p><strong>目标：</strong> 搞清楚这个文件是干嘛用的。</p>
+<ul>
+<li><strong>背景知识：</strong> 这个文件路径里有 <code>minisgl</code> 和 <code>radix</code>。<ul>
+<li><code>minisgl</code> 通常指一个轻量级的大模型推理框架（类似 SGLang）。</li>
+<li><code>radix</code> 指的是 <strong>Radix Tree（基数树/前缀树）</strong>。在大模型推理中，我们经常需要把用户的提问（Token IDs）和缓存里的历史记录进行比对，看看有没有一样的前缀可以复用（这就叫 KV Cache 复用）。</li>
+</ul>
+</li>
+<li><strong>具体场景：</strong> 假设你有两个很长的数字列表（Tensor），比如 <code>[101, 202, 303...]</code> 和 <code>[101, 202, 555...]</code>。你需要极快地判断它们是否相等，或者匹配了多少位。</li>
+<li><strong>结论：</strong> 这个文件的任务就是<strong>极速比较两个数字序列</strong>。</li>
+</ul>
+<hr />
+<h3>🟡 任务 2：理解性能瓶颈 (Why C++?)</h3>
+<p><strong>目标：</strong> 明白为什么要写这么复杂的代码，而不是直接用 Python 的 <code>==</code>。</p>
+<ul>
+<li><strong>问题：</strong> Python 处理循环和逐个比对数字是非常慢的。在大模型服务中，每秒可能要处理成千上万次这种比对，如果用 Python 写，系统会卡死。</li>
+<li><strong>解决：</strong> 这种“脏活累活”（密集计算），通常写成 C++ 代码（也就是代码里提到的 <code>radix.cpp</code>）。</li>
+<li><strong>结论：</strong> 这个 Python 文件本身不干活，它只是一个 <strong>“遥控器”</strong>，用来控制底层的 C++ 引擎。</li>
+</ul>
+<hr />
+<h3>🟠 任务 3：拆解代码——加载模块 (The Loader)</h3>
+<p><strong>目标：</strong> 看懂 <code>_load_radix_module</code> 函数。</p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@lru_cache</span><span class="p">(</span><span class="n">maxsize</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_load_radix_module</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">Module</span><span class="p">:</span>
+    <span class="k">return</span> <span class="n">load_aot</span><span class="p">(</span><span class="s2">&quot;radix&quot;</span><span class="p">,</span> <span class="n">cpp_files</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;radix.cpp&quot;</span><span class="p">])</span>
+</code></pre></div>
+
+<ul>
+<li><strong>Step 3.1: <code>load_aot</code> 是什么？</strong><ul>
+<li>AOT 意为 "Ahead-Of-Time"（提前编译）。这行代码的意思是：去把那个写好的 C++ 文件 (<code>radix.cpp</code>) 加载进来，变成 Python 能用的模块。</li>
+</ul>
+</li>
+<li><strong>Step 3.2: 为什么要用 <code>@lru_cache</code>？</strong><ul>
+<li>加载 C++ 模块是一个很慢的操作（涉及读取文件、链接动态库等）。</li>
+<li>你肯定不想每次比对数字时都重新加载一次。</li>
+<li><code>@lru_cache(maxsize=None)</code> 的作用是 <strong>“永久缓存”</strong>。第一次运行这个函数时，它会加载模块；第二次再调用时，直接返回第一次加载好的结果，不再重复加载。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🔴 任务 4：拆解代码——核心接口 (The Interface)</h3>
+<p><strong>目标：</strong> 看懂 <code>fast_compare_key</code> 函数。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">fast_compare_key</span><span class="p">(</span><span class="n">x</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">y</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+    <span class="c1"># compare 2 1-D int cpu tensors for equality</span>
+    <span class="k">return</span> <span class="n">_load_radix_module</span><span class="p">()</span><span class="o">.</span><span class="n">fast_compare_key</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">y</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>Step 4.1: 输入是什么？</strong><ul>
+<li><code>x</code> 和 <code>y</code> 都是 <code>torch.Tensor</code>（张量，你可以理解为就是数组），而且注释说了是 CPU 上的 1维整数数组。</li>
+</ul>
+</li>
+<li><strong>Step 4.2: 它做了什么？</strong><ul>
+<li>它调用了 <code>_load_radix_module()</code>（拿到刚才加载的 C++ 模块）。</li>
+<li>然后调用了 C++ 模块里的同名函数 <code>.fast_compare_key(x, y)</code>。</li>
+</ul>
+</li>
+<li><strong>Step 4.3: 为什么叫 "fast"？</strong><ul>
+<li>因为它跳过了 Python 解释器，直接在内存层面用 C++ 指针进行比对，速度比 Python 快几十倍甚至上百倍。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ 总结 (Summary)</h3>
+<p>如果把这个文件翻译成人话，它其实就在说下面这几件事：</p>
+<ol>
+<li><strong>准备工作</strong>：我要用到一个很厉害的 C++ 工具箱 (<code>radix.cpp</code>)，但我只加载一次，然后把它存起来（<code>lru_cache</code>）。</li>
+<li><strong>对外服务</strong>：我提供一个叫 <code>fast_compare_key</code> 的功能给别人用。</li>
+<li><strong>实际操作</strong>：当你们调用这个功能比对数据时，我直接把数据丢给那个 C++ 工具箱去算，算完把结果给你。</li>
+</ol>
+<p><strong>一句话概括：</strong>
+这是一个 <strong>Python 包装器 (Wrapper)</strong>，它把底层的 <strong>C++ 高性能比对算法</strong> 包装成了一个简单的 Python 函数供上层调用。</p>

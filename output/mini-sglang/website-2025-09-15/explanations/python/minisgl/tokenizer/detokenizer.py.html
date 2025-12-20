@@ -1,0 +1,116 @@
+<h1>python/minisgl/tokenizer/detokenizer.py</h1>
+<p>这份代码确实乍一看有点绕，因为它处理的是大模型服务中最繁琐的细节之一：<strong>流式解码（Streaming Detokenization）</strong>。</p>
+<p>简单来说，它的任务是：<strong>把模型吐出的一个个数字（Token ID），实时地、连贯地、不出乱码地转换成人类能看的文字。</strong></p>
+<p>为了让你彻底搞懂，我把阅读这份代码的任务拆解成 <strong>5 个待办事项 (Todo List)</strong>。我们一步步来划掉这些任务。</p>
+<hr />
+<h3>📝 任务清单 (Todo List)</h3>
+<ol>
+<li><strong>Task 1: 理解核心目标（什么是增量输出？）</strong></li>
+<li><strong>Task 2: 理解“记账本”（为什么要存状态？）</strong></li>
+<li><strong>Task 3: 解决“半个汉字”的问题（UTF-8 乱码处理）</strong></li>
+<li><strong>Task 4: 解决“半个单词”的问题（美观处理）</strong></li>
+<li><strong>Task 5: 串联逻辑（DetokenizeManager 怎么工作？）</strong></li>
+</ol>
+<hr />
+<h3>逐步讲解</h3>
+<h4>✅ Task 1: 理解核心目标（什么是增量输出？）</h4>
+<p><strong>背景：</strong>
+大模型是一个字一个字往外蹦的。
+比如模型生成：“我”、“爱”、“吃”、“苹”、“果”。
+- 第1秒，你收到“我”，你要立刻展示“我”。
+- 第2秒，你收到“爱”，你要立刻展示“爱”（而不是把“我爱”重新发一遍）。</p>
+<p><strong>代码对应：</strong>
+这就是 <code>DetokenizeManager.detokenize</code> 方法最后返回 <code>incremental_strs</code> 的原因。它只返回<strong>最新生成的那一点点文字</strong>，而不是整句话。</p>
+<hr />
+<h4>✅ Task 2: 理解“记账本”（为什么要存状态？）</h4>
+<p><strong>背景：</strong>
+因为是流式生成，函数会被调用很多次。
+第一次调用：输入 token <code>101</code>。
+第二次调用：输入 token <code>202</code>。
+函数必须记住：“哦，这个用户之前已经有了 <code>101</code>，现在要把 <code>202</code> 接在后面。”</p>
+<p><strong>代码对应：</strong>
+看 <code>@dataclass class DecodeStatus</code>。这就是每个用户的“记账本”：
+*   <code>decoded_ids</code>: 存下目前为止所有的 token ID。
+*   <code>decoded_str</code>: 存下目前为止解码出来的完整字符串。
+*   <code>sent_offset</code>: <strong>最重要</strong>。记录“我已经发给用户多少个字符了”。比如生成了“Hello World”，发了“Hello ”，下次就只发“World”。</p>
+<hr />
+<h4>✅ Task 3: 解决“半个汉字”的问题（UTF-8 乱码处理）</h4>
+<p><strong>背景（最难懂的地方）：</strong>
+在计算机里，英文通常占1个字节，但汉字通常占3个字节。
+Token ID 和 汉字 不是一一对应的。
+假设“好”字的 UTF-8 编码是 <code>[E5, A5, BD]</code>。
+模型可能会分两次吐出 token：
+- Token A: 包含 <code>[E5, A5]</code>
+- Token B: 包含 <code>[BD]</code></p>
+<p>如果你收到 Token A 立刻解码，电脑看不懂 <code>[E5, A5]</code> 是啥，就会显示一个“”（乱码符号，Replacement Character）。
+<strong>我们绝对不能把“”发给用户！</strong> 我们必须<strong>憋着</strong>，等 Token B 来了，拼成完整的“好”字再发。</p>
+<p><strong>代码对应：</strong>
+看 <code>detokenize</code> 方法里的这段：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">new_text</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">new_text</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="s2">&quot;&quot;</span><span class="p">):</span>
+    <span class="c1"># 如果没有乱码，说明字是完整的，更新状态，准备发送</span>
+    <span class="n">output_str</span> <span class="o">=</span> <span class="n">s</span><span class="o">.</span><span class="n">decoded_str</span> <span class="o">+</span> <span class="n">new_text</span>
+    <span class="o">...</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="c1"># 如果以  结尾，说明是“半个字”，先别更新状态，等下一个 token 来了再说</span>
+    <span class="o">...</span>
+</code></pre></div>
+
+<hr />
+<h4>✅ Task 4: 解决“半个单词”的问题（美观处理）</h4>
+<p><strong>背景：</strong>
+英文是以空格分词的。
+比如单词 "Apple"，模型可能先吐出 "App"，下一秒吐出 "le"。
+有些展示界面如果不完整显示单词会很丑。
+所以有一个策略：<strong>只要没看到空格或换行，我就先不发给用户，怕是半个词。</strong></p>
+<p>但是！<strong>中文不需要空格</strong>。中文是连着写的。如果用英文的逻辑（等空格），中文用户可能半天看不到字，直到一句话结束才蹦出来。</p>
+<p><strong>代码对应：</strong>
+这是辅助函数 <code>_is_chinese_char</code> 和 <code>find_printable_text</code> 的作用。
+*   <code>_is_chinese_char</code>: 判断是不是中日韩字符。
+*   <code>find_printable_text</code>: 这是一个过滤器。
+    *   如果是换行符 <code>\n</code>：直接发。
+    *   如果是中文：直接发（不用等空格）。
+    *   如果是英文：<strong>为了安全，只打印到最后一个空格为止</strong>，剩下的留到下次。</p>
+<hr />
+<h4>✅ Task 5: 串联逻辑（DetokenizeManager 怎么工作？）</h4>
+<p>现在我们把整个 <code>detokenize</code> 函数的流程串起来：</p>
+<ol>
+<li><strong>输入</strong>：一批消息 <code>msgs</code>，每个包含一个新的 token ID。</li>
+<li><strong>更新 ID</strong>：<ul>
+<li>找到这个用户的“记账本” (<code>DecodeStatus</code>)。</li>
+<li>把新 ID 加进 <code>decoded_ids</code>。</li>
+</ul>
+</li>
+<li><strong>尝试解码</strong>：<ul>
+<li>调用 <code>tokenizer.batch_decode</code> 把 ID 变成文字。</li>
+<li><em>注：代码里用了 <code>read_ids</code> 和 <code>surr_ids</code> 做了一些切片优化，为了不每次都重新解码几千个词，只解码最近的一部分。</em></li>
+</ul>
+</li>
+<li><strong>检查完整性 (核心逻辑)</strong>：<ul>
+<li>算出新生成的文字 <code>new_text</code>。</li>
+<li><strong>检查1 (Task 3)</strong>：<code>new_text</code> 结尾是不是乱码 ``？<ul>
+<li>如果是：说明字节不完整（半个汉字），<strong>本轮跳过</strong>，什么都不发，等下一个 token。</li>
+<li>如果否：进入检查2。</li>
+</ul>
+</li>
+<li><strong>检查2 (Task 4)</strong>：调用 <code>find_printable_text</code>。<ul>
+<li>如果是英文且没空格，可能砍掉一部分先不发。</li>
+<li>如果是中文，全发。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li><strong>计算增量 (Task 1)</strong>：<ul>
+<li><code>output_str</code> (当前完整的安全文字) - <code>sent_offset</code> (上次发过的位置) = <strong>增量文字</strong>。</li>
+<li>更新 <code>sent_offset</code>。</li>
+</ul>
+</li>
+<li><strong>输出</strong>：返回这个增量文字给用户。</li>
+</ol>
+<hr />
+<h3>总结</h3>
+<p>这个文件的核心思想就是：<strong>“忍”</strong>。</p>
+<p>它收到 Token 后，不会无脑直接发给用户，而是先解码看看：
+1.  是不是<strong>乱码</strong>（半个字节）？是就<strong>忍住</strong>不发。
+2.  是不是<strong>半个单词</strong>（英文）？是就<strong>忍住</strong>不发。
+3.  只有确定是<strong>完整、安全</strong>的文字，才计算出相对于上次多了什么，然后发给用户。</p>
+<p>这样你再回去看代码，尤其是 <code>detokenize</code> 函数里的那个 <code>if/else</code> 循环，应该就清晰多了。</p>

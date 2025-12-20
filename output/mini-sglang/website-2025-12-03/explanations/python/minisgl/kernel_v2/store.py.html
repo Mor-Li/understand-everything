@@ -1,0 +1,97 @@
+<h1>python/minisgl/kernel_v2/store.py</h1>
+<p>这段代码确实比较底层，它属于 <strong>大模型推理框架（如 vLLM 或 SGLang）的核心组件</strong>。</p>
+<p>简单来说，这段代码的任务是：<strong>高效地管理和搬运 GPU 显存中的数据（KV Cache）</strong>。</p>
+<p>为了让你看懂，我制定了一个 <strong>5步走的学习清单（To-Do List）</strong>。我们像剥洋葱一样，一层一层把它的逻辑理清楚。</p>
+<hr />
+<h3>✅ Task 1: 理解背景 —— 什么是 KV Cache？</h3>
+<p><strong>目标：</strong> 明白这段代码是在处理什么数据。</p>
+<ul>
+<li><strong>概念：</strong> 在大模型（LLM）生成文本时，每生成一个新字，都需要用到之前所有字计算出的中间结果（Key 和 Value）。为了不重复计算，我们会把这些 K 和 V 存起来，这就叫 <strong>KV Cache</strong>。</li>
+<li><strong>问题：</strong> 随着对话变长，KV Cache 会越来越大。我们需要把新生成的 K 和 V 塞进显存里指定的位置。</li>
+<li><strong>代码对应：</strong><ul>
+<li><code>k_cache</code>, <code>v_cache</code>: 这是两块巨大的显存空间，用来存所有数据的“大仓库”。</li>
+<li><code>k</code>, <code>v</code>: 这是当前这一步新计算出来的、热乎的数据。</li>
+<li><code>indices</code>: 这是一个索引列表，告诉程序：“把新的 <code>k</code> 和 <code>v</code> 放到仓库的第几号货架上”。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 核心动作 —— <code>store_cache</code> 函数</h3>
+<p><strong>目标：</strong> 看懂数据是怎么被“搬运”进去的。</p>
+<p>请看代码中的 <code>store_cache</code> 函数：</p>
+<ol>
+<li>
+<p><strong>准备工作：</strong>
+    <code>python
+    num_tokens = k_cache.shape[0]
+    k_cache = k_cache.view(num_tokens, -1) # 把数据拉平，方便处理</code>
+    它首先把大仓库的形状调整一下，方便后续操作。</p>
+</li>
+<li>
+<p><strong>调用搬运工：</strong>
+    <code>python
+    module = _jit_store_module(element_size)
+    module.launch(k_cache, v_cache, indices, k, v)</code>
+    这里是关键。Python 跑循环太慢了，所以它没有用 Python 的 <code>for</code> 循环去一个一个赋值，而是调用了一个 <strong>C++/CUDA 写的高性能内核（Kernel）</strong> 来并行完成搬运。</p>
+<ul>
+<li><code>module.launch(...)</code> 就是在这个瞬间，成千上万个 GPU 线程同时启动，把 <code>k</code> 和 <code>v</code> 塞进了 <code>k_cache</code> 和 <code>v_cache</code> 的 <code>indices</code> 指定的位置。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 3: 幕后黑手 —— JIT 编译 (<code>_jit_store_module</code>)</h3>
+<p><strong>目标：</strong> 理解那个高性能“搬运工”是从哪来的。</p>
+<p>请看代码中的 <code>_jit_store_module</code> 函数：</p>
+<ul>
+<li><strong>JIT (Just-In-Time) 即时编译：</strong>
+    <code>python
+    return load_jit("store", ..., cuda_files=["store.cu"], ...)</code>
+    这段代码的意思是：程序运行时，会去读取一个叫 <code>store.cu</code> 的 C++/CUDA 文件，把它现场编译成机器码。</li>
+<li><strong>为什么要这样做？</strong> 为了速度。它根据数据的具体大小 (<code>element_size</code>) 定制一个最快的搬运工。</li>
+<li><strong>@lru_cache：</strong> 这是一个装饰器。意思是“编译过一次就记住”，下次再用同样的参数调用时，直接用缓存好的，不用重新编译。</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 管理“目录” —— 页表操作 (<code>store/load_decode_indices</code>)</h3>
+<p><strong>目标：</strong> 理解“非连续内存”的管理（类似操作系统的虚拟内存）。</p>
+<p>在大模型推理中，显存非常宝贵，我们不能保证给每个请求分配连续的空间（就像硬盘碎片一样）。所以我们需要一个 <strong>Page Table（页表）</strong> 来记录：“第 A 个请求的第 B 个 token，存在物理显存的哪个位置”。</p>
+<ol>
+<li>
+<p><strong><code>store_decode_indices</code> (写目录)：</strong></p>
+<ul>
+<li><strong>输入：</strong> <code>pos</code> (由 <code>(请求ID, 位置ID)</code> 组成的列表)。</li>
+<li><strong>计算：</strong> <code>p[0] * page_table_len + p[1]</code>。这行代码把二维坐标（第几行第几列）算成了一个一维的绝对坐标（Flat Index）。</li>
+<li><strong>动作：</strong> <code>flattened_table[pos_tensor] = indices</code>。把物理地址（indices）写到页表里。以后查这个页表，就知道数据在哪了。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>load_decode_indices</code> (读目录)：</strong></p>
+<ul>
+<li><strong>动作：</strong> 和上面相反。给它逻辑坐标，它去查页表，然后告诉你物理地址在哪。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 5: 性能微操 —— <code>_lru_get_pos</code></h3>
+<p><strong>目标：</strong> 理解一个极小的性能优化细节。</p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@lru_cache</span><span class="p">(</span><span class="n">maxsize</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_lru_get_pos</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="c1"># ...</span>
+    <span class="n">pos_tensor</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">pos_tensor</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>痛点：</strong> 在 CPU 上创建 Tensor 然后搬到 GPU (<code>.to(device)</code>) 是有开销的。</li>
+<li><strong>优化：</strong> 如果程序连续多次访问相同的位置模式（比如在解码阶段，每次都是读取最后一位），这个函数会把生成的坐标 Tensor <strong>缓存起来</strong>。</li>
+<li><strong>结果：</strong> 下次再问同样的位置，直接甩给你已经在 GPU 上的 Tensor，省去了 CPU 到 GPU 的搬运时间。</li>
+</ul>
+<hr />
+<h3>📝 总结：这个文件到底在干啥？</h3>
+<p>把这个文件想象成一个 <strong>全自动化的仓储物流中心</strong>：</p>
+<ol>
+<li><strong><code>_jit_store_module</code></strong>: 招聘并培训了一批极其强壮的搬运工（编译 CUDA 内核）。</li>
+<li><strong><code>store_cache</code></strong>: 指挥搬运工，把新到的货物（K/V）瞬间放到指定的货架（Cache）上。</li>
+<li><strong><code>store_decode_indices</code></strong>: 仓库管理员记账，在账本（Page Table）上记录哪个客户的货放在了哪个格子里。</li>
+<li><strong><code>_lru_get_pos</code></strong>: 管理员脑子里的快速记忆，对于常问的位置，不需要翻账本就能直接反应过来。</li>
+</ol>
+<p>它的核心目的只有一个：<strong>为了让大模型推理更快，用 C++ 和缓存技术把数据读写速度压榨到极致。</strong></p>

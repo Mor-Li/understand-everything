@@ -1,0 +1,101 @@
+<h1>python/minisgl/attention/fi.py</h1>
+<p>这份代码确实涉及到底层的显存管理和算子调用，如果对大模型推理框架（如 vLLM, SGLang）的内部机制不熟悉，看起来会非常吃力。</p>
+<p><strong>简单来说，这个文件的作用是：</strong>
+它是 <strong>MiniSGL</strong> 框架和 <strong>FlashInfer</strong>（一个高性能 Attention 算子库）之间的<strong>中间人（Adapter/Driver）</strong>。它的核心任务是把大模型框架里“人类易读”的数据结构（比如 Batch 请求），转换成 FlashInfer 算子能看懂的“底层指针和索引”，然后指挥 GPU 进行计算。</p>
+<p>为了让你看懂，我们把“执行一次 Attention 计算”想象成<strong>“去图书馆借阅并整理资料”</strong>的任务。</p>
+<p>以下是你要完成这个任务的 <strong>To-Do List</strong>，以及代码是如何一步步实现它的。</p>
+<hr />
+<h3>核心任务 To-Do List</h3>
+<ol>
+<li><strong>[初始化]</strong>：准备好工具箱（分配显存缓冲区，加载 FlashInfer 算子）。</li>
+<li><strong>[准备元数据 (Metadata)]</strong>：这是最繁琐的一步。<ul>
+<li>也就是“查目录”。你需要告诉 GPU：这一批请求里有几个人？每个人的句子有多长？他们的历史记录（KV Cache）存在显存的哪个角落（Page Table）？</li>
+</ul>
+</li>
+<li><strong>[执行计算 (Forward)]</strong>：<ul>
+<li>把新的 Key/Value 存入仓库（KV Cache）。</li>
+<li>调用 FlashInfer 算子，根据刚才准备的元数据，算出 Attention 结果。</li>
+</ul>
+</li>
+<li><strong>[进阶优化 (CUDA Graph)]</strong>：<ul>
+<li>如果每次都要重复“查目录”太慢了，对于固定大小的任务，我们可以把流程“录像”下来，下次直接回放。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>逐步代码讲解</h3>
+<h4>1. [初始化]：准备工具箱 (<code>__init__</code>)</h4>
+<p>在 <code>FlashInferBackend</code> 类初始化时，我们主要做两件事：分配临时空间（Workspace）和初始化算子包装器。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>FlashInferBackend.__init__</code></li>
+<li><strong>解读</strong>:<ul>
+<li><code>self.float_workspace_buffer</code>: FlashInfer 运行需要一些临时显存（比如存中间结果），这里预先申请了 128MB。</li>
+<li><code>BatchPrefill...</code> 和 <code>BatchDecode...</code>: 分别对应大模型的两个阶段。<ul>
+<li><strong>Prefill (预填充)</strong>: 一次性处理很长的 Prompt（比如用户输入了 1000 字）。</li>
+<li><strong>Decode (解码)</strong>: 逐个生成 token（比如 GPT 一个字一个字往外蹦）。</li>
+</ul>
+</li>
+<li><strong>观点</strong>: 这里体现了<strong>复用</strong>的思想，Prefill 和 Decode 共享同一个 workspace 内存。</li>
+</ul>
+</li>
+</ul>
+<h4>2. [准备元数据]：翻译数据 (<code>prepare_metadata</code>)</h4>
+<p>这是全文件最核心、最复杂的逻辑。FlashInfer 不认识什么是 <code>Batch</code> 对象，它只认识 Tensor 指针。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>prepare_metadata</code></li>
+<li><strong>任务</strong>: 将 <code>Batch</code> 对象里的请求列表（Reqs）转化为 <code>FIMetadata</code>。</li>
+<li><strong>关键步骤</strong>:<ol>
+<li><strong>计算长度</strong>:<ul>
+<li><code>seqlens_q</code>: 这次来了多少新词？（Decode 阶段通常是 1，Prefill 阶段是 Prompt 长度）。</li>
+<li><code>seqlens_k</code>: 历史上总共有多少词？（用于查 KV Cache）。</li>
+</ul>
+</li>
+<li><strong>生成 <code>cu_seqlens</code> (Cumulative Sequence Lengths)</strong>:<ul>
+<li>FlashInfer 需要知道每个请求在扁平化数组中的起始位置。</li>
+<li>比如请求 A 长度 10，请求 B 长度 20。<code>cu_seqlens</code> 就是 <code>[0, 10, 30]</code>。</li>
+<li>代码中的 <code>.cumsum_(dim=0)</code> 就是做这个累加。</li>
+</ul>
+</li>
+<li><strong>处理页表 (<code>page_table</code> / <code>indices</code>)</strong>:<ul>
+<li>大模型的 KV Cache 是非连续存储的（分页管理，像操作系统的内存页）。</li>
+<li>这里需要把每个请求对应的<strong>物理页号</strong>提取出来，拼成一个长长的 Tensor (<code>indices</code>) 传给 GPU。</li>
+<li><code>out_loc</code>: 告诉 GPU，新生成的 KV 数据应该写到显存的哪个物理位置。</li>
+</ul>
+</li>
+<li><strong>打包</strong>: 最后把这些算出来的 Tensor 塞进 <code>FIMetadata</code> 对象里。</li>
+</ol>
+</li>
+</ul>
+<h4>3. [执行计算]：运行算子 (<code>forward</code>)</h4>
+<p>万事俱备，开始计算。</p>
+<ul>
+<li><strong>代码位置</strong>: <code>forward</code></li>
+<li><strong>步骤</strong>:<ol>
+<li><code>metadata = batch.attn_metadata</code>: 拿到上一步准备好的元数据。</li>
+<li><code>self._initialize_once(metadata)</code>: 这是一个懒加载（Lazy Init）。只有真正要跑的时候，才调用 FlashInfer 的 <code>plan</code> 方法（预规划计算路径），避免重复开销。</li>
+<li><code>self.kvcache.store_kv(...)</code>: <strong>关键动作</strong>。先把当前层计算出的 K 和 V 矩阵，保存到显存的 KV Cache 中（根据 <code>out_loc</code> 指示的位置）。</li>
+<li><code>metadata.wrapper.run(...)</code>: <strong>核心一击</strong>。调用 FlashInfer 的底层 CUDA Kernel，传入 Q 和刚才存好的 KV Cache，吐出 Attention 的结果。</li>
+</ol>
+</li>
+</ul>
+<h4>4. [进阶优化]：CUDA Graph (<code>init_capture_graph</code> 等)</h4>
+<p>Python 的运行速度其实很慢。在 Decode 阶段，GPU 计算可能只需要 10 微秒，但 Python 准备元数据可能要花 50 微秒。为了消除这个 CPU 开销，使用了 <strong>CUDA Graph</strong>。</p>
+<ul>
+<li><strong>概念</strong>: CUDA Graph 就像是“录制宏”。</li>
+<li><strong>代码解读</strong>:<ul>
+<li><code>FICaptureData</code>: 专门定义了一组<strong>静态的、固定大小</strong>的 Tensor。</li>
+<li><code>init_capture_graph</code>: 初始化这些静态 Tensor。比如我们决定录制 Batch Size = 1, 2, 4, 8 的几种情况。</li>
+<li><code>prepare_for_capture</code>: 在录制模式下，我们不再动态创建 Tensor，而是把数据填入预先分配好的 <code>FICaptureData</code> 里的静态内存中。</li>
+<li><code>prepare_for_replay</code>: 在回放模式下，只需要把新的 <code>input_ids</code> 拷贝到静态内存，然后直接告诉 GPU “执行第 X 号录像”即可，跳过了繁琐的 Python 对象创建和内存分配过程。</li>
+</ul>
+</li>
+</ul>
+<h3>总结文中的核心观点</h3>
+<ol>
+<li><strong>数据布局转换</strong>: 必须将面向对象的 Batch 请求（逻辑视图）转换为面向底层算子的 CSR（压缩稀疏行）索引和页表索引（物理视图）。</li>
+<li><strong>显存管理</strong>: 极其在意显存分配。能复用的 workspace 绝不重新申请；能用 Pinned Memory (锁页内存) 加速 CPU-GPU 传输就用。</li>
+<li><strong>计算与存储分离</strong>: <code>forward</code> 函数清晰地展示了先“存 KV”再“算 Attention”的流程。</li>
+<li><strong>消除 CPU 瓶颈</strong>: 对于高频、短小的 Decode 操作，必须使用 CUDA Graph 来绕过 Python 的解释器开销。</li>
+</ol>
+<h3>给你的一句话建议</h3>
+<p>如果你想修改或调试这段代码，<strong>重点关注 <code>FIMetadata</code> 里的那些 Tensor 是怎么算出来的</strong>（即 <code>prepare_metadata</code> 函数）。只要索引（indices）和长度（seqlens）对上了，FlashInfer 就能跑对；如果崩了，99% 是因为索引指错了位置。</p>

@@ -1,0 +1,96 @@
+<h1>python/minisgl/kvcache/base.py</h1>
+<p>这份代码确实比较抽象，因为它全是<strong>接口（Interface）</strong>和<strong>抽象基类（Abstract Base Class, ABC）</strong>。也就是说，它只规定了“<strong>应该长什么样</strong>”和“<strong>应该有哪些功能</strong>”，并没有写具体的实现逻辑。</p>
+<p>这就像是一个建筑蓝图，规定了房子要有门有窗，但没说门是木头的还是铁的。</p>
+<p>为了让你看懂，我们将这个文件看作是在构建一个<strong>智能图书馆系统（用于存放 LLM 的记忆）</strong>。</p>
+<p>我为你列了一个 <strong>Task To-Do List</strong>，我们一步步来完成这个系统的设计：</p>
+<h3>📝 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1: 理解核心概念</strong> —— 什么是 KV Cache？为什么需要它？</li>
+<li><strong>Task 2: 设计物理仓库 (<code>BaseKVCache</code>)</strong> —— 规定数据存在哪里，怎么存取。</li>
+<li><strong>Task 3: 设计图书管理员 (<code>BaseCacheManager</code>)</strong> —— 规定怎么查找、借阅和清理库存。</li>
+<li><strong>Task 4: 理解高级操作 (Match &amp; Lock)</strong> —— 如何复用已有的知识（前缀匹配）。</li>
+<li><strong>Task 5: 理解内存维护 (Evict)</strong> —— 空间不够了怎么扔东西。</li>
+</ol>
+<hr />
+<h3>逐步讲解</h3>
+<h4>Task 1: 理解核心概念 (KV Cache)</h4>
+<p>在 LLM（大语言模型）推理中，每生成一个新字，模型都需要回顾之前所有的字。为了不重复计算，我们将之前计算过的 Key 和 Value 矩阵存下来，这就叫 <strong>KV Cache</strong>。</p>
+<ul>
+<li><strong>比喻</strong>：就像你写作文，KV Cache 就是你的<strong>草稿本</strong>。你不用每次都重新默写前面的段落，只需要看草稿本接着写就行。</li>
+</ul>
+<h4>Task 2: 设计物理仓库 (<code>BaseKVCache</code>)</h4>
+<p>代码中的 <code>class BaseKVCache(ABC):</code> 就是在定义这个“草稿本”的物理规格。</p>
+<ul>
+<li><strong>它的职责</strong>：只管存数据，不管逻辑。它就是显存里的一块地。</li>
+<li><strong>关键方法解读</strong>：<ul>
+<li><code>k_cache(index)</code>, <code>v_cache(index)</code>: <strong>“给我看第几页”</strong>。获取指定位置的张量数据。</li>
+<li><code>store_kv(...)</code>: <strong>“把这行字写进去”</strong>。把计算好的 K 和 V 存入指定位置。</li>
+<li><code>device</code>, <code>dtype</code>, <code>num_layers</code>: <strong>“本子的属性”</strong>。这本子是在 CPU 还是 GPU 上？用什么精度（FP16/FP32）？有多少层？</li>
+</ul>
+</li>
+</ul>
+<blockquote>
+<p><strong>总结</strong>：<code>BaseKVCache</code> 是底层的<strong>存储容器</strong>接口。</p>
+</blockquote>
+<h4>Task 3: 设计图书管理员 (<code>BaseCacheManager</code>)</h4>
+<p>光有本子不行，我们需要一个<strong>管理员</strong>来决定写在哪一页，或者哪一页可以擦掉重写。这就是 <code>class BaseCacheManager(ABC):</code>。</p>
+<ul>
+<li><strong>它的职责</strong>：管理内存分配、复用旧数据、清理空间。</li>
+<li><strong>关键辅助类</strong>：<ul>
+<li><code>BaseCacheHandle</code>: 像是一个<strong>借书证</strong>。拿着它，证明你引用了某段缓存。</li>
+<li><code>SizeInfo</code>: 记录<strong>库存状态</strong>。<code>evictable_size</code>（没人用、可被删的大小）和 <code>protected_size</code>（正在用、受保护的大小）。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 理解高级操作 (Match &amp; Lock) —— 这是最难的部分</h4>
+<p>这个文件暗示了系统支持 <strong>Prefix Caching（前缀缓存/Radix Attention）</strong>。
+比如用户问了两次：“<em>请把莎士比亚的《哈姆雷特》翻译成中文...</em>”。
+第一次计算后，系统会把《哈姆雷特》的 KV Cache 存下来。第二次问时，管理员应该能发现：“嘿，这前半段我以前算过！”</p>
+<ul>
+<li><strong><code>match_prefix(input_ids)</code></strong>:<ul>
+<li><strong>含义</strong>：拿着新的输入，去仓库里找有没有<strong>重合的前缀</strong>。</li>
+<li><strong>比喻</strong>：你去图书馆问“有没有《哈姆雷特》？”管理员查表后告诉你：“有，在第 5 排。”</li>
+</ul>
+</li>
+<li><strong><code>lock_handle(handle)</code></strong>:<ul>
+<li><strong>含义</strong>：<strong>锁定</strong>这块缓存。</li>
+<li><strong>比喻</strong>：你告诉管理员：“这本书我要看，<strong>千万别把它扔了</strong>。”</li>
+<li><strong>重要性</strong>：因为显存有限，如果不锁，系统可能会为了腾空间把这段缓存删掉（Evict）。</li>
+</ul>
+</li>
+<li><strong><code>insert_prefix(...)</code></strong>:<ul>
+<li><strong>含义</strong>：把新计算出来的独特内容存进去。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 5: 理解内存维护 (Evict)</h4>
+<p>显存（仓库）是有限的，满了怎么办？</p>
+<ul>
+<li><strong><code>evict(size)</code></strong>:<ul>
+<li><strong>含义</strong>：驱逐（删除）部分缓存以释放空间。</li>
+<li><strong>比喻</strong>：书架满了，管理员要把那些<strong>很久没人看、且当前没被锁定</strong>的书扔进碎纸机。</li>
+<li><strong>规则</strong>：只能删 <code>evictable</code> 的，不能删 <code>protected</code>（被 Lock 住）的。</li>
+</ul>
+</li>
+<li><strong><code>reset()</code></strong>:<ul>
+<li><strong>含义</strong>：清空一切，重置系统。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>全文逻辑串联（大白话总结）</h3>
+<p>这个文件 <code>base.py</code> 实际上是在定义一套<strong>标准</strong>：</p>
+<ol>
+<li><strong>不管你底层用什么技术存 Tensor</strong>（是连续内存还是分页内存），你都必须遵守 <code>BaseKVCache</code> 的规定（要有 <code>store_kv</code>, <code>k_cache</code> 等方法）。</li>
+<li><strong>不管你用什么算法管理内存</strong>（是 LRU 还是 FIFO），你都必须遵守 <code>BaseCacheManager</code> 的规定（要有 <code>match_prefix</code>, <code>lock</code>, <code>evict</code> 等方法）。</li>
+</ol>
+<p><strong>代码中的流程通常是这样的：</strong></p>
+<ol>
+<li><strong>用户来了</strong>：带着一段文字 <code>input_ids</code>。</li>
+<li><strong>查找 (<code>match_prefix</code>)</strong>：Manager 看看这段文字的前半部分是不是以前算过？</li>
+<li><strong>锁定 (<code>lock_handle</code>)</strong>：如果算过，赶紧把那部分内存锁住，别被删了。</li>
+<li><strong>计算与写入 (<code>store_kv</code> / <code>insert_prefix</code>)</strong>：计算剩下的新文字，把结果存入 KV Cache。</li>
+<li><strong>解锁 (<code>unlock</code>)</strong>：这次推理结束了，解锁内存。</li>
+<li><strong>清理 (<code>evict</code>)</strong>：如果下一个用户来了发现内存不够，就把刚才那些没锁的旧数据删掉腾地方。</li>
+</ol>
+<p>希望这个 List 和比喻能帮你理解这个文件的作用！它是整个推理引擎记忆管理的<strong>骨架</strong>。</p>

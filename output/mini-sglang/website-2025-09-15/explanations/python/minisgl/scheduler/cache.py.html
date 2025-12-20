@@ -1,0 +1,132 @@
+<h1>python/minisgl/scheduler/cache.py</h1>
+<p>这份代码确实涉及到底层的显存管理（Memory Management），如果对大模型推理（LLM Inference）的机制不熟悉，看代码会非常头大。</p>
+<p>简单来说，这个文件定义了一个 <strong><code>CacheManager</code>（缓存大管家）</strong>。它的核心工作是管理 <strong>KV Cache（键值缓存）</strong> 的内存页（Pages）。</p>
+<p>想象你在管理一个 <strong>图书馆的阅览室</strong>：
+*   <strong>显存（Memory）</strong> 就是阅览室里的 <strong>座位</strong>。
+*   <strong>KV Cache</strong> 就是读者写满笔记的 <strong>草稿纸</strong>。
+*   <strong>Token</strong> 就是读者要读的 <strong>书</strong>。</p>
+<p>为了让你看懂，我制定了一个 <strong>“理解任务清单” (Task List)</strong>，我们一步一步拆解这个管家到底在干什么。</p>
+<hr />
+<h3>📋 任务清单 (Task Todo List)</h3>
+<ol>
+<li><strong>Task 1: 盘点家底 (Init)</strong> - 搞清楚我们一共有多少个空座位。</li>
+<li><strong>Task 2: 查重 (Match Req)</strong> - 新读者来了，看看他要读的书是不是之前有人读过（能不能抄作业？）。</li>
+<li><strong>Task 3: 算账 (Available Size)</strong> - 看看现在还有多少空位，加上那些可以被赶走的人占的位子。</li>
+<li><strong>Task 4: 占座与离座 (Lock/Unlock)</strong> - 正在读的人不能被赶走，读完了才能释放。</li>
+<li><strong>Task 5: 分配座位 (Allocate)</strong> - <strong>[最重要]</strong> 新人来了，怎么给他找位子？（不够就得赶人）。</li>
+<li><strong>Task 6: 归还座位 (Free)</strong> - 人走了，他的草稿纸是扔掉，还是留给下一个人用？</li>
+</ol>
+<hr />
+<h3>💡 逐步讲解 (Step-by-Step Walkthrough)</h3>
+<h4>Task 1: 盘点家底 (<code>__init__</code>)</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">CacheManager</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">num_pages</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+        <span class="c1"># self.free_slots: 这是一个列表，记录了所有目前“空闲”的座位号（页索引）。</span>
+        <span class="c1"># 一开始，所有的座位（0 到 num_pages-1）都是空的。</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">free_slots</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">num_pages</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+
+        <span class="c1"># self.manager: 这是底层的“智能管理员”（RadixCache），它负责记住哪些草稿纸值得保留。</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">manager</span> <span class="o">=</span> <span class="n">create_cache_manager</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：初始化时，管家手里握着一大把空的显存页索引 (<code>free_slots</code>)，准备分配。</li>
+</ul>
+<h4>Task 2: 查重 (<code>match_req</code>)</h4>
+<div class="codehilite"><pre><span></span><code>    <span class="k">def</span><span class="w"> </span><span class="nf">match_req</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">PendingReq</span><span class="p">):</span>
+        <span class="c1"># 看看新来的请求（req），它的前缀（input_ids）是不是已经在缓存里了？</span>
+        <span class="c1"># 比如之前有人问过 &quot;如何做红烧肉&quot;，现在有人问 &quot;如何做红烧肉放糖吗&quot;。</span>
+        <span class="c1"># &quot;如何做红烧肉&quot; 这部分的计算结果可以直接复用，不用重新算。</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">manager</span><span class="o">.</span><span class="n">match_prefix</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">input_ids</span><span class="p">[:</span> <span class="n">input_len</span> <span class="o">-</span> <span class="mi">1</span><span class="p">])</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：为了省显存和加速，先去智能管理员那里查查有没有“前缀”可以复用。这叫 <strong>Radix Attention (前缀树缓存)</strong>。</li>
+</ul>
+<h4>Task 3: 算账 (<code>available_size</code>)</h4>
+<div class="codehilite"><pre><span></span><code>    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">available_size</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="c1"># 可用空间 = 智能管理员觉得可以扔掉的旧缓存 (evictable) + 完全空闲的座位 (free_slots)</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">manager</span><span class="o">.</span><span class="n">size_info</span><span class="o">.</span><span class="n">evictable_size</span> <span class="o">+</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">free_slots</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：当显存不够时，我们不仅用剩下的空位，还可以把那些很久没用的旧缓存清空来腾位置。</li>
+</ul>
+<h4>Task 4: 占座与离座 (<code>lock</code>, <code>unlock</code>)</h4>
+<div class="codehilite"><pre><span></span><code>    <span class="k">def</span><span class="w"> </span><span class="nf">lock</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">handle</span><span class="p">:</span> <span class="n">BaseCacheHandle</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># 给这个缓存块加把锁，标记为“正在使用”，千万不能被清理掉。</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">manager</span><span class="o">.</span><span class="n">lock_handle</span><span class="p">(</span><span class="n">handle</span><span class="p">,</span> <span class="n">unlock</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">unlock</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">handle</span><span class="p">:</span> <span class="n">BaseCacheHandle</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># 用完了，解锁。这时候它变成了“可被清理（Evictable）”的状态，但数据还在。</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">manager</span><span class="o">.</span><span class="n">lock_handle</span><span class="p">(</span><span class="n">handle</span><span class="p">,</span> <span class="n">unlock</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：正在推理的请求，其显存绝对不能被回收。</li>
+</ul>
+<h4>Task 5: 分配座位 (<code>allocate</code>) —— <strong>核心逻辑</strong></h4>
+<p>这是代码最复杂的部分。你需要 <code>needed_len</code> 个座位，怎么办？</p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">def</span><span class="w"> </span><span class="nf">allocate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">needed_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+        <span class="c1"># 情况 0: 不需要座位，返回空。</span>
+        <span class="k">if</span> <span class="n">needed_len</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span> <span class="o">...</span>
+
+        <span class="c1"># 情况 1: 空闲座位够用 (free_slots 充足)</span>
+        <span class="k">if</span> <span class="n">needed_len</span> <span class="o">&lt;=</span> <span class="p">(</span><span class="n">free_len</span> <span class="o">:=</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">free_slots</span><span class="p">)):</span>
+            <span class="c1"># 直接从 free_slots 拿走前 needed_len 个</span>
+            <span class="n">allocated</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">free_slots</span><span class="p">[:</span><span class="n">needed_len</span><span class="p">]</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">free_slots</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">free_slots</span><span class="p">[</span><span class="n">needed_len</span><span class="p">:]</span> <span class="c1"># 更新剩下的空位</span>
+            <span class="k">return</span> <span class="n">allocated</span>
+
+        <span class="c1"># 情况 2: 空闲座位不够！需要踢人 (Evict)</span>
+        <span class="c1"># 计算还需要多少个座位</span>
+        <span class="n">evicted</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">manager</span><span class="o">.</span><span class="n">evict</span><span class="p">(</span><span class="n">needed_len</span> <span class="o">-</span> <span class="n">free_len</span><span class="p">)</span>
+
+        <span class="c1"># 把刚才踢出来的旧座位 (evicted) 和原本剩下的空座位 (free_slots) 合并起来</span>
+        <span class="n">merged</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="bp">self</span><span class="o">.</span><span class="n">free_slots</span><span class="p">,</span> <span class="n">evicted</span><span class="p">])</span>
+
+        <span class="c1"># 再次检查现在够不够，不够就报错</span>
+        <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">merged</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">needed_len</span><span class="p">,</span> <span class="s2">&quot;Eviction did not free enough space.&quot;</span>
+
+        <span class="c1"># 分配给你，剩下的放回 free_slots</span>
+        <span class="n">allocated</span> <span class="o">=</span> <span class="n">merged</span><span class="p">[:</span><span class="n">needed_len</span><span class="p">]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">free_slots</span> <span class="o">=</span> <span class="n">merged</span><span class="p">[</span><span class="n">needed_len</span><span class="p">:]</span>
+        <span class="k">return</span> <span class="n">allocated</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：<ol>
+<li>优先用现成的空位。</li>
+<li>没有空位时，强行让很久没用的缓存“腾笼换鸟”（Eviction）。</li>
+<li>这体现了缓存管理的精髓：<strong>LRU (Least Recently Used)</strong> 策略，保证显存永远在流转。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 6: 归还座位 (<code>free</code>)</h4>
+<div class="codehilite"><pre><span></span><code>    <span class="k">def</span><span class="w"> </span><span class="nf">free</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">handle</span><span class="p">:</span> <span class="n">BaseCacheHandle</span><span class="p">,</span> <span class="n">input_ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">indices</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># 1. 先解锁，表示我不正在用了。</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">unlock</span><span class="p">(</span><span class="n">handle</span><span class="p">)</span>
+
+        <span class="c1"># 2. 尝试把这些数据存入“智能管理员”的前缀树里 (insert_prefix)。</span>
+        <span class="c1"># 这样下次有人问同样的问题，就能复用了。</span>
+        <span class="n">in_cache_len</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">manager</span><span class="o">.</span><span class="n">insert_prefix</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">indices</span><span class="p">)</span>
+
+        <span class="c1"># 3. 这一行代码有点反直觉：</span>
+        <span class="c1"># 如果 insert_prefix 返回了一些长度，说明有些物理页(indices)并没有被前缀树真正“独占”或者被替换出来了。</span>
+        <span class="c1"># 这些被退回来的页索引，我们把它扔回 free_slots (空闲池) 里，供别人使用。</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">free_slots</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="bp">self</span><span class="o">.</span><span class="n">free_slots</span><span class="p">,</span> <span class="n">indices</span><span class="p">[:</span><span class="n">in_cache_len</span><span class="p">]])</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：请求结束时，并不是简单地把数据删了。而是<strong>试图把它变成公共缓存</strong>。如果变成了公共缓存，它就归 <code>manager</code> 管；如果没变成缓存（比如重复了或者存不下），就把物理页还给 <code>free_slots</code>。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个 <code>CacheManager.py</code> 实际上是在做一个 <strong>显存资源的调度中心</strong>。</p>
+<p>它解决的核心矛盾是：<strong>GPU 显存有限</strong> vs <strong>大模型上下文越来越长</strong>。</p>
+<ul>
+<li>它维护一个空闲池 (<code>free_slots</code>)。</li>
+<li>它利用 Radix Tree (<code>manager</code>) 来复用历史数据。</li>
+<li>当内存不足时，它负责执行“淘汰机制”，把旧的记忆忘掉，给新的请求腾地方。</li>
+</ul>

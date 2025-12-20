@@ -1,0 +1,132 @@
+<h1>python/minisgl/scheduler/cache.py</h1>
+<p>这份代码确实涉及到底层的大模型推理优化（特别是显存管理），如果对 KV Cache（键值缓存）和 PagedAttention（分页注意力机制）不熟悉，看起来会非常吃力。</p>
+<p>这段代码的核心是一个 <strong>显存大管家（CacheManager）</strong>。它的工作是管理 GPU 上有限的显存“页（Page）”，决定谁能用显存、谁该被清理，以及如何复用以前算过的结果（这是 SGLang 的核心特性）。</p>
+<p>为了让你读懂，我制定了一个 <strong>7步的学习任务清单 (Todo List)</strong>。我们将通过这个清单，把代码拆解开来，用通俗的“图书馆/仓库”比喻来讲解。</p>
+<hr />
+<h3>学习任务清单 (Todo List)</h3>
+<ol>
+<li><strong>Task 1: 理解核心概念 (KV Cache &amp; Page)</strong> - 为什么要写这个类？</li>
+<li><strong>Task 2: 初始化仓库 (<code>__init__</code>)</strong> - 我们的家底有多少？</li>
+<li><strong>Task 3: 核心功能一：查找复用 (<code>match_req</code>)</strong> - 以前做过这道题吗？</li>
+<li><strong>Task 4: 核心功能二：分配内存 (<code>allocate</code>)</strong> - 给我拿几个空箱子来！</li>
+<li><strong>Task 5: 核心功能三：淘汰机制 (<code>evict</code>)</strong> - 箱子不够了怎么办？</li>
+<li><strong>Task 6: 核心功能四：善后处理 (<code>free_and_cache_finished_req</code>)</strong> - 任务做完了，箱子怎么处理？</li>
+<li><strong>Task 7: 辅助功能 (<code>lock</code>/<code>check</code>)</strong> - 保护现场与查账。</li>
+</ol>
+<hr />
+<h3>逐步讲解</h3>
+<h4>Task 1: 理解核心概念 (KV Cache &amp; Page)</h4>
+<ul>
+<li><strong>背景</strong>：大模型生成文字时，每生成一个新字，都需要用到之前所有字的信息。为了不重复计算，我们将算好的中间结果存起来，这就叫 <strong>KV Cache</strong>。</li>
+<li><strong>问题</strong>：显存很贵，不能随便浪费。</li>
+<li><strong>解决方案</strong>：像操作系统管理内存一样，把显存切成一块一块的，叫 <strong>"Page"（页）</strong>。</li>
+<li><strong>这个类的作用</strong>：它就是在这个“分页显存池”里负责记账的管理员。</li>
+</ul>
+<h4>Task 2: 初始化仓库 (<code>__init__</code>)</h4>
+<p>看代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="n">num_pages</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">type</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+    <span class="c1"># _free_slots 就像一个记事本，记着哪些页号是空的。</span>
+    <span class="c1"># 一开始，所有的页（0 到 num_pages-1）都是空的。</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">_free_slots</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">num_pages</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+
+    <span class="c1"># self.manager 是一个更高级的“树形”管理员（Radix Cache），</span>
+    <span class="c1"># 专门负责记录“哪句话对应哪些页”，方便以后查找。</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">manager</span> <span class="o">=</span> <span class="n">create_cache_manager</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span> <span class="nb">type</span><span class="o">=</span><span class="nb">type</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>比喻</strong>：你开了一个储物柜中心。<code>_free_slots</code> 是你手里的一把空柜子钥匙。<code>manager</code> 是你的电脑系统，用来记录哪个客户存了什么东西。</li>
+</ul>
+<h4>Task 3: 核心功能一：查找复用 (<code>match_req</code>)</h4>
+<p>这是 SGLang 最厉害的地方：<strong>前缀复用</strong>。
+看代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">match_req</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">PendingReq</span><span class="p">):</span>
+    <span class="c1"># ...</span>
+    <span class="c1"># 拿着新请求的前缀（比如 &quot;今天天气&quot;），去 manager 里查。</span>
+    <span class="c1"># 如果以前有人算过 &quot;今天天气&quot;，就把对应的缓存直接拿来用，不用重算了。</span>
+    <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">manager</span><span class="o">.</span><span class="n">match_prefix</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">input_ids</span><span class="p">[:</span> <span class="n">input_len</span> <span class="o">-</span> <span class="mi">1</span><span class="p">])</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：在分配新内存前，先看看能不能“抄作业”。如果前缀匹配上了，就能省下计算时间和显存。</li>
+</ul>
+<h4>Task 4: 核心功能二：分配内存 (<code>allocate</code>)</h4>
+<p>如果没法复用，或者需要生成新内容，就需要新内存。
+看代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">allocate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">needed_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+    <span class="c1"># 1. 先看手里的空闲柜子（_free_slots）够不够</span>
+    <span class="k">if</span> <span class="n">needed_len</span> <span class="o">&lt;=</span> <span class="p">(</span><span class="n">free_len</span> <span class="o">:=</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_free_slots</span><span class="p">)):</span>
+        <span class="c1"># 够的话，直接切一部分出去</span>
+        <span class="n">allocated</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_free_slots</span><span class="p">[:</span><span class="n">needed_len</span><span class="p">]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_free_slots</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_free_slots</span><span class="p">[</span><span class="n">needed_len</span><span class="p">:]</span> <span class="c1"># 更新剩下的空柜子</span>
+        <span class="k">return</span> <span class="n">allocated</span>
+
+    <span class="c1"># 2. 如果不够，进入 Task 5 (淘汰机制) ...</span>
+</code></pre></div>
+
+<h4>Task 5: 核心功能三：淘汰机制 (<code>evict</code>)</h4>
+<p>接上面的代码，如果空闲柜子不够了：</p>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># 计算还缺多少个</span>
+    <span class="c1"># NOTE: len(evicted) + free_len &gt;= needed_len</span>
+    <span class="c1"># 这里的 evict 是“驱逐”的意思。让 manager 挑出那些很久没用的缓存页清理掉。</span>
+    <span class="n">evicted</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">manager</span><span class="o">.</span><span class="n">evict</span><span class="p">(</span><span class="n">needed_len</span> <span class="o">-</span> <span class="n">free_len</span><span class="p">)</span>
+
+    <span class="c1"># 把“原本空闲的”和“刚清理出来的”拼在一起</span>
+    <span class="n">merged</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="bp">self</span><span class="o">.</span><span class="n">_free_slots</span><span class="p">,</span> <span class="n">evicted</span><span class="p">])</span>
+
+    <span class="c1"># 再分配出去</span>
+    <span class="n">allocated</span> <span class="o">=</span> <span class="n">merged</span><span class="p">[:</span><span class="n">needed_len</span><span class="p">]</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">_free_slots</span> <span class="o">=</span> <span class="n">merged</span><span class="p">[</span><span class="n">needed_len</span><span class="p">:]</span>
+    <span class="k">return</span> <span class="n">allocated</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：显存是有限的。当新任务来时，如果空间不足，必须无情地把旧的、不常用的缓存数据删掉（Eviction），腾出空间给新人。</li>
+</ul>
+<h4>Task 6: 核心功能四：善后处理 (<code>free_and_cache_finished_req</code>)</h4>
+<p>这是最复杂但也最重要的逻辑。当一个请求（比如生成一句话）彻底完成时：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">free_and_cache_finished_req</span><span class="p">(</span>
+    <span class="bp">self</span><span class="p">,</span>
+    <span class="n">old_handle</span><span class="p">:</span> <span class="n">BaseCacheHandle</span><span class="p">,</span>
+    <span class="n">input_ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+    <span class="n">indices</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="c1"># 1. 把这次生成的结果，存入 Radix Tree (manager) 中。</span>
+    <span class="c1"># 这样下次有人问同样的问题，就可以复用了。</span>
+    <span class="c1"># insert_prefix 会返回“存入了多少长度”。</span>
+    <span class="n">in_cache_len</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">manager</span><span class="o">.</span><span class="n">insert_prefix</span><span class="p">(</span><span class="n">input_ids</span><span class="p">,</span> <span class="n">indices</span><span class="p">)</span>
+
+    <span class="c1"># 2. 这里的逻辑很有趣：</span>
+    <span class="c1"># indices 是这个请求占用的所有物理页。</span>
+    <span class="c1"># 我们把变成了“公共缓存”的部分（in_cache_len）保留在 manager 里。</span>
+    <span class="c1"># 把剩下的部分（用完即弃的部分）归还给 _free_slots。</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">_free</span><span class="p">(</span><span class="n">indices</span><span class="p">[</span><span class="n">old_handle</span><span class="o">.</span><span class="n">cached_len</span> <span class="p">:</span> <span class="n">in_cache_len</span><span class="p">])</span>
+
+    <span class="c1"># 3. 解锁句柄</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">unlock</span><span class="p">(</span><span class="n">old_handle</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：任务结束后，不是把所有内存都释放！而是把<strong>有价值的前缀</strong>存入“公共知识库”（<code>manager</code>），只有那些没价值的尾巴才会被扔回空闲池子。</li>
+</ul>
+<h4>Task 7: 辅助功能 (<code>lock</code> / <code>check</code>)</h4>
+<ul>
+<li><strong>lock/unlock</strong>:<ul>
+<li>当一个请求正在跑的时候，它用到的缓存页必须被 <strong>锁住</strong>（引用计数+1），防止被 <code>evict</code> 机制误删。</li>
+</ul>
+</li>
+<li><strong>check_integrity</strong>:<ul>
+<li><strong>查账</strong>：<code>空闲页数量 + 已用页数量</code> 必须等于 <code>总页数 (num_pages)</code>。如果不相等，说明系统出Bug了（比如内存泄漏）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码讲了一个什么故事？</h3>
+<p>这段代码描述了一个 <strong>精打细算的显存管理员</strong>：</p>
+<ol>
+<li>它手里握着一堆空白的显存页 (<code>_free_slots</code>)。</li>
+<li>当新任务来时，它先去 <strong>Radix Tree (<code>manager</code>)</strong> 里翻翻，看有没有现成的作业可以抄 (<code>match_req</code>)。</li>
+<li>如果需要新内存，它优先用空白页；如果空白页没了，它就强行清理掉最不常用的旧数据 (<code>evict</code>)。</li>
+<li>当任务做完时，它会把这次生成的内容里<strong>有复用价值的部分</strong>存回 Radix Tree 供未来使用，剩下的才扔回空白堆里 (<code>free_and_cache_finished_req</code>)。</li>
+</ol>
+<p>这就是 MiniSGL 高效推理的核心逻辑：<strong>最大限度地复用显存，最大限度地减少重复计算。</strong></p>

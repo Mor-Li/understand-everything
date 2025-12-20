@@ -1,0 +1,96 @@
+<h1>python/minisgl/scheduler/prefill.py</h1>
+<p>这份代码是 <code>minisgl</code>（一个轻量级的大模型推理框架）中负责 <strong>Prefill（预填充）</strong> 阶段的调度器逻辑。</p>
+<p>为了让你看懂，我们先把“代码”放一边，建立一个<strong>任务清单（Task List）</strong>。我们将整个流程想象成<strong>一家由于显存（座位）有限，必须精打细算的“大模型餐厅”</strong>。</p>
+<p>“Prefill”阶段就是客人刚进店点菜（输入Prompt），厨师需要先理解完所有菜单（计算KV Cache），才能开始上菜（生成Token）。</p>
+<p>下面是你的学习 Task List：</p>
+<hr />
+<h3>Task 1: 理解核心概念（基本术语）</h3>
+<p><strong>目标：</strong> 搞懂我们在调度什么。</p>
+<ol>
+<li><strong>Prefill (预填充):</strong> 大模型推理的第一步。把用户的输入（Prompt）一次性算完，生成 KV Cache。这一步计算量大，显存占用增长快。</li>
+<li><strong>KV Cache:</strong> 大模型的“记忆”。算过的 Token 不需要重算，存下来就行。</li>
+<li><strong>Token Budget (计算预算):</strong> 显卡一次能处理的 Token 数量是有限的（比如一次只能算 4096 个），不能撑死。</li>
+<li><strong>Chunked Prefill (分块预填充):</strong> 如果用户的 Prompt 特别长（比如 1万字），一次算不完，就切成几段（Chunk）分批算。</li>
+</ol>
+<hr />
+<h3>Task 2: 认识“餐厅经理” (<code>PrefillManager</code>)</h3>
+<p><strong>目标：</strong> 看懂代码最下面的 <code>PrefillManager</code> 类。</p>
+<p><strong>角色：</strong> 它是总调度，负责接待排队的客人（Request），并决定下一批谁能进厨房。</p>
+<ul>
+<li><strong><code>pending_list</code></strong>: 等位区。新来的请求 (<code>add_one_req</code>) 都先丢到这里排队。</li>
+<li><strong><code>schedule_next_batch</code> (核心方法)</strong>: 这是经理的主要工作。<ol>
+<li>它看了一眼厨房现在的能力 (<code>prefill_budget</code>)。</li>
+<li>它叫来一个助手 <code>PrefillAdder</code>（专门负责算账的）。</li>
+<li>它遍历排队的人 (<code>pending_list</code>)，一个个问助手：“这个能塞进去吗？”</li>
+<li>如果助手说“能”，就放进 <code>reqs</code> 列表。</li>
+<li>如果遇到一个超长的请求被“切分”了 (<code>ChunkedReq</code>)，就把剩下的部分留回排队列表头 (<code>chunked_list</code>)，下次接着算。</li>
+<li>最后打包成一个 <code>Batch</code> 发给 GPU 去跑。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>Task 3: 认识“算账助手” (<code>PrefillAdder</code>)</h3>
+<p><strong>目标：</strong> 看懂 <code>PrefillAdder</code> 类。</p>
+<p><strong>角色：</strong> 它的工作是拿着计算器，精细计算每一个请求能不能塞进当前的显存和计算预算里。</p>
+<p>它有两个核心变量：
+*   <code>token_budget</code>: 还剩多少计算力（还能处理多少个 Token）。
+*   <code>reserved_size</code>: 预留显存大小（防止生成过程中显存爆了）。</p>
+<p>它有两个核心动作（方法），我们一步步看：</p>
+<h4>Step 3.1: 尝试分配资源 (<code>_try_allocate_one</code>)</h4>
+<p>这是在问：<strong>“显存够不够存放这个人的记忆？”</strong></p>
+<ol>
+<li><strong>查表 (<code>cache_manager.match_req</code>)</strong>: 这一步很关键。它会看这个请求是不是以前来过（或者有一部分前缀是一样的，比如系统提示词）。如果以前算过，直接复用（Radix Attention 机制），省显存。</li>
+<li><strong>估算显存</strong>:<ul>
+<li><code>cached_len</code>: 以前算过多少。</li>
+<li><code>extend_len</code>: 这次要新算多少。</li>
+<li><code>estimated_len</code>: 算完后总共占多少。</li>
+</ul>
+</li>
+<li><strong>检查容量</strong>: 如果 <code>estimated_len</code> + <code>reserved_size</code> 超过了总显存 (<code>available_size</code>)，那就<strong>拒绝</strong> (<code>return None</code>)。</li>
+<li><strong>分配物理内存</strong>: 如果够，就去 <code>table_manager</code> 申请物理显存位置，并把已有的缓存数据拷过去。</li>
+</ol>
+<h4>Step 3.2: 真正塞入请求 (<code>_add_one_req</code>)</h4>
+<p>这是在问：<strong>“这次预算能吃几口？”</strong></p>
+<ol>
+<li><strong>计算切分</strong>:<ul>
+<li><code>remain_len</code>: 还有多少字没读完。</li>
+<li><code>chunk_size</code>: 取 <code>token_budget</code> 和 <code>remain_len</code> 的最小值。</li>
+<li><strong>关键点</strong>: 如果预算不够读完剩下的字，就标记为 <code>is_chunked</code>（分块）。</li>
+</ul>
+</li>
+<li><strong>扣除预算</strong>: <code>self.token_budget -= chunk_size</code>。</li>
+<li><strong>搬运数据</strong>: 把用户输入的 Token ID (<code>input_ids</code>) 拷贝到 GPU 的显存池 (<code>token_pool</code>) 里。</li>
+<li><strong>生成对象</strong>:<ul>
+<li>如果是分块的，返回 <code>ChunkedReq</code>（告诉经理：我还没完，下次继续）。</li>
+<li>如果读完了，返回普通的 <code>Req</code>（告诉经理：这人进入 Decode 生成阶段了）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>Task 4: 串联整个逻辑（代码走读）</h3>
+<p>现在回到 <code>PrefillManager.schedule_next_batch</code> 方法，逻辑就通了：</p>
+<ol>
+<li><strong>初始化助手</strong>: 创建 <code>PrefillAdder</code>，给它当前的预算。</li>
+<li><strong>循环处理排队者</strong>: <code>for pending_req in self.pending_list:</code></li>
+<li><strong>尝试添加</strong>: 调用 <code>adder.try_add_one(pending_req)</code>。<ul>
+<li><strong>情况 A (老熟人继续吃)</strong>: 如果这个请求本身就是上次没吃完的 (<code>chunked_req</code>)，直接继续喂 (<code>_add_one_req</code>)。</li>
+<li><strong>情况 B (新客人)</strong>: 先看显存够不够 (<code>_try_allocate_one</code>)，够的话再喂 (<code>_add_one_req</code>)。</li>
+<li><strong>情况 C (没资源了)</strong>: 返回 <code>None</code>，循环 <code>break</code>，这一批次这就样了。</li>
+</ul>
+</li>
+<li><strong>处理结果</strong>:<ul>
+<li>如果是 <code>ChunkedReq</code>（没读完），把它放回队首 (<code>chunked_list</code>)，保证下次优先处理它。</li>
+<li>如果是普通 <code>Req</code>，放入本批次执行列表。</li>
+</ul>
+</li>
+<li><strong>发车</strong>: 返回 <code>Batch</code> 对象。</li>
+</ol>
+<hr />
+<h3>Task 5: 总结</h3>
+<p><strong>这代码到底在讲啥？</strong></p>
+<p>它在实现一个<strong>支持“断点续传”和“缓存复用”的排队系统</strong>。</p>
+<ul>
+<li><strong>为了省显存</strong>：它在 <code>_try_allocate_one</code> 里拼命找能不能复用之前的缓存 (<code>match_req</code>)。</li>
+<li><strong>为了不卡顿</strong>：它引入了 <code>ChunkedReq</code>。如果一个 Prompt 太长，它不会让 GPU 一直卡在那算这一个人的，而是切成小块，每次算一点，利用 <code>token_budget</code> 控制每一轮的负载均衡。</li>
+</ul>
+<p>现在你再回头看代码，重点关注 <code>ChunkedReq</code>（分块请求）和 <code>PrefillAdder</code>（资源计算器），应该就能看懂了。</p>

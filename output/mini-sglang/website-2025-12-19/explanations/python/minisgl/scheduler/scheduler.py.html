@@ -1,0 +1,107 @@
+<h1>python/minisgl/scheduler/scheduler.py</h1>
+<p>这份代码确实比较硬核，它实现了一个 <strong>LLM 推理引擎的调度器（Scheduler）</strong>。</p>
+<p>你可以把这个 Scheduler 想象成一家 <strong>火爆的餐厅经理</strong>。他的工作不是亲自炒菜（炒菜是 GPU/Engine 的事），而是负责<strong>接单、安排座位、把菜单递给后厨、把做好的菜端给客人、以及清理桌子</strong>。</p>
+<p>为了让你看懂，我们将这个过程拆解为一个 <strong>"处理一批用户请求" 的 To-Do List</strong>。代码中的 <code>run_forever</code> 实际上就是在疯狂循环执行这个清单。</p>
+<hr />
+<h3>📋 调度器的工作清单 (To-Do List)</h3>
+<ol>
+<li><strong>[接单]</strong>: 查看有没有新顾客（用户请求）进来？有的话先记下来。</li>
+<li><strong>[排班]</strong>: 决定下一批让谁进食（GPU计算）。是让新来的点菜（Prefill），还是让正在吃的继续吃下一口（Decode）？</li>
+<li><strong>[备料]</strong>: 为这批顾客分配“餐具”和“座位”（显存/KV Cache），准备好数据索引。</li>
+<li><strong>[下厨]</strong>: 把数据送进 GPU 进行计算（模型前向传播），算出下一个 token。</li>
+<li><strong>[上菜与结账]</strong>:<ul>
+<li>把 GPU 算出的结果拿回来。</li>
+<li>告诉用户：“你的下一个字是XXX”。</li>
+<li>如果用户吃完了（生成结束），清理他的资源（释放显存）。</li>
+</ul>
+</li>
+<li><strong>[并行魔法]</strong>: 在等待 GPU 炒菜的同时，CPU 赶紧处理上一批的账单（Overlap 优化）。</li>
+</ol>
+<hr />
+<h3>逐步代码解析</h3>
+<p>现在我们对照代码，一步步把上面的 List 展开讲：</p>
+<h4>1. [接单] 接收消息</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>_process_one_msg</code> 和 <code>receive_msg</code></li>
+<li><strong>解释</strong>:<ul>
+<li>外界会发消息给调度器。如果是 <code>UserMsg</code>（用户发来的 Prompt），调度器会检查长度是否超标。</li>
+<li>如果没问题，就把它丢给 <code>prefill_manager</code>（预填充管理器），相当于把顾客领进等候区。</li>
+</ul>
+</li>
+</ul>
+<h4>2. [排班] 决定下一批跑什么</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>_schedule_next_batch</code></li>
+<li><strong>解释</strong>:<ul>
+<li>显卡资源有限，不能一次性服务所有人。</li>
+<li>代码逻辑：<code>prefill_manager.schedule_next_batch(...) or self.decode_manager.schedule_next_batch()</code></li>
+<li><strong>优先策略</strong>: 代码里写的是先看有没有需要 <strong>Prefill</strong>（刚来的新请求处理 Prompt）的，如果没有，再看有没有需要 <strong>Decode</strong>（正在生成后续 token）的。</li>
+<li>选好了一批请求，打包成一个 <code>batch</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>3. [备料] 准备内存和索引</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>_prepare_batch</code></li>
+<li><strong>核心逻辑</strong>:<ul>
+<li><strong>分配显存</strong>: <code>self.cache_manager.allocate</code>。大模型推理需要 KV Cache，这里就是在显存里挖一块地给这个 batch 用。</li>
+<li><strong>构建索引</strong>: <code>_make_2d_indices</code>。<ul>
+<li><em>这也是你觉得难懂的地方</em>。简单说，逻辑上的数据是 2D 的（比如 Batch Size=3, 每个人长度不一样），但物理显存是 1D 的大数组。</li>
+<li>这个函数就是生成一个“映射表”，告诉 GPU：“第 1 个人的数据在物理内存第 100-105 格，第 2 个人的在 500-510 格”。</li>
+</ul>
+</li>
+<li><strong>写入页表</strong>: <code>self.page_table... = batch.out_loc</code>。把分配好的地址记录在页表里，防止以后找不到。</li>
+</ul>
+</li>
+</ul>
+<h4>4. [下厨] GPU 计算</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>_forward</code></li>
+<li><strong>解释</strong>:<ul>
+<li><code>_load_token_ids</code>: 根据刚才算的索引，把输入的 token 搬运好。</li>
+<li><code>self.engine.forward_batch</code>: <strong>这是最重的一步</strong>。调用底层引擎，让 GPU 跑神经网络。</li>
+<li><code>_write_token_ids</code>: 把算出来的 token 填回池子里。</li>
+<li><code>self.decode_manager.add_reqs</code>: 如果是新来的请求（Prefill），跑完第一次后，就把它转移到 Decode 队列，准备下一轮生成。</li>
+</ul>
+</li>
+</ul>
+<h4>5. [上菜与结账] 处理结果</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>_process_last_data</code></li>
+<li><strong>解释</strong>:<ul>
+<li>当 GPU 算完后，结果还在显存里，需要拷回 CPU (<code>next_tokens_cpu</code>)。</li>
+<li><strong>遍历请求</strong>:<ul>
+<li>把生成的 token 加入请求的历史记录。</li>
+<li><strong>检查结束</strong>: <code>finished |= next_token == self.eos_token_id</code>。如果生成了句号（EOS）或者达到最大长度，就结束。</li>
+</ul>
+</li>
+<li><strong>发送结果</strong>: <code>DetokenizeMsg</code>，把 token ID 转成文字发给用户。</li>
+<li><strong>清理资源</strong>: 如果请求结束了 (<code>finished</code>)，调用 <code>table_manager.free</code> 和 <code>cache_manager.free</code>，把占用的显存坑位腾出来给别人用。</li>
+</ul>
+</li>
+</ul>
+<h4>6. [并行魔法] Overlap Loop</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>overlap_loop</code></li>
+<li><strong>解释</strong>:<ul>
+<li>这是高阶操作。GPU 算得很慢，CPU 算得很快。</li>
+<li>如果傻傻地等 GPU 算完再处理数据，CPU 就闲置了。</li>
+<li><strong>Overlap (重叠)</strong>:<ul>
+<li>当 GPU 正在跑 <strong>当前 Batch</strong> 的 <code>_forward</code> 时。</li>
+<li>CPU 同时在处理 <strong>上一个 Batch</strong> 的 <code>_process_last_data</code>（发结果、释放内存）以及准备 <strong>下一个 Batch</strong> 的数据。</li>
+<li>代码里用了 <code>torch.cuda.stream</code> 来实现这种异步操作。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结文中的核心观点</h3>
+<p>这个文件的核心观点（或者说设计哲学）是：</p>
+<ol>
+<li><strong>显存管理是核心</strong>: 代码里花了大量篇幅在 <code>PageTable</code>（页表）、<code>indices</code>（索引）、<code>CacheManager</code> 上。因为大模型推理的瓶颈通常在显存带宽和容量，必须精细化管理（PagedAttention 机制）。</li>
+<li><strong>流水线并行 (Overlap)</strong>: 为了极致的性能，不能让 CPU 等 GPU，也不能让 GPU 等 CPU。<code>overlap_loop</code> 就是为了让两者同时忙碌，压榨出每一滴算力。</li>
+<li><strong>批处理 (Batching)</strong>: 所有的操作都是以 <code>Batch</code> 为单位，而不是单个请求。这是为了利用 GPU 的并行计算能力。</li>
+</ol>
+<p><strong>简单一句话：</strong>
+这是一个<strong>精打细算的管家</strong>，一边疯狂地给 GPU 喂数据，一边快速地整理 GPU 吐出来的结果，还得保证内存不炸、顺序不乱。</p>

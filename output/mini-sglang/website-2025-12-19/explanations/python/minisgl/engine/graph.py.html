@@ -1,0 +1,100 @@
+<h1>python/minisgl/engine/graph.py</h1>
+<p>这份代码的核心功能是利用 <strong>CUDA Graph（CUDA 图）</strong> 技术来加速大模型推理中的 <strong>Decode（解码/生成）阶段</strong>。</p>
+<p>简单来说，通常 CPU 指挥 GPU 干活是一步一步来的（发射指令 -&gt; GPU 执行 -&gt; 返回），这会有 CPU 的调度开销。CUDA Graph 相当于把一整套 GPU 指令“录制”下来，下次 CPU 只要按一个按钮，GPU 就自动把这一整套动作做完，极大地减少了 CPU 的开销。</p>
+<p>为了让你读懂，我把这个文件的逻辑拆解成一个 <strong>“任务清单 (Todo List)”</strong>，我们按照这个流程一步步看代码是怎么实现的。</p>
+<hr />
+<h3>任务清单 (Task List)</h3>
+<ol>
+<li><strong>策略制定</strong>：决定我们要录制哪些规格（Batch Size）的图？</li>
+<li><strong>环境准备</strong>：分配显存，准备录制设备。</li>
+<li><strong>预热 (Warmup)</strong>：先假装录一次，把该申请的内存申请好。</li>
+<li><strong>正式录制 (Capture)</strong>：针对每个 Batch Size，实际运行一遍模型并录制下来。</li>
+<li><strong>运行时：凑整 (Padding)</strong>：当真实请求来了，把数量凑成录制过的规格。</li>
+<li><strong>运行时：回放 (Replay)</strong>：播放录制好的图，得到结果。</li>
+</ol>
+<hr />
+<h3>详细步骤讲解</h3>
+<h4>Task 1: 策略制定 —— 决定录制哪些 Batch Size</h4>
+<p><strong>代码对应函数：</strong> <code>_determine_cuda_graph_bs</code></p>
+<ul>
+<li><strong>背景</strong>：CUDA Graph 是静态的，输入数据的形状（Shape）必须固定。我们不可能为 1 到 256 的每个数字都录制一个图，那样显存会爆。</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li>看显存够不够（<code>free_memory</code>）。如果是 H200 这种大卡（&gt;80GB），最大 Batch Size 设为 256，否则设为 160。</li>
+<li>生成一个列表：<code>[1, 2, 4, 8, 16, 24, 32, ...]</code>。</li>
+<li><strong>解释</strong>：我们只录制这些特定档位的图。如果来了 7 个请求，我们就用 8 的图；来了 3 个，就用 4 的图。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 环境准备 —— 初始化</h4>
+<p><strong>代码对应：</strong> <code>GraphRunner.__init__</code> 的前半部分</p>
+<ul>
+<li><strong>代码逻辑</strong>：<ul>
+<li><code>self.logits = torch.empty(...)</code>: 提前在 GPU 上申请一块地，用来存放模型输出的结果（Logits）。</li>
+<li><code>attn_backend.init_capture_graph(...)</code>: 告诉注意力机制（Attention）后端，“我要开始录像了，你准备一下 KV Cache 的指针”。</li>
+<li><code>torch.cuda.empty_cache()</code>: 清理垃圾，确保录制时有最大显存可用。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 预热 (Warmup) —— 跑通流程</h4>
+<p><strong>代码对应：</strong> <code>GraphRunner.__init__</code> 中的 <code>warm up</code> 部分</p>
+<ul>
+<li><strong>代码逻辑</strong>：
+    <code>python
+    # 创建一个临时的图
+    g = torch.cuda.CUDAGraph()
+    # 假装跑一次 forward
+    with torch.cuda.graph(g, stream=stream):
+        self.logits[:] = model.forward()
+    del g  # 跑完就删</code></li>
+<li><strong>为什么要这样做？</strong>：PyTorch 和 CUDA 在第一次运行时会分配很多内部的 buffer。如果不预热，这些动态分配动作会被录制进图里，导致后续运行时崩溃或显存错误。预热是为了让环境进入“稳定态”。</li>
+</ul>
+<h4>Task 4: 正式录制 (Capture) —— 核心循环</h4>
+<p><strong>代码对应：</strong> <code>GraphRunner.__init__</code> 中的 <code>for bs in pbar:</code> 循环</p>
+<p>这是整个文件最核心的部分。</p>
+<ul>
+<li><strong>流程</strong>：<ol>
+<li>遍历我们选定的 Batch Size 列表（比如 128, 64, ... 8, 4, 2, 1）。</li>
+<li><strong>造假数据</strong>：<code>batch = Batch(reqs=[dummy_req] * bs, ...)</code>。用“哑弹（dummy request）”填满 Batch，因为录制只关心形状（Shape），不关心内容。</li>
+<li><strong>开始录制</strong>：
+    <code>python
+    with torch.cuda.graph(g, pool=pool, stream=stream):
+        self.logits[:bs] = model.forward()</code><ul>
+<li><code>pool=pool</code>: <strong>关键点</strong>。所有的图（Graph）共享同一个显存池（Memory Pool）。这意味着 Batch Size 为 1 和 Batch Size 为 128 的图，它们中间产生的临时变量共用同一块显存，极大地节省了显存占用。</li>
+</ul>
+</li>
+<li><strong>保存</strong>：<code>graph_list.append((bs, g))</code>。把录好的图存进字典 <code>self.graph_map</code> 里。</li>
+</ol>
+</li>
+</ul>
+<h4>Task 5: 运行时：凑整 (Padding)</h4>
+<p><strong>代码对应：</strong> <code>pad_batch</code> 方法</p>
+<ul>
+<li><strong>场景</strong>：现在正在推理，用户来了 <code>batch.size = 7</code> 个请求。</li>
+<li><strong>问题</strong>：我们只有 1, 2, 4, 8... 的图，没有 7 的图。</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li>在 <code>self.graph_bs_list</code> 里找，找到第一个比 7 大的数，也就是 8。</li>
+<li><code>batch.padded_reqs = ... + [self.dummy_req] * (8 - 7)</code>。</li>
+<li><strong>操作</strong>：在原本的 7 个请求后面，塞进去 1 个假的请求（Dummy），凑成 8 个。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 6: 运行时：回放 (Replay)</h4>
+<p><strong>代码对应：</strong> <code>replay</code> 方法</p>
+<ul>
+<li><strong>场景</strong>：已经凑整好了，现在是 8 个请求（7真1假）。</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li><code>g = self.graph_map[batch.padded_size]</code>：拿出 Batch Size = 8 的那个录像带（Graph）。</li>
+<li><code>self.attn_backend.prepare_for_replay(batch)</code>：更新一下指针，告诉图这次处理的数据实际地址在哪里。</li>
+<li><code>g.replay()</code>：<strong>播放录像</strong>。这一步非常快，CPU 几乎不干活，全扔给 GPU。</li>
+<li><code>return self.logits[: batch.size]</code>：虽然 GPU 算了 8 个结果，但我们只把前 7 个（真实的）结果切片返回去，丢掉那个假的。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个 <code>graph.py</code> 就像是一个 <strong>“GPU 动作预设管理器”</strong>：
+1.  它先算好几种固定的队伍长度（1, 2, 4, 8...）。
+2.  让模型排练每种长度的动作，并录下来。
+3.  真正干活时，如果队伍长度不标准（比如 7），就塞几个假人凑成标准长度（8）。
+4.  直接播放录像，让 GPU 极速干完活。</p>
+<p><strong>注意事项</strong>：
+*   代码里有个 <code>can_use_cuda_graph</code> 检查：只在 <strong>Decode 阶段</strong>（<code>batch.is_decode</code>）且 Batch Size 不太大时使用。因为 Prefill 阶段（处理长文本输入）计算量大且形状太动态，不适合用 Graph。</p>

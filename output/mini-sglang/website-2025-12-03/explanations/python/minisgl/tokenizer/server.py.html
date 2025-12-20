@@ -1,0 +1,93 @@
+<h1>python/minisgl/tokenizer/server.py</h1>
+<p>没问题，这段代码初看确实有点绕，因为它涉及到了<strong>多进程通信（ZMQ）</strong>和<strong>深度学习推理系统的架构</strong>。</p>
+<p>你可以把这个文件 <code>server.py</code> 想象成一个 <strong>“专职翻译官”</strong>。它的工作非常单一：把人类看得懂的字变成机器看得懂的数字（Tokenize），或者把机器生成的数字变回人类看得懂的字（Detokenize）。</p>
+<p>为了让你彻底理解，我把理解这段代码的过程拆解成 <strong>7 个待办任务（Todo List）</strong>，我们一步步来勾选完成。</p>
+<hr />
+<h3>📝 任务清单：构建一个 Tokenizer Server</h3>
+<h4>✅ Task 1: 搞清楚我是谁，我要跟谁说话 (初始化通信)</h4>
+<p><strong>代码对应位置：</strong> <code>tokenize_worker</code> 函数的前几行。
+<strong>解读：</strong>
+作为一个翻译官，你得先连通电话线。在这个系统里，有三个角色：
+1.  <strong>Frontend (前台/用户)</strong>：给用户发消息的地方。
+2.  <strong>Backend (后台/大脑)</strong>：真正跑大模型（GPU）推理的地方。
+3.  <strong>Tokenizer (我/翻译官)</strong>：就是当前这个文件。</p>
+<p>代码里做了三件事：
+*   <code>send_backend</code>: 建立一条发往后台的通道（把翻译好的数字发给 GPU）。
+*   <code>send_frontend</code>: 建立一条发往前台的通道（把翻译好的文字发给用户）。
+*   <code>recv_listener</code>: 建立一个接收通道（接收外面发来的活儿）。</p>
+<blockquote>
+<p><strong>通俗理解：</strong> 我坐在中间，左手接活（recv），右手把处理好的东西分发给大脑（backend）或者客户（frontend）。</p>
+</blockquote>
+<h4>✅ Task 2: 准备好翻译词典 (加载模型)</h4>
+<p><strong>代码对应位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">tokenizer</span><span class="p">:</span> <span class="n">LlamaTokenizer</span> <span class="o">=</span> <span class="n">AutoTokenizer</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">tokenizer_path</span><span class="p">,</span> <span class="n">use_fast</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">tokenize_manager</span> <span class="o">=</span> <span class="n">TokenizeManager</span><span class="p">(</span><span class="n">tokenizer</span><span class="p">)</span>
+<span class="n">detokenize_manager</span> <span class="o">=</span> <span class="n">DetokenizeManager</span><span class="p">(</span><span class="n">tokenizer</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+干活前得先把工具备好。这里加载了 HuggingFace 的 <code>AutoTokenizer</code>。
+*   <code>TokenizeManager</code>: 专门负责“字转数字”的管家。
+*   <code>DetokenizeManager</code>: 专门负责“数字转字”的管家。</p>
+<h4>✅ Task 3: 告诉老板我准备好了 (ACK)</h4>
+<p><strong>代码对应位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="n">ack_queue</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">ack_queue</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Tokenize server </span><span class="si">{</span><span class="n">tokenizer_id</span><span class="si">}</span><span class="s2"> is ready&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+这是一个信号机制。启动后喊一声“我这就位了”，主进程才会继续往下跑。</p>
+<h4>✅ Task 4: 开始无限循环接单 (主循环与批处理)</h4>
+<p><strong>代码对应位置：</strong> <code>while True:</code> 及其后的 <code>pending_msg</code> 处理逻辑。
+<strong>解读：</strong>
+翻译官不能干完一单就下班，要一直死循环等着。
+这里有一个很重要的逻辑叫 <strong>Batching (凑单)</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">while</span> <span class="nb">len</span><span class="p">(</span><span class="n">pending_msg</span><span class="p">)</span> <span class="o">&lt;</span> <span class="n">local_bs</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">recv_listener</span><span class="o">.</span><span class="n">empty</span><span class="p">():</span>
+    <span class="n">pending_msg</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>为什么要这么做？</strong> 假设你一次能拿 10 个快递，如果只来了一个，你可以稍微等一下，凑够几个一起处理，效率更高。</li>
+<li><code>_unwrap_msg</code>: 有时候发过来的是一个大包裹（BatchMsg），需要把它拆开成一个个小任务。</li>
+</ul>
+<h4>✅ Task 5: 任务分类 (是翻译进去，还是翻译出来？)</h4>
+<p><strong>代码对应位置：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">detokenize_msg</span> <span class="o">=</span> <span class="p">[</span><span class="n">m</span> <span class="k">for</span> <span class="n">m</span> <span class="ow">in</span> <span class="n">pending_msg</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">m</span><span class="p">,</span> <span class="n">DetokenizeMsg</span><span class="p">)]</span>
+<span class="n">tokenize_msg</span> <span class="o">=</span> <span class="p">[</span><span class="n">m</span> <span class="k">for</span> <span class="n">m</span> <span class="ow">in</span> <span class="n">pending_msg</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">m</span><span class="p">,</span> <span class="n">TokenizeMsg</span><span class="p">)]</span>
+</code></pre></div>
+
+<p><strong>解读：</strong>
+收到的任务混杂在一起，需要分类：
+*   <strong>DetokenizeMsg (数字转字)</strong>：通常是 GPU 刚算出了一个新的数字，需要转成字显示给用户。
+*   <strong>TokenizeMsg (字转数字)</strong>：通常是用户刚输入了一段话（Prompt），需要转成数字喂给 GPU。</p>
+<h4>✅ Task 6: 处理“数字转字”并回复用户 (Detokenize)</h4>
+<p><strong>代码对应位置：</strong> <code>if len(detokenize_msg) &gt; 0:</code> 代码块。
+<strong>解读：</strong>
+1.  调用 <code>detokenize_manager</code> 把数字变成字。
+2.  包装成 <code>UserReply</code>（用户回复）。
+3.  通过 <code>send_frontend</code> 发送给前台。</p>
+<blockquote>
+<p><strong>场景：</strong> 模型生成了一个词，这里把它翻译出来，推送到网页上给用户看。</p>
+</blockquote>
+<h4>✅ Task 7: 处理“字转数字”并发送给大脑 (Tokenize)</h4>
+<p><strong>代码对应位置：</strong> <code>if len(tokenize_msg) &gt; 0:</code> 代码块。
+<strong>解读：</strong>
+1.  调用 <code>tokenize_manager</code> 把用户的文字变成 Tensor (张量/数字数组)。
+2.  包装成 <code>UserMsg</code>。
+3.  通过 <code>send_backend</code> 发送给后台 GPU。</p>
+<blockquote>
+<p><strong>场景：</strong> 用户刚提问了，这里把问题翻译成数字，扔给 GPU 去计算答案。</p>
+</blockquote>
+<hr />
+<h3>总结</h3>
+<p>这文件其实就干了一件事：<strong>做一个中间人</strong>。</p>
+<ul>
+<li><strong>输入</strong>：混合的请求（有的要转数字，有的要转文字）。</li>
+<li><strong>处理</strong>：利用 <code>transformers</code> 库进行转换，并利用 <code>local_bs</code> 尽量凑单批量处理。</li>
+<li><strong>输出</strong>：<ul>
+<li>如果是用户的新提问 -&gt; 转成数字 -&gt; 扔给 <strong>Backend</strong> (GPU)。</li>
+<li>如果是 GPU 算出的结果 -&gt; 转成文字 -&gt; 扔给 <strong>Frontend</strong> (用户)。</li>
+</ul>
+</li>
+</ul>
+<p>现在再看代码，是不是清晰多了？</p>

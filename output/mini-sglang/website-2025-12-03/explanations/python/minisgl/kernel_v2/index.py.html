@@ -1,0 +1,115 @@
+<h1>python/minisgl/kernel_v2/index.py</h1>
+<p>这份代码确实容易让人晕，因为它不是纯 Python 逻辑，而是<strong>Python 包装层（Wrapper）</strong>，它的核心干活部分其实是在 C++/CUDA 代码里（通过 <code>jit</code> 动态加载的）。</p>
+<p>简单来说，这段代码的功能是实现一个<strong>高性能的“查表”操作（Embedding Lookup / Gather）</strong>。</p>
+<p>为了让你彻底搞懂，我制定了一个 <strong>5 步学习任务清单 (Todo List)</strong>。我们一步步来拆解：</p>
+<hr />
+<h3>✅ Task 1: 理解核心目标——什么是“Indexing”？</h3>
+<p><strong>任务目标</strong>：抛开代码，先理解这个业务逻辑是在干什么。</p>
+<ul>
+<li><strong>场景</strong>：在大模型（LLM）里，我们有一个巨大的词表矩阵（<code>weights</code>），每一行代表一个单词的向量。</li>
+<li><strong>动作</strong>：我们有一堆单词的 ID（<code>indices</code>），我们需要从大矩阵里把这些 ID 对应的行<strong>取出来</strong>，拼成一个新的矩阵（<code>output</code>）。</li>
+<li><strong>PyTorch 原生写法</strong>：<code>output = weights[indices]</code> 或者 <code>torch.nn.functional.embedding(indices, weights)</code>。</li>
+<li><strong>为什么要重写？</strong>：PyTorch 原生的操作在某些极端情况下（比如显存带宽受限、或者需要特定的并行策略）不够快。这段代码是为了<strong>手动控制 GPU 如何搬运数据</strong>，以达到极致性能。</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 拆解入口函数 <code>indexing</code> —— 数据的准备工作</h3>
+<p><strong>任务目标</strong>：看懂主函数 <code>indexing</code> 是怎么处理输入数据的。</p>
+<p>代码位置：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">indexing</span><span class="p">(</span><span class="n">weights</span><span class="p">,</span> <span class="n">indices</span><span class="p">,</span> <span class="o">...</span><span class="p">,</span> <span class="n">output</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+    <span class="c1"># 1. 准备输出容器</span>
+    <span class="k">if</span> <span class="n">output</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">output</span> <span class="o">=</span> <span class="n">weights</span><span class="o">.</span><span class="n">new_empty</span><span class="p">(</span><span class="n">indices</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="n">weights</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span>
+
+    <span class="c1"># 2. 计算每一行数据的大小（字节数）</span>
+    <span class="c1"># weights.shape[1] 是向量维度（比如 4096），element_size() 是数据类型大小（比如 fp16 是 2字节）</span>
+    <span class="n">element_size</span> <span class="o">=</span> <span class="n">weights</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">*</span> <span class="n">weights</span><span class="o">.</span><span class="n">element_size</span><span class="p">()</span>
+
+    <span class="c1"># ... (下一步讲这个 if-else)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：<ul>
+<li>这步就是为了给 GPU 准备好“盘子”（<code>output</code>）。</li>
+<li>算出了每一行数据到底有多重（<code>element_size</code>），这对 GPU 搬运工来说很重要。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 理解核心优化 —— 那个奇怪的 <code>if-else</code> (2048/1024)</h3>
+<p><strong>任务目标</strong>：理解为什么要有 <code>num_splits</code> 这个变量。</p>
+<p>代码位置：</p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">if</span> <span class="n">element_size</span> <span class="o">%</span> <span class="mi">2048</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="n">num_splits</span> <span class="o">=</span> <span class="mi">4</span>
+    <span class="k">elif</span> <span class="n">element_size</span> <span class="o">%</span> <span class="mi">1024</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="n">num_splits</span> <span class="o">=</span> <span class="mi">2</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">num_splits</span> <span class="o">=</span> <span class="mi">1</span>
+</code></pre></div>
+
+<ul>
+<li><strong>通俗解释</strong>：<ul>
+<li>这是<strong>经验法则（Heuristic）</strong>。</li>
+<li>GPU 的线程是并行工作的。如果一行数据特别长（比如 <code>element_size</code> 很大），让一个线程搬运一行可能太慢了。</li>
+<li><strong>策略</strong>：<ul>
+<li>如果一行数据大小能被 2048 整除（很大），我们就把它切成 <strong>4 段</strong> (<code>num_splits=4</code>)，让更多的线程同时去搬这一行。</li>
+<li>如果能被 1024 整除，切 <strong>2 段</strong>。</li>
+<li>否则，就不切，直接搬。</li>
+</ul>
+</li>
+<li><strong>目的</strong>：为了让 GPU 的显存带宽跑满，不浪费算力。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 深入黑盒 —— JIT 编译 (<code>_jit_index_module</code>)</h3>
+<p><strong>任务目标</strong>：理解 Python 是怎么调用 C++/CUDA 的。</p>
+<p>代码位置：</p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@lru_cache</span><span class="p">(</span><span class="n">maxsize</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>  <span class="c1"># &lt;--- 重点 1</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_jit_index_module</span><span class="p">(</span><span class="n">element_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">,</span> <span class="n">num_splits</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+    <span class="n">args</span> <span class="o">=</span> <span class="n">make_cpp_args</span><span class="p">(</span><span class="n">element_size</span><span class="p">,</span> <span class="n">num_splits</span><span class="p">,</span> <span class="o">*</span><span class="n">config</span><span class="p">)</span>
+    <span class="c1"># 重点 2: load_jit</span>
+    <span class="k">return</span> <span class="n">load_jit</span><span class="p">(</span>
+        <span class="s2">&quot;index&quot;</span><span class="p">,</span>
+        <span class="o">*</span><span class="n">args</span><span class="p">,</span>
+        <span class="n">cuda_files</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;index.cu&quot;</span><span class="p">],</span>  <span class="c1"># 这里引用了外部的 CUDA 代码</span>
+        <span class="n">cuda_wrappers</span><span class="o">=</span><span class="p">[(</span><span class="s2">&quot;launch&quot;</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;IndexKernel&lt;</span><span class="si">{</span><span class="n">args</span><span class="si">}</span><span class="s2">&gt;::run&quot;</span><span class="p">)],</span>
+    <span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：<ul>
+<li><strong>JIT (Just-In-Time)</strong>：这段代码不是预先编译好的，而是程序运行时，根据你传入的 <code>element_size</code> 和 <code>num_splits</code>，<strong>现场编译</strong>出一个 C++ 内核。</li>
+<li><strong><code>@lru_cache</code> (缓存)</strong>：编译是很慢的。所以用缓存记下来。如果下次来的 <code>element_size</code> 是一样的，就直接用上次编译好的，不用再编译了。</li>
+<li><strong>模板参数</strong>：注意 <code>IndexKernel&lt;{args}&gt;</code>。它把 Python 算出来的 <code>element_size</code> 和 <code>num_splits</code> 作为常量写死在 C++ 代码里，这样 GPU 运行起来飞快（因为它不需要在运行时去读这些变量，全是写死的常量）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 5: 最终执行 —— <code>module.launch</code></h3>
+<p><strong>任务目标</strong>：闭环，看最后一步发生了什么。</p>
+<p>代码位置：</p>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># 拿到编译好的模块</span>
+    <span class="n">module</span> <span class="o">=</span> <span class="n">_jit_index_module</span><span class="p">(</span><span class="n">element_size</span><span class="p">,</span> <span class="n">num_splits</span><span class="o">=</span><span class="n">num_splits</span><span class="p">)</span>
+    <span class="c1"># 发射！</span>
+    <span class="n">module</span><span class="o">.</span><span class="n">launch</span><span class="p">(</span><span class="n">weights</span><span class="p">,</span> <span class="n">indices</span><span class="p">,</span> <span class="n">output</span><span class="p">,</span> <span class="n">vocab_range</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">output</span>
+</code></pre></div>
+
+<ul>
+<li><strong>解读</strong>：<ul>
+<li>Python 把显存上的指针（<code>weights</code>, <code>indices</code>, <code>output</code>）交给编译好的 CUDA 内核。</li>
+<li>CUDA 内核在 GPU 上疯狂并行，把数据从 <code>weights</code> 搬运到 <code>output</code>。</li>
+<li>Python 拿到结果返回。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>这段代码实际上在做一件事：</p>
+<p><strong>为了比 PyTorch 原生操作更快，它根据数据行的长度（字节数），动态生成并编译了一个专门定制的 C++ GPU 内核，把复杂的“查表/取数”操作根据数据长度切分成小块，并行地搬运数据。</strong></p>
+<p><strong>你的学习路径回顾：</strong>
+1.  <strong>干啥的？</strong> -&gt; 查表（从大矩阵取行）。
+2.  <strong>准备数据</strong> -&gt; 算出每行多少字节。
+3.  <strong>优化策略</strong> -&gt; 字节多就切分任务（<code>num_splits</code>），字节少就不切。
+4.  <strong>动态编译</strong> -&gt; 把上面的策略写死进 C++ 代码并编译（JIT），用缓存避免重复编译。
+5.  <strong>执行</strong> -&gt; 调用 C++ 函数干活。</p>

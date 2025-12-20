@@ -1,0 +1,102 @@
+<h1>python/minisgl/layers/rotary.py</h1>
+<p>这份代码确实涉及了深度学习底层比较“硬核”的数学部分（RoPE，旋转位置编码）以及工程优化（FlashInfer）。看不懂是很正常的。</p>
+<p>为了让你能够消化这段代码，我们把它想象成<strong>为一个大型语言模型（LLM）装配“位置感”的工程任务</strong>。</p>
+<p>我们将这个任务拆解为 <strong>5个具体的 TODO</strong>，每一步对应代码中的一部分。</p>
+<hr />
+<h3>✅ Task 1: 理解核心目标——什么是“旋转位置编码” (RoPE)?</h3>
+<p><strong>背景：</strong>
+模型（Transformer）本身是不知道“我爱你”和“你爱我”中字的顺序区别的。我们需要给每个字加上“位置信息”。
+<strong>RoPE (Rotary Positional Embedding)</strong> 是目前最流行的做法（Llama, Qwen, Mistral都在用）。它的原理是：把词向量在一个高维空间里“旋转”一下，旋转的角度取决于这个词在句子里的位置。</p>
+<p><strong>对应代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">RotaryEmbedding</span><span class="p">(</span><span class="n">StateLessOP</span><span class="p">):</span>
+    <span class="o">...</span>
+</code></pre></div>
+
+<p>这个类就是用来制造这种“旋转器”的工厂。</p>
+<hr />
+<h3>✅ Task 2: 预先计算好“小抄” (Pre-calculation)</h3>
+<p><strong>任务：</strong>
+每次来一个词都要现场算正弦（sin）和余弦（cos）太慢了。我们需要在模型初始化的时候，就把所有可能位置的 sin/cos 值算好，存起来查表。</p>
+<p><strong>对应代码（在 <code>__init__</code> 中）：</strong>
+1.  <strong>计算频率 (<code>inv_freq</code>)</strong>:
+    <code>python
+    inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))</code>
+    这是 RoPE 的数学公式核心，决定了旋转的“刻度”。</p>
+<ol>
+<li>
+<p><strong>生成位置表 (<code>t</code>)</strong>:
+    <code>python
+    t = torch.arange(max_position_embeddings, dtype=torch.float)</code>
+    比如支持 4096 长度，就生成 0 到 4095 的数字。</p>
+</li>
+<li>
+<p><strong>计算 Sin/Cos 表 (<code>_cos_sin_cache</code>)</strong>:
+    <code>python
+    freqs = torch.einsum("i,j -&gt; ij", t, inv_freq) # 外积，算出每个位置对应的角度
+    cos = freqs.cos()
+    sin = freqs.sin()
+    self._cos_sin_cache = torch.cat((cos, sin), dim=-1) # 拼起来存好</code>
+    <strong>重点</strong>：这一步生成了一个巨大的缓存表（Cache），以后直接查表，不用再算了。</p>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 3: 真正执行“旋转”动作 (Forward)</h3>
+<p><strong>任务：</strong>
+现在数据流（Query 和 Key 向量）进来了，我们需要利用刚才算好的缓存表，对它们进行旋转。</p>
+<p><strong>对应代码（<code>forward</code> 函数）：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">positions</span><span class="p">,</span> <span class="n">query</span><span class="p">,</span> <span class="n">key</span><span class="p">):</span>
+    <span class="bp">self</span><span class="o">.</span><span class="n">apply_rope_with_cos_sin_cache_inplace</span><span class="p">(</span>
+        <span class="n">positions</span><span class="o">=</span><span class="n">positions</span><span class="p">,</span>
+        <span class="n">query</span><span class="o">=</span><span class="n">query</span><span class="p">,</span>
+        <span class="n">key</span><span class="o">=</span><span class="n">key</span><span class="p">,</span>
+        <span class="o">...</span>
+        <span class="n">cos_sin_cache</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_cos_sin_cache</span><span class="p">,</span> <span class="c1"># 用上了刚才存的表</span>
+    <span class="p">)</span>
+    <span class="k">return</span> <span class="n">query</span><span class="p">,</span> <span class="n">key</span>
+</code></pre></div>
+
+<p><strong>关键点：</strong>
+这里代码并没有用 PyTorch 手写旋转逻辑，而是直接调用了：
+<code>from flashinfer import apply_rope_with_cos_sin_cache_inplace</code>
+<strong>FlashInfer</strong> 是一个极度优化的底层库（通常是 CUDA/C++ 写好的）。这段代码的意思是：“把数据丢给底层加速库，让它帮我把旋转做完，要快！”</p>
+<hr />
+<h3>✅ Task 4: 适配 Llama 3 的特殊癖好 (Scaling)</h3>
+<p><strong>任务：</strong>
+Llama 3 等新模型为了支持超长文本（比如从 8k 扩展到 128k），对 RoPE 的频率做了一些魔改（Scaling）。我们需要支持这种配置。</p>
+<p><strong>对应代码（<code>_get_rope</code> 函数中的 <code>match</code> 块）：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">match</span> <span class="n">rope_scaling</span><span class="p">[</span><span class="s2">&quot;rope_type&quot;</span><span class="p">]:</span>
+    <span class="k">case</span> <span class="s2">&quot;llama3&quot;</span><span class="p">:</span>
+        <span class="c1"># ... 读取各种因子 ...</span>
+        <span class="k">def</span><span class="w"> </span><span class="nf">post_process</span><span class="p">(</span><span class="n">inv_freq</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+            <span class="c1"># ... 复杂的数学调整逻辑 ...</span>
+            <span class="c1"># 如果波长太长，就压缩一下；如果波长短，就保持原样。</span>
+            <span class="k">return</span> <span class="n">factor</span> <span class="o">*</span> <span class="n">inv_freq</span>
+</code></pre></div>
+
+<p>这段逻辑是在说：如果配置文件里说这是 "llama3" 类型的模型，我们在生成 Task 2 的那个频率表之前，先对频率做一些数学上的微调（Scaling），以适应更长的上下文。</p>
+<hr />
+<h3>✅ Task 5: 工程管理——别重复造轮子 (Caching &amp; Device)</h3>
+<p><strong>任务：</strong>
+如果我开了 32 个 Transformer 层，每一层都需要 RoPE，我需要创建 32 个一模一样的 <code>RotaryEmbedding</code> 对象吗？不需要，太浪费内存了。另外，要确保这些计算在 GPU 上进行。</p>
+<p><strong>对应代码（<code>get_rope</code> 和装饰器）：</strong></p>
+<ol>
+<li>
+<p><strong>缓存 (<code>@lru_cache</code>)</strong>:
+    <code>python
+    @lru_cache()
+    def get_rope(...):</code>
+    这个装饰器保证如果你传入相同的参数（比如都是维度128），它会直接返回之前创建好的对象，而不会重新 <code>new</code> 一个。</p>
+</li>
+<li>
+<p><strong>设备管理 (<code>set_rope_device</code>)</strong>:
+    <code>python
+    def set_rope_device(device: torch.device): ...</code>
+    这部分是为了防止在 PyTorch 的 "Meta" 设备（一种不占显存的虚拟设备，用于模型加载初期）上初始化 RoPE 导致报错。它确保 RoPE 真正创建时是在真实的 GPU/CPU 上。</p>
+</li>
+</ol>
+<hr />
+<h3>总结</h3>
+<p>这个文件其实就干了三件事：
+1.  <strong>初始化</strong>：根据数学公式算出 Sin/Cos 表（如果遇到 Llama 3 这种特殊的，就改改公式）。
+2.  <strong>加速执行</strong>：利用 <code>flashinfer</code> 这个外部高性能库，把 Query 和 Key 向量进行位置编码（旋转）。
+3.  <strong>单例管理</strong>：利用 <code>lru_cache</code> 确保全局只创建必要的几个实例，节省资源。</p>

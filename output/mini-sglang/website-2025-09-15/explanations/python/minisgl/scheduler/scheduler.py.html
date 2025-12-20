@@ -1,0 +1,113 @@
+<h1>python/minisgl/scheduler/scheduler.py</h1>
+<p>这份代码实现了一个 <strong>LLM 推理服务的调度器 (Scheduler)</strong>。</p>
+<p>你可以把 <code>Scheduler</code> 想象成一个 <strong>“餐厅经理”</strong>。他的工作不是亲自做菜（做菜是 <code>Engine</code> 的工作），而是负责接单、安排谁先吃、谁后吃、把做好的菜端给客人，并管理餐厅的座位（显存）。</p>
+<p>为了让你读懂，我把这个代码的逻辑拆解成一份 <strong>Task Todo List (任务清单)</strong>，按代码运行的生命周期一步步来讲。</p>
+<hr />
+<h3>Task 1: 开店准备 (初始化 <code>__init__</code>)</h3>
+<p>在一切开始之前，经理需要把店里的设施准备好。</p>
+<ol>
+<li><strong>启动引擎 (<code>self.engine</code>)</strong>:<ul>
+<li>经理得先把厨师团队（Engine）叫醒，准备好 GPU 资源。</li>
+</ul>
+</li>
+<li><strong>建立通信渠道 (ZMQ Queues)</strong>:<ul>
+<li><strong>对外</strong>: 建立“收信箱” (<code>recv_tokenizer</code>) 接收用户的 Prompt；建立“发信箱” (<code>send_tokenizer</code>) 把生成的 Token 发回给用户。</li>
+<li><strong>对内 (多卡并行)</strong>: 如果有多个 GPU (TP &gt; 1)，Rank 0 (主卡) 负责接收外部消息，然后通过广播 (<code>send_ranks</code>) 告诉其他从卡；从卡 (<code>rank1</code>) 只需要监听主卡的指令。</li>
+</ul>
+</li>
+<li><strong>招聘管理员 (Managers)</strong>:<ul>
+<li><code>PageTableManager</code>: 管理显存页表（类似于管理餐厅座位表）。</li>
+<li><code>CacheManager</code>: 管理 KV Cache（类似于管理餐盘和半成品）。</li>
+<li><code>PrefillManager</code>: 负责处理新来的客人（首字推理/Prefill 阶段）。</li>
+<li><code>DecodeManager</code>: 负责处理正在吃的客人（生成后续 Token/Decode 阶段）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>Task 2: 每日循环 (<code>main_loop</code> &amp; <code>run_forever</code>)</h3>
+<p>这是代码的核心，经理开始无限循环地处理事务。我们将 <code>main_loop</code> 拆解为每一步的 Todo：</p>
+<h4>Step 2.1: 检查信箱 (<code>_recv_msg_*</code>)</h4>
+<ul>
+<li><strong>动作</strong>: 经理去门口看看有没有新订单。</li>
+<li><strong>逻辑</strong>:<ul>
+<li>如果当前 GPU 很忙（有任务在跑），就<strong>非阻塞</strong>地看一眼（有信就拿，没信就算）。</li>
+<li>如果当前 GPU 很闲（没任务），就<strong>阻塞</strong>等待（一直等到有信来为止，省电）。</li>
+</ul>
+</li>
+<li><strong>多卡处理</strong>:<ul>
+<li>如果是主卡：从外界收信，然后转发给从卡。</li>
+<li>如果是从卡：只等主卡的转发。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 2.2: 处理新订单 (<code>_process_one_msg</code>)</h4>
+<ul>
+<li><strong>动作</strong>: 打开信封看内容。</li>
+<li><strong>逻辑</strong>:<ul>
+<li>如果是 <code>UserMsg</code> (用户请求): 把它扔进 <code>prefill_manager</code> 的等待队列里（相当于客人在门口排队拿号）。</li>
+<li>如果是 <code>ExitMsg</code>: 关门下班。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 2.3: 决定下一批做什么 (<code>_schedule_next_batch</code>)</h4>
+<ul>
+<li><strong>动作</strong>: 经理看一眼排队区（Prefill）和用餐区（Decode），决定下一秒让厨师做什么。</li>
+<li><strong>逻辑</strong>:<ul>
+<li><strong>优先 Prefill</strong>: 如果有新客人排队，且显存够用，优先处理新客人的 Prompt（因为 Prefill 吞吐量大）。</li>
+<li><strong>其次 Decode</strong>: 如果没有新客人，或者显存不够塞入新客人，就继续给正在生成的请求算下一个 Token。</li>
+<li><strong>结果</strong>: 生成一个 <code>Batch</code> 对象，里面包含了这次要算的请求列表。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 2.4: 厨师开火 (<code>engine.forward_batch</code>)</h4>
+<ul>
+<li><strong>动作</strong>: 把决定好的 <code>Batch</code> 交给 Engine。</li>
+<li><strong>逻辑</strong>:<ul>
+<li><code>engine.prepare_batch</code>: 准备数据。</li>
+<li><code>engine.forward_batch</code>: <strong>GPU 开始计算</strong>。</li>
+<li><strong>关键点</strong>: 这里使用了 CUDA Stream。GPU 在跑的时候，CPU 不会傻等，而是继续往下走（去处理上一批的结果），这叫“流水线并行”。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 2.5: 处理上一批的菜 (<code>_reply_tokenizer_*</code> &amp; <code>_filter_finished_reqs</code>)</h4>
+<ul>
+<li><strong>动作</strong>: 这里的逻辑稍微有点绕。因为 GPU 是异步的，当 CPU 跑到这一步时，处理的其实是<strong>上一次循环</strong>提交给 GPU 的任务结果。</li>
+<li><strong>逻辑</strong>:<ul>
+<li>拿到上一次 GPU 算出来的 Token。</li>
+<li><strong>检查是否结束</strong>: 这个请求是不是生成了结束符 (EOS) 或者达到了最大长度？</li>
+<li><strong>如果结束了</strong>:<ul>
+<li>回收显存 (<code>table_manager.free</code>, <code>cache_manager.free</code>)。</li>
+<li>从 <code>decode_manager</code> 里把这个请求踢出去。</li>
+</ul>
+</li>
+<li><strong>发货</strong>: 把生成的 Token 封装成消息，通过 ZMQ 发回给前端/用户。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：代码的生命周期图解</h3>
+<p>你可以把整个 <code>scheduler.py</code> 看作在维护这样一个死循环：</p>
+<ol>
+<li><strong>收信</strong>: 来了新请求？ -&gt; 加入等待队列。</li>
+<li><strong>调度</strong>:<ul>
+<li>显存够吗？</li>
+<li>先做新来的 (Prefill) 还是继续做旧的 (Decode)？</li>
+<li>选出一批任务 (Batch)。</li>
+</ul>
+</li>
+<li><strong>执行 (GPU)</strong>: 告诉 GPU 去跑这个 Batch (GPU 在后台跑，CPU 继续往下)。</li>
+<li><strong>善后 (CPU)</strong>:<ul>
+<li>看看<strong>上一个</strong> Batch 跑完的结果。</li>
+<li>哪个请求跑完了？ -&gt; 释放显存。</li>
+<li>把生成的字发给用户。</li>
+</ul>
+</li>
+<li><strong>回到第 1 步</strong>。</li>
+</ol>
+<h3>关键函数对应关系</h3>
+<ul>
+<li><strong>想看怎么收数据的</strong>: 看 <code>_recv_msg_single_rank</code>。</li>
+<li><strong>想看怎么选任务的</strong>: 看 <code>_schedule_next_batch</code>。</li>
+<li><strong>想看怎么判断请求结束的</strong>: 看 <code>_filter_finished_reqs</code>。</li>
+<li><strong>想看主循环逻辑的</strong>: 看 <code>main_loop</code>。</li>
+</ul>

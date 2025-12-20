@@ -1,0 +1,130 @@
+<h1>python/minisgl/layers/linear.py</h1>
+<p>这份代码看起来确实比较硬核，因为它涉及到<strong>深度学习中最底层的优化技术——张量并行（Tensor Parallelism, TP）</strong>。</p>
+<p>简单来说，这段代码是为了解决一个问题：<strong>当模型太大（比如 Llama-3-70B），一张显卡装不下它的矩阵（Linear Layer）时，如何把大矩阵切碎，分给多张显卡一起算。</strong></p>
+<p>为了让你看懂，我为你制定了一个 <strong>6步走的“学习任务清单” (To-Do List)</strong>。我们一步步来拆解。</p>
+<hr />
+<h3>✅ Task 1: 理解最基础的“搬砖工具”</h3>
+<p><strong>目标</strong>：看懂 <code>_linear_inplace</code> 函数。</p>
+<ul>
+<li><strong>代码片段</strong>：
+    <code>python
+    def _linear_inplace(...):
+        if bias is not None:
+            torch.addmm(bias, x, weight.t(), out=out)
+        else:
+            torch.mm(x, weight.t(), out=out)
+        return out</code></li>
+<li><strong>讲解</strong>：
+    不要被名字吓到。这其实就是最普通的<strong>矩阵乘法</strong>（$Y = X \times W^T + b$）。<ul>
+<li><code>torch.mm</code>: 矩阵乘法 (Matrix Multiplication)。</li>
+<li><code>torch.addmm</code>: 矩阵乘法后再加上偏置 (Bias)。</li>
+<li><strong>关键点</strong>：它有一个 <code>out=out</code> 参数。这意味着它不创建新内存，直接把结果写在已经分配好的 <code>out</code> 显存里，为了省显存和速度（In-place操作）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 理解“总工头” (基类)</h3>
+<p><strong>目标</strong>：看懂 <code>class _LinearTPImpl(BaseOP)</code>。</p>
+<ul>
+<li>
+<p><strong>核心逻辑</strong>：
+    这是一个基类（父类），它不干具体的活，只负责<strong>定义身份</strong>。
+    在张量并行（TP）中，原本的一个大矩阵被切分了。所以这个类记录了两套尺寸：</p>
+<ol>
+<li><strong>Full Size (全局尺寸)</strong>: 完整的模型原本应该有多大。</li>
+<li>
+<p><strong>Local Size (本地尺寸)</strong>: 切分后，当前这张显卡上只存了多大。</p>
+</li>
+<li>
+<p><code>self.weight</code>: 这里的权重是 <code>local</code> 大小的。比如原本权重是 100x100，如果有2张卡，这里可能只存 50x100 或者 100x50。</p>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 策略一 —— 竖着切 (列并行)</h3>
+<p><strong>目标</strong>：看懂 <code>class LinearColParallelMerged</code>。</p>
+<ul>
+<li><strong>场景</strong>：通常用于 MLP 层的升维部分（Gate / Up proj）。</li>
+<li><strong>核心逻辑</strong>：<ul>
+<li><strong>怎么切？</strong> 把输出维度（Output Dimension）切开。想象一个大西瓜，我们<strong>竖着切</strong>。</li>
+<li><strong>结果</strong>：每张显卡计算出来的结果，只是完整输出向量的<strong>一部分</strong>。<ul>
+<li>卡1 算出输出向量的第 [0-50] 位。</li>
+<li>卡2 算出输出向量的第 [51-100] 位。</li>
+</ul>
+</li>
+<li><strong>代码解读</strong>：
+    <code>tp_output_sizes = [divide_even(size, tp_info.size) ...]</code>
+    这行代码就是在把输出维度除以显卡数量（<code>tp_info.size</code>），计算每张卡该分多少活。</li>
+<li><strong>Merged 是啥？</strong> 有时候为了快，我们会把两个层（比如 Gate层 和 Up层）拼在一起算，所以叫 Merged。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 4: 策略一的进阶版 —— QKV 注意力层</h3>
+<p><strong>目标</strong>：看懂 <code>class LinearQKVMerged</code>。</p>
+<ul>
+<li><strong>场景</strong>：这是 Transformer 中最核心的 Attention 部分（Query, Key, Value）。它本质上也是<strong>列并行</strong>（竖着切），但稍微复杂点。</li>
+<li><strong>难点拆解</strong>：<ol>
+<li><strong>GQA (Grouped Query Attention)</strong>: 现在的模型（如 Llama 3）Q 的头数多，K 和 V 的头数少。代码里的 <code>GQA_ratio</code> 就是在算这个比例。</li>
+<li><strong>QK Norm</strong>: 有些模型在 Q 和 K 算出来后，还需要做一次归一化（RMSNorm）。<ul>
+<li><code>_apply_qk_norm_inplace</code>: 这就是先把 QKV 切开，单独对 Q 和 K 做 Norm，然后再拼回去。</li>
+</ul>
+</li>
+<li><strong>Local Size</strong>:
+    <code>local_num_kv = divide_even(num_kv_heads, tp_info.size)</code>
+    这里不是切隐藏层维度，而是<strong>切“头数” (Heads)</strong>。比如一共 32 个头，2张卡，每张卡负责算 16 个头。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 5: 策略二 —— 横着切 (行并行)</h3>
+<p><strong>目标</strong>：看懂 <code>class LinearRowParallel</code> 和 <code>class LinearOProj</code>。</p>
+<ul>
+<li><strong>场景</strong>：通常用于 MLP 的降维部分（Down proj）或者 Attention 的输出部分（Output proj）。</li>
+<li><strong>核心逻辑</strong>：<ul>
+<li><strong>怎么切？</strong> 把输入维度（Input Dimension）切开。想象一个大西瓜，我们<strong>横着切</strong>。</li>
+<li><strong>问题</strong>：如果不做处理，每张卡只拿到了输入向量的一半去算，算出来的结果是“部分和”（Partial Sum），是不完整的。</li>
+<li><strong>必须做的额外步骤 (All-Reduce)</strong>：
+    因为每张卡算出来的都是一部分数值，必须把所有卡的结果<strong>加起来</strong>，才是最终结果。</li>
+</ul>
+</li>
+<li>
+<p><strong>代码解读</strong>：
+    ```python
+    # 1. 正常计算矩阵乘法
+    _linear_inplace(x, self.weight, self.bias, out=y)</p>
+<h1>2. 关键步骤！如果有多张卡 (tp_size &gt; 1)</h1>
+<p>if self._tp_size &gt; 1:
+    # 通信：大家把手里的结果拿出来，加在一起，同步给所有人
+    y = self._comm.all_reduce(y) 
+<code>``</code>LinearOProj<code>和</code>LinearRowParallel<code>代码几乎一样，只是</code>OProj` 专门指代 Attention 后的那个输出层，为了命名规范区分开了。</p>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 6: 总结全流程 (The Big Picture)</h3>
+<p>把上面 5 个 Task 串起来，这个文件的逻辑就是：</p>
+<ol>
+<li><strong>定义了一个基类</strong>，用来存被切分后的“小权重”。</li>
+<li><strong>定义了“列并行” (ColParallel/QKV)</strong>：<ul>
+<li>大家各自算输出向量的一段。</li>
+<li>算完大家手里各有一截，拼起来就是完整的。</li>
+<li><strong>不需要</strong>通信（All-Reduce）。</li>
+</ul>
+</li>
+<li><strong>定义了“行并行” (RowParallel/OProj)</strong>：<ul>
+<li>大家各自算输入向量的一段。</li>
+<li>算完大家手里的结果都是“半成品”。</li>
+<li><strong>必须</strong>通信（All-Reduce），把数值加起来才是对的。</li>
+</ul>
+</li>
+</ol>
+<p><strong>为什么大模型要这么折腾？</strong>
+通常 Transformer 的结构是：
+<code>Attention (QKV)</code> -&gt; <code>Output (OProj)</code> -&gt; <code>MLP (Gate/Up)</code> -&gt; <code>MLP (Down)</code></p>
+<p>这就形成了一个经典的 <strong>三明治结构</strong>：
+1.  <strong>QKV (列并行)</strong>: 切分，不通信。
+2.  <strong>OProj (行并行)</strong>: 这里的 <code>all_reduce</code> 把数据同步回来。
+3.  <strong>MLP Up (列并行)</strong>: 再切分，不通信。
+4.  <strong>MLP Down (行并行)</strong>: 再 <code>all_reduce</code> 同步回来。</p>
+<p>这个文件就是在实现这个三明治里的每一层。现在再回去看代码，是不是清晰一点了？</p>

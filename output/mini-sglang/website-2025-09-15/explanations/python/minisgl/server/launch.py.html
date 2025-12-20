@@ -1,0 +1,119 @@
+<h1>python/minisgl/server/launch.py</h1>
+<p>这份代码确实涉及到了<strong>多进程编程</strong>、<strong>分布式系统</strong>和<strong>深度学习推理服务</strong>的启动流程，乍一看很乱是很正常的。</p>
+<p>你可以把这个脚本想象成一个 <strong>“餐厅经理”</strong>（Launcher）。它的工作不是亲自做菜，而是负责早上开门时，把<strong>前台</strong>（API Server）、<strong>后厨</strong>（Scheduler/GPU模型）和<strong>传菜员</strong>（Tokenizer）全部叫醒，并确保他们都准备好了再开始营业。</p>
+<p>为了让你听懂，我把这个脚本的任务拆解成一个 <strong>TODO List</strong>，我们一步一步来看它是怎么把整个服务拉起来的。</p>
+<hr />
+<h3>🚀 启动流程 TODO List</h3>
+<ol>
+<li><strong>准备阶段</strong>：读取“菜单”和“排班表”（解析命令行参数）。</li>
+<li><strong>定义核心任务</strong>：规定“后厨”（模型调度器）具体该干什么。</li>
+<li><strong>组建团队（核心逻辑）</strong>：<ul>
+<li>招募“后厨团队”（启动 GPU 模型进程）。</li>
+<li>招募“翻译团队”（启动分词/反分词进程）。</li>
+<li>点名确认（等待所有进程发送“就绪”信号）。</li>
+</ul>
+</li>
+<li><strong>正式开业</strong>：启动 HTTP 服务器，对外提供服务。</li>
+</ol>
+<hr />
+<h3>逐步讲解</h3>
+<h4>Task 1: 准备阶段 (解析参数)</h4>
+<p>在代码的最下面 <code>launch_server</code> 函数的开头：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">server_args</span> <span class="o">=</span> <span class="n">parse_args</span><span class="p">(</span><span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">:])</span>
+<span class="n">logger</span> <span class="o">=</span> <span class="n">init_logger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">,</span> <span class="s2">&quot;initializer&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>做什么</strong>：脚本运行的第一件事，是看用户输入了什么参数（比如模型路径在哪里、用几张显卡 <code>tp_info.size</code>、端口号是多少）。</li>
+<li><strong>观点</strong>：任何服务启动前必须先拿到配置信息。</li>
+</ul>
+<h4>Task 2: 定义核心任务 (模型调度器逻辑)</h4>
+<p>看代码上方的 <code>_run_scheduler</code> 函数：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">_run_scheduler</span><span class="p">(</span><span class="n">args</span><span class="p">:</span> <span class="n">ServerArgs</span><span class="p">,</span> <span class="n">ack_queue</span><span class="p">:</span> <span class="n">mp</span><span class="o">.</span><span class="n">Queue</span><span class="p">[</span><span class="nb">str</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="c1"># ... 省略 import ...</span>
+    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">inference_mode</span><span class="p">():</span>
+        <span class="n">scheduler</span> <span class="o">=</span> <span class="n">Scheduler</span><span class="p">(</span><span class="n">config</span><span class="o">=</span><span class="n">args</span><span class="p">)</span> <span class="c1"># 初始化调度器</span>
+        <span class="n">scheduler</span><span class="o">.</span><span class="n">sync_all_ranks</span><span class="p">()</span>         <span class="c1"># 多显卡之间同步状态</span>
+
+        <span class="k">if</span> <span class="n">args</span><span class="o">.</span><span class="n">tp_info</span><span class="o">.</span><span class="n">is_primary</span><span class="p">():</span>      <span class="c1"># 如果是主卡（0号卡）</span>
+            <span class="n">ack_queue</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="s2">&quot;Scheduler is ready&quot;</span><span class="p">)</span> <span class="c1"># 发个信号：我准备好了！</span>
+
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">scheduler</span><span class="o">.</span><span class="n">run_forever</span><span class="p">()</span>        <span class="c1"># 死循环：一直等待并处理推理请求</span>
+        <span class="k">except</span> <span class="ne">KeyboardInterrupt</span><span class="p">:</span>
+            <span class="c1"># ... 优雅退出 ...</span>
+</code></pre></div>
+
+<ul>
+<li><strong>做什么</strong>：这是定义<strong>每一个 GPU 进程</strong>具体要干的活。它加载模型，同步状态，然后进入一个死循环（<code>run_forever</code>），不停地从队列里拿数据进行计算。</li>
+<li><strong>观点</strong>：这是“后厨”的核心工作手册。注意那个 <code>ack_queue.put(...)</code>，这是为了告诉经理“我准备好了”。</li>
+</ul>
+<h4>Task 3: 组建团队 (启动子进程)</h4>
+<p>这是最复杂的部分，在 <code>start_subprocess</code> 函数里。因为 Python 有全局解释器锁（GIL），为了利用多核 CPU 和多张显卡，必须使用 <code>multiprocessing</code> (mp) 启动多个独立的进程。</p>
+<p><strong>3.1 设置启动方式</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">mp</span><span class="o">.</span><span class="n">set_start_method</span><span class="p">(</span><span class="s2">&quot;spawn&quot;</span><span class="p">,</span> <span class="n">force</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">ack_queue</span><span class="p">:</span> <span class="n">mp</span><span class="o">.</span><span class="n">Queue</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">mp</span><span class="o">.</span><span class="n">Queue</span><span class="p">()</span> <span class="c1"># 创建一个消息队列，用来接收“就绪”信号</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：在 PyTorch/CUDA 编程中，必须用 <code>spawn</code> 方式启动进程，否则会报错。</li>
+</ul>
+<p><strong>3.2 启动 GPU 模型进程 (Scheduler)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">world_size</span> <span class="o">=</span> <span class="n">server_args</span><span class="o">.</span><span class="n">tp_info</span><span class="o">.</span><span class="n">size</span> <span class="c1"># 比如你有 4 张卡，这里就是 4</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">world_size</span><span class="p">):</span>
+    <span class="c1"># ... 配置当前进程是第几号卡 ...</span>
+    <span class="n">mp</span><span class="o">.</span><span class="n">Process</span><span class="p">(</span>
+        <span class="n">target</span><span class="o">=</span><span class="n">_run_scheduler</span><span class="p">,</span> <span class="c1"># 让这个进程去执行 Task 2 定义的函数</span>
+        <span class="n">args</span><span class="o">=</span><span class="p">(</span><span class="n">new_args</span><span class="p">,</span> <span class="n">ack_queue</span><span class="p">),</span>
+        <span class="n">daemon</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+    <span class="p">)</span><span class="o">.</span><span class="n">start</span><span class="p">()</span>
+</code></pre></div>
+
+<ul>
+<li><strong>做什么</strong>：如果你有 4 张显卡，这里就会循环 4 次，启动 4 个进程。每个进程负责管理一张显卡。</li>
+</ul>
+<p><strong>3.3 启动分词与反分词进程 (Tokenizer)</strong>
+模型只认识数字，不认识中文/英文。所以需要专门的进程负责翻译。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 启动 1 个反分词进程 (数字 -&gt; 文本)</span>
+<span class="n">mp</span><span class="o">.</span><span class="n">Process</span><span class="p">(</span><span class="n">target</span><span class="o">=</span><span class="n">tokenize_worker</span><span class="p">,</span> <span class="n">kwargs</span><span class="o">=</span><span class="p">{</span><span class="o">...</span> <span class="s2">&quot;tokenizer_id&quot;</span><span class="p">:</span> <span class="n">num_tokenizers</span> <span class="o">...</span><span class="p">})</span><span class="o">.</span><span class="n">start</span><span class="p">()</span>
+
+<span class="c1"># 启动 N 个分词进程 (文本 -&gt; 数字)</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_tokenizers</span><span class="p">):</span>
+    <span class="n">mp</span><span class="o">.</span><span class="n">Process</span><span class="p">(</span><span class="n">target</span><span class="o">=</span><span class="n">tokenize_worker</span><span class="p">,</span> <span class="n">kwargs</span><span class="o">=</span><span class="p">{</span><span class="o">...</span> <span class="s2">&quot;tokenizer_id&quot;</span><span class="p">:</span> <span class="n">i</span> <span class="o">...</span><span class="p">})</span><span class="o">.</span><span class="n">start</span><span class="p">()</span>
+</code></pre></div>
+
+<ul>
+<li><strong>观点</strong>：分词（Tokenizer）是 CPU 密集型任务，为了不拖累 GPU 推理的速度，通常把它们单独放到另外的进程里跑。这里启动了 1 个负责输出的（DeTokenizer）和 N 个负责输入的。</li>
+</ul>
+<p><strong>3.4 点名确认 (同步)</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1 scheduler + num_tokenizers + 1 detokenizer</span>
+<span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_tokenizers</span> <span class="o">+</span> <span class="mi">2</span><span class="p">):</span>
+    <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="n">ack_queue</span><span class="o">.</span><span class="n">get</span><span class="p">())</span>
+</code></pre></div>
+
+<ul>
+<li><strong>做什么</strong>：主进程在这里<strong>卡住（阻塞）</strong>，等待 <code>ack_queue</code> 里弹出消息。</li>
+<li><strong>为什么</strong>：必须确保后台的所有进程（模型、分词器）都初始化完毕了，才能让 HTTP 服务器开张。否则用户发请求过来，后台还没准备好，就会报错。这里等待的数量 = 1个主模型信号 + N个分词器 + 1个反分词器。</li>
+</ul>
+<h4>Task 4: 正式开业 (启动 API Server)</h4>
+<p>代码的最后一行：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">run_api_server</span><span class="p">(</span><span class="n">server_args</span><span class="p">,</span> <span class="n">start_subprocess</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>做什么</strong>：<ol>
+<li>这一步启动了基于 Web 框架（比如 FastAPI 或其它）的 HTTP 服务器。</li>
+<li>它把 <code>start_subprocess</code> 这个函数作为一个参数传进去了。</li>
+<li><strong>逻辑顺序</strong>：API Server 启动 -&gt; 在内部调用 <code>start_subprocess()</code> -&gt; 等待后台进程全部就绪 -&gt; API Server 开始监听端口，接收用户请求。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底在讲啥？</h3>
+<p>这段代码是一个 <strong>Orchestrator（编排者）</strong>。</p>
+<p>如果不写这个脚本，你需要手动开好几个终端窗口：一个运行模型，一个运行分词器，一个运行 Web 服务，还得自己掐表看它们什么时候启动好。</p>
+<p><strong><code>launch.py</code> 帮你自动化了这一切：</strong>
+1.  它作为主入口。
+2.  它分裂出多个子进程去分别控制 GPU 和 CPU 处理数据。
+3.  它利用 <code>Queue</code> 机制确保所有子进程都 Ready 了。
+4.  最后它启动 Web 接口，让用户可以发请求进来。</p>

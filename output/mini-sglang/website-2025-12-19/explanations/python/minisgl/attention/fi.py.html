@@ -1,0 +1,104 @@
+<h1>python/minisgl/attention/fi.py</h1>
+<p>这份代码确实涉及到底层的大模型推理框架逻辑，如果对 <strong>FlashAttention</strong> 或 <strong>PagedAttention</strong> 不熟悉，看起来会非常吃力。</p>
+<p>简单来说，这个文件是 <strong>MiniSGL</strong> 框架和高性能算子库 <strong>FlashInfer</strong> 之间的 <strong>“适配器” (Adapter)</strong>。它的作用是把 MiniSGL 里的数据（比如用户输入的 prompt、KV Cache）转换成 FlashInfer 能听懂的格式，然后调用 FlashInfer 来计算 Attention。</p>
+<p>为了让你看懂，我列了一个 <strong>“学习任务清单 (To-Do List)”</strong>，我们按照这个顺序一步步拆解代码。</p>
+<hr />
+<h3>任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>理解角色 (The Role)</strong>: 搞清楚 <code>FlashInferBackend</code> 是干什么的。</li>
+<li><strong>理解数据格式 (The Metadata)</strong>: 搞清楚 FlashInfer 计算 Attention 需要什么样的“元数据” (<code>FIMetadata</code>)。</li>
+<li><strong>准备阶段 (Preparation)</strong>: 看懂 <code>prepare_metadata</code> 函数，它是如何把一堆长短不一的句子“打包”给 GPU 的。</li>
+<li><strong>执行阶段 (Execution)</strong>: 看懂 <code>forward</code> 函数，它是如何真正执行计算的。</li>
+<li><strong>进阶优化 (CUDA Graph)</strong>: (可选) 了解它是如何通过“录像”来加速推理的。</li>
+</ol>
+<hr />
+<h3>第一步：理解角色 (The Role)</h3>
+<p><strong>代码对应:</strong> <code>class FlashInferBackend(BaseAttnBackend)</code></p>
+<ul>
+<li><strong>背景</strong>: 在大模型推理中，计算 Attention（注意力机制）是最耗时的部分。<strong>FlashInfer</strong> 是一个极其高效的第三方库（类似 FlashAttention 的变体），专门用来算这个。</li>
+<li><strong>本文件作用</strong>: MiniSGL 自己不想写复杂的 CUDA 核心代码，所以它决定调用 FlashInfer。但是 MiniSGL 的数据结构（<code>Batch</code>）和 FlashInfer 需要的输入不一样。</li>
+<li><strong>结论</strong>: 这个类就是一个<strong>翻译官</strong>。它持有 FlashInfer 的核心对象（<code>prefill_wrapper</code> 和 <code>decode_wrappers</code>），负责指挥它们干活。</li>
+</ul>
+<h3>第二步：理解数据格式 (The Metadata)</h3>
+<p><strong>代码对应:</strong> <code>class FIMetadata(BaseAttnMetadata)</code></p>
+<p>FlashInfer 需要知道哪些信息才能算 Attention？这就是 <code>FIMetadata</code> 里的字段含义：</p>
+<ul>
+<li><strong><code>cu_seqlens_q/k</code> (Cumulative Sequence Lengths)</strong>:<ul>
+<li><strong>难点</strong>: 因为一个 Batch 里每句话长度不一样（Ragged Tensor），GPU 没法直接处理。</li>
+<li><strong>解释</strong>: 这是一个前缀和数组。比如 Batch 有 3 句话，长度分别是 2, 3, 4。那么 <code>cu_seqlens</code> 就是 <code>[0, 2, 5, 9]</code>。它告诉 GPU：第 0 句从 0 开始到 2 结束，第 1 句从 2 开始到 5 结束...</li>
+</ul>
+</li>
+<li><strong><code>indices</code> (Page Table / Paged Attention)</strong>:<ul>
+<li><strong>解释</strong>: KV Cache（历史对话的记忆）在显存里不是连续存放的，而是像内存分页一样打散的。<code>indices</code> 就是一张地图，告诉 GPU 去哪里找这些记忆碎片。</li>
+</ul>
+</li>
+<li><strong><code>wrapper</code></strong>:<ul>
+<li>这是 FlashInfer 的核心执行器，分为 <code>Prefill</code>（处理新输入，算得慢但并行度高）和 <code>Decode</code>（生成下一个词，算得快但因为只有 1 个 token 所以并行度低）。</li>
+</ul>
+</li>
+</ul>
+<h3>第三步：准备阶段 (Preparation) —— 最核心的逻辑</h3>
+<p><strong>代码对应:</strong> <code>def prepare_metadata(self, batch: Batch)</code></p>
+<p>这是最复杂的函数。它的任务是：<strong>每来一个新的 Batch，都要重新计算一遍上面的元数据。</strong></p>
+<ol>
+<li><strong>提取长度信息</strong>:
+    <code>python
+    seqlens_q = [req.extend_len for req in reqs] # 这次要计算的长度（Query）
+    seqlens_k = [req.device_len for req in reqs] # 这句话总共的历史长度（Key/Value）</code></li>
+<li><strong>构建 <code>cu_seqlens</code> (切分点)</strong>:<ul>
+<li>如果是 <strong>Decode 阶段</strong>（每个请求只生成 1 个新词）：<code>max_seqlen_q == 1</code>，那么切分点就是 <code>0, 1, 2, 3...</code>。</li>
+<li>如果是 <strong>Prefill 阶段</strong>（处理刚进来的长 Prompt）：切分点就是根据 prompt 长度累加，比如 <code>0, 100, 250...</code>。</li>
+</ul>
+</li>
+<li><strong>构建 <code>indices</code> (内存页索引)</strong>:<ul>
+<li>代码 <code>torch.cat([self.page_table[req.table_idx, : req.device_len] ...])</code></li>
+<li>把每个请求用到的所有物理显存页号拼成一个长长的一维数组，丢给 FlashInfer。</li>
+</ul>
+</li>
+<li><strong>打包</strong>:<ul>
+<li>最后把这些算好的 tensor 塞进 <code>FIMetadata</code> 对象里，挂载到 <code>batch</code> 上。</li>
+</ul>
+</li>
+</ol>
+<h3>第四步：执行阶段 (Execution)</h3>
+<p><strong>代码对应:</strong> <code>def forward(...)</code></p>
+<p>准备工作做好了，执行就很简单了：</p>
+<ol>
+<li><strong>初始化</strong>: <code>self._initialize_metadata_once(metadata)</code>。<ul>
+<li>这一步调用 FlashInfer 的 <code>wrapper.plan(...)</code>。这就像是告诉 GPU：“我要开始跑了，这是地图（metadata），你先预处理一下内部指针。”</li>
+</ul>
+</li>
+<li><strong>存 KV Cache</strong>: <code>self.kvcache.store_kv(...)</code>。<ul>
+<li>在算 Attention 之前，先把当前层计算出的 K 和 V 存到显存里（Paged KVCache），不然待会儿没法查。</li>
+</ul>
+</li>
+<li><strong>计算</strong>: <code>metadata.wrapper.run(...)</code>。<ul>
+<li>调用 FlashInfer 的 C++ / CUDA 内核，输入 Q (Query) 和刚才存好的 KV Cache，直接吐出 Attention 的结果。</li>
+</ul>
+</li>
+</ol>
+<h3>第五步：进阶优化 (CUDA Graph) —— 稍微难一点</h3>
+<p><strong>代码对应:</strong> <code>FICaptureData</code>, <code>init_capture_graph</code>, <code>prepare_for_capture</code></p>
+<ul>
+<li><strong>问题</strong>: 在 Decode 阶段，GPU 每次只算一点点东西，但是 CPU 发指令（Python overhead）可能比 GPU 算得还慢。</li>
+<li><strong>解决</strong>: <strong>CUDA Graph</strong> 技术。<ul>
+<li>对于固定的 Batch Size（比如 BS=1, 2, 4, 8...），我们可以先“录像”一遍 GPU 的操作。</li>
+<li><code>FICaptureData</code>: 预先分配好的一块显存（静态 buffer）。</li>
+<li><code>prepare_for_capture</code>: 告诉 FlashInfer，把数据写到这个固定的静态 buffer 里。</li>
+<li><code>prepare_for_replay</code>: 之后再推理时，只要把新数据拷贝到这个 buffer，然后按一下“播放键”（Graph Replay），GPU 就自动跑完了，不需要 CPU 一步步指挥，速度极快。</li>
+</ul>
+</li>
+</ul>
+<h3>总结 (Summary)</h3>
+<p>把这个文件看作一个<strong>翻译与调度中心</strong>：</p>
+<ol>
+<li><strong>输入</strong>: MiniSGL 的 <code>Batch</code> 对象（包含请求列表、Token ID、KV Cache管理器）。</li>
+<li><strong>处理 (<code>prepare_metadata</code>)</strong>: 把它转化成 FlashInfer 需要的“前缀和数组” (<code>cu_seqlens</code>) 和“页表索引” (<code>indices</code>)。</li>
+<li><strong>调度 (<code>forward</code>)</strong>:<ul>
+<li>先把 K/V 存好。</li>
+<li>喊 FlashInfer：“嘿，数据准备好了，按这个 plan 跑一下。”</li>
+</ul>
+</li>
+<li><strong>优化</strong>: 用 CUDA Graph 消除 Python 循环发射 GPU kernel 的开销。</li>
+</ol>
+<p>现在你再回头看代码，重点关注 <code>prepare_metadata</code> 里的 tensor 拼接逻辑，以及 <code>forward</code> 里的执行顺序，应该就清晰多了。</p>

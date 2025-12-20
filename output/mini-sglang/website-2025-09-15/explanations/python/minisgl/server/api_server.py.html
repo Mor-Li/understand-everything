@@ -1,0 +1,117 @@
+<h1>python/minisgl/server/api_server.py</h1>
+<p>这份代码是一个 <strong>LLM（大语言模型）推理服务的“前台接待”系统</strong>。它的主要作用是接收用户的 HTTP 请求，把任务转发给后台（模型推理引擎），然后把生成的结果流式地传回给用户。</p>
+<p>为了让你更容易理解，我把理解这份代码的过程拆解成 <strong>5 个 Task</strong>，每个 Task 对应代码中的一个核心逻辑模块。</p>
+<hr />
+<h3>📋 学习任务清单 (To-Do List)</h3>
+<h4>✅ Task 1: 理解角色的定位 (Web Server)</h4>
+<p><strong>核心概念</strong>：这是一个基于 <strong>FastAPI</strong> 的 Web 服务器。
+<strong>代码对应</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">app</span> <span class="o">=</span> <span class="n">FastAPI</span><span class="p">(</span><span class="n">title</span><span class="o">=</span><span class="s2">&quot;MiniSGL API Server&quot;</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>
+<span class="c1"># ...</span>
+<span class="n">uvicorn</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">app</span><span class="p">,</span> <span class="n">host</span><span class="o">=</span><span class="n">host</span><span class="p">,</span> <span class="n">port</span><span class="o">=</span><span class="n">port</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲解</strong>：<ul>
+<li>这就好比一家餐厅的<strong>前台</strong>。</li>
+<li>它的工作不是“做菜”（不是跑模型推理），而是“接单”（接收 HTTP 请求）和“上菜”（返回生成结果）。</li>
+<li><code>uvicorn</code> 是启动这个服务器的引擎。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 理解“通信管道” (ZMQ Queues)</h4>
+<p><strong>核心概念</strong>：前台（API Server）和后厨（推理引擎）之间怎么传纸条？用的是 <strong>ZeroMQ (ZMQ)</strong>。
+<strong>代码对应</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">FrontendManager</span><span class="p">:</span>
+    <span class="n">send_tokenizer</span><span class="p">:</span> <span class="n">ZmqAsyncPushQueue</span><span class="p">[</span><span class="n">BaseTokenizerMsg</span><span class="p">]</span> <span class="c1"># 推送：给后厨发单</span>
+    <span class="n">recv_tokenizer</span><span class="p">:</span> <span class="n">ZmqAsyncPullQueue</span><span class="p">[</span><span class="n">BaseFrontendMsg</span><span class="p">]</span>  <span class="c1"># 拉取：接收后厨做好的菜</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲解</strong>：<ul>
+<li><code>send_tokenizer</code>：这是一个“发送队列”。当用户发来 prompt 时，Server 把任务扔进这个队列，发给 Tokenizer（分词器/模型后端）。</li>
+<li><code>recv_tokenizer</code>：这是一个“接收队列”。后台每生成一个 token（字/词），就会通过这个队列发回给 Server。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 理解核心管家 (FrontendManager)</h4>
+<p><strong>核心概念</strong>：如何管理多个并发的用户？
+<strong>代码对应</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">FrontendManager</span><span class="p">:</span>
+    <span class="n">uid_counter</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="n">ack_map</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">List</span><span class="p">[</span><span class="n">UserReply</span><span class="p">]]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span> <span class="c1"># 存结果的信箱</span>
+    <span class="n">event_map</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">Event</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span> <span class="c1"># 通知铃声</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲解</strong>：<ul>
+<li><strong><code>new_user()</code></strong>: 每来一个请求，就发一个号码牌 (<code>uid</code>)。</li>
+<li><strong><code>ack_map</code></strong>: 这是一个字典。Key 是用户 ID，Value 是后台发回来的结果片段。就像每个用户有一个专属信箱。</li>
+<li><strong><code>event_map</code></strong>: 这是一个异步通知机制。当信箱里有新信件时，触发 <code>Event</code>，告诉等待的程序“有新消息了，快来拿”。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 理解“监听与分发”循环 (The Loop)</h4>
+<p><strong>核心概念</strong>：Server 必须一直盯着后台有没有发回消息。
+<strong>代码对应</strong>：</p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">listen</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
+            <span class="n">msg</span> <span class="o">=</span> <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">recv_tokenizer</span><span class="o">.</span><span class="n">get</span><span class="p">()</span> <span class="c1"># 1. 收到后台消息</span>
+            <span class="k">for</span> <span class="n">msg</span> <span class="ow">in</span> <span class="n">_unwrap_msg</span><span class="p">(</span><span class="n">msg</span><span class="p">):</span>
+                <span class="c1"># 2. 找到对应用户的信箱，把结果放进去</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">ack_map</span><span class="p">[</span><span class="n">msg</span><span class="o">.</span><span class="n">uid</span><span class="p">]</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">msg</span><span class="p">)</span> 
+                <span class="c1"># 3. 按响门铃，通知该用户处理函数</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">event_map</span><span class="p">[</span><span class="n">msg</span><span class="o">.</span><span class="n">uid</span><span class="p">]</span><span class="o">.</span><span class="n">set</span><span class="p">()</span> 
+</code></pre></div>
+
+<ul>
+<li><strong>讲解</strong>：<ul>
+<li>这是一个死循环（后台任务）。它不断从 ZMQ 接收数据。</li>
+<li>一旦收到数据，它看一眼 <code>uid</code>，知道是哪位客人的菜，然后放到 <code>ack_map</code> 里，并触发 <code>Event</code> 解除该用户的阻塞状态。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 理解“流式响应” (Streaming Workflow)</h4>
+<p><strong>核心概念</strong>：如何把结果一点一点吐给用户（像 ChatGPT 打字机效果那样）？
+<strong>代码对应</strong>：</p>
+<div class="codehilite"><pre><span></span><code>    <span class="c1"># 核心逻辑在 wait_for_ack 中</span>
+    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">wait_for_ack</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">uid</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+        <span class="n">event</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">event_map</span><span class="p">[</span><span class="n">uid</span><span class="p">]</span>
+        <span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
+            <span class="k">await</span> <span class="n">event</span><span class="o">.</span><span class="n">wait</span><span class="p">()</span> <span class="c1"># 等待 Task 4 中的门铃响</span>
+            <span class="c1"># ... 拿出数据 ...</span>
+            <span class="k">yield</span> <span class="n">ack</span> <span class="c1"># 把数据交出去</span>
+            <span class="k">if</span> <span class="n">ack</span><span class="o">.</span><span class="n">finished</span><span class="p">:</span> <span class="k">break</span> <span class="c1"># 如果结束了就跳出</span>
+
+    <span class="c1"># API 接口层</span>
+    <span class="nd">@app</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="s2">&quot;/generate&quot;</span><span class="p">)</span>
+    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">generate</span><span class="p">(</span><span class="n">req</span><span class="p">:</span> <span class="n">GenerateRequest</span><span class="p">):</span>
+        <span class="c1"># ...</span>
+        <span class="k">await</span> <span class="n">state</span><span class="o">.</span><span class="n">send_one</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 发送任务</span>
+        <span class="k">return</span> <span class="n">StreamingResponse</span><span class="p">(</span><span class="n">state</span><span class="o">.</span><span class="n">stream_generate</span><span class="p">(</span><span class="n">uid</span><span class="p">),</span> <span class="o">...</span><span class="p">)</span> <span class="c1"># 流式返回</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲解</strong>：<ol>
+<li>用户调用 <code>/generate</code> 接口。</li>
+<li>Server 生成 <code>uid</code>，把任务通过 ZMQ 发给后台。</li>
+<li>Server <strong>不立即返回</strong>，而是进入 <code>stream_generate</code> 函数等待。</li>
+<li>当 <code>listen</code> (Task 4) 收到后台生成的字，触发 Event。</li>
+<li><code>stream_generate</code> 醒来，把新生成的字 <code>yield</code> 给 HTTP 响应流。</li>
+<li>这就实现了“一边生成，一边显示”的效果。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结整个流程</h3>
+<ol>
+<li><strong>用户</strong> 发送 POST 请求到 <code>/generate</code>。</li>
+<li><strong>API Server</strong> 创建一个 <code>uid</code>，把请求打包扔进 <strong>ZMQ 队列</strong>。</li>
+<li><strong>API Server</strong> 开启一个流式响应，开始<strong>死等</strong> (<code>await event.wait()</code>)。</li>
+<li><strong>后台</strong>（代码里没写，但在另一端）收到任务，开始推理，每生成一个词，就通过 <strong>ZMQ</strong> 发回来。</li>
+<li><strong>API Server</strong> 的后台任务 (<code>listen</code>) 收到词，根据 <code>uid</code> 找到正在等的那个请求，<strong>唤醒</strong>它。</li>
+<li><strong>流式响应</strong> 拿到词，发给用户，然后继续等下一个词，直到结束。</li>
+</ol>
+<p>这就是这个文件的全部核心逻辑：<strong>一个负责 HTTP 协议转换和异步消息分发的中间人。</strong></p>

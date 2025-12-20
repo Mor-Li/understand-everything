@@ -1,0 +1,132 @@
+<h1>python/minisgl/models/utils.py</h1>
+<p>这份代码确实涉及了很多大模型（LLM）底层的具体实现细节，如果没接触过Transformer架构或者模型推理加速，看起来会很晕。</p>
+<p>别担心，我们把它拆解成一个<strong>学习清单（Todo List）</strong>。我们可以把这个文件想象成<strong>“搭建一个类似 Llama 的大模型所需要的两个核心乐高组件”</strong>。</p>
+<p>这个文件主要定义了两个类：
+1.  <strong><code>GatedMLP</code></strong>：前馈神经网络（负责处理信息）。
+2.  <strong><code>RopeAttn</code></strong>：带位置编码的注意力机制（负责关联上下文）。</p>
+<p>下面是为你定制的<strong>四步走</strong>学习任务清单：</p>
+<hr />
+<h3>✅ Task 1: 宏观理解——这俩是干啥的？</h3>
+<p><strong>目标</strong>：不看代码，先搞懂这两个组件在模型里的地位。</p>
+<ul>
+<li><strong>背景</strong>：现在的 LLM（像 ChatGPT, Llama）都是由很多层堆叠起来的。每一层通常包含两个主要部分：<ol>
+<li><strong>注意力层（Attention）</strong>：让模型根据上下文理解单词（比如看到“苹果”，结合上下文知道是指水果还是手机）。这就是代码里的 <code>RopeAttn</code>。</li>
+<li><strong>前馈层（Feed Forward / MLP）</strong>：模型的“记忆”和“推理”区域，对注意力层提取的信息进行深加工。这就是代码里的 <code>GatedMLP</code>。</li>
+</ol>
+</li>
+</ul>
+<p><strong>结论</strong>：这个文件就是定义了大模型每一层里最核心的两个“器官”。</p>
+<hr />
+<h3>✅ Task 2: 拆解 <code>GatedMLP</code> —— 信息的“消化系统”</h3>
+<p><strong>目标</strong>：读懂 <code>GatedMLP</code> 类的代码逻辑。</p>
+<p>这个类实现的是目前最流行的 <strong>SwiGLU</strong> 结构（Llama 就在用这个）。想象数据是一股水流，流过这个管道：</p>
+<ol>
+<li>
+<p><strong>第一步：变宽（<code>gate_up_proj</code>）</strong></p>
+<ul>
+<li>代码：<code>self.gate_up_proj = LinearColParallelMerged(...)</code></li>
+<li><strong>解释</strong>：输入的数据维度较小，这里把它投影到更高的维度（通常是 2-4 倍宽）。</li>
+<li><em>注意</em>：这里用了 <code>ColParallel</code>（列并行），说明这个模型设计是为了在多张显卡上并行运行的，把大矩阵切分了。</li>
+</ul>
+</li>
+<li>
+<p><strong>第二步：筛选（<code>act_fn</code> / <code>silu_and_mul</code>）</strong></p>
+<ul>
+<li>代码：<code>y = self.act_fn(gate_up)</code></li>
+<li><strong>解释</strong>：这是“门控（Gated）”的核心。它把数据分成两半，一半经过 SiLU 激活函数（非线性变换），另一半保持原样，然后两者相乘。</li>
+<li><em>作用</em>：像一个过滤器，决定哪些信息重要，哪些该被抑制。</li>
+</ul>
+</li>
+<li>
+<p><strong>第三步：变窄（<code>down_proj</code>）</strong></p>
+<ul>
+<li>代码：<code>self.down_proj = LinearRowParallel(...)</code></li>
+<li><strong>解释</strong>：处理完的信息维度太高了，需要把它压缩回原来的大小，以便传给下一层。</li>
+<li><em>注意</em>：这里用了 <code>RowParallel</code>（行并行），这是为了配合第一步的列并行，把分布在不同显卡上的数据结果合并回来。</li>
+</ul>
+</li>
+<li>
+<p><strong>内存小细节</strong></p>
+<ul>
+<li>代码：<code>del x</code>, <code>del gate_up</code></li>
+<li><strong>解释</strong>：这是为了省显存。用完的变量立刻删掉，防止显存爆炸。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 3: 拆解 <code>RopeAttn</code> —— 信息的“搜索引擎”</h3>
+<p><strong>目标</strong>：读懂 <code>RopeAttn</code> 类的代码逻辑。</p>
+<p>这是大模型的灵魂——注意力机制。这里的 <code>Rope</code> 指的是 <strong>Rotary Positional Embeddings（旋转位置编码）</strong>，也是 Llama 的标配。</p>
+<ol>
+<li>
+<p><strong>第一步：准备查询（<code>qkv_proj</code>）</strong></p>
+<ul>
+<li>代码：<code>self.qkv_proj = LinearQKVMerged(...)</code></li>
+<li><strong>解释</strong>：输入一个词向量，把它变成三个向量：<ul>
+<li><strong>Q (Query)</strong>：我想找什么？</li>
+<li><strong>K (Key)</strong>：我有什么特征？</li>
+<li><strong>V (Value)</strong>：我的内容是什么？</li>
+</ul>
+</li>
+<li>这里把 Q, K, V 的计算合并在一个大矩阵里做，效率更高。</li>
+</ul>
+</li>
+<li>
+<p><strong>第二步：位置与归一化（Norm &amp; RoPE）</strong></p>
+<ul>
+<li>代码：<code>if has_qk_norm: ...</code> 和 <code>rotary_config=...</code></li>
+<li><strong>解释</strong>：<ul>
+<li><strong>Q/K Norm</strong>：为了训练稳定，有时会对 Q 和 K 做标准化（RMSNorm）。</li>
+<li><strong>RoPE</strong>：这是关键。普通的注意力不知道“我爱你”和“你爱我”中“你”的位置区别。RoPE 通过数学上的旋转操作，把<strong>位置信息</strong>注入到 Q 和 K 中。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>第三步：计算注意力（<code>self.attn.forward</code>）</strong></p>
+<ul>
+<li>代码：<code>o = self.attn.forward(qkv)</code></li>
+<li><strong>解释</strong>：这里调用了底层的 <code>AttentionLayer</code>。它拿着 Q 去和所有的 K 匹配，算出权重，然后加权求和 V。这就是模型“理解上下文”的过程。</li>
+</ul>
+</li>
+<li>
+<p><strong>第四步：输出整合（<code>o_proj</code>）</strong></p>
+<ul>
+<li>代码：<code>self.o_proj = LinearOProj(...)</code></li>
+<li><strong>解释</strong>：把多头注意力（Multi-head）算出的结果拼起来，再经过一次线性变换，整理好形状输出。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 4: 进阶——看懂那些“奇怪”的词</h3>
+<p><strong>目标</strong>：理解代码中出现的工程化术语。</p>
+<p>你可能注意到了，代码里用的不是普通的 <code>torch.nn.Linear</code>，而是带后缀的类。这说明这个库是专门为了<strong>高性能推理</strong>和<strong>多卡并行</strong>设计的。</p>
+<ol>
+<li>
+<p><strong><code>LinearColParallelMerged</code> / <code>LinearRowParallel</code></strong>：</p>
+<ul>
+<li><strong>含义</strong>：张量并行（Tensor Parallelism）。</li>
+<li><strong>通俗解释</strong>：模型太大了，一张显卡放不下。我们把矩阵切成好几块，A 显卡算一部分，B 显卡算一部分。</li>
+<li><strong>Col（列）</strong>：把矩阵竖着切。</li>
+<li><strong>Row（行）</strong>：把矩阵横着切。</li>
+<li>这通常是成对出现的（先列切，再行切），这样结果可以直接相加，数学上等价。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>silu_and_mul</code></strong>：</p>
+<ul>
+<li>这是专门手写的算子（Kernel），通常用 C++ 或 CUDA 写好再给 Python 调。比你自己写 <code>F.silu(x) * y</code> 速度快得多，显存占用更少。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>minisgl</code></strong>：</p>
+<ul>
+<li>从包名看，这应该是一个轻量级的（mini）、基于 SGLang 思想的高性能推理库。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结</h3>
+<p>这个文件其实就在说一件事：
+<strong>“为了让 Llama 这种大模型跑得快、还能在多张显卡上跑，我们重新定义了它的两个核心组件：带门控的 MLP 和带旋转位置编码的 Attention，并且加上了并行计算和内存优化的功能。”</strong></p>
+<p>现在再回头看代码，是不是稍微清晰一点了？</p>

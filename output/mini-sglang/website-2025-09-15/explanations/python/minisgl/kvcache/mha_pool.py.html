@@ -1,0 +1,115 @@
+<h1>python/minisgl/kvcache/mha_pool.py</h1>
+<p>没问题。这段代码初看确实比较吓人，因为它涉及到了<strong>大模型的显存管理</strong>、<strong>并行计算</strong>以及<strong>张量维度的变换</strong>。</p>
+<p>简单来说，这个文件 <code>mha_pool.py</code> 定义了一个<strong>“仓库管理员”</strong>。它的工作是在显卡（GPU）上预先申请一大块显存，用来存放 LLM 推理过程中产生的 Key 和 Value 缓存（也就是 KV Cache），并提供存取的方法。</p>
+<p>为了让你彻底搞懂，我制定了一个 <strong>5步走的 Task List</strong>，我们一步一步来拆解：</p>
+<h3>📋 学习任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1：搞懂核心概念 —— 什么是 KV Cache Pool？</strong></li>
+<li><strong>Task 2：拆解初始化 (<code>__init__</code>) —— 仓库是怎么建起来的？</strong></li>
+<li><strong>Task 3：理解并行 (<code>get_tp_info</code>) —— 为什么要切分 Heads？</strong></li>
+<li><strong>Task 4：攻克难点 (<code>Layout</code>) —— 内存是怎么排列的？</strong></li>
+<li><strong>Task 5：实际操作 (<code>store_kv</code>) —— 怎么往仓库里放东西？</strong></li>
+</ol>
+<hr />
+<h3>🚀 Task 1：搞懂核心概念 —— 什么是 KV Cache Pool？</h3>
+<p><strong>背景：</strong>
+LLM 在生成文字时，每生成一个字，都需要用到之前所有字的信息。为了不重复计算，我们将之前字的计算结果（Key 和 Value 矩阵）存下来，这就是 <strong>KV Cache</strong>。</p>
+<p><strong>代码意图：</strong>
+通常显存很贵，不能随用随申请。<code>MHAKVCache</code> 这个类采用了 <strong>PagedAttention</strong>（类似操作系统的分页内存）的思想。它不属于某一个具体的请求，而是一个<strong>全局的显存池</strong>。</p>
+<ul>
+<li><strong>MHA</strong>: Multi-Head Attention（多头注意力机制）。</li>
+<li><strong>Pool</strong>: 池子。</li>
+<li><strong>作用</strong>: 一次性申请好几 GB 的显存，切成无数个小块（Pages），谁需要就分给谁几块。</li>
+</ul>
+<hr />
+<h3>🏗️ Task 2：拆解初始化 (<code>__init__</code>) —— 仓库是怎么建起来的？</h3>
+<p>看 <code>__init__</code> 函数，它是在根据图纸建仓库。</p>
+<ul>
+<li>
+<p><strong>输入参数解释</strong>：</p>
+<ul>
+<li><code>num_kv_heads</code>: 模型有多少个 KV 头（比如 Llama-3 有 8 个）。</li>
+<li><code>num_layers</code>: 模型有多少层（比如 32 层）。</li>
+<li><code>num_pages</code>: <strong>关键点</strong>。这个池子能容纳多少个 Page（比如 10000 个）。</li>
+<li><code>head_dim</code>: 每个向量有多长（比如 128）。</li>
+</ul>
+</li>
+<li>
+<p><strong>核心动作</strong>：
+    代码中 <code>torch.empty(...)</code> 就是在 GPU 上划地盘。
+    它申请了一个巨大的 5 维或 6 维张量（Tensor），这个张量就是那个“大仓库”。</p>
+</li>
+</ul>
+<hr />
+<h3>🤝 Task 3：理解并行 (<code>get_tp_info</code>) —— 为什么要切分 Heads？</h3>
+<p>看这几行代码：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">tp_info</span> <span class="o">=</span> <span class="n">get_tp_info</span><span class="p">()</span>
+<span class="n">local_kv_heads</span> <span class="o">=</span> <span class="n">divide_even</span><span class="p">(</span><span class="n">num_kv_heads</span><span class="p">,</span> <span class="n">tp_info</span><span class="o">.</span><span class="n">size</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+*   <strong>TP (Tensor Parallel)</strong>: 现在的大模型太大，一张显卡装不下，通常用多张卡（比如 4 张卡）一起跑。
+*   <strong>切分任务</strong>: 如果模型总共有 32 个 KV Heads，且我们有 4 张显卡。那么每张显卡只需要负责存储和计算 <code>32 / 4 = 8</code> 个 Heads。
+*   <strong>结论</strong>: <code>local_kv_heads</code> 就是<strong>当前这张显卡</strong>需要负责管理的 Heads 数量。这个类只管自己这张卡上的显存。</p>
+<hr />
+<h3>🧩 Task 4：攻克难点 (<code>Layout</code>) —— 内存是怎么排列的？</h3>
+<p>这是代码中最绕的部分：<code>match kv_layout</code>。这决定了数据在内存里是“横着放”还是“竖着放”。</p>
+<ul>
+<li>
+<p><strong><code>KVCacheLayout.LayerFirst</code> (层优先)</strong>:</p>
+<ul>
+<li>形状：<code>(2, num_layers, num_pages, ...)</code></li>
+<li>逻辑：先把第 1 层所有的 Page 放一起，再放第 2 层的。</li>
+<li>代码直接申请了这个形状。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>KVCacheLayout.PageFirst</code> (页优先)</strong>:</p>
+<ul>
+<li>形状：<code>(2, num_pages, num_layers, ...)</code></li>
+<li>逻辑：先把第 1 个 Page 在所有层的数据放一起（物理上连续），再放第 2 个 Page。</li>
+<li><strong>注意代码中的 <code>permute</code></strong>:
+    <code>python
+    torch.empty((2, num_pages, num_layers, ...)).permute(0, 2, 1, 3, 4)</code>
+    虽然物理内存是按 Page 优先申请的，但 <code>permute</code> 把它的<strong>逻辑视图</strong>扭转成了 <code>(2, layers, pages...)</code>。</li>
+</ul>
+</li>
+<li>
+<p><strong>最终统一视图</strong>:
+    <code>python
+    self._kv_buffer = kv_buffer.view(2, num_layers, num_pages, 1, local_kv_heads, head_dim)</code>
+    无论物理上怎么存，最后都统一成一个标准形状，方便后面使用。</p>
+<ul>
+<li><code>2</code>: 代表 Key 和 Value 两个矩阵。</li>
+<li><code>self._k_buffer = self._kv_buffer[0]</code>: 把 K 库分离出来。</li>
+<li><code>self._v_buffer = self._kv_buffer[1]</code>: 把 V 库分离出来。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>🚚 Task 5：实际操作 (<code>store_kv</code>) —— 怎么往仓库里放东西？</h3>
+<p>当模型算出了新的 Token 的 K 和 V，需要存进来：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">store_kv</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">out_loc</span><span class="p">,</span> <span class="n">layer_id</span><span class="p">):</span>
+    <span class="c1"># ...</span>
+    <span class="n">store_cache</span><span class="p">(</span>
+        <span class="n">k_cache</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_k_buffer</span><span class="p">[</span><span class="n">layer_id</span><span class="p">]</span><span class="o">...</span><span class="p">,</span> <span class="c1"># 目标：当前层的 K 仓库</span>
+        <span class="n">v_cache</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_v_buffer</span><span class="p">[</span><span class="n">layer_id</span><span class="p">]</span><span class="o">...</span><span class="p">,</span> <span class="c1"># 目标：当前层的 V 仓库</span>
+        <span class="n">out_loc</span><span class="o">=</span><span class="n">out_loc</span><span class="p">,</span>                     <span class="c1"># 地址：存到哪几个 Page 里？</span>
+        <span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span>                                 <span class="c1"># 货物：新计算出的 K</span>
+        <span class="n">v</span><span class="o">=</span><span class="n">v</span><span class="p">,</span>                                 <span class="c1"># 货物：新计算出的 V</span>
+    <span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+1.  <strong>入参</strong>: <code>layer_id</code> 告诉它是第几层；<code>out_loc</code> 是一个索引数组（类似指针），告诉程序这些数据应该写到哪几个 Page 里面去。
+2.  <strong>动作</strong>: 它调用了一个底层的 CUDA Kernel (<code>minisgl.kernel.store_cache</code>)。
+3.  <strong>目的</strong>: 这是一个搬运工，把计算好的 <code>k</code> 和 <code>v</code> 快速拷贝到显存池子 (<code>_k_buffer</code>) 对应的位置上。</p>
+<hr />
+<h3>📝 总结：这段代码到底讲了啥？</h3>
+<p>这段代码实现了一个 <strong>支持多卡并行（TP）的、基于分页内存管理的 KV 缓存池</strong>。</p>
+<ol>
+<li><strong>它是一块大显存</strong>: 启动时就占好坑。</li>
+<li><strong>它是分层的</strong>: 每一层 Transformer 都有自己的存储空间。</li>
+<li><strong>它是分片的</strong>: 只存当前显卡负责的那部分 Heads。</li>
+<li><strong>它是提供接口的</strong>: 提供了 <code>store_kv</code> 让模型在推理时把中间结果存进去，供后续 Attention 计算使用。</li>
+</ol>

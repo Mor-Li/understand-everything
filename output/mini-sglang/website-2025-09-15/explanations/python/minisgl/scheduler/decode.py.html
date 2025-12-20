@@ -1,0 +1,133 @@
+<h1>python/minisgl/scheduler/decode.py</h1>
+<p>没问题。这段代码看起来只有几十行，但它涉及了大模型推理（LLM Inference）中最核心的<strong>显存管理</strong>和<strong>调度逻辑</strong>。</p>
+<p>如果不了解背景，确实很难看懂。为了让你理解，我们把这个 <code>DecodeManager</code> 想象成一个 <strong>“餐厅的领班”</strong>，他的工作是专门负责那些 <strong>“正在一口一口吃饭的顾客”</strong>（即：正在逐个生成 token 的请求）。</p>
+<p>在大模型里，生成过程分两步：
+1.  <strong>Prefill（预填充）</strong>：一口气读完你的问题。
+2.  <strong>Decode（解码）</strong>：一个字一个字地往外蹦答案。</p>
+<p><strong>这个文件 <code>decode.py</code> 专门负责第 2 步。</strong></p>
+<p>我们可以把理解这段代码的过程，拆解成下面这个 <strong>Todo List</strong>。我们一步步勾选，每一步对应代码里的一个部分。</p>
+<hr />
+<h3>📝 学习任务清单 (Todo List)</h3>
+<ul>
+<li>[ ] <strong>Task 1: 理解角色分配 (<code>__init__</code>)</strong> —— 领班手里都有什么资源？</li>
+<li>[ ] <strong>Task 2: 接待与送客 (<code>add/remove</code>)</strong> —— 怎么管理正在吃饭的顾客？</li>
+<li>[ ] <strong>Task 3: 核心调度 (<code>schedule_next_batch</code>)</strong> —— 怎么安排下一口饭？(最重要！)<ul>
+<li>[ ] 3.1 检查有没有人要吃饭</li>
+<li>[ ] 3.2 检查碗筷够不够 (显存检查)</li>
+<li>[ ] 3.3 发放碗筷 (显存分配)</li>
+<li>[ ] 3.4 记账 (更新页表)</li>
+</ul>
+</li>
+<li>[ ] <strong>Task 4: 状态汇报 (<code>properties</code>)</strong> —— 向上级汇报当前忙不忙。</li>
+</ul>
+<hr />
+<h3>详细讲解</h3>
+<h4>✅ Task 1: 理解角色分配 (<code>__init__</code>)</h4>
+<p>首先看类的初始化。作为一个领班，你需要知道谁在吃饭，碗筷在哪，座位表在哪。</p>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">DecodeManager</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">cache_manager</span><span class="p">:</span> <span class="n">CacheManager</span><span class="p">,</span> <span class="n">table_manager</span><span class="p">:</span> <span class="n">PageTableManager</span><span class="p">):</span>
+        <span class="c1"># 1. 顾客名单：这是一个集合，存着当前所有正在生成的请求 (Req)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">running_reqs</span><span class="p">:</span> <span class="n">Set</span><span class="p">[</span><span class="n">Req</span><span class="p">]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+
+        <span class="c1"># 2. 仓库管理员：负责管理 KV Cache (显存/内存)，也就是“碗筷”</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">cache_manager</span> <span class="o">=</span> <span class="n">cache_manager</span>
+
+        <span class="c1"># 3. 座位管理员：负责管理页表 (Page Table)，记录每个请求的数据存在显存的哪个位置</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">table_manager</span> <span class="o">=</span> <span class="n">table_manager</span>
+</code></pre></div>
+
+<p><strong>白话解释：</strong>
+启动时，我拿到了仓库钥匙 (<code>cache_manager</code>) 和座位登记表 (<code>table_manager</code>)，并准备了一个空本子 (<code>running_reqs</code>) 用来记谁正在生成。</p>
+<hr />
+<h4>✅ Task 2: 接待与送客 (<code>add/remove</code>)</h4>
+<p>这部分逻辑最简单，就是往名单里加人或减人。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">def</span><span class="w"> </span><span class="nf">add_reqs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">reqs</span><span class="p">:</span> <span class="n">Iterable</span><span class="p">[</span><span class="n">Req</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># 新来了一批已经处理完 Prompt 的请求，加入“正在解码”的名单</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">running_reqs</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">reqs</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">remove_req</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">req</span><span class="p">:</span> <span class="n">Req</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># 某个请求生成完了（或者被取消了），从名单划掉</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">running_reqs</span><span class="o">.</span><span class="n">discard</span><span class="p">(</span><span class="n">req</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">remove_reqs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">reqs</span><span class="p">:</span> <span class="n">Iterable</span><span class="p">[</span><span class="n">Req</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># 批量划掉</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">running_reqs</span><span class="o">.</span><span class="n">difference_update</span><span class="p">(</span><span class="n">reqs</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>白话解释：</strong>
+这就是领班的日常：有新请求进入“逐字生成”阶段，就记下来；生成完了，就划掉。</p>
+<hr />
+<h4>✅ Task 3: 核心调度 (<code>schedule_next_batch</code>)</h4>
+<p><strong>这是全篇最难懂也是最核心的地方。</strong>
+大模型生成是一个循环：预测下一个字 -&gt; 存起来 -&gt; 预测再下一个字。
+这个函数就是<strong>“准备跑一步”</strong>的过程。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="k">def</span><span class="w"> </span><span class="nf">schedule_next_batch</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">Req</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># 3.1 检查有没有人要吃饭</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">running_reqs</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">None</span>  <span class="c1"># 没人就休息</span>
+
+        <span class="c1"># 引入一个底层内核函数，用来操作 GPU 数据的，稍后解释</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">minisgl.kernel</span><span class="w"> </span><span class="kn">import</span> <span class="n">store_decode_indices</span>
+
+        <span class="c1"># decode_bs (Batch Size): 这一轮有多少个请求要同时生成下一个字</span>
+        <span class="n">decode_bs</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">running_reqs</span><span class="p">)</span>
+
+        <span class="c1"># 3.2 检查碗筷够不够 (显存检查)</span>
+        <span class="c1"># 每一个请求生成 1 个新字，就需要 1 个单位的 KV Cache 空间。</span>
+        <span class="c1"># 如果仓库里的空闲空间 &lt; 请求数量，说明显存不够了。</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cache_manager</span><span class="o">.</span><span class="n">available_size</span> <span class="o">&lt;</span> <span class="n">decode_bs</span><span class="p">:</span>
+            <span class="c1"># 这里抛出异常，说明代码还没写完。</span>
+            <span class="c1"># 正常逻辑应该是：暂停某些请求，把显存让给别人 (Retract/Preemption)。</span>
+            <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="s2">&quot;TODO: Implement decode retract&quot;</span><span class="p">)</span>
+
+        <span class="n">reqs</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">running_reqs</span><span class="p">)</span>
+
+        <span class="c1"># 3.3 发放碗筷 (显存分配)</span>
+        <span class="c1"># 向仓库申请 decode_bs 这么多个新的物理显存位置。</span>
+        <span class="c1"># out_loc 是分配到的物理索引列表（比如：[102, 55, 89...]）</span>
+        <span class="n">out_loc</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">cache_manager</span><span class="o">.</span><span class="n">allocate</span><span class="p">(</span><span class="n">decode_bs</span><span class="p">)</span>
+
+        <span class="c1"># 3.4 记账 (更新页表 - 这是一个 GPU 操作)</span>
+        <span class="c1"># 这一步非常关键！</span>
+        <span class="c1"># 我们分配了物理位置 out_loc，现在要告诉系统：</span>
+        <span class="c1"># “请求A 的第 N 个字，请存在物理位置 102”</span>
+        <span class="c1"># “请求B 的第 M 个字，请存在物理位置 55”</span>
+        <span class="n">store_decode_indices</span><span class="p">(</span>
+            <span class="n">page_table</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">table_manager</span><span class="o">.</span><span class="n">page_table</span><span class="p">,</span> <span class="c1"># 全局页表</span>
+            <span class="n">indices</span><span class="o">=</span><span class="n">out_loc</span><span class="p">,</span>                          <span class="c1"># 刚申请到的物理地址</span>
+            <span class="c1"># 告诉内核：对于每个请求，它的页表索引在哪，它当前生成到了多长</span>
+            <span class="n">pos</span><span class="o">=</span><span class="p">[(</span><span class="n">req</span><span class="o">.</span><span class="n">page_table_idx</span><span class="p">,</span> <span class="n">req</span><span class="o">.</span><span class="n">cached_len</span><span class="p">)</span> <span class="k">for</span> <span class="n">req</span> <span class="ow">in</span> <span class="n">reqs</span><span class="p">],</span>
+        <span class="p">)</span>
+
+        <span class="c1"># 返回这批请求，交给模型去跑计算</span>
+        <span class="k">return</span> <span class="n">reqs</span>
+</code></pre></div>
+
+<p><strong>白话解释 Task 3：</strong>
+1.  <strong>点名</strong>：看有多少人在等。假设有 5 个人。
+2.  <strong>查库存</strong>：我要生成 5 个新字，仓库里还有 5 个空位吗？没有就报错（或者以后实现暂停策略）。
+3.  <strong>拿资源</strong>：有空位，那就向仓库管理员要 5 个具体的物理地址（比如显存里的第 100 号、200 号格子...）。
+4.  <strong>写映射</strong>：调用 <code>store_decode_indices</code>。这就像在座位表上写下：“张三的下一个字，放第 100 号格子；李四的下一个字，放第 200 号格子”。这样 GPU 计算时才知道把算出来的数据存哪。</p>
+<hr />
+<h4>✅ Task 4: 状态汇报 (<code>properties</code>)</h4>
+<p>最后是一些辅助属性，方便外部查看状态。</p>
+<div class="codehilite"><pre><span></span><code>    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">inflight_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="c1"># 统计所有正在跑的请求，还要生成多少个字（剩余工作量总和）</span>
+        <span class="k">return</span> <span class="nb">sum</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">remain_len</span> <span class="k">for</span> <span class="n">req</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">running_reqs</span><span class="p">)</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">runnable</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="c1"># 只要还有人在名单里，我就能跑</span>
+        <span class="k">return</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">running_reqs</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span>
+</code></pre></div>
+
+<hr />
+<h3>总结：这篇文章讲了什么观点？</h3>
+<p>这个文件并没有讲什么复杂的“观点”，它是一个<strong>工程实现</strong>。它展示了 <strong>PagedAttention</strong>（一种在大模型推理中广泛使用的显存管理技术）中最基础的调度逻辑：</p>
+<ol>
+<li><strong>显存按需分配</strong>：不是一开始就给请求分配一大块内存，而是每生成一个字（Decode 一步），就临时去申请一个槽位 (<code>cache_manager.allocate</code>)。</li>
+<li><strong>物理与逻辑分离</strong>：通过页表 (<code>table_manager</code>) 和内核函数 (<code>store_decode_indices</code>)，把逻辑上连续的句子，映射到物理上不连续的显存空间里。</li>
+</ol>
+<p><strong>一句话总结：</strong>
+这是 <code>minisgl</code> 系统的<strong>解码调度器</strong>，它负责在每一轮生成循环中，确认显存足够，分配新的显存块，并更新页表，从而让 GPU 能够正确地存储新生成的 Token 数据。</p>

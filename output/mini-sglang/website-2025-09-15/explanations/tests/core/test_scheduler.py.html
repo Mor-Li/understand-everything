@@ -1,0 +1,115 @@
+<h1>tests/core/test_scheduler.py</h1>
+<p>这份代码确实涉及了很多底层概念（多进程、网络通信、大模型推理调度），乍一看非常复杂。</p>
+<p>你可以把这份代码看作是一个 <strong>“迷你版的大模型聊天机器人后端演示”</strong>。它模拟了用户发一句“你好”，然后后台计算并逐字吐出回复的过程。</p>
+<p>为了让你听懂，我把阅读这份代码拆解成 <strong>6 个任务 (Task)</strong>，我们一步步来完成：</p>
+<hr />
+<h3>📋 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1：搞懂“谁是老板，谁是打工人”</strong> (理解多进程架构)</li>
+<li><strong>Task 2：查看“员工守则”</strong> (理解配置 <code>SchedulerConfig</code>)</li>
+<li><strong>Task 3：架设“电话线”</strong> (理解 ZMQ 消息队列)</li>
+<li><strong>Task 4：老板下达指令</strong> (数据预处理与发送请求)</li>
+<li><strong>Task 5：老板接收汇报</strong> (流式接收生成的文字)</li>
+<li><strong>Task 6：下班关门</strong> (发送退出指令)</li>
+</ol>
+<hr />
+<h3>详细讲解</h3>
+<h4>✅ Task 1：搞懂“谁是老板，谁是打工人” (多进程)</h4>
+<p>这段代码并没有在一个线程里跑完所有事，而是开了<strong>两个进程</strong>（你可以理解为两个独立的程序同时在跑）。</p>
+<ul>
+<li><strong>主进程 (<code>main</code> 函数)</strong>：这是<strong>老板</strong>（也就是用户客户端）。它的工作是：发问题，等着收答案。</li>
+<li><strong>子进程 (<code>scheduler</code> 函数)</strong>：这是<strong>打工人</strong>（后台调度器）。它的工作是：加载沉重的大模型，一直死循环待命，收到问题就计算，算好了把结果扔回去。</li>
+</ul>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 启动打工人进程</span>
+<span class="n">p</span> <span class="o">=</span> <span class="n">mp</span><span class="o">.</span><span class="n">Process</span><span class="p">(</span><span class="n">target</span><span class="o">=</span><span class="n">scheduler</span><span class="p">,</span> <span class="n">args</span><span class="o">=</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">q</span><span class="p">))</span>
+<span class="n">p</span><span class="o">.</span><span class="n">start</span><span class="p">()</span>
+<span class="c1"># 老板等着打工人说“我准备好了” (q.get())</span>
+<span class="n">q</span><span class="o">.</span><span class="n">get</span><span class="p">()</span>
+</code></pre></div>
+
+<h4>✅ Task 2：查看“员工守则” (配置 Config)</h4>
+<p>在招募打工人之前，老板定了一套规则，告诉它要干什么活。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">config</span> <span class="o">=</span> <span class="n">SchedulerConfig</span><span class="p">(</span>
+    <span class="n">model_path</span><span class="o">=</span><span class="s2">&quot;meta-llama/Llama-3.1-8B-Instruct&quot;</span><span class="p">,</span> <span class="c1"># 1. 用什么模型（Llama 3.1）</span>
+    <span class="n">tp_info</span><span class="o">=</span><span class="n">DistributedInfo</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>                 <span class="c1"># 2. 用几张显卡（这里是单卡）</span>
+    <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span>                          <span class="c1"># 3. 计算精度</span>
+    <span class="n">max_running_req</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>                             <span class="c1"># 4. 最多同时服务几个人</span>
+    <span class="n">cuda_graph_bs</span><span class="o">=</span><span class="p">[</span><span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">],</span>                       <span class="c1"># 5. 显卡加速的优化设置（不用深究）</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<h4>✅ Task 3：架设“电话线” (ZMQ 消息队列)</h4>
+<p>老板和打工人不在同一个进程，内存不共享，怎么说话？通过 <strong>ZMQ (ZeroMQ)</strong> 这种网络消息队列。你可以把它想象成两个<strong>邮箱</strong>。</p>
+<ul>
+<li><strong><code>send_backend</code> (Push)</strong>：老板的<strong>发信箱</strong>。老板把问题丢进去，打工人在另一头收。</li>
+<li><strong><code>recv_backend</code> (Pull)</strong>：老板的<strong>收信箱</strong>。打工人把算出来的字丢进去，老板从这里拿。</li>
+</ul>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 发信箱</span>
+<span class="n">send_backend</span> <span class="o">=</span> <span class="n">ZmqPushQueue</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">encoder</span><span class="o">=</span><span class="n">BaseBackendMsg</span><span class="o">.</span><span class="n">encoder</span><span class="p">)</span>
+<span class="c1"># 收信箱</span>
+<span class="n">recv_backend</span> <span class="o">=</span> <span class="n">ZmqPullQueue</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">decoder</span><span class="o">=</span><span class="n">BaseTokenizerMsg</span><span class="o">.</span><span class="n">decoder</span><span class="p">)</span>
+</code></pre></div>
+
+<h4>✅ Task 4：老板下达指令 (发送请求)</h4>
+<p>老板（用户）想问一个问题：“生命的意义是什么？”。
+但是模型听不懂英语，它只认识数字（Token ID）。所以需要先“翻译”成数字，然后打包成一个任务单 (<code>UserMsg</code>) 发出去。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 准备问题</span>
+<span class="n">prompt</span> <span class="o">=</span> <span class="s2">&quot;What&#39;s the answer to life, the universe, and everything?&quot;</span>
+<span class="c1"># 2. 翻译成数字 (Tokenization)</span>
+<span class="n">ids</span> <span class="o">=</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="n">prompt</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">int32</span><span class="p">)</span>
+<span class="c1"># 3. 打包并扔进发信箱</span>
+<span class="n">send_backend</span><span class="o">.</span><span class="n">put</span><span class="p">(</span>
+    <span class="n">UserMsg</span><span class="p">(</span>
+        <span class="n">uid</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>           <span class="c1"># 用户ID</span>
+        <span class="n">input_ids</span><span class="o">=</span><span class="n">ids</span><span class="p">,</span>   <span class="c1"># 问题内容的数字版</span>
+        <span class="n">output_len</span><span class="o">=</span><span class="mi">100</span><span class="p">,</span>  <span class="c1"># 告诉模型：你最多给我写100个字</span>
+    <span class="p">)</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<h4>✅ Task 5：老板接收汇报 (流式接收)</h4>
+<p>这是最关键的一步。大模型不是一下子把整段话写完给你的，而是<strong>像打字机一样，一个字一个字蹦出来的</strong>。
+所以老板需要写一个 <code>while True</code> 循环，一直盯着收信箱。</p>
+<p><strong>过程模拟：</strong>
+1.  打工人算出了第一个字 "42"，发过来。
+2.  老板收到 "42"，拼接到原来的句子里。
+3.  打工人算出第二个字 "is"，发过来。
+4.  ...
+5.  直到打工人发来一个信号 <code>finished=True</code>，老板才停止循环。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
+    <span class="c1"># 从收信箱拿一个字</span>
+    <span class="n">msg</span> <span class="o">=</span> <span class="n">recv_backend</span><span class="o">.</span><span class="n">get</span><span class="p">()</span>
+    <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">msg</span><span class="p">,</span> <span class="n">DetokenizeMsg</span><span class="p">)</span> <span class="c1"># 确认是解词消息</span>
+
+    <span class="c1"># 把新字拼起来</span>
+    <span class="n">ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">ids</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="n">msg</span><span class="o">.</span><span class="n">next_token</span><span class="p">]</span><span class="o">...</span><span class="p">)])</span>
+
+    <span class="c1"># 如果打工人说“写完了”，就跳出循环</span>
+    <span class="k">if</span> <span class="n">msg</span><span class="o">.</span><span class="n">finished</span><span class="p">:</span>
+        <span class="k">break</span>
+
+<span class="c1"># 最后把一堆数字翻译回人类语言打印出来</span>
+<span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="n">ids</span><span class="o">.</span><span class="n">tolist</span><span class="p">()))</span>
+</code></pre></div>
+
+<h4>✅ Task 6：下班关门 (退出)</h4>
+<p>任务做完了，老板需要告诉打工人：“你可以下班了，别空转费电了”。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">send_backend</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">ExitMsg</span><span class="p">())</span> <span class="c1"># 发送“下班卡”</span>
+</code></pre></div>
+
+<hr />
+<h3>总结</h3>
+<p>这整个文件其实就是演示了 <strong>MiniSGL</strong> 这个框架是如何工作的：</p>
+<ol>
+<li><strong>初始化</strong>：配置模型参数。</li>
+<li><strong>启动</strong>：后台起一个 Scheduler 进程跑模型。</li>
+<li><strong>交互</strong>：主进程把文本转成 ID 发过去，后台把生成的 ID 一个个发回来。</li>
+<li><strong>结束</strong>：主进程把 ID 转回文本，并关闭后台。</li>
+</ol>
+<p>现在再回去看代码，是不是清晰多了？</p>

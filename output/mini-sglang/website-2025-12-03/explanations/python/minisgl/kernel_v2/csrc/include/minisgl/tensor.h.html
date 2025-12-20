@@ -1,0 +1,104 @@
+<h1>python/minisgl/kernel_v2/csrc/include/minisgl/tensor.h</h1>
+<p>这份代码写得非常“现代 C++”（用了 C++20 的很多特性，比如 <code>concepts</code>, <code>ranges</code>, <code>span</code>），而且涉及到底层深度学习框架（TVM/DLPack）的开发，所以看不懂是非常正常的。</p>
+<p>简单来说，<strong>这个文件的核心功能是：定义一套规则，用来检查（Verify）一个 Tensor（张量）是否符合我们的预期。</strong></p>
+<p>比如，你想写一个函数，要求输入必须是：“一个 float32 类型的 Tensor，运行在 CUDA 上，形状是 <code>[BatchSize, 128]</code>”。这个文件里的代码就是用来帮你做这种<strong>“模式匹配”和“参数校验”</strong>的工具。</p>
+<p>为了让你读懂它，我给你列一个 <strong>5步走的 Task List</strong>，我们像剥洋葱一样一层层看。</p>
+<hr />
+<h3>Task 1: 搞定基础 —— 数据类型与设备 (Lines 30-135)</h3>
+<p><strong>目标</strong>：看懂它是如何包装底层的 <code>DLPack</code> 结构体的。</p>
+<ol>
+<li><strong>背景</strong>：<code>DLDataType</code> (数据类型) 和 <code>DLDevice</code> (设备) 是 <code>dlpack.h</code> 里的 C 语言结构体，很原始。</li>
+<li><strong>代码在做什么</strong>：<ul>
+<li><code>dtype_trait&lt;T&gt;</code>：这是一个模板魔法。它的作用是把 C++ 的类型（如 <code>float</code>, <code>int</code>）自动映射成 <code>DLDataType</code> 结构体。</li>
+<li><code>kDeviceStringMap</code>：这是一个查找表，用来把设备 ID（比如 <code>kDLCUDA</code>）变成字符串 <code>"cuda"</code>，方便打印报错信息。</li>
+<li><code>operator&lt;&lt;</code>：重载了输出流，让你能直接用 <code>std::cout &lt;&lt; device</code> 打印设备信息。</li>
+</ul>
+</li>
+<li><strong>结论</strong>：这一块只是为了<strong>方便打印</strong>和<strong>方便定义类型</strong>，是基础设施。</li>
+</ol>
+<h3>Task 2: 理解核心概念 —— "Symbolic" (符号化) (Lines 137-308)</h3>
+<p><strong>目标</strong>：理解为什么叫 <code>SymbolicSize</code>, <code>SymbolicDType</code>, <code>SymbolicDevice</code>。这是全篇最核心的设计逻辑。</p>
+<ol>
+<li>
+<p><strong>核心逻辑</strong>：</p>
+<ul>
+<li>在深度学习编译中，有时候我们不知道 Tensor 具体的大小（比如 Batch Size 是动态的），或者我们想表达“必须和上一个 Tensor 一样大”。</li>
+<li><strong><code>SymbolicSize</code></strong>：它像一个代数变量 $x$。<ul>
+<li><strong>状态 1 (未定)</strong>：刚开始它不知道自己是多少。</li>
+<li><strong>状态 2 (已定)</strong>：当它第一次遇到一个具体的 Tensor（比如长度 32）时，它就“锁定”为 32。</li>
+<li><strong>校验 (Verify)</strong>：如果它已经锁定了 32，下次再遇到一个长度 64 的 Tensor，它就会报错（Panic）。</li>
+</ul>
+</li>
+<li><strong><code>SymbolicDType</code> / <code>SymbolicDevice</code></strong>：逻辑类似。它们可以存一个“允许列表”（比如只允许 <code>float32</code> 或 <code>float16</code>）。如果来的 Tensor 类型不在列表里，就报错。</li>
+</ul>
+</li>
+<li>
+<p><strong>关键方法</strong>：看 <code>verify</code> 函数。</p>
+<ul>
+<li>逻辑是：<code>if (has_value)</code> -&gt; 检查是否相等；<code>else</code> -&gt; 赋值锁定。</li>
+</ul>
+</li>
+</ol>
+<h3>Task 3: 引用包装 —— <code>Ref</code> 结构体 (Lines 314-377)</h3>
+<p><strong>目标</strong>：理解 <code>details::BaseRef</code> 及其子类。</p>
+<ol>
+<li><strong>为什么需要这个</strong>：<ul>
+<li>有时候你想在多个 Tensor 之间<strong>共享</strong>同一个维度变量。</li>
+<li>比如：输入是 <code>[N, 128]</code>，输出必须也是 <code>[N, 128]</code>。这个 <code>N</code> 必须是同一个对象。</li>
+</ul>
+</li>
+<li><strong>代码在做什么</strong>：<ul>
+<li><code>BaseRef</code> 既可以持有一个自己的值，也可以引用外部传进来的变量。</li>
+<li><code>SizeRef</code>, <code>DTypeRef</code> 都是为了方便用户写代码时，既可以直接传数字（<code>32</code>），也可以传一个共享的符号变量。</li>
+</ul>
+</li>
+</ol>
+<h3>Task 4: 主角登场 —— <code>TensorMatcher</code> (Lines 379-End)</h3>
+<p><strong>目标</strong>：看懂这个类是如何把上面的东西串起来的。这是一个<strong>Builder Pattern（建造者模式）</strong>。</p>
+<ol>
+<li><strong>构造</strong>：<code>TensorMatcher({A, B})</code>。这里定义了形状的规则。</li>
+<li><strong>链式调用</strong>：<ul>
+<li><code>.with_dtype(...)</code>：添加数据类型规则。</li>
+<li><code>.with_device(...)</code>：添加设备规则。</li>
+<li><code>.with_strides(...)</code>：添加内存步长规则（检查内存是否连续）。</li>
+</ul>
+</li>
+<li><strong>核心动作 <code>verify</code></strong> (Line 436)：<ul>
+<li>这是最终执行检查的地方。</li>
+<li>它接收一个真实的 <code>tvm::ffi::TensorView</code>（真实的 Tensor）。</li>
+<li>它会依次检查：维度数量对不对？每一维的大小对不对？类型对不对？设备对不对？</li>
+<li>如果有任何不对，抛出异常 <code>PanicError</code>。</li>
+</ul>
+</li>
+</ol>
+<h3>Task 5: 脑补使用场景 (The "Aha!" Moment)</h3>
+<p><strong>目标</strong>：把代码翻译成伪代码，你就彻底懂了。</p>
+<p>想象一下，开发者在写一个矩阵乘法算子 <code>MatMul(A, B, C)</code>，他可以使用这个头文件来做参数检查：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1">// 1. 定义一些符号变量，代表动态的维度</span>
+<span class="n">SymbolicSize</span><span class="w"> </span><span class="n">BatchSize</span><span class="p">(</span><span class="s">&quot;batch&quot;</span><span class="p">);</span><span class="w"> </span>
+<span class="n">SymbolicSize</span><span class="w"> </span><span class="n">K_Dim</span><span class="p">(</span><span class="s">&quot;k&quot;</span><span class="p">);</span>
+
+<span class="c1">// 2. 定义对 Tensor A 的要求：</span>
+<span class="c1">//    形状必须是 [BatchSize, K_Dim]，类型必须是 float32，设备是 CUDA</span>
+<span class="k">auto</span><span class="w"> </span><span class="n">matcherA</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">TensorMatcher</span><span class="p">({</span><span class="n">BatchSize</span><span class="p">,</span><span class="w"> </span><span class="n">K_Dim</span><span class="p">})</span>
+<span class="w">                  </span><span class="p">.</span><span class="n">with_dtype</span><span class="o">&lt;</span><span class="kt">float</span><span class="o">&gt;</span><span class="p">()</span>
+<span class="w">                  </span><span class="p">.</span><span class="n">with_device</span><span class="o">&lt;</span><span class="n">kDLCUDA</span><span class="o">&gt;</span><span class="p">();</span>
+
+<span class="c1">// 3. 定义对 Tensor B 的要求：</span>
+<span class="c1">//    注意：这里复用了 K_Dim！这意味着 B 的第一维必须和 A 的第二维相等！</span>
+<span class="k">auto</span><span class="w"> </span><span class="n">matcherB</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">TensorMatcher</span><span class="p">({</span><span class="n">K_Dim</span><span class="p">,</span><span class="w"> </span><span class="mi">128</span><span class="p">})</span><span class="w"> </span><span class="c1">// 假设输出维度固定 128</span>
+<span class="w">                  </span><span class="p">.</span><span class="n">with_dtype</span><span class="o">&lt;</span><span class="kt">float</span><span class="o">&gt;</span><span class="p">()</span>
+<span class="w">                  </span><span class="p">.</span><span class="n">with_device</span><span class="o">&lt;</span><span class="n">kDLCUDA</span><span class="o">&gt;</span><span class="p">();</span>
+
+<span class="c1">// 4. 实际运行时：</span>
+<span class="n">matcherA</span><span class="p">.</span><span class="n">verify</span><span class="p">(</span><span class="n">tensor_a</span><span class="p">);</span><span class="w"> </span><span class="c1">// 此时 BatchSize 会被锁定为 tensor_a 的实际行数，K_Dim 被锁定</span>
+<span class="n">matcherB</span><span class="p">.</span><span class="n">verify</span><span class="p">(</span><span class="n">tensor_b</span><span class="p">);</span><span class="w"> </span><span class="c1">// 此时会检查 tensor_b 的第一维是否等于刚才锁定的 K_Dim</span>
+</code></pre></div>
+
+<h3>总结</h3>
+<p>这个文件就是写了一个<strong>“Tensor 格式验证器”</strong>。</p>
+<ul>
+<li>它不存数据。</li>
+<li>它存的是<strong>“形状、类型、设备”的约束条件</strong>。</li>
+<li>它支持<strong>动态绑定</strong>（第一次遇到什么值，以后就必须是什么值），非常适合用来检查深度学习算子的输入输出是否合法。</li>
+</ul>

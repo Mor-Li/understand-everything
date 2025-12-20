@@ -1,0 +1,118 @@
+<h1>python/minisgl/kvcache/mha_pool.py</h1>
+<p>这份代码确实涉及了很多大模型推理（Inference）底层的概念，如果对 LLM 的部署架构不熟悉，看起来确实像天书。</p>
+<p>简单来说，这个类 <code>MHAKVCache</code> 就是一个<strong>“仓库管理员”</strong>。它的工作是在显存（GPU Memory）里划出一大块地盘，用来存放 LLM 推理过程中产生的 Key 和 Value 矩阵（即 KV Cache），并负责管理数据的存取。</p>
+<p>为了让你读懂它，我为你列了一个 <strong>5步走的 Task List（学习清单）</strong>。我们一步一步来拆解：</p>
+<hr />
+<h3>📝 学习清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1: 理解背景——什么是 KV Cache 以及为什么要“分块/分页”？</strong></li>
+<li><strong>Task 2: 理解初始化——如何在 GPU 上挖个大坑 (<code>__init__</code>)？</strong></li>
+<li><strong>Task 3: 理解并行——多张显卡怎么分锅 (Tensor Parallelism)？</strong></li>
+<li><strong>Task 4: 理解内存布局——书是按“层”摆还是按“页”摆 (<code>KVCacheLayout</code>)？</strong></li>
+<li><strong>Task 5: 理解操作——如何把新产生的数据塞进去 (<code>store_kv</code>)？</strong></li>
+</ol>
+<hr />
+<h3>💡 逐步讲解</h3>
+<h4>Task 1: 理解背景 (KV Cache &amp; Paging)</h4>
+<ul>
+<li><strong>概念</strong>：在大模型生成文字时，是一个字一个字蹦出来的。为了不重复计算前面已经算过的字，我们需要把中间结果（Key 和 Value 向量）存下来。这就叫 <strong>KV Cache</strong>。</li>
+<li><strong>代码对应</strong>：<ul>
+<li><code>MHAKVCache</code> 这个名字就是 Multi-Head Attention KV Cache 的缩写。</li>
+<li><code>num_pages</code>: 这里没有直接存一整块连续内存，而是像操作系统管理内存一样，把显存切成很多小块，叫“页（Pages）”。这是为了更灵活地利用显存（类似 vLLM 的 PagedAttention 技术）。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 理解并行 (Tensor Parallelism)</h4>
+<ul>
+<li><strong>概念</strong>：大模型参数太多，一张显卡装不下或者算得慢。我们通常把模型的“头”（Heads）切分开，分给不同的显卡算。</li>
+<li><strong>代码对应</strong>：
+    <code>python
+    tp_info = get_tp_info()  # 获取当前显卡在分布式环境下的信息
+    # num_kv_heads 是总的头数，size 是显卡数量
+    # 比如总共32个头，有4张卡，那么 local_kv_heads 就是 8。
+    local_kv_heads = divide_even(num_kv_heads, tp_info.size)</code><ul>
+<li><strong>解释</strong>：这个类只管理<strong>当前这张显卡</strong>负责的那一部分 KV Cache，而不是全部。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 3: 理解内存布局 (Layout)</h4>
+<ul>
+<li><strong>概念</strong>：我们需要申请一个巨大的 Tensor 来存数据。但是，数据的维度怎么排布读取最快？这取决于具体的计算内核（Kernel）怎么写。</li>
+<li><strong>代码对应</strong>：
+    <code>python
+    match kv_layout:
+        case KVCacheLayout.PageFirst:
+            # 布局 1: [2, 页数, 层数, 头数, 维度]
+            # 这里的 permute 是为了把内存顺序调整好，方便后面统一 view
+            kv_buffer = torch.empty(...).permute(0, 2, 1, 3, 4)
+        case KVCacheLayout.LayerFirst:
+            # 布局 2: [2, 层数, 页数, 头数, 维度]
+            kv_buffer = torch.empty(...)</code><ul>
+<li><strong>解释</strong>：<ul>
+<li><code>2</code>: 代表 K 和 V 两个矩阵。</li>
+<li><code>num_layers</code>: 模型有多少层（比如 Llama3-8B 有 32 层）。</li>
+<li><code>num_pages</code>: 预先分配好的显存页数（比如能存 10000 个 token）。</li>
+<li><code>local_kv_heads</code>: 当前卡负责的头数。</li>
+<li><code>head_dim</code>: 每个头的向量维度（比如 128）。</li>
+</ul>
+</li>
+<li><strong>核心</strong>：这就是在 GPU 上圈了一块巨大的地，不管你用不用，先占着。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 4: 统一视图 (View)</h4>
+<ul>
+<li><strong>概念</strong>：不管物理内存怎么排（PageFirst 还是 LayerFirst），为了方便后面写代码，我们给它套一个统一的“滤镜”（View）。</li>
+<li>
+<p><strong>代码对应</strong>：
+    ```python
+    # 强行把形状解释为: [2, 层数, 页数, 1, 本地头数, 维度]
+    self._kv_buffer = kv_buffer.view(2, num_layers, num_pages, 1, local_kv_heads, head_dim)</p>
+<h1>把 K 和 V 分开引用，方便取用</h1>
+<p>self._k_buffer = self._kv_buffer[0]
+self._v_buffer = self._kv_buffer[1]
+```</p>
+</li>
+</ul>
+<h4>Task 5: 存取数据 (Store &amp; Get)</h4>
+<ul>
+<li>
+<p><strong>读取 (<code>k_cache</code>, <code>v_cache</code>)</strong>：</p>
+<ul>
+<li>给定一个层号 <code>index</code>，返回那一层的所有 Cache。</li>
+<li><code>return self._k_buffer[index]</code></li>
+</ul>
+</li>
+<li>
+<p><strong>写入 (<code>store_kv</code>)</strong>：</p>
+<ul>
+<li>这是最关键的一步。当模型算出了新的 token 的 K 和 V，需要存入这个大仓库。</li>
+<li><strong>代码对应</strong>：
+    ```python
+    def store_kv(self, k, v, out_loc, layer_id):
+        from minisgl.kernel_v2 import store_cache<div class="codehilite"><pre><span></span><code><span class="err">#</span><span class="w"> </span><span class="n">调用底层的</span><span class="w"> </span><span class="n">CUDA</span><span class="w"> </span><span class="n">Kernel</span><span class="w"> </span><span class="p">(</span><span class="n">C</span><span class="o">++</span><span class="n">写的加速代码</span><span class="p">)</span>
+<span class="n">store_cache</span><span class="p">(</span>
+<span class="w">    </span><span class="err">#</span><span class="w"> </span><span class="n">拿到当前层的仓库入口</span>
+<span class="w">    </span><span class="n">k_cache</span><span class="o">=</span><span class="n">self</span><span class="p">.</span><span class="n">_k_buffer</span><span class="o">[</span><span class="n">layer_id</span><span class="o">]</span><span class="p">.</span><span class="k">view</span><span class="p">(</span><span class="n">self</span><span class="p">.</span><span class="n">_storage_shape</span><span class="p">),</span>
+<span class="w">    </span><span class="n">v_cache</span><span class="o">=</span><span class="n">self</span><span class="p">.</span><span class="n">_v_buffer</span><span class="o">[</span><span class="n">layer_id</span><span class="o">]</span><span class="p">.</span><span class="k">view</span><span class="p">(</span><span class="n">self</span><span class="p">.</span><span class="n">_storage_shape</span><span class="p">),</span>
+<span class="w">    </span><span class="n">indices</span><span class="o">=</span><span class="n">out_loc</span><span class="p">,</span><span class="w"> </span><span class="err">#</span><span class="w"> </span><span class="n">告诉</span><span class="w"> </span><span class="n">Kernel</span><span class="err">：</span><span class="n">存到哪一页</span><span class="err">、</span><span class="n">哪一个位置</span>
+<span class="w">    </span><span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span><span class="w">             </span><span class="err">#</span><span class="w"> </span><span class="n">要存的数据</span><span class="w"> </span><span class="n">K</span>
+<span class="w">    </span><span class="n">v</span><span class="o">=</span><span class="n">v</span><span class="p">,</span><span class="w">             </span><span class="err">#</span><span class="w"> </span><span class="n">要存的数据</span><span class="w"> </span><span class="n">V</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p><code>``
+    *   **解释**：Python 处理大规模数据搬运太慢了，所以这里只是准备好数据的指针（地址），然后丢给</code>minisgl.kernel_v2.store_cache` 这个用 C++/CUDA 写的黑盒去干苦力。</p>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码到底在干啥？</h3>
+<p>想象你在管理一个<strong>超大的图书馆（KV Cache）</strong>：</p>
+<ol>
+<li><strong><code>__init__</code></strong>: 建馆。根据是不是连锁店（多卡并行），决定你这家分店管多少类书。根据装修图纸（Layout），决定书架是按“楼层”摆还是按“类别”摆。先把架子（Tensor）全部搭好。</li>
+<li><strong><code>k_cache/v_cache</code></strong>: 查阅。给我第 5 层楼的所有书的目录。</li>
+<li><strong><code>store_kv</code></strong>: 进货。新书（新的 K/V）到了，根据入库单（<code>out_loc</code>），把书塞到指定的架子上。这步动作很快，找了专业的搬运工（CUDA Kernel）来做。</li>
+</ol>
+<p>现在再回头看一遍代码，是不是清晰一点了？</p>

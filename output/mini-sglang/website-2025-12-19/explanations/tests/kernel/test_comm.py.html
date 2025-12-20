@@ -1,0 +1,85 @@
+<h1>tests/kernel/test_comm.py</h1>
+<p>这份代码其实是一个<strong>针对多显卡（分布式）通信功能的测试脚本</strong>。</p>
+<p>简单来说，它的目的是验证一个叫 <code>minisgl</code> 的库中，负责显卡之间“互通有无”（交换数据）的模块（<code>pynccl</code>）是否工作正常，以及速度有多快。</p>
+<p>为了让你更容易理解，我把它拆解成一个 <strong>“5步走”的任务清单 (Task List)</strong>。你可以把这个脚本想象成是在组织一场 <strong>4个人（4张显卡）的接力赛</strong>。</p>
+<hr />
+<h3>任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>【准备工作】搭建赛场</strong>：启动多个进程，模拟多张显卡的环境。</li>
+<li><strong>【热身运动】初始化通信</strong>：每张显卡“打卡”上线，建立彼此的连接通道。</li>
+<li><strong>【技能测试 1】All-Reduce (求和)</strong>：测试大家能不能把手里的数字加在一起，并保证结果正确。</li>
+<li><strong>【体能测试】测速 (Benchmark)</strong>：测试通信速度有多快（带宽是多少）。</li>
+<li><strong>【技能测试 2】All-Gather (收集)</strong>：测试能不能把大家手里的数据汇总到一起。</li>
+</ol>
+<hr />
+<h3>逐步讲解 (Step-by-Step)</h3>
+<p>下面我按照上面的清单，带你一步步看代码。</p>
+<h4>1. 【准备工作】搭建赛场 (主程序入口)</h4>
+<p>代码的最下面 <code>if __name__ == "__main__":</code> 部分。</p>
+<ul>
+<li><strong>目标</strong>：在一台机器上模拟 4 张显卡（<code>tp_size = 4</code>）同时工作的场景。</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li>设置 <code>MASTER_ADDR</code> 和 <code>PORT</code>：相当于告诉大家“集合地点”在哪里。</li>
+<li><code>mp.Process(...)</code>：启动 4 个独立的进程。每个进程代表一张显卡（Rank 0 到 Rank 3）。</li>
+<li>它们都会去执行同一个函数：<code>run(tp_size, tp_rank)</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>2. 【热身运动】初始化通信 (进入 <code>run</code> 函数)</h4>
+<p>代码 <code>run</code> 函数的开头部分。</p>
+<ul>
+<li><strong>目标</strong>：让当前进程绑定到具体的显卡，并建立通信群组。</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li><code>torch.cuda.set_device(tp_rank)</code>：我是 0 号进程，我就用 0 号显卡。</li>
+<li><code>torch.distributed.init_process_group</code>：使用 CPU 建立一个基础的“微信群”（backend="gloo"），用于简单的握手和协调。</li>
+<li><strong>关键点</strong>：<code>comm = kernel.init_pynccl(...)</code>。这是这个脚本<strong>真正要测的主角</strong>。它初始化了一个基于 NCCL（NVIDIA的高速通信库）的自定义通信器，用于显卡间传输大规模数据。</li>
+</ul>
+</li>
+</ul>
+<h4>3. 【技能测试 1】All-Reduce (求和)</h4>
+<p>对应代码中的 <code>test_correctness</code> 函数。</p>
+<ul>
+<li><strong>概念</strong>：<code>All-Reduce</code> 是分布式训练中最常用的操作。意思是：我有 1，你有 2，他有 3。操作完后，我们要变成每个人手里都是 6 (1+2+3)。</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li><strong>基础测试</strong>：每人生成全是 1 的张量。跑完 <code>all_reduce</code> 后，检查是不是变成了 <code>4</code> (因为有4张卡)。</li>
+<li><strong>同步测试 (Sanity check)</strong>：<ul>
+<li><code>if tp_rank == 0: time.sleep(1)</code>：故意让 0 号显卡睡 1 秒，偷个懒。</li>
+<li>测试目的是看其他显卡会不会<strong>乖乖等待</strong> 0 号醒来。分布式系统必须步调一致，不能有人掉队。</li>
+</ul>
+</li>
+<li><strong>混合数据测试</strong>：用不同的数据（0和1组合）再测一次，确保没算错。</li>
+</ul>
+</li>
+</ul>
+<h4>4. 【体能测试】测速 (Benchmark)</h4>
+<p>对应代码中的 <code>bench_performance</code> 函数。</p>
+<ul>
+<li><strong>目标</strong>：看看这个 <code>all_reduce</code> 操作到底有多快，计算带宽（GB/s）。</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li><strong>预热 (Warmup)</strong>：先跑两次 <code>f(x)</code>，让机器热身，避免第一次运行慢影响成绩。</li>
+<li><strong>CUDA Graph</strong>：代码里有一个 <code>if use_graph:</code> 分支。这是 NVIDIA 的一种黑科技，可以把一连串 GPU 操作“录制”下来然后回放，通常能加速。</li>
+<li><strong>计时</strong>：使用 <code>torch.cuda.Event</code> 进行毫秒级的精确计时。</li>
+<li><strong>算分</strong>：<ul>
+<li><code>avg_time</code>：平均跑一次要多少微秒。</li>
+<li><code>bandwidth</code>：数据量 / 时间 = 带宽。</li>
+</ul>
+</li>
+<li>最后打印出：<code>Rank 0 all-reduce bandwidth: xxx GB/s</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>5. 【技能测试 2】All-Gather (收集)</h4>
+<p>对应 <code>run</code> 函数的最后部分。</p>
+<ul>
+<li><strong>概念</strong>：<code>All-Gather</code> 的意思是“全员收集”。我有 A，你有 B。操作完后，我手里要是 <code>[A, B]</code>，你手里也是 <code>[A, B]</code>。</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li><code>src</code>：当前显卡手里的数据（比如 Rank 0 手里全是 0，Rank 1 手里全是 1）。</li>
+<li><code>dst</code>：准备一个大容器。</li>
+<li><code>comm.all_gather(dst, src)</code>：开始交换。</li>
+<li><strong>验证</strong>：检查 <code>dst</code> 里面是不是按顺序包含了 0, 1, 2, 3。如果是，说明数据收集成功。</li>
+</ul>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个文件就是一个<strong>质检员</strong>。</p>
+<p>它不训练模型，也不做推理。它唯一的任务就是把 <code>minisgl.kernel</code> 里的通信模块拿出来，先确认它算得对（Correctness），再确认它跑得快（Benchmark），最后确认所有功能（Reduce, Gather）都正常，然后收工。</p>

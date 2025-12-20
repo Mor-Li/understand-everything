@@ -1,0 +1,126 @@
+<h1>python/minisgl/layers/rotary.py</h1>
+<p>没问题，这份代码涉及了大语言模型（LLM）底层非常核心的一个概念：<strong>RoPE（旋转位置编码）</strong>。如果直接看代码细节确实容易晕。</p>
+<p>为了让你听懂，我们把阅读这份代码的任务拆解成 <strong>5 个具体的 Task（待办事项）</strong>，由浅入深，一步步攻克。</p>
+<hr />
+<h3>📝 学习任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1：搞懂背景</strong> —— 这份代码到底是干嘛的？</li>
+<li><strong>Task 2：看懂预处理</strong> —— <code>RotaryEmbedding</code> 的初始化在算什么？</li>
+<li><strong>Task 3：看懂计算过程</strong> —— <code>forward</code> 函数是怎么“旋转”数据的？</li>
+<li><strong>Task 4：进阶理解</strong> —— 那个复杂的 <code>llama3</code> case 是在做什么？</li>
+<li><strong>Task 5：工程细节</strong> —— 为什么要用 <code>lru_cache</code> 和 <code>device</code> 设置？</li>
+</ol>
+<hr />
+<h3>🚀 开始执行任务</h3>
+<h4>✅ Task 1：搞懂背景 —— 这份代码是干嘛的？</h4>
+<p><strong>核心观点：</strong>
+LLM（如 Llama、Qwen）在处理句子时，需要知道每个词的<strong>位置</strong>（比如“我爱你”和“你爱我”词一样但顺序不同，意思完全不同）。
+这个文件实现了一种叫 <strong>RoPE (Rotary Positional Embedding)</strong> 的技术。</p>
+<ul>
+<li><strong>通俗理解：</strong> 想象每个词是一个向量（箭头）。RoPE 的做法是根据词的位置，把这个箭头在空间里“旋转”一下。位置不同，旋转的角度就不同。这样模型就能通过角度识别出位置关系。</li>
+<li><strong>代码对应：</strong> 整个文件都在定义如何生成这些旋转角度，以及如何把旋转应用到 Query (Q) 和 Key (K) 上。</li>
+</ul>
+<hr />
+<h4>✅ Task 2：看懂预处理 —— <code>__init__</code> 在算什么？</h4>
+<p><strong>目标代码：</strong> <code>RotaryEmbedding</code> 类的 <code>__init__</code> 方法。</p>
+<p><strong>核心观点：</strong>
+每次来数据再算旋转角度太慢了，我们需要<strong>提前算好一张“角度表”</strong>（缓存 Cache），存在显存里，用的时候直接查表。</p>
+<p><strong>步骤解析：</strong>
+1.  <strong>计算频率 (<code>inv_freq</code>)：</strong>
+    <code>python
+    inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))</code>
+    这是一个数学公式，你只需要知道它生成了一组不同频率的数字。低频负责捕捉长距离关系，高频负责短距离。</p>
+<ol>
+<li>
+<p><strong>生成时间步 (<code>t</code>)：</strong>
+    <code>python
+    t = torch.arange(max_position_embeddings, dtype=torch.float)</code>
+    这里生成了从 0 到 几千（最大长度）的位置索引。</p>
+</li>
+<li>
+<p><strong>计算 Cos 和 Sin 表 (<code>freqs</code>, <code>cos</code>, <code>sin</code>)：</strong>
+    <code>python
+    freqs = torch.einsum("i,j -&gt; ij", t, inv_freq) # 外积，算出所有位置对应的所有频率的角度
+    cos = freqs.cos()
+    sin = freqs.sin()
+    self._cos_sin_cache = torch.cat((cos, sin), dim=-1) # 拼起来存好</code>
+    <strong>重点：</strong> 这里它把 Cos 值和 Sin 值算好，拼成了一个巨大的表 <code>_cos_sin_cache</code>。</p>
+<ul>
+<li>以后输入任何数据，不需要重新算 Cos/Sin，直接从这个表里拿就行了。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 3：看懂计算过程 —— <code>forward</code> 怎么旋转？</h4>
+<p><strong>目标代码：</strong> <code>RotaryEmbedding</code> 类的 <code>forward</code> 方法。</p>
+<p><strong>核心观点：</strong>
+真正干活的地方。把输入的 Query 和 Key 拿来，根据它们的位置，查上面的表，然后进行旋转。</p>
+<p><strong>步骤解析：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">positions</span><span class="p">,</span> <span class="n">query</span><span class="p">,</span> <span class="n">key</span><span class="p">):</span>
+    <span class="n">apply_rope_with_cos_sin_cache_inplace</span><span class="p">(</span>
+        <span class="n">positions</span><span class="o">=</span><span class="n">positions</span><span class="p">,</span>
+        <span class="n">query</span><span class="o">=</span><span class="n">query</span><span class="p">,</span>
+        <span class="n">key</span><span class="o">=</span><span class="n">key</span><span class="p">,</span>
+        <span class="n">head_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">head_size</span><span class="p">,</span>
+        <span class="n">cos_sin_cache</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_cos_sin_cache</span><span class="p">,</span>
+    <span class="p">)</span>
+    <span class="k">return</span> <span class="n">query</span><span class="p">,</span> <span class="n">key</span>
+</code></pre></div>
+
+<ol>
+<li><strong>输入：</strong> <code>positions</code>（告诉模型现在的词在第几个位置），<code>query</code> 和 <code>key</code>（注意力机制的核心矩阵）。</li>
+<li><strong>黑魔法 (<code>apply_rope_...</code>)：</strong> 这里调用了一个外部函数 <code>sgl_kernel.elementwise...</code>。<ul>
+<li>这是一个<strong>CUDA Kernel（底层加速代码）</strong>。</li>
+<li><strong>Inplace（原地修改）：</strong> 注意看函数名里的 <code>inplace</code>。它没有创建新的 Tensor，而是直接修改了显存里的 <code>query</code> 和 <code>key</code>。这样做是为了省显存和速度快。</li>
+<li>它做的事情就是数学上的：$x' = x \cdot \cos(\theta) - y \cdot \sin(\theta)$ （复数旋转）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 4：进阶理解 —— <code>llama3</code> case 是在做什么？</h4>
+<p><strong>目标代码：</strong> <code>_get_rope</code> 函数里的 <code>match rope_scaling</code> 部分。</p>
+<p><strong>核心观点：</strong>
+这是为了<strong>长文本扩展（Long Context）</strong>。
+比如 Llama 3 训练时只看了 8k 长度的文本，但我们现在想让它处理 128k 的长度。直接跑会乱码，需要对频率进行“缩放”或“平滑”。</p>
+<p><strong>步骤解析：</strong>
+1.  <strong>判断类型：</strong> 代码检查 <code>rope_scaling["rope_type"]</code> 是否是 <code>"llama3"</code>。
+2.  <strong>定义 <code>post_process</code>：</strong> 这是一个回调函数，用来修改 Task 2 中提到的 <code>inv_freq</code>（频率）。
+    <code>python
+    def post_process(inv_freq):
+        # ...复杂的数学计算...
+        factor = (1 - smooth) / scaling_factor + smooth
+        return factor * inv_freq</code>
+    *   <strong>大白话：</strong> 它根据波长（wave_len），把原本的频率进行拉伸或压缩。
+    *   <strong>低频因子 vs 高频因子：</strong> 代码里有 <code>low_freq_factor</code> 和 <code>high_freq_factor</code>。这是 Llama 3 的特性：对于常见的短距离依赖（高频），不怎么改；对于没见过的长距离（低频），进行强力压缩，把没见过的长位置映射回模型熟悉的范围内。</p>
+<hr />
+<h4>✅ Task 5：工程细节 —— 缓存与设备管理</h4>
+<p><strong>目标代码：</strong> <code>get_rope</code> 和 <code>set_rope_device</code>。</p>
+<p><strong>核心观点：</strong>
+为了省资源，不要重复创建对象；为了避免报错，要处理好 PyTorch 的设备问题。</p>
+<ol>
+<li>
+<p><strong><code>@lru_cache</code> (最近最少使用缓存)：</strong></p>
+<ul>
+<li><code>get_rope</code> 函数头顶上有个 <code>@lru_cache()</code>。</li>
+<li><strong>作用：</strong> 如果你请求过一次 <code>head_dim=128, max_pos=4096</code> 的 RoPE 对象，下次再请求一模一样的参数，Python 就直接返回上次创建好的那个对象，而不会重新跑一遍 <code>__init__</code> 里的算表过程。</li>
+</ul>
+</li>
+<li>
+<p><strong>Meta Device 问题：</strong></p>
+<ul>
+<li>PyTorch 有个 <code>meta</code> device，用于只占坑不分配内存（为了省显存初始化大模型）。</li>
+<li>但 RoPE 需要算具体的 Cos/Sin 值，必须有真实的内存。</li>
+<li>代码逻辑：如果当前是在 <code>meta</code> 设备上，必须报错或者切换到用户指定的真实设备 (<code>_ROPE_DEVICE</code>) 上去计算，否则算不出数值。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🎓 总结 (Executive Summary)</h3>
+<p>把这个文件看作一个<strong>“位置感知的计算器”</strong>：</p>
+<ol>
+<li><strong>初始化时</strong>：它造了一张巨大的 Cos/Sin 查找表（<code>__init__</code>）。</li>
+<li><strong>运行时</strong>：它接收 Query 和 Key，根据位置查表，用 C++ 底层代码快速地把它们“旋转”一下（<code>forward</code>）。</li>
+<li><strong>特殊情况</strong>：如果是 Llama 3 这种超长文本模型，它会用特殊的数学公式调整查找表的频率，防止模型“晕车”（<code>_get_rope</code> 中的 scaling）。</li>
+<li><strong>优化</strong>：它用缓存机制保证全局只造一份表，省内存（<code>get_rope</code>）。</li>
+</ol>
+<p>现在再回头看代码，是不是清晰很多了？</p>

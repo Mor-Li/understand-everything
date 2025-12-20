@@ -1,0 +1,122 @@
+<h1>python/minisgl/layers/attention.py</h1>
+<p>这段代码确实比较硬核，它是一个<strong>大模型推理框架（Inference Engine）</strong>中的核心组件——<strong>注意力层（Attention Layer）</strong>的实现。</p>
+<p>为了让你看懂，我们不需要一下子钻进代码细节。我们可以把它想象成一个<strong>“任务清单”（Todo List）</strong>。我们现在的目标是：<strong>手动实现一个能在多张显卡上运行、速度极快的LLM注意力层</strong>。</p>
+<p>下面是为你定制的学习路径和步骤解析：</p>
+<hr />
+<h3>🚀 学习任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 01: 理解我们在造什么 (宏观概念)</strong></li>
+<li><strong>Task 02: 搞定多卡并行 (Tensor Parallelism)</strong></li>
+<li><strong>Task 03: 拆解输入数据 (Q, K, V)</strong></li>
+<li><strong>Task 04: 注入位置信息 (RoPE)</strong></li>
+<li><strong>Task 05: 调用加速引擎 (Backend/Kernel)</strong></li>
+</ol>
+<hr />
+<h3>📝 逐步讲解</h3>
+<h4>✅ Task 01: 理解我们在造什么</h4>
+<p><strong>目标</strong>：知道 <code>AttentionLayer</code> 是干嘛的。</p>
+<ul>
+<li><strong>通俗解释</strong>：在大模型里，"注意力"机制就是让模型在生成下一个字时，回头看看前面的字（Context）。</li>
+<li><strong>代码对应</strong>：
+    <code>python
+    class AttentionLayer(BaseOP):</code>
+    这是一个类，代表 Transformer 架构中的一层注意力层。</li>
+</ul>
+<h4>✅ Task 02: 搞定多卡并行 (Tensor Parallelism)</h4>
+<p><strong>目标</strong>：模型太大，一张显卡装不下，我们需要把计算任务分摊给多张卡。</p>
+<ul>
+<li><strong>通俗解释</strong>：假设模型有 32 个“头”（Heads，可以理解为 32 个并行的思考单元）。如果你有 2 张显卡，那么每张卡只需要负责计算 16 个头。</li>
+<li>
+<p><strong>代码对应</strong> (<code>__init__</code> 函数部分)：
+    ```python
+    # 获取并行信息，比如现在有几张卡 (tp_size)
+    tp_size = get_tp_info().size</p>
+<h1>将总的 Query 头数除以卡数，算出当前这张卡负责几个头</h1>
+<p>self._num_qo_heads = divide_even(num_qo_heads, tp_size)</p>
+<h1>同理，算出当前这张卡负责几个 KV 头</h1>
+<p>self._num_kv_heads = divide_even(num_kv_heads, tp_size)
+```
+<strong>核心点</strong>：这段代码在做<strong>切分</strong>，确保每张卡只处理属于它那一小部分的计算量。</p>
+</li>
+</ul>
+<h4>✅ Task 03: 拆解输入数据 (Q, K, V)</h4>
+<p><strong>目标</strong>：处理进入这一层的原始数据。</p>
+<ul>
+<li><strong>通俗解释</strong>：
+    输入的数据通常是一个融合的大张量 <code>qkv</code>。我们需要把它切成三份：<ol>
+<li><strong>Q (Query)</strong>: 我现在想查什么？</li>
+<li><strong>K (Key)</strong>: 文章里有哪些关键词？</li>
+<li><strong>V (Value)</strong>: 关键词对应的内容是什么？</li>
+</ol>
+</li>
+<li>
+<p><strong>代码对应</strong> (<code>forward</code> 函数部分)：
+    ```python
+    # 计算切分点：Q的维度，K的维度，V的维度
+    self._qo_attn_dim = self._num_qo_heads * head_dim
+    self._kv_attn_dim = self._num_kv_heads * head_dim</p>
+<h1>动作：一刀切成三份</h1>
+<h1>split 的依据是 dim=-1 (最后一个维度)</h1>
+<p>q, k, v = qkv.split([self._qo_attn_dim, self._kv_attn_dim, self._kv_attn_dim], dim=-1)
+```</p>
+</li>
+</ul>
+<h4>✅ Task 04: 注入位置信息 (RoPE)</h4>
+<p><strong>目标</strong>：告诉模型“第一个字”和“第十个字”的区别。</p>
+<ul>
+<li><strong>通俗解释</strong>：Transformer 本质上不认识顺序（“我爱你”和“你爱我”对它来说是一样的）。我们需要给向量“打上位置标签”。这里用的是 <strong>RoPE (旋转位置编码)</strong>，一种通过旋转向量角度来表示位置的高级数学技巧。</li>
+<li>
+<p><strong>代码对应</strong>：
+    ```python
+    # 1. 初始化 RoPE 工具 (在 <strong>init</strong> 里)
+    self.rotary = get_rope(...)</p>
+<h1>2. 获取当前这批数据的位置信息 (比如这是第几个token)</h1>
+<p>metadata = ctx.batch.attn_metadata</p>
+<h1>3. 执行旋转操作 (在 forward 里)</h1>
+<p>if self.rotary:
+    # 给 Q 和 K 加上位置信息，V 不需要加
+    q, k = self.rotary.forward(metadata.get_positions(), q, k)
+```</p>
+</li>
+</ul>
+<h4>✅ Task 05: 调用加速引擎 (Backend/Kernel)</h4>
+<p><strong>目标</strong>：执行真正的注意力计算（矩阵乘法 + Softmax）。</p>
+<ul>
+<li><strong>通俗解释</strong>：这是最耗时的步骤。Python 算得太慢了。这段代码并没有自己写 <code>for</code> 循环或者 <code>torch.matmul</code> 来算注意力，而是把整理好的 Q、K、V 直接丢给一个写好的<strong>C++/CUDA 底层加速器</strong>（通常是 FlashAttention 或者 PagedAttention）。</li>
+<li>
+<p><strong>代码对应</strong> (<code>forward</code> 函数最后)：
+    ```python
+    # 调整 Q 的形状，以便后端处理
+    q = q.view(-1, self._num_qo_heads, self._head_dim)</p>
+<h1>【关键一步】把任务外包给 attn_backend</h1>
+<h1>这里的 ctx.attn_backend 就像是一个黑盒，</h1>
+<h1>它可以是 FlashInfer, xFormers 或者 vLLM 的 PagedAttention</h1>
+<p>o = ctx.attn_backend.forward(q, k, v, self._layer_id, ctx.batch)</p>
+<h1>把结果变回原来的形状返回</h1>
+<p>return o.view(-1, self._qo_attn_dim)
+```</p>
+</li>
+</ul>
+<hr />
+<h3>总结：这段代码的剧情走向</h3>
+<ol>
+<li>
+<p><strong>准备阶段 (<code>__init__</code>)</strong>：</p>
+<ul>
+<li>我是第几层？</li>
+<li>我有几张显卡？那我分到几个头？</li>
+<li>准备好位置编码器 (RoPE)。</li>
+</ul>
+</li>
+<li>
+<p><strong>运行阶段 (<code>forward</code>)</strong>：</p>
+<ul>
+<li>拿到一坨混合数据 <code>qkv</code>。</li>
+<li><strong>切菜</strong>：把 <code>qkv</code> 切分成 <code>q</code>, <code>k</code>, <code>v</code>。</li>
+<li><strong>撒盐</strong>：给 <code>q</code> 和 <code>k</code> 撒上位置信息 (RoPE)。</li>
+<li><strong>下锅炒</strong>：把处理好的原料丢给超级厨师 (<code>attn_backend</code>) 进行极速爆炒。</li>
+<li><strong>出锅</strong>：把炒好的结果 <code>o</code> 整理一下盘子 (reshape)，端出去。</li>
+</ul>
+</li>
+</ol>
+<p>现在的感觉是不是清晰一点了？这其实是一个<strong>胶水代码</strong>，负责数据预处理和调度，真正的数学计算都在 <code>ctx.attn_backend</code> 和 <code>self.rotary</code> 里面。</p>

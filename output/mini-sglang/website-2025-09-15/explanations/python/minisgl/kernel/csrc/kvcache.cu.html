@@ -1,0 +1,113 @@
+<h1>python/minisgl/kernel/csrc/kvcache.cu</h1>
+<p>这份代码确实比较硬核，因为它涉及到 <strong>CUDA编程</strong>、<strong>PyTorch的C++扩展</strong> 以及 <strong>底层内存优化</strong>。</p>
+<p>简单来说，这个文件的作用是：<strong>“搬运工”</strong>。它负责把大模型推理过程中新生成的 Key 和 Value 数据（<code>k</code>, <code>v</code>），高效地“搬运”到显存中预先分配好的 KV Cache 缓存区（<code>k_cache</code>, <code>v_cache</code>）的指定位置（<code>out_loc</code>）。</p>
+<p>为了让你读懂，我把阅读这个文件拆解成一个 <strong>5步走的 Task List</strong>，我们一步步来攻克。</p>
+<hr />
+<h3>Task List: 读懂 KV Cache 搬运工</h3>
+<ol>
+<li><strong>Task 1: 搞清楚目标 (Objective)</strong> —— 为什么要写这个文件？</li>
+<li><strong>Task 2: 找到入口 (Entry Point)</strong> —— Python 是怎么调用它的？</li>
+<li><strong>Task 3: 数据预处理 (Preparation)</strong> —— 在 CPU 上要做哪些准备工作？</li>
+<li><strong>Task 4: 核心搬运逻辑 (The Kernel)</strong> —— GPU 线程具体是怎么搬数据的？</li>
+<li><strong>Task 5: 理解黑魔法 (Optimization)</strong> —— 为什么要用 <code>uint64_t</code>？</li>
+</ol>
+<hr />
+<h3>详细讲解</h3>
+<h4>Task 1: 搞清楚目标 (Objective)</h4>
+<p>在 LLM 推理（比如 GPT 生成文字）时，为了加速，我们需要把之前计算过的 Key 和 Value 保存下来，这就是 <strong>KV Cache</strong>。
+显存中的 Cache 是一块巨大的内存池。每生成一个新 token，我们就要把它的 K 和 V 塞进这个池子里对应的位置。</p>
+<ul>
+<li><strong>输入</strong>：<ul>
+<li><code>k</code>, <code>v</code>: 当前新生成的 Key 和 Value 数据。</li>
+<li><code>out_loc</code>: 告诉程序，这批数据应该放在 Cache 的第几个格子里（显存地址索引）。</li>
+</ul>
+</li>
+<li><strong>输出</strong>：<ul>
+<li>把数据填进 <code>k_cache</code> 和 <code>v_cache</code>。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 2: 找到入口 (Entry Point)</h4>
+<p>看文件的最末尾。这是 PyTorch C++ 扩展的标准写法。</p>
+<div class="codehilite"><pre><span></span><code><span class="n">PYBIND11_MODULE</span><span class="p">(</span><span class="n">kvcache_kernel</span><span class="p">,</span><span class="w"> </span><span class="n">m</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="c1">// Python 里的函数名叫 store_cache，对应 C++ 里的 store_cache_dispatch 函数</span>
+<span class="w">  </span><span class="n">m</span><span class="p">.</span><span class="n">def</span><span class="p">(</span><span class="s">&quot;store_cache&quot;</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">store_cache_dispatch</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;Store key-value cache...&quot;</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><strong>解读</strong>：
+你在 Python 里调用 <code>minisgl.store_cache(...)</code> 时，实际上是在运行 C++ 里的 <code>store_cache_dispatch</code> 函数。</p>
+<h4>Task 3: 数据预处理 (Preparation)</h4>
+<p>现在看 <code>store_cache_dispatch</code> 函数（代码中间部分）。这是在 CPU 上运行的主控逻辑。</p>
+<p><strong>它的 Todo List：</strong>
+1.  <strong>检查数据合法性</strong>：
+    *   <code>TORCH_CHECK(...)</code>: 确保所有 Tensor 都在 GPU 上（CUDA），确保 K 和 V 的形状一样，确保内存是连续的。
+2.  <strong>计算指针和步长 (Strides)</strong>：
+    *   代码里有一堆 <code>stride</code> 计算。最关键的是它把数据指针转换成了 <code>uint64_t*</code>。
+    *   <code>static_cast&lt;uint64_t *&gt;(k_cache.data_ptr())</code>: 获取显存的物理地址。
+3.  <strong>决定启动多少 GPU 线程</strong>：
+    *   <code>num_warps</code>: 按照每个 Block 256 个线程计算。
+    *   <code>num_blocks</code>: 根据要处理的数据长度（<code>length</code>）决定启动多少个 Block。
+4.  <strong>选择并启动内核 (Launch Kernel)</strong>：
+    *   这里有一个 <code>if (size_bytes % 256 == 0)</code> 的判断。
+    *   这是为了性能。如果数据宽度是 256 字节的倍数，就用 <code>store_kv_cache_256x1</code>（更快）；如果是 128 字节的倍数，用另一个。
+    *   <strong>核心动作</strong>：<code>&lt;&lt;&lt;num_blocks, num_threads...&gt;&gt;&gt;</code> 这行代码就是命令 GPU 开始干活。</p>
+<h4>Task 4: 核心搬运逻辑 (The Kernel)</h4>
+<p>这是最难懂的部分，看 <code>__global__ void store_kv_cache_256x1</code>。这是在 GPU 上运行的代码。</p>
+<p><strong>场景想象</strong>：
+假设有一堆搬运工（GPU 线程），我们要把一车砖（K/V 数据）搬到仓库（Cache）的指定货架（out_loc）。</p>
+<p><strong>步骤解析</strong>：</p>
+<ol>
+<li>
+<p><strong>分组干活 (Warp)</strong>：
+    <code>cpp
+    const auto warp_id = idx / 32; // 第几组搬运工
+    const auto lane_id = idx % 32; // 组里的第几号工人</code>
+    GPU 里的线程是按“Warp”（32个线程一组）来干活的。<strong>这里设计的是：一个 Warp 负责搬运一个 Token 的 K 和 V。</strong></p>
+</li>
+<li>
+<p><strong>确定目标地址</strong>：
+    <code>cpp
+    if (warp_id &gt;= length) return; // 工人多了，没活干的休息
+    const auto offset = out_loc[warp_id]; // 查表：我的这个 Token 该放哪个货架？</code>
+    <code>out_loc</code> 就是那个表格，告诉第 <code>warp_id</code> 个 Token 应该去 Cache 的第 <code>offset</code> 行。</p>
+</li>
+<li>
+<p><strong>计算具体内存地址</strong>：
+    <code>cpp
+    const auto k_dst = k_cache + offset * kv_cache_stride; // 目标 K 地址
+    const auto k_src = k + warp_id * kv_input_stride;      // 源 K 地址</code></p>
+</li>
+<li>
+<p><strong>疯狂搬运 (Loop Copy)</strong>：
+    <code>cpp
+    for (size_t i = 0; i &lt; num_items; ++i) {
+      // 32个线程同时干活，每个人搬一部分
+      k_dst[lane_id + i * 32] = k_src[lane_id + i * 32];
+      v_dst[lane_id + i * 32] = v_src[lane_id + i * 32];
+    }</code>
+    这里是并行拷贝。因为一个 Token 的向量可能很长（比如 128 维或更大），32 个线程一次搬不完，所以用 <code>for</code> 循环分几次搬。</p>
+</li>
+</ol>
+<h4>Task 5: 理解黑魔法 (Optimization)</h4>
+<p>你可能会困惑：<strong>为什么代码里全是 <code>uint64_t</code>？我的模型不是 <code>float16</code> 吗？</strong></p>
+<p>这是 <strong>内存拷贝的极速优化</strong>。</p>
+<ul>
+<li><strong>原理</strong>：<ul>
+<li><code>float16</code> 是 2 个字节。</li>
+<li><code>uint64_t</code> 是 8 个字节。</li>
+<li>GPU 的内存总线很宽。如果你一次只搬 2 字节，效率很低。</li>
+<li><strong>Trick</strong>：我们把数据看作是“一串二进制”，不管它是浮点数还是什么。我们强制把它当成 <code>uint64_t</code> 来搬，这样<strong>一次指令就能搬运 4 个 <code>float16</code> 的数据</strong>（8字节）。</li>
+</ul>
+</li>
+<li><strong>代码体现</strong>：<ul>
+<li><code>kv_cache_stride_bytes / 8</code>: 计算步长时除以 8，就是因为单位变成了 8 字节的 <code>uint64_t</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件在讲什么？</p>
+<p>它定义了一个函数，利用 GPU 的并行能力，把一批新的 K/V 向量，<strong>无视数据类型（强制转为64位整数）</strong>，以 <strong>Warp（32线程）为单位</strong>，飞快地拷贝到显存中由 <code>out_loc</code> 指定的非连续内存地址中去。</p>
+<p><strong>一句话人话版</strong>：
+“嘿 GPU，别管这堆数据是啥，按每 8 字节一组，把它们全速复制到我给你的那个地址列表里去！”</p>

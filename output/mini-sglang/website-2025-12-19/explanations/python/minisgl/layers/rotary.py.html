@@ -1,0 +1,81 @@
+<h1>python/minisgl/layers/rotary.py</h1>
+<p>这段代码确实涉及了大模型（LLM）底层比较核心和数学化的部分，叫做 <strong>RoPE (Rotary Positional Embedding，旋转位置编码)</strong>。简单来说，这是为了让模型知道“哪个词在前，哪个词在后”。</p>
+<p>为了让你能看懂，我把它拆解成一个 <strong>6步的学习清单 (Todo List)</strong>。我们一步步来打钩。</p>
+<hr />
+<h3>✅ Task 1: 搞懂核心目标 (What is this?)</h3>
+<p><strong>目标</strong>：理解这个类 <code>RotaryEmbedding</code> 是干什么的。
+<strong>解释</strong>：
+在大模型里，如果不加位置编码，模型会觉得 "我 爱 你" 和 "你 爱 我" 是一样的，因为它只看词，不看顺序。
+RoPE 是一种数学技巧，通过<strong>旋转</strong>向量的角度来表示位置。
+*   <strong>代码对应</strong>：整个 <code>class RotaryEmbedding</code>。它的作用就是给输入的 <code>query</code> (查询向量) 和 <code>key</code> (键向量) 加上位置信息。</p>
+<hr />
+<h3>✅ Task 2: 准备数学“刻度尺” (Initialization)</h3>
+<p><strong>目标</strong>：看懂 <code>__init__</code> 函数的前半部分。
+<strong>解释</strong>：
+要进行旋转，首先得算出每个位置（第1个词、第2个词...）需要转多少度。
+*   <strong>代码对应</strong>：
+    ```python
+    # 1. 计算频率的倒数。base通常是10000或500000。
+    # 这就好比时钟的长针和短针，转的速度不一样。
+    inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))</p>
+<div class="codehilite"><pre><span></span><code><span class="err">#</span><span class="w"> </span><span class="mi">2</span><span class="p">.</span><span class="w"> </span><span class="nx">生成位置索引</span><span class="w"> </span><span class="p">[</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="o">...</span><span class="p">,</span><span class="w"> </span><span class="nx">max_pos</span><span class="p">]</span>
+<span class="nx">t</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">torch</span><span class="p">.</span><span class="nx">arange</span><span class="p">(</span><span class="nx">max_position_embeddings</span><span class="p">,</span><span class="w"> </span><span class="nx">dtype</span><span class="p">=</span><span class="nx">torch</span><span class="p">.</span><span class="nx">float</span><span class="p">)</span>
+
+<span class="err">#</span><span class="w"> </span><span class="mi">3</span><span class="p">.</span><span class="w"> </span><span class="nx">外积计算</span><span class="err">。</span><span class="nx">得到一个大矩阵</span><span class="err">，</span><span class="nx">包含了所有位置对应的旋转角度</span><span class="err">。</span>
+<span class="nx">freqs</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">torch</span><span class="p">.</span><span class="nx">einsum</span><span class="p">(</span><span class="s">&quot;i,j -&gt; ij&quot;</span><span class="p">,</span><span class="w"> </span><span class="nx">t</span><span class="p">,</span><span class="w"> </span><span class="nx">inv_freq</span><span class="p">)</span>
+<span class="err">```</span>
+</code></pre></div>
+
+<hr />
+<h3>✅ Task 3: 预计算并缓存 (Caching)</h3>
+<p><strong>目标</strong>：看懂 <code>_cos_sin_cache</code> 是干嘛的。
+<strong>解释</strong>：
+旋转在数学上是通过乘以 $\cos$ 和 $\sin$ 来实现的。因为这些角度对于固定的长度是永远不变的，我们<strong>不需要每次推理都算一遍</strong>。
+*   <strong>代码对应</strong>：
+    <code>python
+    cos = freqs.cos()
+    sin = freqs.sin()
+    # 把 cos 和 sin 拼起来存好。
+    # 这就好比你查字典，先把字典印好放在桌上，而不是每次要查字的时候现写一本字典。
+    self._cos_sin_cache = torch.cat((cos, sin), dim=-1)</code></p>
+<hr />
+<h3>✅ Task 4: 真正干活的地方 (Forward &amp; Optimization)</h3>
+<p><strong>目标</strong>：看懂 <code>forward</code> 函数和 <code>flashinfer</code>。
+<strong>解释</strong>：
+这是代码最“硬核”的地方。普通的 PyTorch 实现 RoPE 比较慢，这里为了加速（MiniSGL 是一个高性能推理库），直接调用了底层的 C++/CUDA 库 <code>flashinfer</code>。
+*   <strong>代码对应</strong>：
+    ```python
+    from flashinfer import apply_rope_with_cos_sin_cache_inplace</p>
+<div class="codehilite"><pre><span></span><code>def forward(self, positions, query, key):
+    # 这里的 inplace 意味着直接修改 query 和 key 的数值，不创建新变量，省显存。
+    # 它利用之前算好的 _cos_sin_cache，根据 positions (当前词的位置)，
+    # 把 query 和 key 进行“旋转”。
+    self.apply_rope_with_cos_sin_cache_inplace(...)
+    return query, key
+```
+</code></pre></div>
+
+<hr />
+<h3>✅ Task 5: 进阶 - LLaMA 3 的特殊处理 (Scaling)</h3>
+<p><strong>目标</strong>：看懂 <code>_get_rope</code> 里的 <code>match rope_scaling</code> 部分。
+<strong>解释</strong>：
+LLaMA 3 引入了一种新的技术来支持超长文本（比如本来只能看8k长度，现在想看128k）。这需要对旋转的频率做“缩放”（Scaling）。
+*   <strong>代码对应</strong>：
+    *   <code>case "llama3"</code>: 专门针对 LLaMA 3 的逻辑。
+    *   <code>def post_process(inv_freq)</code>: 这是一个修正函数。它根据 <code>low_freq_factor</code> 和 <code>high_freq_factor</code> 把原来的频率（刻度尺）拉伸或压缩了一下，让模型能处理更长的文章。</p>
+<hr />
+<h3>✅ Task 6: 节省资源的“单例模式” (Global Helper)</h3>
+<p><strong>目标</strong>：看懂 <code>get_rope</code> 和 <code>@lru_cache</code>。
+<strong>解释</strong>：
+一个大模型有几十层（Layers），每一层都需要用 RoPE。但每一层的 RoPE 参数其实是一模一样的。我们不需要创建 32 个 <code>RotaryEmbedding</code> 对象，太浪费内存了。
+*   <strong>代码对应</strong>：
+    *   <code>@lru_cache()</code>: Python 的装饰器。如果参数一样，直接返回上次创建好的对象，不再新建。
+    *   <code>set_rope_device</code>: 告诉程序，这些计算是在 CPU 上做还是 GPU 上做。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件的逻辑流是：
+1.  <strong><code>get_rope</code></strong>: 外部调用这个函数获取对象（带缓存，省内存）。
+2.  <strong><code>_get_rope</code></strong>: 决定是用普通的 RoPE 还是 LLaMA 3 特供版 RoPE。
+3.  <strong><code>RotaryEmbedding.__init__</code></strong>: 算出 $\cos$ 和 $\sin$ 表，存起来（Cache）。
+4.  <strong><code>RotaryEmbedding.forward</code></strong>: 真正推理时，调用超快的 <code>flashinfer</code> 库，查表并旋转向量。</p>
+<p>现在你再回头看代码，是不是清晰了一些？重点就是：<strong>预计算角度表</strong> 和 <strong>调用底层加速库进行旋转</strong>。</p>

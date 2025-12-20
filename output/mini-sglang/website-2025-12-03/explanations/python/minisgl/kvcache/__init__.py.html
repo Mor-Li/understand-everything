@@ -1,0 +1,89 @@
+<h1>python/minisgl/kvcache/<strong>init</strong>.py</h1>
+<p>这份代码看起来虽然短，但它实际上是一个<strong>大型语言模型（LLM）推理引擎</strong>的核心组件之一：<strong>显存管理入口</strong>。</p>
+<p>为了让你彻底搞懂，我们不能只看代码，得先懂“为什么要写这几行代码”。我为你设计了一个由浅入深的 <strong>4步学习任务清单 (Todo List)</strong>。</p>
+<hr />
+<h3>📋 学习任务清单</h3>
+<ol>
+<li><strong>Task 1：搞懂背景</strong> —— 什么是 KV Cache？为什么要存它？</li>
+<li><strong>Task 2：搞懂存储</strong> —— <code>create_kvcache</code> 函数是在造什么？</li>
+<li><strong>Task 3：搞懂管理</strong> —— <code>create_cache_manager</code> 函数是在管什么？</li>
+<li><strong>Task 4：搞懂代码</strong> —— 这个文件的角色是什么？</li>
+</ol>
+<hr />
+<h3>🟢 Task 1：搞懂背景 (什么是 KV Cache)</h3>
+<p><strong>概念：</strong>
+LLM（像 ChatGPT）生成文字时，是一个字一个字蹦出来的。
+比如生成：“我爱吃苹果”。
+1. 输入“我”，模型算出“爱”。
+2. 把“我爱”放进去，算出“吃”。
+3. 把“我爱吃”放进去，算出“苹果”。</p>
+<p><strong>问题：</strong>
+每次生成新字，前面的“我爱吃”都要重新算一遍，非常浪费时间。
+<strong>KV Cache</strong> 就是把前面算过的“我爱吃”的数学特征（Key 和 Value 矩阵）<strong>存下来</strong>。下次只算新字，前面的直接从显存里拿。</p>
+<p><strong>结论：</strong>
+KV Cache 就是一块<strong>显存区域</strong>，用来存历史数据的“笔记”，以加速推理。</p>
+<hr />
+<h3>🟢 Task 2：搞懂存储 (<code>create_kvcache</code>)</h3>
+<p>现在看代码中的第一个函数 <code>create_kvcache</code>。</p>
+<p><strong>代码逻辑：</strong>
+这是一个<strong>工厂函数</strong>（Factory）。就像你要买车，你不需要知道车怎么造，你只需要告诉工厂：“我要4个轮子、红色、跑车”，工厂就给你返一个车对象。</p>
+<p><strong>参数详解（你需要告诉工厂什么）：</strong>
+*   <code>num_layers</code>: 模型有多少层（比如 Llama3-8B 有32层）。
+*   <code>num_kv_heads</code>: 有多少个注意力头（负责并行计算的单元）。
+*   <code>head_dim</code>: 每个头的大小。
+*   <code>num_pages</code>: <strong>重点！</strong> 现在的推理引擎（如 vLLM）不申请连续显存，而是像操作系统一样，把显存切成一块块的“页（Page）”。这里问的是：你要申请多少页显存作为总池子？
+*   <code>device</code>: 存到哪？（通常是 GPU，即 <code>cuda</code>）。
+*   <code>cache_type</code>: 缓存类型。代码里目前只支持 <code>MHA</code> (Multi-Head Attention，最标准的多头注意力)。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">create_kvcache</span><span class="p">(</span><span class="o">...</span><span class="p">):</span>
+    <span class="c1"># ... 导入具体的实现类 MHAKVCache</span>
+    <span class="k">match</span> <span class="n">cache_type</span><span class="p">:</span>
+        <span class="k">case</span> <span class="n">KVCacheType</span><span class="o">.</span><span class="n">MHA</span><span class="p">:</span>
+            <span class="c1"># 如果你要 MHA 类型的缓存，我就给你实例化一个 MHAKVCache 对象</span>
+            <span class="c1"># 这里的 MHAKVCache 就是真正占用了几 GB 显存的大仓库</span>
+            <span class="k">return</span> <span class="n">MHAKVCache</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>Task 2 总结：</strong> 这个函数的作用是<strong>“划地盘”</strong>。它在显卡上根据你给的参数，圈出一大块显存，切成很多小块（Pages），准备用来存数据。</p>
+<hr />
+<h3>🟢 Task 3：搞懂管理 (<code>create_cache_manager</code>)</h3>
+<p>地盘（Cache）划好了，谁来负责分配？
+比如：用户A来了，给他第5页；用户B来了，给他第8页。这就需要一个<strong>管理员</strong>。</p>
+<p>这就是 <code>create_cache_manager</code> 的作用。</p>
+<p><strong>两种管理员（策略）：</strong>
+1.  <strong><code>naive</code> (NaiveCacheManager)</strong>:
+    *   <strong>傻瓜式管理</strong>。来一个请求，就按顺序给它分配显存页。用完就释放。简单，但不够聪明。
+2.  <strong><code>radix</code> (RadixCacheManager)</strong>:
+    *   <strong>高级管理（基数树管理）</strong>。这是 SGLang/vLLM 的精髓。
+    *   <strong>场景</strong>：你问了一遍“北京天气怎么样？”，然后又问“北京天气怎么样？需不需要带伞？”
+    *   Naive 管理员会重新算两遍。
+    *   Radix 管理员会发现：“哎？‘北京天气怎么样’这句话刚才算过了，存在第 10 页显存里，我不删它，你直接复用第 10 页，接着算后面的就行！”
+    *   它能<strong>复用前缀</strong>，极大提高速度。</p>
+<p><strong>代码解读：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">create_cache_manager</span><span class="p">(</span><span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">,</span> <span class="nb">type</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">BaseCacheManager</span><span class="p">:</span>
+    <span class="k">match</span> <span class="nb">type</span><span class="p">:</span>
+        <span class="k">case</span> <span class="s2">&quot;radix&quot;</span><span class="p">:</span>
+            <span class="c1"># 创建一个聪明的管理员，支持前缀复用</span>
+            <span class="k">return</span> <span class="n">RadixCacheManager</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+        <span class="k">case</span> <span class="s2">&quot;naive&quot;</span><span class="p">:</span>
+            <span class="c1"># 创建一个普通的管理员</span>
+            <span class="k">return</span> <span class="n">NaiveCacheManager</span><span class="p">(</span><span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>Task 3 总结：</strong> 这个函数的作用是<strong>“雇管家”</strong>。决定是用普通管家还是高级管家来分配显存页。</p>
+<hr />
+<h3>🟢 Task 4：搞懂代码 (文件角色)</h3>
+<p>最后回到这个文件 <code>python/minisgl/kvcache/__init__.py</code> 本身。</p>
+<p><strong>它的角色：</strong>
+它是 <code>kvcache</code> 这个模块的<strong>“接待大厅” (Public API)</strong>。</p>
+<ol>
+<li><strong>对外暴露接口</strong>：外部代码不需要知道 <code>MHAKVCache</code> 在 <code>mha_pool.py</code> 里，也不需要知道 <code>RadixCacheManager</code> 在 <code>radix_manager.py</code> 里。</li>
+<li><strong>简化调用</strong>：外部只需要 <code>import minisgl.kvcache</code>，然后调用 <code>create_kvcache</code> 或 <code>create_cache_manager</code> 即可。</li>
+<li><strong><code>__all__</code></strong>：定义了当别人写 <code>from minisgl.kvcache import *</code> 时，能导出哪些东西。</li>
+</ol>
+<hr />
+<h3>🎯 最终总结 (一句话看懂)</h3>
+<p>这个文件是 <strong>KV Cache 系统的控制台</strong>。它提供了两个按钮：
+1.  <strong><code>create_kvcache</code></strong>: 帮你在显卡上<strong>买一块地</strong>（申请显存池）。
+2.  <strong><code>create_cache_manager</code></strong>: 帮你<strong>雇一个管家</strong>（管理显存分配策略，是简单的还是可复用的）。</p>
+<p>所有的底层复杂实现（怎么切分内存、怎么构建树结构）都被藏在了 <code>create_...</code> 函数内部的 <code>import</code> 里，让你用起来很简单。</p>

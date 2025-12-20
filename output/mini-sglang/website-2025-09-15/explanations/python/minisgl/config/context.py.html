@@ -1,0 +1,101 @@
+<h1>python/minisgl/config/context.py</h1>
+<p>这份代码是 <code>minisgl</code>（看起来是一个迷你版的大语言模型推理框架，类似 vLLM 或 SGLang）的核心状态管理模块。</p>
+<p>它主要解决的问题是：<strong>当大模型同时服务多个用户时，如何管理每个用户的请求数据、如何把它们打包成批次（Batch）、以及如何告诉 GPU 当前要处理哪些数据。</strong></p>
+<p>为了让你听懂，我制定了一个<strong>四步走的学习清单 (Task List)</strong>。我们会从最微观的“单个请求”开始，一直讲到“全局管理”。</p>
+<hr />
+<h3>📚 学习清单 (Task List)</h3>
+<ol>
+<li><strong>Task 01: 理解最小单元 <code>Req</code> (Request)</strong><ul>
+<li>搞懂一个用户的请求里包含了哪些核心数据（输入、历史记录、显存位置）。</li>
+</ul>
+</li>
+<li><strong>Task 02: 理解打包机制 <code>Batch</code> &amp; <code>Phase</code></strong><ul>
+<li>搞懂为什么要区分 "Prefill" (预填充) 和 "Decode" (解码) 阶段。</li>
+<li>代码是如何自动判断当前处于哪个阶段的。</li>
+</ul>
+</li>
+<li><strong>Task 03: 理解环境上下文 <code>Context</code></strong><ul>
+<li>搞懂什么是 <code>page_table</code>（页表），它在显存管理里起什么作用。</li>
+<li><code>Context</code> 类是如何作为“管家”协调 KV Cache 和 Attention 后端的。</li>
+</ul>
+</li>
+<li><strong>Task 04: 全局单例模式</strong><ul>
+<li>最后看一眼代码底部的 <code>_GLOBAL_CTX</code> 是干嘛的。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 01: 理解最小单元 <code>Req</code> (Request)</h4>
+<p><strong>概念：</strong>
+想象你在跟 ChatGPT 聊天。你发出的每一次对话，在系统里就是一个 <code>Req</code> 对象。</p>
+<p><strong>代码核心点解析：</strong></p>
+<ul>
+<li><strong><code>input_ids</code></strong>: 用户输入的文字转换成的数字 ID。代码里有一段逻辑 <code>if not input_ids.is_cuda...</code>，这是为了把数据从 CPU 搬运到 GPU 上，这是深度学习推理的第一步。</li>
+<li><strong><code>page_table_idx</code></strong>: <strong>这是最关键的概念。</strong> 大模型推理需要记住之前的对话（KV Cache）。为了不浪费显存，现代框架（如 vLLM）使用“分页内存管理”。这个 ID 就是告诉你：“这个请求的历史记忆存储在显存的第几页”。</li>
+<li><strong><code>cached_len</code> vs <code>device_len</code></strong>:<ul>
+<li><code>device_len</code>: 当前 GPU 上总共有多少个 token。</li>
+<li><code>cached_len</code>: 已经计算过并存入 KV Cache 的 token 数量。</li>
+<li><strong>例子</strong>: 你发了 "Hello world" (2个词)。第一次处理时，<code>device_len</code>=2，<code>cached_len</code>=0。处理完后，这两个词存入缓存。当你生成下一个词时，<code>cached_len</code> 就变成 2 了。</li>
+</ul>
+</li>
+<li><strong><code>append</code> 方法</strong>: 当模型吐出一个新词（<code>next_token</code>）时，把它拼接到 <code>device_ids</code> 后面，并更新缓存长度。这就是“自回归生成”（一个词接一个词蹦）。</li>
+</ul>
+<h4>Task 02: 理解打包机制 <code>Batch</code> &amp; <code>Phase</code></h4>
+<p><strong>概念：</strong>
+GPU 很强大，一次只处理一个人的请求太浪费了。我们需要把多个 <code>Req</code> 打包成一个 <code>Batch</code> 一起送进 GPU。</p>
+<p><strong>代码核心点解析：</strong></p>
+<ul>
+<li><strong><code>Phase</code> (阶段)</strong>: 大模型推理主要分两个阶段：<ol>
+<li><strong>Prefill (预填充)</strong>: 处理用户刚发的长提示词（Prompt）。这是一次性计算很多 Token，计算量大。</li>
+<li><strong>Decode (解码)</strong>: 根据提示词，一个接一个地生成新 Token。这是串行的，每次只处理 1 个 Token。</li>
+</ol>
+</li>
+<li><strong><code>_auto_phase</code> (自动判断阶段)</strong>:<ul>
+<li>代码逻辑：<code>if all(req.extend_len == 1 for req in reqs): return "decode"</code></li>
+<li><strong>解释</strong>: 如果这个批次里，<strong>所有</strong>请求都只需要处理 <strong>1个</strong> 新 Token（说明之前的都处理完了，正在生成新词），那就是 <strong>Decode</strong> 阶段。否则，只要有一个请求需要处理一大段新话，系统就认为是 <strong>Prefill</strong> 阶段。</li>
+</ul>
+</li>
+<li><strong><code>Batch</code> 类</strong>: 它就是一个容器，装着一堆 <code>Req</code>，并且标记了当前这堆东西是处于 Prefill 还是 Decode 状态。</li>
+</ul>
+<h4>Task 03: 理解环境上下文 <code>Context</code></h4>
+<p><strong>概念：</strong>
+<code>Context</code> 是整个推理引擎的“大管家”或者“工作台”。它持有所有共享的资源。</p>
+<p><strong>代码核心点解析：</strong></p>
+<ul>
+<li><strong><code>page_table</code> (页表)</strong>:<ul>
+<li>代码：<code>create_page_table</code> 创建了一个全是 0 的二维 Tensor。</li>
+<li><strong>解释</strong>: 这是一个映射表。就像书的目录。它记录了“逻辑上的 Token”到底存放在“物理显存（KV Cache）”的哪个位置。</li>
+<li><code>max_entries</code> 是最大并发请求数，<code>max_seq_len</code> 是最大句子长度。</li>
+</ul>
+</li>
+<li><strong><code>kv_cache</code> &amp; <code>attn_backend</code></strong>:<ul>
+<li><code>kv_cache</code>: 实际存放数据的仓库对象。</li>
+<li><code>attn_backend</code>: 实际执行 Attention 计算（比如 FlashAttention）的算法后端。</li>
+</ul>
+</li>
+<li><strong><code>forward_batch</code> (上下文管理器)</strong>:<ul>
+<li>这是一个 Python 的 <code>with</code> 语法糖。</li>
+<li><strong>作用</strong>: 当模型开始跑一次前向传播（Forward）时，要把当前的 <code>Batch</code> 设为全局可见。</li>
+<li>流程：<code>set_batch</code> (设置当前批次) -&gt; <code>yield</code> (执行模型计算) -&gt; <code>reset_batch</code> (清空，准备下一轮)。</li>
+</ul>
+</li>
+</ul>
+<h4>Task 04: 全局单例模式</h4>
+<p><strong>代码：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">_GLOBAL_CTX</span><span class="p">:</span> <span class="n">Context</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">set_global_ctx</span><span class="p">(</span><span class="n">ctx</span><span class="p">:</span> <span class="n">Context</span><span class="p">):</span> <span class="o">...</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">get_global_ctx</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">Context</span><span class="p">:</span> <span class="o">...</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+这是一个典型的编程模式。因为 <code>Context</code> 包含了页表、KV Cache 等核心资源，这些资源在模型的很多深层函数里都需要用到。
+如果每次调用函数都把 <code>ctx</code> 作为一个参数传进去（比如 <code>func(a, b, c, ctx)</code>），代码会变得非常丑陋且麻烦。
+所以，这里设置了一个<strong>全局变量</strong>。初始化一次后，任何地方只要调用 <code>get_global_ctx()</code> 就能拿到这个大管家，获取显存信息或当前批次信息。</p>
+<h3>总结</h3>
+<p>这段代码描述了一个 <strong>支持分页显存管理的大模型推理引擎的基础架构</strong>：</p>
+<ol>
+<li><strong>Req</strong>: 记录单个用户的输入和缓存进度。</li>
+<li><strong>Batch</strong>: 把多个 Req 凑在一起，并判断是该“阅读全文”(Prefill) 还是 “蹦字”(Decode)。</li>
+<li><strong>Context</strong>: 拿着显存地图 (Page Table) 和仓库 (KV Cache)，指挥 GPU 处理当前的 Batch。</li>
+</ol>

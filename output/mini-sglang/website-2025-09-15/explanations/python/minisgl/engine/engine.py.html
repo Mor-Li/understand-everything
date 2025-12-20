@@ -1,0 +1,103 @@
+<h1>python/minisgl/engine/engine.py</h1>
+<p>这份代码是一个 <strong>LLM（大语言模型）推理引擎</strong>的核心部分。你可以把它想象成一个<strong>“大模型的高级管家”</strong>。它的主要工作是：把模型加载到显卡上，管理显存（特别是KV Cache），然后一批一批地处理用户的请求，生成下一个字。</p>
+<p>为了让你看懂，我把这个 <code>Engine</code> 类要做的事情拆解成一个 <strong>“入职待办清单 (Todo List)”</strong>。</p>
+<p>我们将代码分为两个阶段：<strong>启动阶段（初始化）</strong> 和 <strong>工作阶段（推理）</strong>。</p>
+<hr />
+<h3>第一阶段：启动阶段 (Initialization)</h3>
+<p><em>对应代码中的 <code>__init__</code> 方法及其调用的辅助函数</em></p>
+<p>想象引擎刚启动，它需要做以下准备工作：</p>
+<h4>✅ Task 1: 认领工位与建立群聊 (环境配置)</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>__init__</code> 开头, <code>_init_communication</code></li>
+<li><strong>他在干嘛</strong>:<ul>
+<li><strong>认领工位</strong>: 确定自己是用哪张显卡（Rank ID），并绑定上去 (<code>torch.cuda.set_device</code>)。</li>
+<li><strong>建立群聊</strong>: 如果是多卡运行（TP, Tensor Parallel），通过 <code>torch.distributed</code> 建立通信组。这样多张显卡才能一起计算同一个模型。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 2: 检查仓库空余空间 (显存摸底)</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>_sync_get_memory</code></li>
+<li><strong>他在干嘛</strong>:<ul>
+<li>在加载模型前，先看看显卡里还剩多少显存。</li>
+<li>如果是多卡运行，必须确保所有卡的剩余显存是差不多的（Sync），否则会报错。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 3: 聘请大厨进场 (加载模型)</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>create_model</code>, <code>_load_weight_state_dict</code></li>
+<li><strong>他在干嘛</strong>:<ul>
+<li>在显存里创建模型的骨架（Layers, Attention等）。</li>
+<li>从硬盘加载模型的权重文件（Weights），填入骨架中。这就好比大厨（模型）已经站在灶台前准备好了。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 4: 准备记事本 (分配 KV Cache) —— <strong>核心难点</strong></h4>
+<ul>
+<li><strong>代码位置</strong>: <code>_determine_num_pages</code>, <code>create_kvcache</code>, <code>Context.create_page_table</code></li>
+<li><strong>他在干嘛</strong>:<ul>
+<li><strong>原理</strong>: LLM生成文字时，需要记住之前说过的每一句话，这叫 KV Cache。这东西非常占显存。</li>
+<li><strong>计算</strong>: 引擎计算加载完模型后，显卡还剩多少显存。</li>
+<li><strong>切分</strong>: 把剩余显存切分成一个个小的“页（Page）”（类似操作系统的内存管理）。这就是 <strong>PagedAttention</strong> 的核心。</li>
+<li><strong>申请</strong>: 一次性把这些显存全占住，专门用来存对话历史，防止运行中显存爆炸。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 5: 制定SOP标准作业程序 (CUDA Graph 预录制)</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>GraphWorker</code></li>
+<li><strong>他在干嘛</strong>:<ul>
+<li>GPU 运行很多小任务时，启动开销很大。</li>
+<li><code>GraphWorker</code> 会把一套标准的计算流程“录制”下来（CUDA Graph）。</li>
+<li>以后再跑同样大小的任务，直接回放录像，速度会快很多。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>第二阶段：工作阶段 (Forward Loop)</h3>
+<p><em>对应代码中的 <code>forward_batch</code> 方法</em></p>
+<p>现在引擎启动完毕，开始接单干活了。</p>
+<h4>✅ Task 6: 接收点单 (Prepare Batch)</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>prepare_batch</code> (在末尾), <code>forward_batch</code> (开头)</li>
+<li><strong>他在干嘛</strong>:<ul>
+<li>外部会送来一批请求（Batch），包含用户发来的 Prompt。</li>
+<li>引擎需要为这些请求分配 KV Cache 的页表位置（告诉模型把记忆写在哪一页纸上）。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 7: 开始做菜 (模型前向计算)</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>forward_batch</code> 中的 <code>self.graph_worker.replay</code> 或 <code>self.model.forward</code></li>
+<li><strong>他在干嘛</strong>:<ul>
+<li>这是最耗算力的一步。</li>
+<li>如果这批数据的形状符合之前的“SOP录像”（CUDA Graph），就直接回放录像（快）。</li>
+<li>如果不符合，就老老实实跑一遍 PyTorch 的计算流程（慢）。</li>
+<li><strong>产出</strong>: 得到 <code>logits</code>（模型对下一个字是啥的概率预测）。</li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 8: 挑选结果 (Sampling)</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>torch.argmax(logits, ...)</code></li>
+<li><strong>他在干嘛</strong>:<ul>
+<li>从概率里挑出概率最大的那个字（Token）。</li>
+<li><em>注：代码里写了 TODO，目前只用了简单的 argmax（选最大的），实际应用通常会用更复杂的采样策略。</em></li>
+</ul>
+</li>
+</ul>
+<h4>✅ Task 9: 上菜与清理 (Result Handling)</h4>
+<ul>
+<li><strong>代码位置</strong>: <code>req.append</code>, <code>result.next_tokens_cpu.copy_</code></li>
+<li><strong>他在干嘛</strong>:<ul>
+<li>把生成的这个字，追加到该请求的记录里。</li>
+<li>把生成的字从 GPU 显存搬运到 CPU 内存（因为 Python 逻辑主要在 CPU 跑）。</li>
+<li>准备好处理下一个字。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结一下这段代码在干啥</h3>
+<p>这是一个<strong>实现了 PagedAttention（分页显存管理）和 CUDA Graph（图优化）的轻量级推理引擎</strong>。</p>
+<p>如果你是初学者，最容易晕的是 <code>num_pages</code> 和 <code>page_table</code> 那部分。你只需要理解为：<strong>它不想让显存碎片化，所以像操作系统管理内存一样，把显存切成块，按需分配给不同的用户请求用来存对话历史。</strong></p>

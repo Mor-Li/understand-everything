@@ -1,0 +1,109 @@
+<h1>python/minisgl/kernel/store.py</h1>
+<p>这段代码确实比较底层，它主要是在处理 <strong>大模型推理（Inference）</strong> 时的 <strong>显存管理</strong>，特别是关于 <strong>KV Cache（键值缓存）</strong> 的存储和索引。</p>
+<p>简单来说，这段代码是 Python 和底层 CUDA（显卡加速代码）之间的桥梁。</p>
+<p>为了让你听懂，我把这个过程拆解成一个 <strong>“4步走”的 Task List</strong>，我们一步一步来攻克：</p>
+<h3>📋 学习任务清单 (Todo List)</h3>
+<ol>
+<li><strong>Task 1：搞懂背景 —— 什么是 KV Cache？（仓库的概念）</strong></li>
+<li><strong>Task 2：分析 <code>store_cache</code> —— 怎么把货物搬进仓库？</strong></li>
+<li><strong>Task 3：分析 Page Table —— 怎么记录货物放哪了？（索引管理）</strong></li>
+<li><strong>Task 4：分析 <code>_lru_get_pos</code> —— 怎么让记账更快？（性能优化）</strong></li>
+</ol>
+<hr />
+<h3>✅ Task 1：搞懂背景 —— 什么是 KV Cache？</h3>
+<p>在看代码前，你得知道我们在干嘛。</p>
+<ul>
+<li><strong>场景</strong>：大模型生成文字时，是一个字一个字蹦出来的。</li>
+<li><strong>问题</strong>：为了生成第 10 个字，模型需要回顾前 9 个字的信息。如果不存下来，生成第 11 个字时，又要重新算前 10 个字，太慢了。</li>
+<li><strong>解决</strong>：把算过的“中间结果”（也就是 <strong>K</strong>ey 和 <strong>V</strong>alue 向量）存起来，下次直接用。这就叫 <strong>KV Cache</strong>。</li>
+<li><strong>代码里的角色</strong>：<ul>
+<li><code>k_cache</code>, <code>v_cache</code>：这就是那个巨大的“仓库”，用来存所有历史数据的。</li>
+<li><code>k</code>, <code>v</code>：这是当前这一步新算出来的“货物”，需要存进仓库。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 2：分析 <code>store_cache</code> —— 把货物搬进仓库</h3>
+<p>请看代码中的 <code>store_cache</code> 函数。</p>
+<p><strong>它的任务是</strong>：把当前新生成的 <code>k</code> 和 <code>v</code> 数据，搬运到 <code>k_cache</code> 和 <code>v_cache</code> 这个大仓库的指定位置。</p>
+<p><strong>代码拆解：</strong></p>
+<ol>
+<li>
+<p><strong>加载搬运工</strong>：
+    <code>python
+    module = _load_kvcache_module()</code>
+    这里加载了一个 C++/CUDA 写的高速模块（<code>kvcache.cu</code>）。因为 Python 搬运数据太慢了，所以请了“专业搬运工”。</p>
+</li>
+<li>
+<p><strong>把货物打包（扁平化）</strong>：
+    <code>python
+    k_cache = k_cache.view(max_tokens, -1)
+    # ... 其他变量也做了 view 操作</code>
+    <code>view</code> 的作用是改变形状。为了方便 C++ 处理，它把复杂的多维数组（比如 [层数, 批次, 长度, 维度]）全都“压扁”成简单的二维表格。这就像把立体的货物压成一张纸，方便塞进机器处理。</p>
+</li>
+<li>
+<p><strong>开始搬运</strong>：
+    <code>python
+    module.store_cache(k_cache, v_cache, out_loc, k, v)</code></p>
+<ul>
+<li><code>out_loc</code>：这是“目标地址”。告诉搬运工，这批货要放在仓库的第几排、第几号。</li>
+<li>这行代码执行完，你的 GPU 显存里就存好了最新的 KV 数据。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 3：分析 Page Table —— 记录货物放哪了？</h3>
+<p>大模型的显存管理现在流行一种叫 <strong>PagedAttention</strong> 的技术（类似操作系统的内存分页）。数据不是连续存的，而是东一块西一块（为了不浪费空间）。</p>
+<p>既然数据是散乱存放的，就需要一个 <strong>“账本” (Page Table)</strong> 来记录：“第 X 句话的第 Y 个词，存在物理显存的哪个位置”。</p>
+<p><strong>代码拆解：</strong></p>
+<ol>
+<li>
+<p><strong><code>store_decode_indices</code> (写账本)</strong>：</p>
+<ul>
+<li><strong>输入</strong>：<code>page_table</code> (账本), <code>indices</code> (物理地址), <code>pos</code> (逻辑位置，比如[第几句话, 第几页])。</li>
+<li><strong>计算位置</strong>：
+    <code>python
+    pos_list = tuple(p[0] * page_table_len + p[1] for p in pos)</code>
+    这里把二维坐标（第几行第几列）算成了一个一维的绝对坐标（从头数第几个格子）。</li>
+<li><strong>写入</strong>：
+    <code>python
+    flattened_table[pos_tensor] = indices</code>
+    把物理地址填入账本的对应格子里。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>load_decode_indices</code> (查账本)</strong>：</p>
+<ul>
+<li>逻辑和上面相反。给我逻辑位置，我去账本里查查，这块数据到底存在物理显存的哪里。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 4：分析 <code>_lru_get_pos</code> —— 性能优化</h3>
+<p>这是一个纯粹为了<strong>提速</strong>的小技巧。</p>
+<p><strong>问题</strong>：
+在 <code>store_decode_indices</code> 里，我们需要把一个 Python 的列表（<code>pos_list</code>）转换成 PyTorch 的 Tensor（<code>pos_tensor</code>）并搬到 GPU 上。</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这一步如果不优化，每秒钟发生几千次，会非常慢！</span>
+<span class="n">pos_tensor</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解决办法</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@lru_cache</span><span class="p">(</span><span class="n">maxsize</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_lru_get_pos</span><span class="p">(</span><span class="n">pos_list</span><span class="p">:</span> <span class="n">Tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">],</span> <span class="n">device</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+    <span class="c1"># ... 创建 tensor ...</span>
+</code></pre></div>
+
+<ul>
+<li><code>@lru_cache(maxsize=1)</code>：这是一个缓存装饰器。</li>
+<li><strong>原理</strong>：如果这次进来的 <code>pos_list</code> 和上一次的一模一样（这种情况在大模型解码时经常发生，因为位置往往是固定的或者是顺序增加的），就<strong>不要</strong>重新创建 Tensor，直接把上次造好的拿来用。</li>
+<li><strong>效果</strong>：省去了反复在 CPU 和 GPU 之间申请内存和搬运数据的时间。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这段代码其实就讲了三件事：</p>
+<ol>
+<li><strong>存数据 (<code>store_cache</code>)</strong>：调用 C++ 核心，把 KV 向量塞进显存。</li>
+<li><strong>记账 (<code>store/load_decode_indices</code>)</strong>：维护一个映射表，记录逻辑页面和物理内存的对应关系。</li>
+<li><strong>省时间 (<code>_lru_get_pos</code>)</strong>：用缓存机制减少创建 Tensor 的开销。</li>
+</ol>
+<p>现在再回头看代码，是不是感觉逻辑清晰了一些？</p>

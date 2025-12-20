@@ -1,0 +1,133 @@
+<h1>tests/core/test_scheduler.py</h1>
+<p>这段代码确实涉及了不少概念：<strong>多进程（Multiprocessing）、消息队列（ZeroMQ）、大模型推理（LLM Inference）</strong>。如果你没有相关背景，看懂它是很难的。</p>
+<p>简单来说，这段代码是在<strong>模拟一个“迷你版”的 ChatGPT 服务端和客户端的交互过程</strong>。</p>
+<ul>
+<li><strong>后台（Scheduler）：</strong> 负责加载模型（Llama-3），等着处理任务。</li>
+<li><strong>前台（Main）：</strong> 负责发问题（"What's the answer to life..."），然后等着接收答案。</li>
+</ul>
+<p>为了让你听懂，我把阅读这段代码拆解成 <strong>5 个任务（Task List）</strong>，我们一步一步来完成。</p>
+<hr />
+<h3>📋 任务清单 (Todo List)</h3>
+<ol>
+<li><strong>Task 1: 定义“大脑”的配置 (Configuring the Brain)</strong><ul>
+<li>弄清楚我们要跑什么模型，用什么参数。</li>
+</ul>
+</li>
+<li><strong>Task 2: 启动“后台服务”进程 (Starting the Backend Process)</strong><ul>
+<li>把模型在一个独立的进程里跑起来，让它待命。</li>
+</ul>
+</li>
+<li><strong>Task 3: 建立“通信管道” (Setting up Communication)</strong><ul>
+<li>在“前台”和“后台”之间拉两根电话线，一根发消息，一根收消息。</li>
+</ul>
+</li>
+<li><strong>Task 4: 发送“提问” (Sending the Prompt)</strong><ul>
+<li>把人类的语言转换成机器语言，发给后台。</li>
+</ul>
+</li>
+<li><strong>Task 5: 接收“答案流” (Streaming the Response)</strong><ul>
+<li>像打字机一样，一个字一个字地接收后台吐出来的答案，直到结束。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>🔍 逐步讲解</h3>
+<h4>Task 1: 定义“大脑”的配置</h4>
+<p><strong>代码位置：</strong> <code>main</code> 函数开头部分</p>
+<div class="codehilite"><pre><span></span><code><span class="n">config</span> <span class="o">=</span> <span class="n">SchedulerConfig</span><span class="p">(</span>
+    <span class="n">model_path</span><span class="o">=</span><span class="s2">&quot;meta-llama/Llama-3.1-8B-Instruct&quot;</span><span class="p">,</span> <span class="c1"># 1. 用哪个模型？Llama 3</span>
+    <span class="n">tp_info</span><span class="o">=</span><span class="n">DistributedInfo</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>                 <span class="c1"># 2. 分布式信息（这里是用1张卡）</span>
+    <span class="n">dtype</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">bfloat16</span><span class="p">,</span>                          <span class="c1"># 3. 数据精度</span>
+    <span class="n">max_running_req</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>                             <span class="c1"># 4. 最多同时处理4个请求</span>
+    <span class="n">cuda_graph_bs</span><span class="o">=</span><span class="p">[</span><span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">],</span>                       <span class="c1"># 5. 显卡加速优化参数</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p><strong>观点：</strong> 跑大模型很复杂，必须先写好“配置单”。这就像你组装电脑前先列配置单一样。</p>
+<h4>Task 2: 启动“后台服务”进程</h4>
+<p><strong>代码位置：</strong> <code>scheduler</code> 函数 和 <code>main</code> 中的 <code>mp.Process</code></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这是一个独立的函数，它会在另一个进程里跑</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">scheduler</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">queue</span><span class="p">):</span>
+    <span class="n">scheduler</span> <span class="o">=</span> <span class="n">Scheduler</span><span class="p">(</span><span class="n">config</span><span class="p">)</span> <span class="c1"># 初始化调度器</span>
+    <span class="n">queue</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="kc">None</span><span class="p">)</span>               <span class="c1"># 告诉主进程：“我准备好了”</span>
+    <span class="n">scheduler</span><span class="o">.</span><span class="n">run_forever</span><span class="p">()</span>       <span class="c1"># 死循环，一直等着干活</span>
+
+<span class="c1"># 主程序里启动它</span>
+<span class="n">p</span> <span class="o">=</span> <span class="n">mp</span><span class="o">.</span><span class="n">Process</span><span class="p">(</span><span class="n">target</span><span class="o">=</span><span class="n">scheduler</span><span class="p">,</span> <span class="n">args</span><span class="o">=</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">q</span><span class="p">))</span>
+<span class="n">p</span><span class="o">.</span><span class="n">start</span><span class="p">()</span>
+<span class="n">q</span><span class="o">.</span><span class="n">get</span><span class="p">()</span> <span class="c1"># 阻塞在这里，直到scheduler发信号说“准备好了”</span>
+</code></pre></div>
+
+<p><strong>观点：</strong>
+*   <strong>为什么要多进程？</strong> 因为大模型推理非常占显卡和CPU，不能让它卡住主程序的界面。所以要把脏活累活扔给一个独立的进程（Worker）去干。
+*   <code>q.get()</code> 是一个同步点，确保后台完全启动了，前台才继续往下走。</p>
+<h4>Task 3: 建立“通信管道”</h4>
+<p><strong>代码位置：</strong> <code>ZmqPushQueue</code> 和 <code>ZmqPullQueue</code></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 发送管道：前台 -&gt; 后台</span>
+<span class="n">send_backend</span> <span class="o">=</span> <span class="n">ZmqPushQueue</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> 
+
+<span class="c1"># 接收管道：后台 -&gt; 前台</span>
+<span class="n">recv_backend</span> <span class="o">=</span> <span class="n">ZmqPullQueue</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>观点：</strong>
+*   前台和后台在不同的进程（甚至可以是不同的机器），内存不共享。
+*   它们必须通过<strong>消息队列（ZMQ）</strong>来交流。
+*   <code>send_backend</code> 就像前台的<strong>发信箱</strong>。
+*   <code>recv_backend</code> 就像前台的<strong>收信箱</strong>。</p>
+<h4>Task 4: 发送“提问”</h4>
+<p><strong>代码位置：</strong> <code>tokenizer</code> 部分 和 <code>send_backend.put</code></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 1. 把人类语言 &quot;What&#39;s the answer...&quot; 变成数字 [123, 456, ...]</span>
+<span class="n">tokenizer</span> <span class="o">=</span> <span class="n">AutoTokenizer</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+<span class="n">prompt</span> <span class="o">=</span> <span class="s2">&quot;What&#39;s the answer to life, the universe, and everything?&quot;</span>
+<span class="n">ids</span> <span class="o">=</span> <span class="n">tokenizer</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> 
+
+<span class="c1"># 2. 把这些数字封装成一个 UserMsg（用户消息），扔进“发信箱”</span>
+<span class="n">send_backend</span><span class="o">.</span><span class="n">put</span><span class="p">(</span>
+    <span class="n">UserMsg</span><span class="p">(</span>
+        <span class="n">uid</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+        <span class="n">input_ids</span><span class="o">=</span><span class="n">ids</span><span class="p">,</span>
+        <span class="n">sampling_params</span><span class="o">=</span><span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">100</span><span class="p">),</span> <span class="c1"># 告诉模型最多吐100个字</span>
+    <span class="p">)</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p><strong>观点：</strong>
+*   模型看不懂英文，只看得懂数字（Token IDs），所以需要 <code>Tokenizer</code>。
+*   我们把“请求”打包成一个对象 <code>UserMsg</code> 发给后台。后台收到后，就会开始计算。</p>
+<h4>Task 5: 接收“答案流”</h4>
+<p><strong>代码位置：</strong> <code>while True</code> 循环</p>
+<div class="codehilite"><pre><span></span><code><span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
+    <span class="c1"># 1. 从“收信箱”里拿出一个消息</span>
+    <span class="n">msg</span> <span class="o">=</span> <span class="n">recv_backend</span><span class="o">.</span><span class="n">get</span><span class="p">()</span>
+
+    <span class="c1"># 2. 确保拿到的消息是“解码后的Token”</span>
+    <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">msg</span><span class="p">,</span> <span class="n">DetokenizeMsg</span><span class="p">)</span>
+
+    <span class="c1"># 3. 把新生成的这个字（token）拼接到原来的id列表后面</span>
+    <span class="n">ids</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">([</span><span class="n">ids</span><span class="p">,</span> <span class="o">...</span><span class="p">])</span>
+
+    <span class="c1"># 4. 如果模型说“我说完了”（finished=True），就跳出循环</span>
+    <span class="k">if</span> <span class="n">msg</span><span class="o">.</span><span class="n">finished</span><span class="p">:</span>
+        <span class="k">break</span>
+
+<span class="c1"># 5. 把所有数字转换回人类语言并打印</span>
+<span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="n">tokenizer</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="n">ids</span><span class="o">.</span><span class="n">tolist</span><span class="p">()))</span>
+
+<span class="c1"># 6. 告诉后台：“你可以下班了”</span>
+<span class="n">send_backend</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">ExitMsg</span><span class="p">())</span>
+</code></pre></div>
+
+<p><strong>观点：</strong>
+*   <strong>流式传输（Streaming）：</strong> 大模型不是一下子把整段话算出来的，而是一个字一个字蹦出来的。
+*   所以这里必须用 <code>while True</code> 循环，不断地从队列里取结果。
+*   这就像你在看 ChatGPT 网页版时，字是一个一个打出来的效果。</p>
+<hr />
+<h3>总结：这篇代码讲了啥？</h3>
+<p>这篇代码展示了 <strong>MiniSGL</strong>（一个轻量级的大模型服务框架）的核心工作流：</p>
+<ol>
+<li><strong>解耦：</strong> 将“模型推理”（Scheduler）和“用户交互”（Main）分离到不同进程。</li>
+<li><strong>异步通信：</strong> 使用队列进行发单和收单，互不干扰。</li>
+<li><strong>推理生命周期：</strong> 包含了 <code>Prompt处理</code> -&gt; <code>入队</code> -&gt; <code>推理</code> -&gt; <code>流式回传</code> -&gt; <code>解码</code> 的完整过程。</li>
+</ol>
+<p>如果你把这个脚本跑起来，它的效果就是在控制台打印出那个终极问题的答案（通常模型会回答 "42" 或者一段废话），然后程序自动退出。</p>

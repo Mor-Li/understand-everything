@@ -1,0 +1,79 @@
+<h1>docs/structures.md</h1>
+<p>这篇文章描述的是一个叫 <strong>Mini-SGLang</strong> 的系统的架构。这其实是一个<strong>让大模型（LLM）跑起来并能够回答用户问题的后端系统</strong>。</p>
+<p>既然你觉得难懂，我们可以把它想象成开了一家<strong>“大模型餐厅”</strong>。为了让你理解，我把理解这篇文档的过程拆解成 <strong>3 个 Todo Task</strong>，我们一步步来完成。</p>
+<hr />
+<h3>✅ Task 1：搞清楚“谁在干活”？（理解系统架构）</h3>
+<p>这篇文档的第一部分 <code>System Architecture</code> 讲的是这家餐厅里有哪些员工（组件）。</p>
+<p><strong>核心观点：</strong> 大模型太大了，一个人（一个进程/GPU）可能干不过来，所以需要分工合作。</p>
+<p>请按这个对应关系来理解：</p>
+<ol>
+<li><strong>API Server（前台服务员）</strong><ul>
+<li><strong>作用</strong>：它是用户的唯一入口。</li>
+<li><strong>工作</strong>：用户（食客）把点菜单（Prompt）给它，它最后把做好的菜（生成的文本）端给用户。它提供类似 OpenAI 的接口。</li>
+</ul>
+</li>
+<li><strong>Tokenizer Worker（翻译官 - 进）</strong><ul>
+<li><strong>作用</strong>：大模型看不懂中文或英文，只看得懂数字。</li>
+<li><strong>工作</strong>：把用户的文字（比如 "你好"）切分成数字代号（Token，比如 <code>[101, 256]</code>）。</li>
+</ul>
+</li>
+<li><strong>Scheduler Worker（厨师长/调度员）</strong><ul>
+<li><strong>作用</strong>：这是核心，负责指挥 GPU 干活。</li>
+<li><strong>重点</strong>：如果模型很大，需要多张显卡（多 GPU），每张卡都有一个调度员。</li>
+<li><strong>TP Rank</strong>：你可以理解为厨师的编号。<strong>Rank 0</strong> 是领班，负责对外沟通；其他 Rank 负责闷头干活。</li>
+</ul>
+</li>
+<li><strong>Detokenizer Worker（翻译官 - 出）</strong><ul>
+<li><strong>作用</strong>：把模型算出来的数字变回人能看懂的字。</li>
+<li><strong>工作</strong>：把数字（Token）转回文字，交给前台。</li>
+</ul>
+</li>
+</ol>
+<p><strong>通信方式（他们怎么交流）：</strong>
+*   <strong>ZeroMQ (ZMQ)</strong>：相当于<strong>对讲机</strong>。用来传简单的指令（比如“来活了”、“做完了”）。
+*   <strong>NCCL</strong>：相当于<strong>传送带</strong>。专门在 GPU 之间传输沉重的数据（Tensor 数据）。</p>
+<hr />
+<h3>✅ Task 2：搞清楚“这事儿怎么流转的”？（理解数据流）</h3>
+<p>文档中的 <code>Data Flow</code> 和 <code>Request Lifecycle</code> 讲的是从你发消息到收到回复，中间发生了什么。</p>
+<p><strong>任务流转清单（一步步看）：</strong></p>
+<ol>
+<li><strong>点单</strong>：你（User）发请求给 <strong>前台（API Server）</strong>。</li>
+<li><strong>翻译</strong>：前台把字给 <strong>翻译官（Tokenizer）</strong>，变成数字。</li>
+<li><strong>派单</strong>：翻译官把数字给 <strong>厨师领班（Scheduler Rank 0）</strong>。</li>
+<li><strong>广播</strong>：领班大喊一声，把任务分发给所有 <strong>厨师（其他 Schedulers）</strong>。</li>
+<li><strong>烹饪（核心）</strong>：所有厨师启动 <strong>引擎（Engine）</strong>，用显卡开始狂算，算出一个新字（Token）。</li>
+<li><strong>收菜</strong>：领班（Rank 0）收集大家算出来的那个字，扔给 <strong>翻译官（Detokenizer）</strong>。</li>
+<li><strong>上菜</strong>：翻译官把那个字变成文字，给 <strong>前台（API Server）</strong>。</li>
+<li><strong>反馈</strong>：前台把这个字显示在你的屏幕上。<ul>
+<li><em>注：大模型是一个字一个字往外蹦的，所以步骤 5-8 会循环很多次，直到说完。</em></li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 3：搞清楚“代码在哪”？（理解代码结构）</h3>
+<p>文档最后一部分 <code>Code Organization</code> 是给程序员看的导航图。如果你要改代码，得知道去哪找。</p>
+<p>我们可以把这些模块分成几类来理解：</p>
+<p><strong>1. 基础数据与工具（地基）</strong>
+*   <code>minisgl.core</code>: 定义了什么是“请求(Req)”，什么是“批次(Batch)”。
+*   <code>minisgl.utils</code>: 日志工具、通信工具等杂项。
+*   <code>minisgl.message</code>: 定义了各个组件之间发消息的格式（比如前台发给翻译官的消息长啥样）。</p>
+<p><strong>2. 核心大脑（模型相关）</strong>
+*   <code>minisgl.models</code>: 这里面装着 Llama、Qwen 等具体模型的代码。
+*   <code>minisgl.layers</code>: 模型的零件（比如全连接层、Embedding 层）。
+*   <code>minisgl.attention</code>: <strong>注意力机制</strong>（大模型最核心的算法），这里提到了 FlashAttention（一种加速技术）。</p>
+<p><strong>3. 记忆管理（显存管理）</strong>
+*   <code>minisgl.kvcache</code>: <strong>KV Cache</strong> 是大模型推理时的“短期记忆”。这个模块管理显存，确保聊得长了也不会爆内存。</p>
+<p><strong>4. 执行与调度（干活的）</strong>
+*   <code>minisgl.scheduler</code>: 上面提到的“厨师长”代码。
+*   <code>minisgl.engine</code>: 上面提到的“引擎”代码，真正在单个 GPU 上跑模型的地方。
+*   <code>minisgl.distributed</code>: 处理多张显卡怎么协作（分布式计算）。</p>
+<p><strong>5. 对外接口（门面）</strong>
+*   <code>minisgl.server</code>: 启动整个系统的入口，以及 API Server 的代码。
+*   <code>minisgl.tokenizer</code>: 翻译官的代码。</p>
+<hr />
+<h3>总结</h3>
+<p>这篇文档其实就在说三件事：
+1.  <strong>分工</strong>：把大模型推理拆成了 API、Tokenizer、Scheduler 三块。
+2.  <strong>流程</strong>：数据怎么在这些块之间转圈圈。
+3.  <strong>目录</strong>：代码文件夹里每个文件是负责上面哪一块的。</p>
+<p>现在你再回头看原来的文档，是不是稍微清晰一点了？</p>

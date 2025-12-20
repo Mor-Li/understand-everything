@@ -1,0 +1,78 @@
+<h1>python/minisgl/kvcache/mha_pool.py</h1>
+<p>这段代码涉及的是 <strong>大语言模型（LLM）推理加速</strong> 中最核心的概念之一：<strong>KV Cache（键值缓存）的管理</strong>，具体来说是基于 <strong>Paged Attention（分页注意力机制）</strong> 的内存池实现。</p>
+<p>如果不懂背景，这段代码确实像天书。为了让你理解，我制定了一个 <strong>5步学习清单 (Task List)</strong>，我们一步步拆解，从宏观概念到具体代码实现。</p>
+<hr />
+<h3>学习清单 (Task To-Do List)</h3>
+<ol>
+<li><strong>Task 1: 理解背景</strong> —— 什么是 KV Cache？为什么要把它存起来？</li>
+<li><strong>Task 2: 理解核心数据结构</strong> —— <code>__init__</code> 里的那个巨大 Tensor 是做什么的？</li>
+<li><strong>Task 3: 理解并行计算</strong> —— 为什么要算 <code>local_kv_heads</code>？(Tensor Parallelism)</li>
+<li><strong>Task 4: 理解内存布局</strong> —— <code>PageFirst</code> vs <code>LayerFirst</code> 是什么意思？</li>
+<li><strong>Task 5: 理解读写操作</strong> —— <code>store_kv</code> 是怎么把数据放进去的？</li>
+</ol>
+<hr />
+<h3>逐步讲解</h3>
+<h4>Task 1: 理解背景 —— 什么是 KV Cache？</h4>
+<p><strong>概念：</strong>
+在大模型生成文字时（比如 ChatGPT 回答你），它是<strong>一个字一个字</strong>往外蹦的。
+当你生成第 10 个字时，模型需要回顾前 9 个字的信息。为了不每次都重新计算前 9 个字的数学特征（也就是 Key 和 Value 向量），我们将这些算好的 K 和 V <strong>存下来</strong>，这就叫 KV Cache。</p>
+<p><strong>在这段代码里：</strong>
+这个类 <code>MHAKVCache</code> 就是一个<strong>仓库管理员</strong>，专门负责管理这些存下来的 K 和 V 数据。</p>
+<hr />
+<h4>Task 2: 理解核心数据结构 —— <code>__init__</code> 里的那个巨大 Tensor</h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">kv_buffer</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+这就好比你在显存（GPU内存）里<strong>圈了一大块地</strong>，准备盖仓库。
+*   <strong>为什么要 <code>empty</code>？</strong> 因为我们先占好位置（预分配内存），后面再往里面填数据。这样比每次生成一个字就申请一点内存要快得多。
+*   <strong>维度里的 <code>2</code> 是什么？</strong> 代表 <strong>K</strong> (Key) 和 <strong>V</strong> (Value) 两份数据。
+*   <strong><code>num_pages</code> 是什么？</strong> 这里用到了 <strong>PagedAttention</strong> 的技术。以前显存是按“一句话”分配的，现在像操作系统管理内存一样，切成一个个小的“页（Page）”。这样可以极大地节省显存，让模型能处理更长的上下文。</p>
+<p><strong>总结：</strong> <code>kv_buffer</code> 就是整个仓库的实体，所有的 K 和 V 最终都住在这里面。</p>
+<hr />
+<h4>Task 3: 理解并行计算 —— <code>local_kv_heads</code></h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">tp_info</span> <span class="o">=</span> <span class="n">get_tp_info</span><span class="p">()</span>
+<span class="n">local_kv_heads</span> <span class="o">=</span> <span class="n">divide_even</span><span class="p">(</span><span class="n">num_kv_heads</span><span class="p">,</span> <span class="n">tp_info</span><span class="o">.</span><span class="n">size</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+现在的 LLM 太大了，一张显卡装不下，通常需要多张显卡一起跑（这叫张量并行，Tensor Parallelism）。
+*   假设模型有 32 个“头”（Heads，处理信息的单元）。
+*   假设你有 4 张显卡 (<code>tp_info.size = 4</code>)。
+*   那么每张显卡只需要负责存 <code>32 / 4 = 8</code> 个头的数据。</p>
+<p><strong>总结：</strong> <code>local_kv_heads</code> 算出的是<strong>当前这张显卡</strong>需要负责存储多少个头的数据。代码只管自己这一亩三分地。</p>
+<hr />
+<h4>Task 4: 理解内存布局 —— <code>PageFirst</code> vs <code>LayerFirst</code></h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">match</span> <span class="n">kv_layout</span><span class="p">:</span>
+    <span class="k">case</span> <span class="n">KVCacheLayout</span><span class="o">.</span><span class="n">PageFirst</span><span class="p">:</span>
+        <span class="c1"># (2, num_pages, num_layers, ...)</span>
+    <span class="k">case</span> <span class="n">KVCacheLayout</span><span class="o">.</span><span class="n">LayerFirst</span><span class="p">:</span>
+        <span class="c1"># (2, num_layers, num_pages, ...)</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+这相当于仓库货架的摆放方式：
+*   <strong>LayerFirst:</strong> 先按“层”分货架，每一层里再放不同的“页”。
+*   <strong>PageFirst:</strong> 先按“页”分货架，每一页里包含所有层的信息。</p>
+<p><strong>为什么有两种？</strong> 不同的推理框架或计算核心（Kernel）对数据的读取顺序偏好不同。有的喜欢横着读，有的喜欢竖着读。这段代码通过 <code>match</code> 语句来兼容不同的物理排列方式，但最终通过 <code>.view()</code> 统一成一个逻辑形状，方便后面使用。</p>
+<hr />
+<h4>Task 5: 理解读写操作 —— <code>store_kv</code></h4>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">store_kv</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">out_loc</span><span class="p">,</span> <span class="n">layer_id</span><span class="p">):</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">minisgl.kernel</span><span class="w"> </span><span class="kn">import</span> <span class="n">store_cache</span>
+    <span class="n">store_cache</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">indices</span><span class="o">=</span><span class="n">out_loc</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="o">=</span><span class="n">v</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>讲解：</strong>
+这是实际干活的地方。
+*   <strong>输入：</strong> 新算出来的 <code>k</code> 和 <code>v</code> 数据。
+*   <strong><code>out_loc</code> (Indices)：</strong> 这是一个索引列表，告诉管理员：“把这些数据存到仓库的第几页、第几个位置”。
+*   <strong><code>store_cache</code>：</strong> 这是一个底层的 CUDA Kernel（用 C++/CUDA 写的加速代码）。Python 跑循环太慢了，所以这里直接调用底层的函数，把数据“瞬间”拷贝到我们在 Task 2 里预分配好的 <code>kv_buffer</code> 里。</p>
+<hr />
+<h3>全文总结 (The Big Picture)</h3>
+<p><strong>这个文件 <code>mha_pool.py</code> 的作用是：</strong></p>
+<p>它在显卡上预先划定了一大块内存区域（<code>kv_buffer</code>），根据你是不是在用多卡并行（<code>local_kv_heads</code>）以及你喜欢的排列方式（<code>kv_layout</code>）来组织这块内存。</p>
+<p>当模型推理生成新 Token 时，它提供了一个接口 <code>store_kv</code>，利用底层加速代码，将新的 Key/Value 数据精准地塞进这个内存池的指定“页”中，供后续计算使用。</p>

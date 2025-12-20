@@ -1,0 +1,94 @@
+<h1>python/minisgl/scheduler/scheduler.py</h1>
+<p>这份代码实现了一个 <strong>LLM 推理引擎的调度器（Scheduler）</strong>。</p>
+<p>如果把整个推理引擎比作一个繁忙的<strong>餐厅厨房</strong>：
+*   <strong>Engine (引擎/GPU)</strong> 是<strong>大厨</strong>，负责真正的炒菜（计算矩阵乘法、生成 Token）。
+*   <strong>Scheduler (调度器)</strong> 就是<strong>前厅经理</strong>。</p>
+<p><strong>经理（Scheduler）的职责是：</strong> 接待顾客（接收请求）、安排座位（分配显存）、把单子递给大厨（发送 Batch）、把做好的菜端给顾客（返回生成的 Token）。</p>
+<p>为了让你看懂，我把代码中最核心的 <code>main_loop</code>（主循环）拆解成一个 <strong>“前厅经理的任务清单 (To-Do List)”</strong>，一步步带你看。</p>
+<hr />
+<h3>📋 前厅经理的任务清单 (Scheduler To-Do List)</h3>
+<p>这个循环在 <code>run_forever</code> -&gt; <code>main_loop</code> 中不断执行。</p>
+<h4>Task 1: 查看是否有新订单 (Receive Messages)</h4>
+<p><strong>代码位置:</strong> <code>self.recv_msg(blocking=...)</code>
+*   <strong>动作:</strong> 经理看一眼大门（ZMQ 消息队列），看有没有 Tokenizer 发来的新请求。
+*   <strong>逻辑:</strong>
+    *   如果厨房正忙（有正在跑的 Batch），或者有排队的单子，经理就<strong>不阻塞</strong>（匆匆看一眼，没有就继续干活）。
+    *   如果厨房完全空闲，经理就<strong>阻塞等待</strong>（盯着大门口，直到有新客人来，否则不干活省电）。
+*   <strong>多卡情况 (TP):</strong> 如果是多张显卡（TP &gt; 1），主卡（Rank 0）负责收消息，然后广播给其他副卡，确保大家步调一致。</p>
+<h4>Task 2: 处理订单信息 (Process Messages)</h4>
+<p><strong>代码位置:</strong> <code>_process_one_msg</code>
+*   <strong>动作:</strong> 把收到的消息拆开看。
+*   <strong>情况 A (UserMsg):</strong> 是新用户的 Prompt。经理把它扔进 <code>prefill_manager</code>（预填充管理器）的等待队列里。
+*   <strong>情况 B (ExitMsg):</strong> 关门指令。抛出异常，结束程序。</p>
+<h4>Task 3: 决定下一批做什么菜 (Schedule Next Batch)</h4>
+<p><strong>代码位置:</strong> <code>_schedule_next_batch</code>
+*   <strong>动作:</strong> 经理看了一眼手里的单子，决定马上给大厨送什么。
+*   <strong>策略 (优先级):</strong>
+    1.  <strong>Prefill (预填充/首字生成):</strong> 优先处理新来的客人（计算 Prompt 的 KV Cache）。如果有，打包成一个 Batch。
+    2.  <strong>Decode (解码/生成后续 Token):</strong> 如果没有新客人，就给正在吃饭的客人加菜（生成下一个 Token）。
+*   <strong>结果:</strong> 生成一个 <code>this_batch</code>（这一批要算的单子）。</p>
+<h4>Task 4: 准备食材 (Prepare Batch)</h4>
+<p><strong>代码位置:</strong> <code>self.engine.prepare_batch(this_batch)</code>
+*   <strong>动作:</strong> 告诉大厨准备开火。这通常涉及将数据从 CPU 移动到 GPU，或者更新页表（Page Table），确保显存里有地方放计算结果。</p>
+<h4>Task 5: 大厨开火 (Engine Forward)</h4>
+<p><strong>代码位置:</strong> <code>self.engine.forward_batch(this_batch)</code>
+*   <strong>动作:</strong> 这是最核心的一步。GPU 开始疯狂计算。
+*   <strong>细节 (Streams):</strong> 注意代码里的 <code>self.stream</code> 和 <code>self.engine.stream</code>。
+    *   经理（CPU）处理元数据用一个流。
+    *   大厨（GPU）计算用另一个流。
+    *   这就像经理在整理下一桌的单子时，大厨正在炒上一桌的菜，<strong>并行工作</strong>，互不耽误。</p>
+<h4>Task 6: 记录在席客人 (Update Managers)</h4>
+<p><strong>代码位置:</strong> <code>self.decode_manager.add_reqs(...)</code>
+*   <strong>动作:</strong> 如果刚才做的是 Prefill（新客人），现在他们已经吃上第一口了，经理要把他们从“等位区”移动到“用餐区”（加入 <code>decode_manager</code>），下一轮循环就开始给他们做 Decode。</p>
+<h4>Task 7: 给上一批客人上菜 (Reply Tokenizer)</h4>
+<p><strong>代码位置:</strong> <code>self.reply_tokenizer(last_result, last_batch)</code>
+*   <strong>注意:</strong> 这里处理的是 <strong><code>last_batch</code></strong>（上一轮循环送进去的单子），因为 GPU 是异步的，现在的循环可能是在处理刚才计算完的结果。
+*   <strong>动作:</strong>
+    1.  拿到 GPU 算出来的 <code>next_tokens</code>。
+    2.  <strong>判断结束:</strong> 客人吃饱了吗？（生成了 EOS 结束符，或者达到最大长度）。
+    3.  <strong>清理:</strong> 如果吃饱了，结账走人（释放显存 <code>free</code>，从调度器移除）。
+    4.  <strong>发送:</strong> 把生成的 Token 发回给 Tokenizer（前端）。</p>
+<hr />
+<h3>🧩 关键模块通俗解释</h3>
+<p>为了辅助理解上面的流程，这里解释一下 <code>Scheduler</code> 类里初始化的那几个 Manager：</p>
+<ol>
+<li>
+<p><strong><code>PrefillManager</code> (等位区管理员):</strong></p>
+<ul>
+<li>管理刚进来的、还没开始生成的请求。</li>
+<li>它负责把长长的 Prompt 拆分成块（Chunked Prefill），防止显存爆掉。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>DecodeManager</code> (用餐区管理员):</strong></p>
+<ul>
+<li>管理正在一个字一个字往外蹦的请求。</li>
+<li>它负责把这些请求凑在一起（Batching），让 GPU 一次算多个，提高效率。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>PageTableManager</code> &amp; <code>CacheManager</code> (座位/餐具管理员):</strong></p>
+<ul>
+<li>LLM 推理最吃显存的是 KV Cache。</li>
+<li>这两个家伙负责管理显存块（Pages）。</li>
+<li><strong>PageTable:</strong> 记录哪个请求用了哪几块显存（类似餐厅的桌号图）。</li>
+<li><strong>Cache:</strong> 实际的显存池子。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>TP (Tensor Parallelism)</code> 相关代码:</strong></p>
+<ul>
+<li>代码里有很多 <code>if self.tp_info.size &gt; 1</code>。</li>
+<li>这是因为大模型太大，一张卡装不下，需要多张卡一起算。</li>
+<li><strong>Rank 0</strong> 是组长，负责对外联络。</li>
+<li><strong>Rank 1...N</strong> 是组员，只听组长的指挥，不做决策，只负责算数。</li>
+</ul>
+</li>
+</ol>
+<h3>总结</h3>
+<p>这段代码其实就是一个<strong>无限循环的流水线</strong>：
+1.  <strong>收单</strong> (ZMQ)
+2.  <strong>排单</strong> (Prefill/Decode Manager)
+3.  <strong>下厨</strong> (Engine Forward)
+4.  <strong>上菜 &amp; 结账</strong> (Reply &amp; Free Memory)</p>
+<p>只要在这个循环里转，ChatGPT 就能一个字接一个字地给你吐答案。</p>

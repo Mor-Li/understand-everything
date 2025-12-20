@@ -1,0 +1,103 @@
+<h1>tests/core/test_engine.py</h1>
+<p>这份代码其实是一个<strong>极其简化的“大模型推理引擎”的测试脚本</strong>。</p>
+<p>简单来说，它的作用是：<strong>手动演示如何用这个引擎（MiniSGL）加载一个模型，并让它回答一个问题。</strong></p>
+<p>为了让你看懂，我把这段代码拆解成一个 <strong>“大模型生成任务的 TODO List”</strong>，我们一步一步来完成这个任务。</p>
+<hr />
+<h3>任务清单：如何让模型开口说话</h3>
+<h4>✅ 第一步：准备引擎配置 (Configuring the Engine)</h4>
+<p>就像你要开车前得先检查油箱、调整座椅一样，我们需要先告诉程序我们要用什么模型，以及怎么用。</p>
+<ul>
+<li><strong>代码对应：</strong>
+    <code>python
+    config = EngineConfig(
+        model_path="meta-llama/Llama-3.1-8B-Instruct", # 1. 用哪个模型？Llama 3.1
+        tp_info=DistributedInfo(0, 1),                 # 2. 用几张显卡？这里是单卡 (rank 0, world_size 1)
+        dtype=torch.bfloat16,                          # 3. 数据精度？bfloat16 (省显存)
+        max_running_req=4,                             # 4. 同时最多处理几个人的提问？4个
+        cuda_graph_bs=[2, 4, 8],                       # 5. 性能优化配置 (CUDA Graph)
+        attention_backend="fi",                        # 6. 注意力算法后端
+    )
+    engine = Engine(config) # 启动引擎！</code></li>
+<li><strong>白话解释：</strong> 这部分是在初始化。不管是 ChatGPT 还是这里的 MiniSGL，第一步永远是把庞大的模型权重加载到显卡里，并设置好运行参数。</li>
+</ul>
+<h4>✅ 第二步：准备输入数据 (Preparing the Request)</h4>
+<p>模型听不懂英文，它只认识数字。我们需要把问题转换成数字，并建立一个“请求单”。</p>
+<ul>
+<li>
+<p><strong>代码对应：</strong>
+    ```python
+    tokenizer = AutoTokenizer.from_pretrained(...)
+    prompt = "What's the answer to life, the universe, and everything?"</p>
+<h1>把文本变成数字 ID (例如: [128, 45, 99...])</h1>
+<p>input_ids = tokenizer.encode(prompt) </p>
+<h1>创建一个请求对象 (Request)</h1>
+<p>req = Req(
+    input_ids=input_ids,
+    page_table_idx=0,   # 这个请求用第0号页表
+    cached_len=0,       # 目前还没生成过，缓存长度为0
+    output_len=10,      # 我们希望它生成10个词
+    device=engine.device,
+    uid=0,              # 请求的身份证号 ID
+)
+```
+*   <strong>白话解释：</strong> 
+1.  <strong>Tokenizer</strong> 是翻译官，把“Life”翻译成数字。
+2.  <strong>Req (Request)</strong> 是一个档案袋。因为服务器可能同时服务很多人，所以需要给你的这个提问建个档案，记录你问了啥、你现在生成到第几个词了、你的数据存在哪。</p>
+</li>
+</ul>
+<h4>✅ 第三步：手动分配显存 (Memory Allocation)</h4>
+<p><strong>这是这段代码最硬核、最不像普通代码的地方。</strong> 因为这是一个“Mini”引擎，它把显存管理暴露出来了。通常这步是自动的。</p>
+<ul>
+<li><strong>代码对应：</strong>
+    <code>python
+    # allocate indices for page table
+    # 给第0号请求，预定显存里的物理块
+    engine.ctx.page_table[0][:1000] = torch.arange(1000, dtype=torch.int32, device=engine.device)</code></li>
+<li><strong>白话解释：</strong> 大模型生成时需要记住之前的对话（KV Cache）。这里采用了 <strong>PagedAttention（分页注意力）</strong> 技术（类似操作系统的内存管理）。<ul>
+<li>这行代码的意思是：<strong>“喂，显卡，给第0号请求预留好位置，把它的数据存在物理内存的第0到1000号块里。”</strong></li>
+</ul>
+</li>
+</ul>
+<h4>✅ 第四步：生成循环 (The Generation Loop)</h4>
+<p>大模型不是一次性吐出整段话的，而是<strong>像挤牙膏一样，一个词一个词往外挤</strong>。所以这里必须有一个 <code>for</code> 循环。</p>
+<ul>
+<li><strong>代码对应：</strong>
+    ```python
+    for _ in range(100): # 最多循环100次（生成100个词）
+        batch = Batch(reqs=[req])       # 1. 打包：把刚才那个请求放进一个批次里
+        engine.prepare_batch(batch)     # 2. 准备：计算这一步需要的元数据
+        engine.forward_batch(batch)     # 3. 推理：模型运行一次 (Forward Pass)<div class="codehilite"><pre><span></span><code><span class="n">result</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">engine</span><span class="o">.</span><span class="n">last_batch_result</span><span class="w"> </span>
+<span class="n">result</span><span class="o">.</span><span class="n">offload_event</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span><span class="w"> </span><span class="c1"># 等待GPU计算完成</span>
+
+<span class="c1"># 4. 获取结果：拿到模型刚刚吐出的那个词的ID</span>
+<span class="n">next_token</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb nb-Type">int</span><span class="p">(</span><span class="n">result</span><span class="o">.</span><span class="n">next_tokens_cpu</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">())</span>
+
+<span class="c1"># 5. 检查结束：如果模型吐出了“结束符(EOS)”，就停下来</span>
+<span class="k">if</span><span class="w"> </span><span class="n">next_token</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">tokenizer</span><span class="o">.</span><span class="n">eos_token_id</span><span class="p">:</span>
+<span class="w">    </span><span class="k">break</span>
+</code></pre></div>
+
+<p>```
+*   <strong>白话解释：</strong> 
+*   <strong>Batch</strong>: 即使只有你一个人在问，也要把你打包成一个“批次”，这是 GPU 处理的习惯。
+*   <strong>Forward</strong>: 这是最费时间的一步，GPU 在疯狂计算，预测下一个词是什么。
+*   <strong>Loop</strong>: 算出第一个词 -&gt; 放回去 -&gt; 算出第二个词 -&gt; 放回去... 直到模型说“我说完了”。</p>
+</li>
+</ul>
+<h4>✅ 第五步：解码与展示 (Decode and Print)</h4>
+<p>现在我们手里有一串数字（原始问题 + 生成的新数字），需要翻译回人类语言。</p>
+<ul>
+<li><strong>代码对应：</strong>
+    <code>python
+    tokens = req.device_ids.cpu().tolist() # 把显卡里的数字列表拿出来
+    logger.info_rank0(tokenizer.decode(tokens)) # 翻译成英文并打印</code></li>
+<li><strong>白话解释：</strong> 把 <code>[128, 45, 99, ...]</code> 这种数字列表，重新变回 "The answer is 42." 这样的文本并打印在屏幕上。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这段代码其实就是模拟了 ChatGPT 后台处理<strong>一条消息</strong>的全过程：
+1.  <strong>开机</strong> (Engine Init)
+2.  <strong>接单</strong> (Create Req)
+3.  <strong>铺桌子</strong> (Alloc Memory)
+4.  <strong>一个字一个字写回复</strong> (For Loop &amp; Forward)
+5.  <strong>把写好的纸条给你看</strong> (Decode)</p>

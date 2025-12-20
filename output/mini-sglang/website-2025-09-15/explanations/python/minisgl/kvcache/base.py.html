@@ -1,0 +1,71 @@
+<h1>python/minisgl/kvcache/base.py</h1>
+<p>这份代码确实比较抽象，因为它定义的是<strong>接口（Interface）</strong>和<strong>基类（Base Class）</strong>，也就是“规矩”和“框架”，而不是具体的“干活代码”。</p>
+<p>简单来说，这个文件是在为<strong>大语言模型（LLM）的推理加速</strong>设计一套<strong>显存管理系统</strong>，核心技术通常被称为 <strong>KV Cache（键值缓存）</strong>。</p>
+<p>为了让你听懂，我们把大模型推理想象成<strong>一个学生在考试写作文</strong>。
+*   <strong>KV Cache</strong> 就是学生的<strong>草稿纸</strong>（记录了之前的思路，不用反复想）。
+*   <strong>显存</strong> 就是<strong>课桌的大小</strong>（空间有限）。</p>
+<p>下面我列一个 <strong>Task Todo List</strong>，按顺序带你一步步理解这个文件里的设计思想。</p>
+<hr />
+<h3>Task 1：准备草稿纸仓库 (<code>BaseKVCache</code>)</h3>
+<p>大模型生成每一个字，都需要回头看之前的内容。为了不每次都重新计算，我们需要把算过的中间结果（Key 和 Value）存起来。</p>
+<ul>
+<li><strong>核心观点</strong>：我们需要一个底层仓库来存数据，不关心怎么管理，只关心存和取。</li>
+<li><strong>代码对应</strong>：<code>class BaseKVCache(ABC)</code><ul>
+<li><strong>Todo 1.1 - 查数据</strong>：<code>k_cache(index)</code>, <code>v_cache(index)</code><ul>
+<li><em>解释</em>：给我第 <code>index</code> 页草稿纸上的内容。</li>
+</ul>
+</li>
+<li><strong>Todo 1.2 - 存数据</strong>：<code>store_kv(...)</code><ul>
+<li><em>解释</em>：把算好的新数据写到指定的格子（<code>out_loc</code>）里去。</li>
+</ul>
+</li>
+<li><strong>Todo 1.3 - 查配置</strong>：<code>device</code>, <code>dtype</code><ul>
+<li><em>解释</em>：这草稿纸是放在桌子上（GPU）还是抽屉里（CPU）？用圆珠笔还是铅笔写（数据类型）？</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 2：设计一个聪明的图书管理员 (<code>BaseCacheManager</code>)</h3>
+<p>这是这个文件最核心的部分。因为显存（课桌）很贵且有限，我们不能无脑存。我们需要一个管理员来决定<strong>存什么、删什么、复用什么</strong>。这个管理员通常用于实现 <strong>Prefix Caching（前缀缓存）</strong> 技术（比如 SGLang 或 RadixAttention）。</p>
+<ul>
+<li><strong>核心观点</strong>：不要每次都从头算。如果用户问过类似的问题，直接复用之前的草稿。</li>
+</ul>
+<h4>Step 2.1：查找有没有抄过的作业 (Match)</h4>
+<p>当一个新的请求（比如“介绍一下苹果公司”）进来时：
+*   <strong>Todo</strong>：<code>match_prefix(input_ids)</code>
+*   <strong>解释</strong>：管理员去翻以前的草稿堆。
+    *   <em>场景</em>：以前有人问过“介绍一下苹果”，虽然这次多了“公司”两个字，但前面的“介绍一下苹果”是一样的。
+    *   <em>结果</em>：返回一个“句柄”（Handle，即草稿的位置）和匹配的长度。这样前几个字就不用算了，直接从缓存拿，速度飞快。</p>
+<h4>Step 2.2：锁定草稿，防止被扔掉 (Lock)</h4>
+<p>找到了可以复用的草稿后，正在使用它的时候，不能让别人把它扔了。
+*   <strong>Todo</strong>：<code>lock_handle(handle)</code>
+*   <strong>解释</strong>：给这几页草稿纸贴个条：“正在使用，勿动”。
+*   <strong>代码对应</strong>：<code>lock_handle_guard</code> 是一个上下文管理器（<code>with</code> 语句），自动帮你贴条和撕条，防止你忘了解锁。</p>
+<h4>Step 2.3：写入新的思考 (Insert)</h4>
+<p>在复用了前面的内容后，模型生成了新的内容（或者计算了不匹配的那部分 Prompt）。
+*   <strong>Todo</strong>：<code>insert_prefix(input_ids, indices)</code>
+*   <strong>解释</strong>：把新计算出来的部分，注册到管理员的目录里。
+    *   <em>目的</em>：下次如果有人问完全一样的问题，这些新算出来的也能被复用。</p>
+<h4>Step 2.4：空间不够，扔垃圾 (Evict)</h4>
+<p>显存（课桌）满了，必须腾地方给新任务。
+*   <strong>Todo</strong>：<code>evict(size)</code>
+*   <strong>解释</strong>：管理员根据策略（比如 LRU，最近最少使用的）扔掉一些很久没人查阅的草稿。
+    *   <code>SizeInfo</code> 类就是用来统计现在还有多少空位的（<code>evictable_size</code> 可被扔掉的大小，<code>protected_size</code> 被锁定正在用的大小）。</p>
+<hr />
+<h3>Task 3：总结与回顾</h3>
+<p>把上面的流程串起来，这个文件的逻辑就是：</p>
+<ol>
+<li><strong>定义仓库 (<code>BaseKVCache</code>)</strong>：定义了物理上数据怎么存（是 LayerFirst 还是 PageFirst 布局）。</li>
+<li><strong>定义大脑 (<code>BaseCacheManager</code>)</strong>：<ul>
+<li><strong>来活了</strong> -&gt; 先用 <code>match_prefix</code> 看看能不能偷懒（复用缓存）。</li>
+<li><strong>确定复用</strong> -&gt; 用 <code>lock_handle</code> 锁住数据。</li>
+<li><strong>干活中</strong> -&gt; 调用 <code>BaseKVCache</code> 的 <code>store_kv</code> 存物理数据。</li>
+<li><strong>干完活</strong> -&gt; 用 <code>insert_prefix</code> 告诉管理员“我存了新东西，下次记得用”。</li>
+<li><strong>没地了</strong> -&gt; 用 <code>evict</code> 清理旧缓存。</li>
+</ul>
+</li>
+</ol>
+<p><strong>一句话总结：</strong>
+这是一个<strong>带有“前缀匹配功能”的显存管理系统</strong>的接口定义，目的是为了让大模型在处理相似的 Prompt 时，能通过“抄以前的作业”来大幅提高速度，并自动管理有限的显存空间。</p>

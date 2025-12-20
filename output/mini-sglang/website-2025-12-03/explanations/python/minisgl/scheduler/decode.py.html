@@ -1,0 +1,76 @@
+<h1>python/minisgl/scheduler/decode.py</h1>
+<p>这份代码确实涉及到底层的 LLM（大语言模型）推理系统设计，如果不了解背景（比如 PagedAttention、KV Cache），确实像天书。</p>
+<p>别担心，我们把它想象成一个<strong>餐厅的领班（Manager）</strong>，他的工作是安排正在<strong>一边吃饭一边说话（Decode 阶段）</strong>的客人们。</p>
+<p>在 LLM 推理中，<strong>Decode（解码）</strong> 阶段指的是模型<strong>一个字一个字往外蹦</strong>的过程。</p>
+<p>我为你列了一个 <strong>"领班的任务清单 (To-Do List)"</strong>，我们按照这个清单，一步步把代码对应进去。</p>
+<hr />
+<h3>任务清单：DecodeManager 的工作流程</h3>
+<h4>Task 1: 确立职责 —— 我是谁？</h4>
+<p><strong>目标</strong>：管理所有已经开始说话（生成回答）的请求，安排它们生成下一个字。
+*   <strong>代码对应</strong>：<code>class DecodeManager</code>
+*   <strong>解释</strong>：这个类就是领班。它手里有两个工具：
+    1.  <code>cache_manager</code>：<strong>管座位的</strong>（显存管理器，管理 KV Cache）。
+    2.  <code>table_manager</code>：<strong>管记账的</strong>（页表管理器，记录哪个请求的数据存在哪里）。</p>
+<h4>Task 2: 维护客人名单 —— 谁在场？</h4>
+<p><strong>目标</strong>：随时知道哪些请求正在运行，哪些已经说完话离开了。
+*   <strong>代码对应</strong>：
+    *   <code>self.running_reqs: Set[Req] = set()</code> (初始化一个空名单)
+    *   <code>add_reqs(...)</code>: 新客人加入（通常是从 Prefill 阶段转过来的）。
+    *   <code>remove_req(...)</code>: 客人说完话了，把名字划掉。
+*   <strong>解释</strong>：Decode 阶段的特点是，所有在名单里的请求，<strong>每一轮都要生成 1 个新 token</strong>。所以只要你在名单里，下一轮就有你一份。</p>
+<h4>Task 3: 检查工作量 —— 还有多少活？</h4>
+<p><strong>目标</strong>：看看所有客人加起来还需要说多少个字。
+*   <strong>代码对应</strong>：<code>inflight_tokens</code> 属性
+*   <strong>解释</strong>：<code>sum(req.remain_len ...)</code>。这通常用于统计负载。</p>
+<hr />
+<h3>Task 4: (核心) 安排下一轮上菜 —— <code>schedule_next_batch</code></h3>
+<p>这是整个文件最核心的逻辑。领班要指挥后厨给所有在场的客人每人上“一个字”。</p>
+<p>我们可以把它拆解为三个子步骤：</p>
+<h4>Step 4.1: 检查座位够不够</h4>
+<p><strong>目标</strong>：我要给现在的 $N$ 个客人每人生成 1 个新 token，显存（KV Cache）里还有 $N$ 个空位吗？
+*   <strong>代码对应</strong>：
+    <code>python
+    decode_bs = len(self.running_reqs)  # 这一轮的批处理大小 = 客人数量
+    if self.cache_manager.available_size &lt; decode_bs:
+        raise NotImplementedError(...) # 如果没位子了，目前代码会报错（实际上应该暂停某些请求）</code>
+*   <strong>解释</strong>：因为每个请求生成一个新 token，就需要占用一点新的显存来存 KV Cache。如果没有足够显存，系统就转不动了。</p>
+<h4>Step 4.2: 分配座位（物理地址）</h4>
+<p><strong>目标</strong>：去仓库里拿 $N$ 个新的空位子（物理块索引）出来。
+*   <strong>代码对应</strong>：
+    <code>python
+    reqs = list(self.running_reqs) # 把集合转成列表，固定顺序
+    out_loc = self.cache_manager.allocate(decode_bs) # 找管座位的要 N 个位置</code>
+*   <strong>解释</strong>：<code>out_loc</code> 拿到的是物理显存的地址索引。比如：“给这 5 个请求分配显存块号 [101, 102, 103, 104, 105]”。</p>
+<h4>Step 4.3: 更新账本（页表映射）</h4>
+<p><strong>目标</strong>：告诉 GPU，“第 A 号客人的第 X 个字，存放在刚才申请的第 Y 号物理位置”。
+*   <strong>代码对应</strong>：
+    ```python
+    from minisgl.kernel_v2 import store_decode_indices</p>
+<div class="codehilite"><pre><span></span><code>store_decode_indices(
+    page_table=self.table_manager.page_table, # 拿出总账本
+    indices=out_loc,                          # 刚才申请到的物理位置
+    pos=[(req.page_table_idx, req.cached_len) for req in reqs], # 逻辑位置
+)
+```
+</code></pre></div>
+
+<ul>
+<li><strong>解释</strong>：这是最难懂的一步。<ul>
+<li><strong>逻辑位置</strong>：比如“请求A”现在已经有了 10 个字，现在要存第 11 个字。<code>req.page_table_idx</code> 是请求A在账本里的行号，<code>req.cached_len</code> 是它当前的长度。</li>
+<li><strong>物理位置</strong>：<code>out_loc</code> (Step 4.2 拿到的)。</li>
+<li><strong>动作</strong>：调用一个 GPU 核函数 (<code>store_decode_indices</code>)，把逻辑位置和物理位置对应关系写进页表。这样 GPU 在计算时，才知道去哪里读取和写入数据。</li>
+</ul>
+</li>
+</ul>
+<h4>Step 4.4: 发令枪</h4>
+<p><strong>目标</strong>：返回这批请求，让模型引擎去执行计算。
+*   <strong>代码对应</strong>：<code>return reqs</code></p>
+<hr />
+<h3>总结：这段代码在讲什么？</h3>
+<p>这段代码是一个 <strong>"Decode 阶段调度器"</strong>。</p>
+<p>如果不看代码细节，它就在做一件事：</p>
+<blockquote>
+<p><strong>看着手里的一把请求，确认显存够不够，如果够，就给每个请求分配一个新的显存坑位，把坑位地址记在小本本（页表）上，然后把请求交出去让 GPU 跑一轮。</strong></p>
+</blockquote>
+<p><strong>为什么你之前看不懂？</strong>
+因为它省略了具体的计算逻辑（在 <code>kernel_v2</code> 里），只保留了<strong>资源管理</strong>逻辑。你只要理解它是在<strong>"分配显存"</strong>和<strong>"更新映射表"</strong>，就看懂了 90%。</p>

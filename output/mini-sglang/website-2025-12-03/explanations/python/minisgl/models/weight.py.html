@@ -1,0 +1,101 @@
+<h1>python/minisgl/models/weight.py</h1>
+<p>这段代码看起来很硬核，因为它涉及到了<strong>大模型推理系统（Inference System）</strong>中最核心的两个环节：<strong>模型权重的加载</strong> 和 <strong>张量并行（Tensor Parallelism）的切分</strong>。</p>
+<p>简单来说，这段代码的任务就是：<strong>把 HuggingFace 上的模型下载下来，根据你有几张显卡把模型“切开”，然后把能合并的矩阵合并一下，最后放到显卡里准备开跑。</strong></p>
+<p>为了让你更容易理解，我为你列了一个 <strong>“学习与执行 To-Do List”</strong>。我们可以把这段代码想象成是在<strong>厨房备菜</strong>的过程。</p>
+<hr />
+<h3>📋 任务清单 (To-Do List)</h3>
+<ol>
+<li><strong>Task 1: 采购与拆包 (Download &amp; Load)</strong><ul>
+<li><em>目标</em>：从网上把模型文件下载下来，读取到内存里。</li>
+<li><em>对应代码</em>：<code>load_hf_weight</code> 函数的前半部分。</li>
+</ul>
+</li>
+<li><strong>Task 2: 切分蛋糕 (Sharding / Tensor Parallelism)</strong><ul>
+<li><em>目标</em>：如果你有多张显卡（比如2张），你需要把巨大的模型权重切成两半，每张卡拿一部分。</li>
+<li><em>对应代码</em>：<code>_shard_state_dict</code> 函数。</li>
+</ul>
+</li>
+<li><strong>Task 3: 摆盘优化 (Merging Weights)</strong><ul>
+<li><em>目标</em>：为了计算更快，把原本独立的三个矩阵（Q、K、V）拼成一个大矩阵。</li>
+<li><em>对应代码</em>：<code>_merge_state_dict</code> 函数。</li>
+</ul>
+</li>
+<li><strong>Task 4: 上桌 (To Device)</strong><ul>
+<li><em>目标</em>：把处理好的数据从 CPU 内存搬运到 GPU 显存。</li>
+<li><em>对应代码</em>：<code>load_hf_weight</code> 函数的最后部分。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>逐步讲解 (Step-by-Step)</h3>
+<h4>✅ Task 1: 采购与拆包 (Download &amp; Load)</h4>
+<p><strong>代码逻辑：</strong>
+在 <code>load_hf_weight</code> 函数的一开始：
+1.  <strong><code>snapshot_download</code></strong>: 就像去超市（HuggingFace Hub）把菜买回来。它会下载 <code>.safetensors</code> 格式的权重文件。
+2.  <strong><code>safetensors.safe_open</code></strong>: 打开包装袋。把文件里的权重读取到 CPU 内存（<code>state_dict</code>）中。</p>
+<p><strong>通俗理解：</strong>
+这一步还没什么高科技，就是把模型文件读进字典里，key 是层的名字（比如 <code>layer.0.attention</code>），value 是具体的数字矩阵。</p>
+<hr />
+<h4>✅ Task 2: 切分蛋糕 (Sharding / Tensor Parallelism) 🌟最难点</h4>
+<p><strong>代码逻辑：</strong>
+这是 <code>_shard_state_dict</code> 函数做的事。如果你的 <code>tp_info.size &gt; 1</code>（说明你有多张显卡在跑），就需要切分。</p>
+<p><strong>为什么要切？</strong>
+大模型参数太多，一张卡装不下，或者算得太慢。我们需要把矩阵切开，让多张卡同时算。</p>
+<p><strong>怎么切？（代码中的核心逻辑）：</strong></p>
+<ol>
+<li>
+<p><strong>竖着切 (Column Parallel)</strong>:</p>
+<ul>
+<li><em>代码</em>：<code>SPLIT_DIM_0_LIST</code> (包含 <code>q_proj</code>, <code>k_proj</code>, <code>v_proj</code>, <code>gate</code>, <code>up</code>)。</li>
+<li><em>操作</em>：<code>value.chunk(n, dim=0)[r]</code>。</li>
+<li><em>解释</em>：比如 Q 矩阵及其庞大，我们把它按<strong>输出维度</strong>切开。第 0 号显卡拿第一份，第 1 号显卡拿第二份。</li>
+<li><em>比喻</em>：一块长条蛋糕，横着切几刀，一人拿一段。</li>
+</ul>
+</li>
+<li>
+<p><strong>横着切 (Row Parallel)</strong>:</p>
+<ul>
+<li><em>代码</em>：<code>SPLIT_DIM_1_LIST</code> (包含 <code>o_proj</code>, <code>down_proj</code>)。</li>
+<li><em>操作</em>：<code>value.chunk(n, dim=1)[r]</code>。</li>
+<li><em>解释</em>：这是为了配合上面的竖着切。在线性层运算中，如果前一层是竖着切输出，后一层通常需要横着切输入，以便最后能用 <code>AllReduce</code> 把结果加起来。</li>
+<li><em>比喻</em>：为了让蛋糕还能拼回去，这次我们换个方向切。</li>
+</ul>
+</li>
+<li>
+<p><strong>切词表 (Vocab Parallel)</strong>:</p>
+<ul>
+<li><em>代码</em>：<code>lm_head</code>, <code>embed_tokens</code>。</li>
+<li><em>操作</em>：计算 <code>vocab_start_idx</code> 到 <code>vocab_end_idx</code>。</li>
+<li><em>解释</em>：词表可能有 10 万个词。显卡 0 负责维护前 5 万个词的向量，显卡 1 负责后 5 万个。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>✅ Task 3: 摆盘优化 (Merging Weights)</h4>
+<p><strong>代码逻辑：</strong>
+这是 <code>_merge_state_dict</code> 函数做的事。</p>
+<p><strong>为什么要合并？</strong>
+在 Transformer 模型中，计算 Attention 时需要 Query(Q), Key(K), Value(V) 三个矩阵。
+*   <strong>笨办法</strong>：算 3 次矩阵乘法（Input × Q, Input × K, Input × V）。
+*   <strong>聪明办法</strong>：把 Q, K, V 拼成一个大矩阵，算 <strong>1 次</strong> 矩阵乘法，然后再切开结果。这样效率高很多（利用 GPU 并行优势）。</p>
+<p><strong>代码细节：</strong>
+*   <code>torch.cat([q_proj, k_proj, v_proj], dim=0)</code>: 把 Q、K、V 三兄弟拼在一起，改名叫 <code>.qkv_proj</code>。
+*   <code>torch.cat([gate_proj, up_proj], dim=0)</code>: 同理，把 MLP 层里的 Gate 和 Up 拼在一起，改名叫 <code>.gate_up_proj</code>。
+*   <code>del state_dict[...]</code>: 拼完之后，把原来的小矩阵删掉，节省内存。</p>
+<hr />
+<h4>✅ Task 4: 上桌 (To Device)</h4>
+<p><strong>代码逻辑：</strong>
+回到 <code>load_hf_weight</code> 的最后：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">state_dict</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">state_dict</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
+</code></pre></div>
+
+<p><strong>解释：</strong>
+刚才所有的操作（下载、读取、切分、合并）大多是在 CPU 内存里完成的。这一步是把最终处理好的“干净、切好、拼好”的权重，正式搬运到 GPU 显存里，准备开始推理。</p>
+<hr />
+<h3>总结</h3>
+<p>这个文件的核心观点是：<strong>为了让 MiniSGL（这个库的名字）能高效运行大模型，我们需要在加载阶段就做好两件事：</strong></p>
+<ol>
+<li><strong>分布式切分</strong>：按需把权重分给不同的显卡（<code>_shard_state_dict</code>）。</li>
+<li><strong>算子融合准备</strong>：把能合并计算的矩阵提前拼好（<code>_merge_state_dict</code>）。</li>
+</ol>
+<p>现在再看代码，是不是觉得逻辑清晰了一些？</p>

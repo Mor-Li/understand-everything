@@ -1,0 +1,92 @@
+<h1>tests/core/test_llama.py</h1>
+<p>这份代码其实是一个 <strong>“如何从零开始手动组装并运行一个 Llama 大模型”</strong> 的核心流程演示。</p>
+<p>通常我们用 HuggingFace 的 <code>model.generate()</code> 一行代码就搞定了，但这个文件展示的是<strong>更底层、更硬核</strong>的推理引擎（Inference Engine）是如何工作的（类似于 vLLM 或 SGLang 的简化版）。</p>
+<p>为了让你看懂，我把它拆解成一个 <strong>“启动大模型的 7 个 Task Todo List”</strong>。你可以想象自己是一个大模型的“包工头”，你需要按顺序完成以下任务才能让模型跑起来：</p>
+<hr />
+<h3>📋 Task 1: 准备图纸和场地 (配置与环境)</h3>
+<p><strong>目标</strong>：确定要跑哪个模型，用什么显卡。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    set_tp_info(0, 1)  # 设置分布式信息（这里是单卡运行）
+    model_path = "meta-llama/Llama-3.1-8B-Instruct" # 选定模型图纸
+    config = AutoConfig.from_pretrained(model_path) # 读取图纸参数
+    device = torch.device("cuda:0") # 指定工地（显卡）</code></li>
+<li><strong>解读</strong>：就像盖房子前要看蓝图。这里决定了我们要跑 Llama-3.1-8B，并且告诉系统“只有一张显卡，不用考虑多卡通讯”。</li>
+</ul>
+<h3>📋 Task 2: 搭建空架子 (初始化模型结构)</h3>
+<p><strong>目标</strong>：在显存里把模型的“骨架”搭起来，但这时候里面是空的（没有知识）。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    with torch_dtype(dtype), device:
+        model = LlamaForCausalLM(model_config) # 按照图纸搭建骨架</code></li>
+<li><strong>解读</strong>：这一步创建了神经网络的层数、形状，但是里面的参数（权重）都是随机的乱码。</li>
+</ul>
+<h3>📋 Task 3: 装修填料 (加载权重)</h3>
+<p><strong>目标</strong>：把训练好的“知识”（权重文件）填进刚才的空架子里。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    model.load_state_dict(load_hf_weight(model_path, device))</code></li>
+<li><strong>解读</strong>：从硬盘读取几十 GB 的文件，把真正的模型参数填进去。这一步做完，模型才有脑子。</li>
+</ul>
+<h3>📋 Task 4: 准备笔记本 (创建 KV Cache 显存池)</h3>
+<p><strong>目标</strong>：预先划定一块显存区域，专门用来记笔记（KV Cache）。<strong>这是高性能推理的关键。</strong></p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    kv_cache = create_kvcache(..., num_pages=65536, ...)</code></li>
+<li><strong>解读</strong>：大模型聊天时需要“记住”之前说过的话。普通的写法是每次都重新算，这里则是<strong>预先申请一大块内存（65536页）</strong>，专门用来存对话历史。这就像给模型发了一本超厚的空白笔记本。</li>
+</ul>
+<h3>📋 Task 5: 聘请管理员 (配置计算后端与页表)</h3>
+<p><strong>目标</strong>：设置好“谁来管理笔记本”以及“用什么算法算注意力”。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    page_table = Context.create_page_table(...) # 创建页表（目录）
+    attn_backend = create_attention_backend(..., "fa3", page_table) # 使用 Flash Attention 3
+    ctx = Context(...) # 打包成全局上下文
+    set_global_ctx(ctx)</code></li>
+<li><strong>解读</strong>：<ul>
+<li><strong>Page Table</strong>: 就像书的目录，告诉模型哪段对话存在哪一页。</li>
+<li><strong>Backend ("fa3")</strong>: 指定使用 Flash Attention 3 这种超快的算法来计算注意力。</li>
+</ul>
+</li>
+</ul>
+<h3>📋 Task 6: 接待顾客 (处理输入数据)</h3>
+<p><strong>目标</strong>：把用户的文字变成数字，并包装成一个“推理请求”。</p>
+<ul>
+<li>
+<p><strong>代码对应</strong>：
+    ```python
+    input_str = "Hello, what's your name?"
+    tokenizer = AutoTokenizer.from_pretrained(...) # 翻译官（文本转数字）</p>
+<h1>创建一个批次(Batch)，里面包含一个请求(Req)</h1>
+<p>batch = Batch(
+    reqs=[
+        Req(
+            input_ids=tokenizer.encode(input_str), # 输入的数字
+            page_table_idx=1, # 指定分配给它的显存页索引
+            ...
+        )
+    ],
+)
+<code>``
+*   **解读**：这不仅仅是把文字转 ID，还**手动分配了显存位置**（</code>page_table_idx`）。这就像餐厅领位员，不仅记下客人点了什么菜，还安排好了客人坐在几号桌。</p>
+</li>
+</ul>
+<h3>📋 Task 7: 开工干活 (执行前向传播)</h3>
+<p><strong>目标</strong>：让模型根据输入，算出下一个字的概率。</p>
+<ul>
+<li><strong>代码对应</strong>：
+    <code>python
+    attn_backend.prepare_metadata(batch, allow_graph=False) # 准备计算所需的元数据
+    logits = model.forward_batch(batch) # 真正的计算过程
+    logger.info(logits) # 输出结果</code></li>
+<li><strong>解读</strong>：一切准备就绪，机器轰鸣运转。<code>logits</code> 就是模型输出的一堆分数，分数最高的那个通常就是它想说的下一个字。</li>
+</ul>
+<hr />
+<h3>💡 总结：这篇文章到底在讲啥？</h3>
+<p>这篇代码在讲：<strong>如果不使用 HuggingFace 那些傻瓜式的封装，而是为了极致性能（使用 FlashAttention、KV Cache 分页管理），我们需要如何在底层手动控制数据流和显存。</strong></p>
+<p>它展示了一个<strong>高性能推理引擎的最小工作单元</strong>。</p>

@@ -1,0 +1,115 @@
+<h1>python/minisgl/engine/engine.py</h1>
+<p>这份代码 <code>minisgl/engine/engine.py</code> 是整个推理框架的<strong>核心大脑</strong>（Engine）。它的作用就像是一个<strong>指挥官</strong>，负责管理显卡（GPU）、内存、模型加载、以及最关键的——如何让模型跑起来生成文本。</p>
+<p>为了让你看懂，我把这个 <code>Engine</code> 要做的事情拆解成一个 <strong>Task Todo List</strong>，然后按照这个顺序一步步给你讲解。</p>
+<h3>📋 Engine 的 Task Todo List (任务清单)</h3>
+<p>一个 LLM 推理引擎启动和运行，必须按顺序完成以下任务：</p>
+<ol>
+<li><strong>[环境准备]</strong>：初始化分布式环境（如果是多卡运行），设定好 GPU 设备和通信流。</li>
+<li><strong>[加载模型]</strong>：把神经网络的架构搭建好，并把权重（weights）搬运到显卡上。</li>
+<li><strong>[内存规划 - 最关键一步]</strong>：<ul>
+<li>计算显卡还剩多少显存。</li>
+<li><strong>预先分配 KV Cache</strong>（这是 PagedAttention 的核心）：根据剩余显存，算出能存多少“页”的对话历史，一次性把坑位占好。</li>
+<li>建立<strong>页表 (Page Table)</strong>：用来记录哪个请求的数据存在哪一页。</li>
+</ul>
+</li>
+<li><strong>[性能优化]</strong>：录制 <strong>CUDA Graph</strong>（一种显卡加速技术），把常用的计算流程“录像”下来，以后直接回放，减少 CPU 指挥的时间。</li>
+<li><strong>[执行推理 (Forward Loop)]</strong>：<ul>
+<li>接收一批用户的输入 (Batch)。</li>
+<li>指挥模型进行计算 (Forward)。</li>
+<li>采样 (Sample) 选出下一个字。</li>
+<li>返回结果。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>💡 逐步观点解析</h3>
+<p>下面我们对照代码，通过上面的清单来详细讲解它的设计观点。</p>
+<h4>第一步：环境准备 (初始化通信与设备)</h4>
+<p>在 <code>__init__</code> 和 <code>_init_communication</code> 方法中。</p>
+<ul>
+<li><strong>观点</strong>：<strong>大模型通常太大，一张卡装不下，或者为了跑得快，需要多张卡一起算（Tensor Parallelism, TP）。</strong></li>
+<li><strong>代码逻辑</strong>：<ul>
+<li><code>set_tp_info</code>: 告诉当前进程它是第几号显卡（Rank）。</li>
+<li><code>torch.cuda.set_device</code>: 绑定当前进程到指定的 GPU。</li>
+<li><code>_init_communication</code>: 建立多卡之间的“电话线”（ProcessGroup）。如果是单卡或者是特殊模式，用 Gloo；如果是高性能多卡，用 NCCL（NVIDIA 的通信库）。</li>
+<li><code>_sync_get_memory</code>: <strong>同步显存信息</strong>。这是一个很有意思的细节，它会检查所有显卡，看谁的剩余显存最少（木桶效应），以最少的那个为准，防止有的卡爆显存。</li>
+</ul>
+</li>
+</ul>
+<h4>第二步：加载模型 (把大脑装进显存)</h4>
+<p>在 <code>__init__</code> 和 <code>_load_weight_state_dict</code> 中。</p>
+<ul>
+<li><strong>观点</strong>：<strong>先加载模型权重，才知道还剩多少空间给 KV Cache。</strong></li>
+<li><strong>代码逻辑</strong>：<ul>
+<li><code>create_model</code>: 此时只是在 <code>meta</code> 设备（虚拟设备）上创建模型结构，不占显存。</li>
+<li><code>load_hf_weight</code>: 从硬盘加载 HuggingFace 格式的权重。</li>
+<li><code>self.model.load_state_dict</code>: 真正把权重放进 GPU 显存。</li>
+<li><em>Log</em>: 此时代码会打印 <code>Free memory before loading model</code>，让你知道模型吃掉了多少资源。</li>
+</ul>
+</li>
+</ul>
+<h4>第三步：内存规划 (PagedAttention 的核心)</h4>
+<p>这是 <code>minisgl</code> 最核心的部分，对应 <code>_determine_num_pages</code> 和 <code>create_kvcache</code>。</p>
+<ul>
+<li><strong>观点</strong>：<strong>LLM 推理最占显存的不是模型本身，而是 KV Cache（对话的历史记忆）。</strong> 传统的做法是动态分配，容易产生碎片。现在的做法（PagedAttention）是<strong>像操作系统管理内存一样，把显存切成一块块固定的“页 (Page)”。</strong></li>
+<li><strong>代码逻辑</strong>：<ol>
+<li><strong>算账 (<code>_determine_num_pages</code>)</strong>：<ul>
+<li>看看加载完模型后，显卡还剩多少显存 (<code>new_free_memory</code>)。</li>
+<li>预留一点点缓冲，剩下的全部拿来做 KV Cache。</li>
+<li>计算公式：<code>可用显存 / 每一页的大小 = 总页数 (num_pages)</code>。</li>
+</ul>
+</li>
+<li><strong>占坑 (<code>create_kvcache</code>)</strong>：<ul>
+<li>根据算出来的 <code>num_pages</code>，直接在 GPU 上申请一大块连续的 Tensor。这就是<strong>内存池</strong>。</li>
+</ul>
+</li>
+<li><strong>建表 (<code>create_page_table</code>)</strong>：<ul>
+<li>创建一个表格，用来记录：“请求 A 的第 1 段数据放在物理显存的第 5 页，第 2 段在第 8 页...”。</li>
+<li>这允许显存是不连续的，极大地提高了利用率。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h4>第四步：性能优化 (CUDA Graph)</h4>
+<p>对应 <code>GraphRunner</code> 的初始化。</p>
+<ul>
+<li><strong>观点</strong>：<strong>CPU 发射指令给 GPU 是有延迟的。</strong> 如果每次推理都要 CPU 喊：“算这一层，再算那一层”，GPU 会有很多空闲等待时间。</li>
+<li><strong>代码逻辑</strong>：<ul>
+<li><strong>CUDA Graph</strong> 就像是把一连串的 GPU 操作（算 Attention、算 MLP 等）录制成一个“宏命令”。</li>
+<li><code>GraphRunner</code>: 这里会用一个假的请求 (<code>dummy_req</code>) 预先跑几遍模型，把这个过程“录”下来。</li>
+<li>以后真正跑的时候，只要告诉 GPU：“执行刚才录好的那个宏”，速度会快很多。</li>
+</ul>
+</li>
+</ul>
+<h4>第五步：执行推理 (Forward Batch)</h4>
+<p>对应 <code>forward_batch</code> 方法。这是引擎真正干活的时候。</p>
+<ul>
+<li><strong>观点</strong>：<strong>推理是一个“前向传播 -&gt; 采样 -&gt; 复制结果”的循环。</strong></li>
+<li><strong>代码逻辑</strong>：<ol>
+<li><strong>上下文切换 (<code>self.ctx.forward_batch(batch)</code>)</strong>：告诉全局，现在处理的是这一批请求，把对应的 Page Table 准备好。</li>
+<li><strong>选择路径</strong>：<ul>
+<li>如果这一批数据的形状符合之前录制的 CUDA Graph (<code>can_use_cuda_graph</code>)，直接<strong>回放</strong> (<code>replay</code>)，速度极快。</li>
+<li>如果不符合，就老老实实走普通的 <code>model.forward()</code>。</li>
+</ul>
+</li>
+<li><strong>采样 (<code>sampler.sample</code>)</strong>：模型输出的是概率（Logits），Sampler 根据概率选出下一个 token ID。</li>
+<li><strong>异步拷贝</strong>：<ul>
+<li><code>next_tokens_gpu.to("cpu", non_blocking=True)</code>：把生成的 Token 从 GPU 拷回 CPU。注意这里用了 <code>non_blocking</code>，意味着 CPU 发出拷贝命令后立刻往下走，不傻等，提高效率。</li>
+<li><code>copy_done_event</code>：用一个事件标记来通知外部“什么时候拷贝完了”。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<h3>总结</h3>
+<p>这个 <code>Engine</code> 文件其实就在讲一个故事：</p>
+<blockquote>
+<p>我是一个精打细算的管家。
+1. 我先要把房子（GPU）打扫好，连通电话（分布式）。
+2. 把主人（模型）请进来住下。
+3. 看着剩下的房间，我把它们切建成一个个标准的小隔间（Pages），专门用来存客人的行李（KV Cache），绝不浪费一点空间。
+4. 为了干活快，我把常见的端茶倒水动作练成了肌肉记忆（CUDA Graph）。
+5. 当客人（Batch）来了，我就按流程接待，算出他们想听的下一句话，然后迅速告诉前台。</p>
+</blockquote>
+<p>你看懂这个逻辑，就看懂了现代高性能 LLM 推理引擎（如 vLLM, SGLang）的基础骨架。</p>

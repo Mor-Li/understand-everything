@@ -1,0 +1,85 @@
+<h1>python/minisgl/scheduler/prefill.py</h1>
+<p>这份代码实现了一个 <strong>LLM 推理系统中的“预填充（Prefill）”调度器</strong>。</p>
+<p>简单来说，当你给大模型发一段很长的话（Prompt）时，模型需要先把这段话“读”进去，计算出 KV Cache，这个过程叫 <strong>Prefill</strong>。如果这段话太长，或者同时来的人太多，显存不够用，或者计算量太大，我们就需要<strong>调度</strong>：决定谁先读，读多少，是不是要分批读。</p>
+<p>为了让你听懂，我把这个 <code>prefill.py</code> 当作一个<strong>餐厅经理（Scheduler）</strong>，把它的工作拆解成一个 <strong>To-Do List</strong>。</p>
+<hr />
+<h3>核心任务清单 (To-Do List)</h3>
+<h4>任务一：接待顾客 (接收请求)</h4>
+<p><strong>代码对应：</strong> <code>PrefillManager</code> 类中的 <code>__init__</code> 和 <code>add_raw_req</code></p>
+<ul>
+<li><strong>场景</strong>：用户发来了一个请求（比如“请帮我总结这篇文章...”）。</li>
+<li><strong>动作</strong>：<ol>
+<li>经理拿个小本本（<code>self.pending_list</code>）把顾客记下来。</li>
+<li>记下顾客的 ID (<code>uid</code>)，输入的文字 (<code>input_ids</code>) 和想要生成的长度 (<code>output_len</code>)。</li>
+<li>此时顾客还在排队，还没开始上菜。</li>
+</ol>
+</li>
+</ul>
+<h4>任务二：处理“大胃王” (分块机制)</h4>
+<p><strong>代码对应：</strong> <code>ChunkedReq</code> 类</p>
+<ul>
+<li><strong>场景</strong>：有的顾客点了一桌满汉全席（输入文本特别长，比如 10k token），或者餐厅现在很忙，一次做不完他的菜。</li>
+<li><strong>动作</strong>：<ol>
+<li><strong>切分订单</strong>：我们不能一次性把所有数据塞进显卡（因为会爆显存或阻塞太久）。</li>
+<li><strong>记录进度</strong>：<code>ChunkedReq</code> 就是一个特殊的记账单。它记录了：<ul>
+<li><code>full_input_ids</code>: 完整的菜单（还在 CPU 内存里）。</li>
+<li><code>cached_len</code>: 已经吃（计算）了多少。</li>
+<li><code>remain_chunk_size</code>: 还有多少没吃。</li>
+</ul>
+</li>
+<li><strong>上菜 (<code>next_chunk</code>)</strong>：每次只切一部分（<code>chunk_size</code>），从 CPU 搬运到 GPU (<code>to(device)</code>), 然后告诉系统：“这次先算这 500 个字，剩下的下次调度再说。”</li>
+</ol>
+</li>
+</ul>
+<h4>任务三：核心调度循环 (安排下一批次)</h4>
+<p><strong>代码对应：</strong> <code>schedule_next_batch</code> 方法</p>
+<p>这是最复杂的部分，经理要决定下一秒钟谁能进厨房。经理手里有一个 <strong>“预算” (<code>prefill_budget</code>)</strong>，表示这一轮显卡能处理多少个 Token。</p>
+<p>经理会拿着预算，按顺序遍历排队的顾客 (<code>pending_list</code>)，执行以下步骤：</p>
+<p><strong>步骤 3.1：检查家底</strong>
+*   <strong>动作</strong>：看看还有没有显存（<code>cache_manager</code>）？还有没有空桌子（<code>table_manager</code>）？
+*   <strong>判断</strong>：如果资源不够了，或者预算归零了，立刻停止接单 (<code>break</code>)。</p>
+<p><strong>步骤 3.2：照顾“吃到一半”的顾客</strong>
+*   <strong>代码</strong>：<code>if (chunked_req := req.chunked_req) is not None:</code>
+*   <strong>逻辑</strong>：
+    1.  如果这个顾客上次没吃完（是 <code>ChunkedReq</code>）。
+    2.  看预算还能提供多少（<code>min(剩余量, 预算)</code>）。
+    3.  调用 <code>next_chunk</code> 给他上下一道菜。
+    4.  如果还没吃完，让他继续回排队列表 (<code>chunked_list</code>) 等下一轮。
+    5.  把他这轮要处理的部分加入 <code>result</code>（送去显卡计算）。</p>
+<p><strong>步骤 3.3：处理新顾客 (最关键的逻辑)</strong>
+*   <strong>代码</strong>：<code>handle, match_indices = self.cache_manager.match_req(req)</code> 到结尾
+*   <strong>逻辑</strong>：
+    1.  <strong>查重（Radix Cache）</strong>：先看这个顾客点的菜，以前有没有人点过？（比如多轮对话的前文，或者 System Prompt）。如果有，直接复用缓存 (<code>cached_len</code>)，不用重新算。
+    2.  <strong>计算需求</strong>：这顿饭实际还需要做多少新菜 (<code>extend_len</code> = 总长度 - 抄作业的长度)。
+    3.  <strong>预算判断</strong>：
+        *   如果需要做的新菜太多，超过了预算 -&gt; <strong>强制分块</strong> (<code>is_chunked = True</code>)。把这个请求变成 <code>ChunkedReq</code>，这轮只做一部分。
+        *   如果预算够 -&gt; 一次性做完。
+    4.  <strong>显存预判</strong>：算一下加上他要生成的输出，显存够不够？
+        *   <strong>锁显存 (<code>lock</code>)</strong>：先占住坑位，防止被别人抢了。如果发现不够，解锁并放弃，这轮不让他上了。
+    5.  <strong>分配资源 (<code>allocate</code>)</strong>：
+        *   在页表（Page Table）里申请位置。
+        *   如果是“抄作业”的部分，把索引填进去。
+        *   如果是“新菜”部分，分配新的显存块。
+    6.  <strong>生成请求对象</strong>：
+        *   如果是分块的，创建 <code>ChunkedReq</code>。
+        *   如果是完整的，创建普通 <code>Req</code>。
+    7.  <strong>扣除预算</strong>：<code>prefill_budget -= chunk_size</code>。</p>
+<h4>任务四：整理队伍</h4>
+<p><strong>代码对应：</strong> <code>schedule_next_batch</code> 的最后部分</p>
+<ul>
+<li><strong>动作</strong>：<ol>
+<li>把刚才没处理完的“分块顾客” (<code>chunked_list</code>) 放回队伍最前面。</li>
+<li>把刚才完全没轮到的顾客接在后面。</li>
+<li>把这一轮决定要处理的请求列表 (<code>result</code>) 交给 GPU 去跑。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>总结一下文中的核心观点</h3>
+<ol>
+<li><strong>显存是稀缺的，计算力是有限的</strong>：不能无脑把所有请求扔给 GPU。</li>
+<li><strong>分块（Chunking）是必要的</strong>：为了防止一个超长请求把系统卡死（导致其他短请求一直在等），或者防止显存瞬间爆炸，必须把长文本切碎了，分多次“喂”给模型。</li>
+<li><strong>前缀缓存（Prefix Caching）很重要</strong>：代码里花了很多逻辑在 <code>match_req</code> 和 <code>cached_len</code> 上，就是为了尽量复用以前算过的东西，省时间、省显存。</li>
+<li><strong>CPU 到 GPU 的流式传输</strong>：<code>ChunkedReq</code> 甚至管理了数据从 CPU 内存（<code>_input_ids_cpu</code>）按需移动到 GPU 的过程，避免一次性占用太多 GPU 显存。</li>
+</ol>
+<p>现在再看代码，你应该能对应上了：<code>schedule_next_batch</code> 就是那个精打细算的经理，在显存和计算预算的限制下，尽可能高效地安排顾客就餐。</p>

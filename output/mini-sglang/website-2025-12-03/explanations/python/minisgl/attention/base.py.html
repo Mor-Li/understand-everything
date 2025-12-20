@@ -1,0 +1,100 @@
+<h1>python/minisgl/attention/base.py</h1>
+<p>这份代码确实非常抽象，因为它主要是在定义<strong>接口（Interface）</strong>和<strong>架构标准</strong>，而不是具体的计算逻辑。</p>
+<p>你可以把它想象成是一个<strong>大语言模型（LLM）推理引擎的“交通规则手册”</strong>。它规定了不同的注意力（Attention）算法应该长什么样，但没有具体写算法是怎么算的。</p>
+<p>为了让你读懂，我制定了一个 <strong>5步走的 Task List</strong>，我们一步步来拆解这个文件背后的逻辑。</p>
+<hr />
+<h3>Task 1：理解背景知识 —— LLM 推理的两大阶段</h3>
+<p>在看代码之前，必须先理解 LLM 推理（让模型说话）的两个截然不同的阶段，因为代码里的 <code>HybridBackend</code> 就是为了处理这个区别而存在的。</p>
+<ol>
+<li><strong>Prefill（预填充阶段）</strong>：<ul>
+<li><strong>场景</strong>：你发给模型一段很长的话（Prompt）。</li>
+<li><strong>特点</strong>：模型要一次性并行处理所有输入的字。计算量大，是“大力出奇迹”的阶段。</li>
+</ul>
+</li>
+<li><strong>Decode（解码阶段）</strong>：<ul>
+<li><strong>场景</strong>：模型一个字一个字地往外吐答案。</li>
+<li><strong>特点</strong>：每次只生成一个新词。计算量小，但速度要求极高，通常需要特殊的优化手段。</li>
+</ul>
+</li>
+</ol>
+<p><strong>结论</strong>：因为这两个阶段计算特性完全不同，所以往往需要<strong>两套不同的算法后端</strong>来分别处理。</p>
+<hr />
+<h3>Task 2：看懂 <code>BaseAttnMetadata</code> —— 定义“数据管家”</h3>
+<p><strong>代码位置</strong>：<code>class BaseAttnMetadata(ABC)</code></p>
+<ul>
+<li><strong>它的角色</strong>：这是一个“抽象基类”。它规定了所有具体的 Metadata 类必须具备的功能。</li>
+<li><strong>通俗解释</strong>：算 Attention 需要知道每个 Token（字）在什么位置。这个类就是负责回答“<strong>字都在哪儿？</strong>”的管家。</li>
+<li><strong>关键方法</strong>：<ul>
+<li><code>get_positions()</code>: 告诉我每个 Token 的位置 ID。</li>
+<li><code>get_last_indices()</code>: 告诉我每一句话最后一个 Token 在哪（生成新词时需要用到）。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 3：看懂 <code>BaseAttnBackend</code> —— 定义“计算工头”</h3>
+<p><strong>代码位置</strong>：<code>class BaseAttnBackend(ABC)</code></p>
+<ul>
+<li><strong>它的角色</strong>：这是所有 Attention 算法（比如 FlashAttention, PagedAttention）必须遵守的模板。</li>
+<li><strong>通俗解释</strong>：不管你用什么黑科技算 Attention，你必须提供以下几个按钮给我按。</li>
+<li><strong>关键方法拆解</strong>：<ol>
+<li><strong><code>prepare_metadata(...)</code></strong>：<ul>
+<li><strong>含义</strong>：备菜。</li>
+<li><strong>解释</strong>：在正式计算前，先把辅助数据（位置索引、显存页表等）准备好。</li>
+</ul>
+</li>
+<li><strong><code>forward(q, k, v, ...)</code></strong>：<ul>
+<li><strong>含义</strong>：炒菜（核心计算）。</li>
+<li><strong>解释</strong>：输入 Q、K、V 张量，算出 Attention 的结果。这是最核心的数学计算函数。</li>
+</ul>
+</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>Task 4：攻克难点 —— 什么是“Capture Graph”？</h3>
+<p><strong>代码位置</strong>：<code>BaseAttnBackend</code> 中后半部分的方法 (<code>init_capture_graph</code>, <code>prepare_for_capture</code>, <code>prepare_for_replay</code>)</p>
+<ul>
+<li><strong>背景</strong>：在 Task 1 提到的 <strong>Decode（解码）</strong> 阶段，因为每次只算一点点东西，CPU 发指令给 GPU 的时间可能比 GPU 实际计算的时间还长。这很浪费。</li>
+<li><strong>解决方案（CUDA Graph）</strong>：<ul>
+<li><strong>录像（Capture）</strong>：让 CPU 带着 GPU 走一遍流程，把所有操作录下来。</li>
+<li><strong>回放（Replay）</strong>：以后再跑的时候，CPU 不发指令了，直接按个“播放键”，GPU 自己按录像跑。</li>
+</ul>
+</li>
+<li><strong>代码对应</strong>：<ul>
+<li><code>init_capture_graph</code>: 准备录像带。</li>
+<li><code>prepare_for_capture</code>: 准备好录像时的假数据。</li>
+<li><code>prepare_for_replay</code>: 准备好回放时的真数据。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>Task 5：看懂 <code>HybridBackend</code> —— “双面经理”</h3>
+<p><strong>代码位置</strong>：<code>class HybridBackend(BaseAttnBackend)</code></p>
+<ul>
+<li><strong>它的角色</strong>：这是一个具体的实现类（不是抽象的了）。</li>
+<li><strong>核心逻辑</strong>：它手里捏着两个小弟：<ol>
+<li><code>self.prefill_backend</code>: 专门负责处理长文本输入的。</li>
+<li><code>self.decode_backend</code>: 专门负责一个字一个字生成的。</li>
+</ol>
+</li>
+<li><strong>工作流程（看它的 <code>forward</code> 方法）</strong>：
+    <code>python
+    def forward(...):
+        if batch.is_prefill:  # 如果是刚开始读入 Prompt
+            return self.prefill_backend.forward(...) # 让大力士小弟上
+        else:                 # 如果是在生成回答
+            return self.decode_backend.forward(...)  # 让敏捷小弟上</code></li>
+<li><strong>关于 CUDA Graph 的处理</strong>：<ul>
+<li>你会发现 <code>init_capture_graph</code> 等方法里，它<strong>只调用了 decode_backend</strong>。</li>
+<li><strong>原因</strong>：正如 Task 4 所说，录像回放这种优化技术，通常只用于 <strong>Decode</strong> 阶段。Prefill 阶段变化太大且计算量大，不适合也没必要用这种优化。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个文件其实就讲了三件事：</p>
+<ol>
+<li><strong>定规矩</strong>：所有算 Attention 的必须能回答位置信息 (<code>BaseAttnMetadata</code>)，必须能执行计算和预处理 (<code>BaseAttnBackend</code>)。</li>
+<li><strong>搞优化</strong>：为了加速，定义了一套 CUDA Graph 的录制/回放接口。</li>
+<li><strong>做分流</strong>：<code>HybridBackend</code> 是一个“调度员”，它根据当前是在“读题”还是“答题”，把任务分发给不同的计算后端，并且只在“答题”阶段启用高级优化。</li>
+</ol>

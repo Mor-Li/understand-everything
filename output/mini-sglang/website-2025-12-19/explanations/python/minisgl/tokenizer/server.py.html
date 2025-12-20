@@ -1,0 +1,112 @@
+<h1>python/minisgl/tokenizer/server.py</h1>
+<p>完全没问题。这段代码看起来复杂，但其实它只是在做一个<strong>“翻译官”</strong>的工作。</p>
+<p>在深度学习大模型（LLM）中，模型只认识<strong>数字（Tensor/Tokens）</strong>，而用户只认识<strong>文字（Text）</strong>。
+这个文件 <code>server.py</code> 就是站在中间的那个<strong>翻译中介</strong>。</p>
+<p>我们可以把这个脚本看作是一个不知疲倦的工人（Worker），他的工作流程可以拆解为下面这 <strong>7 个 Task（任务）</strong>。</p>
+<hr />
+<h3>核心角色介绍</h3>
+<ul>
+<li><strong>User/Frontend（前端）</strong>：给文字，想要文字。</li>
+<li><strong>Backend（后端/模型）</strong>：吃数字，吐数字。</li>
+<li><strong>Tokenizer Worker（也就是这个文件）</strong>：负责把文字变成数字给后端，把数字变成文字给前端。</li>
+</ul>
+<hr />
+<h3>任务清单 (Task Todo List)</h3>
+<h4>Task 1: 建立通信渠道 (Setup Communication)</h4>
+<p><strong>目标</strong>：我要知道从哪里听命令，以及翻译好后要把东西发给谁。
+<strong>代码对应</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">send_backend</span> <span class="o">=</span> <span class="n">ZmqPushQueue</span><span class="p">(</span><span class="n">backend_addr</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>  <span class="c1"># 发送给模型（后端）的通道</span>
+<span class="n">send_frontend</span> <span class="o">=</span> <span class="n">ZmqPushQueue</span><span class="p">(</span><span class="n">frontend_addr</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span> <span class="c1"># 发送给用户（前端）的通道</span>
+<span class="n">recv_listener</span> <span class="o">=</span> <span class="n">ZmqPullQueue</span><span class="p">(</span><span class="n">addr</span><span class="p">,</span> <span class="o">...</span><span class="p">)</span>         <span class="c1"># 监听任务的通道（别人发给我）</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：
+代码开头初始化了三个“邮箱”。
+1.  <code>recv_listener</code>: 用来<strong>收信</strong>。这里面会有用户发来的新问题（文字），也会有模型算出来的结果（数字）。
+2.  <code>send_backend</code>: 用来<strong>发信给模型</strong>。把翻译好的数字发过去让模型算。
+3.  <code>send_frontend</code>: 用来<strong>发信给用户</strong>。把翻译好的文字发回去给用户看。</p>
+<h4>Task 2: 拿上翻译字典 (Load Tokenizer)</h4>
+<p><strong>目标</strong>：没有字典我怎么翻译？加载 HuggingFace 的 Tokenizer。
+<strong>代码对应</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">tokenizer</span><span class="p">:</span> <span class="n">LlamaTokenizer</span> <span class="o">=</span> <span class="n">AutoTokenizer</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="n">tokenizer_path</span><span class="p">,</span> <span class="n">use_fast</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="c1"># ... 以及初始化两个具体干活的经理</span>
+<span class="n">tokenize_manager</span> <span class="o">=</span> <span class="n">TokenizeManager</span><span class="p">(</span><span class="n">tokenizer</span><span class="p">)</span>
+<span class="n">detokenize_manager</span> <span class="o">=</span> <span class="n">DetokenizeManager</span><span class="p">(</span><span class="n">tokenizer</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：
+这里加载了 <code>tokenizer</code>（比如 Llama 的分词器）。同时请了两个助手：
+*   <code>TokenizeManager</code>: 专门负责 <strong>文字 -&gt; 数字</strong>。
+*   <code>DetokenizeManager</code>: 专门负责 <strong>数字 -&gt; 文字</strong>。</p>
+<h4>Task 3: 进入工作循环 (Main Loop)</h4>
+<p><strong>目标</strong>：只要没断电，我就一直守在这里等活儿干。
+<strong>代码对应</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">try</span><span class="p">:</span>
+    <span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
+        <span class="c1"># ...</span>
+<span class="k">except</span> <span class="ne">KeyboardInterrupt</span><span class="p">:</span>
+    <span class="k">pass</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：
+一个死循环 <code>while True</code>，表示这个服务启动后会一直运行，等待处理源源不断的消息。</p>
+<h4>Task 4: 接收并凑单 (Receive &amp; Batching)</h4>
+<p><strong>目标</strong>：为了效率，不要来一个做一个，尽量凑够一波（Batch）再一起处理。
+<strong>代码对应</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="n">pending_msg</span> <span class="o">=</span> <span class="n">_unwrap_msg</span><span class="p">(</span><span class="n">recv_listener</span><span class="o">.</span><span class="n">get</span><span class="p">())</span> <span class="c1"># 先拿一个</span>
+<span class="k">while</span> <span class="nb">len</span><span class="p">(</span><span class="n">pending_msg</span><span class="p">)</span> <span class="o">&lt;</span> <span class="n">local_bs</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">recv_listener</span><span class="o">.</span><span class="n">empty</span><span class="p">():</span>
+    <span class="c1"># 如果没凑够 local_bs (比如16个)，且队列里还有信，就继续拿</span>
+    <span class="n">pending_msg</span><span class="o">.</span><span class="n">extend</span><span class="p">(</span><span class="n">_unwrap_msg</span><span class="p">(</span><span class="n">recv_listener</span><span class="o">.</span><span class="n">get</span><span class="p">()))</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：
+<code>local_bs</code> 是“本地批大小”。比如设定为 8，工人就会尝试从邮箱里一次性拿 8 封信。如果只有 1 封，他也得干；如果有 100 封，他一次先拿 8 封。这样批量翻译比一句一句翻译要快。</p>
+<h4>Task 5: 任务分类 (Classification)</h4>
+<p><strong>目标</strong>：手里的这堆信，哪些是“要去模型的”，哪些是“要回给用户的”？
+<strong>代码对应</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 挑出需要“解词”（数字变文字）的任务</span>
+<span class="n">detokenize_msg</span> <span class="o">=</span> <span class="p">[</span><span class="n">m</span> <span class="k">for</span> <span class="n">m</span> <span class="ow">in</span> <span class="n">pending_msg</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">m</span><span class="p">,</span> <span class="n">DetokenizeMsg</span><span class="p">)]</span>
+<span class="c1"># 挑出需要“分词”（文字变数字）的任务</span>
+<span class="n">tokenize_msg</span> <span class="o">=</span> <span class="p">[</span><span class="n">m</span> <span class="k">for</span> <span class="n">m</span> <span class="ow">in</span> <span class="n">pending_msg</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">m</span><span class="p">,</span> <span class="n">TokenizeMsg</span><span class="p">)]</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：
+*   <strong>DetokenizeMsg</strong>: 这是模型刚算完的数字，需要翻译成文字告诉用户（比如 ChatGPT 生成的答案）。
+*   <strong>TokenizeMsg</strong>: 这是用户刚输入的问题，需要翻译成数字告诉模型。</p>
+<h4>Task 6: 处理“数字转文字”任务 (Handle Detokenize)</h4>
+<p><strong>目标</strong>：把模型生成的 Token ID 变成人类能看的字，并发给前端。
+<strong>代码对应</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">detokenize_msg</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+    <span class="n">replies</span> <span class="o">=</span> <span class="n">detokenize_manager</span><span class="o">.</span><span class="n">detokenize</span><span class="p">(</span><span class="n">detokenize_msg</span><span class="p">)</span> <span class="c1"># 1. 翻译</span>
+    <span class="n">batch_output</span> <span class="o">=</span> <span class="n">BatchFrontendMsg</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 2. 打包</span>
+    <span class="n">send_frontend</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">batch_output</span><span class="p">)</span>      <span class="c1"># 3. 发送给前端</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：
+如果发现有来自模型的数字包，就调用 <code>detokenize_manager</code> 变成文字。然后打包成 <code>BatchFrontendMsg</code>（发给前端的批量消息），最后丢进 <code>send_frontend</code> 邮箱。用户就能在屏幕上看到字了。</p>
+<h4>Task 7: 处理“文字转数字”任务 (Handle Tokenize)</h4>
+<p><strong>目标</strong>：把用户的问题变成 Token ID，并发给后端模型。
+<strong>代码对应</strong>：</p>
+<div class="codehilite"><pre><span></span><code><span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">tokenize_msg</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+    <span class="n">tensors</span> <span class="o">=</span> <span class="n">tokenize_manager</span><span class="o">.</span><span class="n">tokenize</span><span class="p">(</span><span class="n">tokenize_msg</span><span class="p">)</span> <span class="c1"># 1. 翻译</span>
+    <span class="n">batch_output</span> <span class="o">=</span> <span class="n">BatchBackendMsg</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 2. 打包</span>
+    <span class="n">send_backend</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">batch_output</span><span class="p">)</span>      <span class="c1"># 3. 发送给后端</span>
+</code></pre></div>
+
+<p><strong>解释</strong>：
+如果发现有来自用户的新问题，就调用 <code>tokenize_manager</code> 变成 Tensor（张量/数字）。然后打包成 <code>BatchBackendMsg</code>（发给后端的批量消息），最后丢进 <code>send_backend</code> 邮箱。模型收到后就开始推理计算了。</p>
+<hr />
+<h3>总结这个文件的逻辑流</h3>
+<ol>
+<li><strong>启动</strong>：加载字典，建立收发室。</li>
+<li><strong>循环</strong>：<ul>
+<li>从 <code>recv_listener</code> 收一堆信。</li>
+<li><strong>分类</strong>：<ul>
+<li>如果是<strong>模型产出的结果</strong> $\rightarrow$ 翻译成<strong>文字</strong> $\rightarrow$ 发给 <strong>用户(Frontend)</strong>。</li>
+<li>如果是<strong>用户输入的问题</strong> $\rightarrow$ 翻译成<strong>数字</strong> $\rightarrow$ 发给 <strong>模型(Backend)</strong>。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<p>这就是这个 <code>server.py</code> 的全部内容，它就是一个兢兢业业的双向翻译中转站。</p>

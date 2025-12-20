@@ -1,0 +1,79 @@
+<h1>python/minisgl/layers/embedding.py</h1>
+<p>这段代码涉及 <strong>大模型推理（LLM Inference）</strong> 中的核心概念：<strong>张量并行（Tensor Parallelism, TP）</strong>。</p>
+<p>简单来说，当模型的词表（Vocabulary）非常大（比如 Llama 3 有 128k 个词），单个 GPU 显存放不下或者计算太慢时，我们需要把这个巨大的“词表矩阵”切成几份，分给不同的 GPU 去处理。</p>
+<p>为了让你听懂，我们把这个过程拆解成一个 <strong>6步走的 Task List</strong>，每一步攻克一个知识点。</p>
+<hr />
+<h3>✅ Task 1: 理解背景——为什么要切分？</h3>
+<p><strong>概念：</strong> 也就是代码里的 <code>VocabParallelEmbedding</code>。
+想象一本超级厚的字典（词表），里面有 10 万个词。
+*   <strong>单卡模式：</strong> 你一个人拿着整本字典查词。
+*   <strong>多卡模式（TP）：</strong> 我们把字典撕成两半。GPU 0 拿前半本（词 ID 0~49999），GPU 1 拿后半本（词 ID 50000~99999）。这就是 <strong>Vocab Parallelism（词表并行）</strong>。</p>
+<p><strong>代码对应：</strong>
+*   <code>tp_info.size</code>: 总共有几个人（几张卡）。
+*   <code>tp_info.rank</code>: 我是第几个人（第几张卡）。</p>
+<hr />
+<h3>✅ Task 2: 理解切分逻辑——我该管哪一部分？</h3>
+<p><strong>位置：</strong> <code>VocabParallelEmbedding</code> 的 <code>__init__</code> 方法。</p>
+<p><strong>逻辑：</strong>
+既然大家分工了，每个人得知道自己负责的范围。
+1.  <code>divide_up(num_embeddings, self.tp_size)</code>: 计算每个人分多少个词。
+2.  <code>start_idx</code> 和 <code>finish_idx</code>: 计算我的负责范围。
+    *   比如 GPU 0 负责 <code>[0, 50)</code>。
+    *   比如 GPU 1 负责 <code>[50, 100)</code>。
+3.  <code>self.weight</code>: 初始化属于<strong>我这一小块</strong>的权重矩阵。</p>
+<hr />
+<h3>✅ Task 3: 攻克输入层——如何查词？(Embedding Forward)</h3>
+<p><strong>位置：</strong> <code>VocabParallelEmbedding</code> 的 <code>forward</code> 方法。</p>
+<p><strong>场景：</strong> 用户输入了一个词 ID，比如是 <code>5</code>。
+*   <strong>GPU 0 (负责 0-49):</strong> 它的范围包含 5。它能查到对应的向量（Vector）。
+*   <strong>GPU 1 (负责 50-99):</strong> 它的范围不包含 5。它查不到，结果通常是全 0 的向量。</p>
+<p><strong>关键操作 <code>all_reduce</code>：</strong>
+既然 GPU 1 的结果是 0，GPU 0 的结果是正确向量。
+代码最后一句 <code>self._comm.all_reduce(y)</code> 的作用是：<strong>把所有 GPU 的结果加起来</strong>。
+*   <code>向量 A (来自GPU0) + 0 (来自GPU1) = 向量 A</code>。
+*   这样每张卡最终都拿到了完整的、正确的词向量。</p>
+<hr />
+<h3>✅ Task 4: 攻克输出层——什么是 LM Head？</h3>
+<p><strong>位置：</strong> <code>ParallelLMHead</code> 类。</p>
+<p><strong>概念：</strong>
+Embedding 是把“词 ID”变成“数学向量”。
+LM Head (Language Model Head) 是反过来的，它把“数学向量”变回“下一个词的概率”。
+它本质上也是一个巨大的矩阵乘法，所以它继承了 <code>VocabParallelEmbedding</code>。</p>
+<p><strong>难点：Weight Tying (权重绑定)</strong>
+*   代码里有 <code>tie_word_embeddings</code>。
+*   <strong>原理：</strong> 为了省显存，很多模型（如 Llama, GPT）的<strong>输入层</strong>（Embedding）和<strong>输出层</strong>（LM Head）共用同一个大矩阵，只是用法不同。
+*   <strong>代码逻辑：</strong> 如果 <code>tied_embedding</code> 不是空，我就不自己创建权重了，直接借用输入层的权重 (<code>self.tied_embedding</code>)。</p>
+<hr />
+<h3>✅ Task 5: 攻克输出层的计算——怎么算出概率？</h3>
+<p><strong>位置：</strong> <code>ParallelLMHead</code> 的 <code>forward</code> 方法。</p>
+<p><strong>逻辑：</strong>
+现在手里有一个隐藏层向量 <code>x</code>，想知道它是哪个词。
+1.  <code>F.linear(x, module.weight, ...)</code>: 做矩阵乘法，算出每个词的打分（Logits）。
+    *   GPU 0 算出词 0~49 的分数。
+    *   GPU 1 算出词 50~99 的分数。</p>
+<p><strong>关键区别：</strong>
+输入层我们要的是<strong>叠加</strong>（因为只有一个词是对的，其他是0），所以用 <code>all_reduce</code>。
+输出层我们要的是<strong>拼接</strong>（因为我们需要知道所有 100 个词的分数，才能算出谁最高），所以代码里用了 <strong><code>all_gather</code></strong>。</p>
+<hr />
+<h3>✅ Task 6: 最后的拼接——All Gather 的魔法</h3>
+<p><strong>位置：</strong> <code>ParallelLMHead</code> 的 <code>forward</code> 最后几行。</p>
+<p><strong>代码解析：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="n">output_tensor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_comm</span><span class="o">.</span><span class="n">all_gather</span><span class="p">(</span><span class="n">logits</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li>GPU 0 手里有 <code>[分数0...分数49]</code>。</li>
+<li>GPU 1 手里有 <code>[分数50...分数99]</code>。</li>
+<li><code>all_gather</code> 之后，大家手里都有了 <code>[分数0...分数49, 分数50...分数99]</code>。</li>
+</ul>
+<p><strong>形状变换 (Reshape/View)：</strong>
+代码最后那堆复杂的 <code>view</code>, <code>movedim</code>, <code>reshape</code> 是为了处理所有 GPU 把数据拼在一起后的形状问题，确保最后输出的形状是 <code>[Batch Size, 完整的词表大小]</code>。</p>
+<hr />
+<h3>📝 总结 Checklist</h3>
+<ol>
+<li><strong>初始化</strong>：根据 GPU 数量，把大词表切成小块，每张卡只存自己那一块。</li>
+<li><strong>Embedding (输入)</strong>：每张卡查自己的表，查不到就是 0。最后把大家的结果<strong>加起来 (<code>all_reduce</code>)</strong>。</li>
+<li><strong>LM Head (输出)</strong>：每张卡算自己负责的那部分词的分数。最后把大家的分数<strong>拼起来 (<code>all_gather</code>)</strong>。</li>
+<li><strong>Tying</strong>：为了省钱（显存），输入和输出经常共用同一套参数。</li>
+</ol>
+<p>现在回头看代码，是不是稍微清晰一点了？</p>

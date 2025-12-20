@@ -1,0 +1,119 @@
+<h1>python/minisgl/layers/embedding.py</h1>
+<p>这就对了！这段代码涉及了大模型推理中非常硬核的<strong>“张量并行”（Tensor Parallelism, TP）</strong>概念。如果没有分布式计算的背景，确实像看天书。</p>
+<p>我们可以把解读这段代码想象成一个<strong>“如何把一本超厚的字典撕成几半，分给几个人同时查，最后还能把结果拼回来”</strong>的任务。</p>
+<p>下面是一个由浅入深的 <strong>学习任务清单 (Todo List)</strong>，带你一步步攻克这段代码：</p>
+<hr />
+<h3>✅ Task 1: 理解核心背景 (为什么要切分？)</h3>
+<p><strong>目标：</strong> 明白这段代码存在的意义。</p>
+<ul>
+<li><strong>概念：</strong> 大语言模型（LLM）的词表（Vocabulary）通常很大（比如 Llama3 有 128k 个词）。这就导致 Embedding 层（把词变成向量）和 LM Head 层（把向量变回词的概率）的矩阵非常巨大，单张显卡可能放不下，或者计算太慢。</li>
+<li><strong>代码对应：</strong> <code>VocabParallelEmbedding</code> 和 <code>ParallelLMHead</code>。</li>
+<li><strong>比喻：</strong> 字典太厚了，我们有 2 个人（2张显卡，TP size=2）。<ul>
+<li><strong>显卡0</strong> 负责保管第 1~64000 个词。</li>
+<li><strong>显卡1</strong> 负责保管第 64001~128000 个词。</li>
+</ul>
+</li>
+<li><strong>关键词：</strong> <code>tp_info.rank</code> (我是第几个人), <code>tp_info.size</code> (一共有几个人), <code>num_embeddings</code> (词表总大小)。</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 解析 <code>VocabParallelEmbedding</code> (输入层)</h3>
+<p><strong>目标：</strong> 搞懂如何“分头查字典”。</p>
+<p>这一层的作用是：你给它一个词的ID（比如 "Apple" 的ID是 50），它给你返回一个向量。</p>
+<ol>
+<li>
+<p><strong>初始化 (<code>__init__</code>)：</strong></p>
+<ul>
+<li><strong>切蛋糕：</strong> <code>divide_up</code> 把总词数除以显卡数。</li>
+<li><strong>认领任务：</strong> <code>start_idx</code> 和 <code>finish_idx</code> 算出当前显卡负责的词ID范围（<code>vocab_range</code>）。比如显卡0负责 [0, 100)，显卡1负责 [100, 200)。</li>
+<li><strong>存权重：</strong> <code>self.weight</code> 只由当前显卡负责的那一小部分权重组成。</li>
+</ul>
+</li>
+<li>
+<p><strong>前向传播 (<code>forward</code>)：</strong></p>
+<ul>
+<li><strong>单卡情况：</strong> <code>if self.tp_size == 1</code>，直接查表，没啥好说的。</li>
+<li><strong>多卡情况 (重点)：</strong><ul>
+<li>假设输入是 ID=50。</li>
+<li><strong>显卡0 (负责0-100)：</strong> 发现50在我的范围内，查出对应的向量 <code>v</code>。</li>
+<li><strong>显卡1 (负责100-200)：</strong> 发现50<strong>不在</strong>我的范围内，输出一个<strong>全0的向量</strong>。</li>
+<li><strong>代码对应：</strong> <code>fused_indexing</code> 就是做这个“如果在范围内就查，不在就返回0”的操作。</li>
+</ul>
+</li>
+<li><strong>合并结果：</strong> <code>self._comm.all_reduce(y)</code>。<ul>
+<li>这是一个通信操作。它把所有显卡的结果<strong>加起来</strong>。</li>
+<li>显卡0的向量 <code>v</code> + 显卡1的 <code>0</code> = <code>v</code>。</li>
+<li>这样每张显卡最终都得到了正确的向量，即使那个词原本不在它手里。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 3: 解析 <code>ParallelLMHead</code> (输出层)</h3>
+<p><strong>目标：</strong> 搞懂如何“分头算概率”。</p>
+<p>这一层是 LLM 的最后一层，把隐藏层向量变回词的概率（Logits）。这相当于矩阵乘法 $Y = X \times W^T$。</p>
+<ol>
+<li>
+<p><strong>初始化：</strong></p>
+<ul>
+<li>继承了上面的 Embedding 类，因为结构是一样的（也是按词切分）。</li>
+<li><code>self.bias</code>：偏置项，也切分了。</li>
+</ul>
+</li>
+<li>
+<p><strong>前向传播 (<code>forward</code>) - 第一阶段：计算</strong></p>
+<ul>
+<li><code>logits = F.linear(x, self.weight, bias)</code></li>
+<li>注意：这里的 <code>weight</code> 是切分过的。</li>
+<li><strong>结果：</strong> 显卡0 算出了输入对应的 <strong>第0~100个词的打分</strong>；显卡1 算出了 <strong>第100~200个词的打分</strong>。大家手里的结果都是“残缺”的，只有一部分词的分数。</li>
+</ul>
+</li>
+<li>
+<p><strong>前向传播 - 第二阶段：合并 (<code>all_gather</code>)</strong></p>
+<ul>
+<li><code>output_tensor = self._comm.all_gather(logits)</code></li>
+<li><strong>动作：</strong> 大家把各自手里的残缺打分表交换一下。</li>
+<li>显卡0 拿到了显卡1 算的那部分，显卡1 也拿到了显卡0 的。</li>
+<li><strong>拼接：</strong> 代码后面那一堆 <code>view</code>, <code>movedim</code>, <code>reshape</code> 是为了把收集来的数据拼成一个完整的形状：<code>[Batch Size, 完整的词表大小]</code>。</li>
+<li><strong>裁剪：</strong> <code>[:, : self.num_embeddings]</code> 因为有时候为了对齐（比如能被8整除），切分时会多补几个占位符，这里要把多余的切掉。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>✅ Task 4: 进阶难点 - “Prefill” 优化</h3>
+<p><strong>目标：</strong> 理解代码中那个奇怪的 <code>if batch.is_prefill</code> 逻辑。</p>
+<ul>
+<li><strong>问题场景：</strong> 在大模型推理的第一阶段（Prefill/预填充），我们输入一句话 "A B C"，目的是预测 "D"。</li>
+<li><strong>常规做法：</strong> 模型会算出 "A-&gt;B", "B-&gt;C", "C-&gt;D" 的所有预测。</li>
+<li><strong>优化做法：</strong> 实际上我们只关心最后一个 token "C" 预测出的 "D"。前面的预测在推理时往往用不到。</li>
+<li><strong>代码解读：</strong>
+    <code>python
+    if batch.is_prefill:
+        # 只要每个序列的最后一个 token 的位置
+        indices = batch.attn_metadata.get_last_indices(bs)
+        # 只保留这些 token 进行计算，扔掉中间的
+        x = x[indices].contiguous()</code></li>
+<li><strong>作用：</strong> 极大地减少了最后一层 LMHead 的计算量（因为 LMHead 的矩阵乘法非常大，只算最后一个 token 能省很多时间）。</li>
+</ul>
+<hr />
+<h3>📝 总结回顾 (Cheat Sheet)</h3>
+<p>把这个文件看作是 <strong>“分布式字典管理器”</strong>：</p>
+<ol>
+<li>
+<p><strong><code>VocabParallelEmbedding</code> (查字典):</strong></p>
+<ul>
+<li><strong>策略：</strong> 字典撕开，每人拿一部分。</li>
+<li><strong>查询：</strong> 每人查自己的部分，查不到给 0。</li>
+<li><strong>合并：</strong> 把大家的结果加起来 (<code>all_reduce</code>)。</li>
+</ul>
+</li>
+<li>
+<p><strong><code>ParallelLMHead</code> (写字典/生成):</strong></p>
+<ul>
+<li><strong>策略：</strong> 每个人只负责算一部分词的得分。</li>
+<li><strong>合并：</strong> 把大家算出的得分拼起来 (<code>all_gather</code>)，形成完整的词表得分。</li>
+<li><strong>优化：</strong> 如果是刚开始读文章（Prefill），只算最后一个字的得分，前面的不管，省力气。</li>
+</ul>
+</li>
+</ol>
+<p>现在再回去看代码，关注 <code>all_reduce</code> (加法合并) 和 <code>all_gather</code> (拼接合并)，应该就清晰多了！</p>

@@ -1,0 +1,108 @@
+<h1>python/minisgl/engine/sample.py</h1>
+<p>这份代码的核心功能是 <strong>“大模型生成文本时的选词逻辑”</strong>。</p>
+<p>简单来说，大模型（LLM）算出一堆候选词的分数（Logits）后，需要有一个人来决定到底选哪个词作为下一个输出。这个 <code>Sampler</code> 类就是做这个决定的“决策官”。</p>
+<p>为了让你彻底看懂，我把阅读这份代码拆解成 <strong>4 个待办任务 (Todo List)</strong>，我们一步步来完成：</p>
+<hr />
+<h3>✅ Task 0: 搞懂核心概念 (背景知识)</h3>
+<p>在看代码前，你需要先建立两个概念，否则后面看不懂：
+1.  <strong>Logits (分数)</strong>: 模型给字典里每个词打的分。分越高，模型觉得这个词越可能是下一个词。
+2.  <strong>Temperature (温度)</strong>: 控制 AI “创造力” 的参数。
+    *   <strong>温度 = 0</strong>: 绝对理性。每次都选分数最高的那个词（贪婪搜索 Greedy）。
+    *   <strong>温度 &gt; 0</strong>: 允许随机。温度越高，AI 越敢选分数没那么高的词（更胡说八道/更有创造力）。</p>
+<hr />
+<h3>✅ Task 1: 准备阶段 - 分析用户的要求</h3>
+<p><strong>对应代码方法：</strong> <code>prepare(self, batch: Batch)</code></p>
+<p>这一步是决策前的“预处理”。因为一次可能处理很多个用户的请求（Batch），每个用户想要的“温度”不一样。</p>
+<ul>
+<li>
+<p><strong>步骤 1.1：检查是否全是“理性派”</strong></p>
+<ul>
+<li>代码：<code>if all(r.sampling_params.temperature &lt;= 0.0 ...)</code></li>
+<li>解释：如果这批次里所有用户都设置温度为 0（或者负数），说明大家都只想要“标准答案”。</li>
+<li>结果：返回 <code>temperatures=None</code>。这是一个信号，告诉后面：“别搞花哨的，直接选分最高的”。</li>
+</ul>
+</li>
+<li>
+<p><strong>步骤 1.2：处理“感性派”的温度</strong></p>
+<ul>
+<li>代码：<code>max(r.sampling_params.temperature, MIN_T)</code> (其中 <code>MIN_T = 1e-5</code>)</li>
+<li>解释：如果用户设置了温度（比如 0.7），我们需要把它存下来。</li>
+<li><strong>细节</strong>：为什么要有 <code>MIN_T</code>？因为数学上不能除以 0。如果用户非要设一个极小的数，我们强制把它变成 <code>0.00001</code>，防止程序崩溃。</li>
+<li>结果：把所有人的温度打包成一个 Tensor（张量），放到 GPU 上备用。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 2: 决策阶段 - 分流处理</h3>
+<p><strong>对应代码方法：</strong> <code>sample(self, logits, args)</code></p>
+<p>这是主入口，模型算出的分数 (<code>logits</code>) 传进来了，现在开始选词。</p>
+<ul>
+<li>
+<p><strong>步骤 2.1：性能打点 (可忽略)</strong></p>
+<ul>
+<li>代码：<code>with torch.cuda.nvtx.range("Sampler"):</code></li>
+<li>解释：这只是为了调试性能用的，不影响逻辑，你可以假装没看见。</li>
+</ul>
+</li>
+<li>
+<p><strong>步骤 2.2：如果是“理性派” (Greedy)</strong></p>
+<ul>
+<li>代码：<code>if args.temperatures is None:</code></li>
+<li>动作：<code>return torch.argmax(logits, dim=-1)</code></li>
+<li>解释：还记得 Task 1 里的信号吗？如果是 <code>None</code>，直接用 <code>argmax</code> 挑出分数最大的那个词的 ID。<strong>任务结束。</strong></li>
+</ul>
+</li>
+<li>
+<p><strong>步骤 2.3：如果是“感性派” (Random)</strong></p>
+<ul>
+<li>代码：<code>else</code> 分支</li>
+<li>动作：<code>return self._sample(logits, args.temperatures)</code></li>
+<li>解释：如果需要随机性，就进入下一个更复杂的函数 <code>_sample</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>✅ Task 3: 执行阶段 - 随机抽样魔法</h3>
+<p><strong>对应代码方法：</strong> <code>_sample(self, logits, temperatures)</code></p>
+<p>这一步是真正实现“根据温度进行随机抽样”的数学逻辑。</p>
+<ul>
+<li>
+<p><strong>步骤 3.1：应用温度 (除法)</strong></p>
+<ul>
+<li>代码：<code>logits.div_(temperatures.unsqueeze(-1))</code></li>
+<li>解释：<strong>公式是 $Logits / Temperature$</strong>。</li>
+<li>原理：<ul>
+<li>如果温度 &gt; 1：分数差距变小，原本分数低的词也有机会被选中（更随机）。</li>
+<li>如果温度 &lt; 1：分数差距被拉大，高分词的优势更明显（更保守）。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>步骤 3.2：归一化 (Softmax)</strong></p>
+<ul>
+<li>代码：<code>torch.softmax(logits, dim=-1, out=logits)</code></li>
+<li>解释：把处理过的分数转换成<strong>概率</strong>（所有词的概率加起来等于 100%）。比如：“苹果”概率 60%，“香蕉”概率 30%，“西瓜”概率 10%。</li>
+</ul>
+</li>
+<li>
+<p><strong>步骤 3.3：掷骰子 (Multinomial)</strong></p>
+<ul>
+<li>代码：<code>torch.multinomial(logits, num_samples=1)</code></li>
+<li>解释：按照上面的概率进行抽奖。</li>
+<li>注意：虽然“苹果”概率最高，但因为是抽奖，依然有 10% 的几率抽到“西瓜”。这就是 AI 为什么每次回答可能不一样的原因。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结 (Summary)</h3>
+<p>把这个文件看作一个<strong>工厂流水线</strong>：</p>
+<ol>
+<li><strong><code>prepare</code></strong>: 看看客户订单，是想要“固定答案”还是“随机惊喜”。</li>
+<li><strong><code>sample</code></strong>:<ul>
+<li>如果是“固定答案”，直接拿分最高的走人。</li>
+<li>如果是“随机惊喜”，送去 <code>_sample</code> 车间处理。</li>
+</ul>
+</li>
+<li><strong><code>_sample</code></strong>: 用温度调整分数，算概率，然后通过摇奖选出一个词。</li>
+</ol>

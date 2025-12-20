@@ -1,0 +1,109 @@
+<h1>python/minisgl/kernel/csrc/index.cu</h1>
+<p>这份代码确实涉及到底层 CUDA 编程，看起来很晦涩是正常的。它的核心功能是一个<strong>经过高度优化的、支持分片（Sharding）的 Embedding 查找（Gather）操作</strong>。</p>
+<p>我们可以把它想象成一个搬运任务。为了让你看懂，我制定了一个 <strong>6步走的 Task List</strong>，我们一步步拆解：</p>
+<h3>📝 学习任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 1：搞懂场景</strong> —— 我们到底要在做什么业务？</li>
+<li><strong>Task 2：搞懂搬运工具 (<code>uint4</code>)</strong> —— 为什么要用这种奇怪的数据类型？</li>
+<li><strong>Task 3：搞懂分工策略 (Warp)</strong> —— 几千个线程怎么分配工作？</li>
+<li><strong>Task 4：核心逻辑解读 (Kernel)</strong> —— 这里的 <code>if/else</code> 到底在判断什么？</li>
+<li><strong>Task 5：理解 "Fused" 和 "Range"</strong> —— 为什么要传入 <code>vocab_range</code>？</li>
+<li><strong>Task 6：Python 接口</strong> —— 怎么把这个 C++ 代码给 Python 用？</li>
+</ol>
+<hr />
+<h3>🟢 Task 1：搞懂场景 (Scenario)</h3>
+<p>想象你有一个巨大的图书馆（<strong>Input Tensor</strong>，比如 Embedding 表），里面有几万本书，每本书的内容都很长（比如 hidden_dim=4096）。
+现在有一张书单（<strong>Index Tensor</strong>），上面写着你要借第 3 本、第 100 本、第 5 本书。
+你的任务是把这些书找出来，按顺序抄写到你的笔记本上（<strong>Output Tensor</strong>）。</p>
+<ul>
+<li><strong>Input:</strong> 大矩阵 <code>[Vocab_Size, Hidden_Dim]</code></li>
+<li><strong>Index:</strong> 索引列表 <code>[Batch_Size]</code></li>
+<li><strong>Output:</strong> 结果矩阵 <code>[Batch_Size, Hidden_Dim]</code></li>
+</ul>
+<p><strong>代码做的事：</strong> 就是把 <code>Input</code> 里对应行的数据，快速拷贝到 <code>Output</code> 里。</p>
+<hr />
+<h3>🟢 Task 2：搞懂搬运工具 (<code>uint4</code>)</h3>
+<p>代码里频繁出现 <code>uint4</code>。这是 GPU 优化的关键。</p>
+<ul>
+<li><strong>普通搬运 (float):</strong> 就像用<strong>勺子</strong>舀水，一次搬运 4 个字节（32-bit）。</li>
+<li><strong>强力搬运 (uint4):</strong> 就像用<strong>大桶</strong>提水。<code>uint4</code> 是 CUDA 的一种向量类型，它包含了 4 个 <code>int</code>（或者说 128 bit 的数据）。</li>
+</ul>
+<p><strong>为什么这么做？</strong>
+GPU 的内存带宽非常宝贵。一次读写 128 bit (16 字节) 比读写 4 次 32 bit 要快得多。
+*   代码中的 <code>reinterpret_cast&lt;uint4*&gt;</code> 就是把原本是 <code>float</code> 或 <code>half</code> 的数据，强行当成 128位的大数据块来搬运，以榨干显卡带宽。</p>
+<hr />
+<h3>🟢 Task 3：搞懂分工策略 (Warp)</h3>
+<p>GPU 有成千上万个线程。怎么分配任务？</p>
+<p>代码里有两个关键变量：
+*   <strong>Warp:</strong> GPU 调度的最小单位，包含 32 个线程。
+*   <strong><code>warp_count</code>:</strong> 搬运<strong>一行数据</strong>（一本书）需要多少个 Warp？</p>
+<p><strong>计算逻辑 (<code>get_warp</code> 函数):</strong>
+假设一行数据有 4096 字节。
+一个线程一次搬运 16 字节 (<code>uint4</code>)。
+一个 Warp (32 线程) 一次齐心协力能搬运 $32 \times 16 = 512$ 字节。
+那么搬运一行就需要 $4096 / 512 = 8$ 个 Warp。</p>
+<p><strong>结论：</strong> 代码的设计是 <strong>"多 Warp 协作搬运一行"</strong>。</p>
+<hr />
+<h3>🟢 Task 4：核心逻辑解读 (Kernel)</h3>
+<p>这是最难的部分，我们看 <code>indexing_kernel_1_fold</code> 函数：</p>
+<div class="codehilite"><pre><span></span><code><span class="c1">// 1. 算出当前线程是谁</span>
+<span class="k">const</span><span class="w"> </span><span class="k">auto</span><span class="w"> </span><span class="n">idx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">blockIdx</span><span class="p">.</span><span class="n">x</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">blockDim</span><span class="p">.</span><span class="n">x</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">threadIdx</span><span class="p">.</span><span class="n">x</span><span class="p">;</span>
+<span class="k">const</span><span class="w"> </span><span class="k">auto</span><span class="w"> </span><span class="n">warp_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">idx</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">32</span><span class="p">;</span><span class="w"> </span><span class="c1">// 当前是第几个 Warp (大组长)</span>
+<span class="k">const</span><span class="w"> </span><span class="k">auto</span><span class="w"> </span><span class="n">lane_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">idx</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="mi">32</span><span class="p">;</span><span class="w"> </span><span class="c1">// 在 Warp 里的编号 (0-31) (组员编号)</span>
+
+<span class="c1">// 2. 算出当前 Warp 负责搬运哪一行 (index_ptr 中的第几个索引)</span>
+<span class="c1">// 比如 index 有 10 个，warp_count 是 2，那么 warp_id=0,1 负责第 0 个索引</span>
+<span class="k">const</span><span class="w"> </span><span class="k">auto</span><span class="w"> </span><span class="n">pos</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">index_ptr</span><span class="p">[</span><span class="n">warp_id</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">warp_count</span><span class="p">];</span><span class="w"> </span>
+
+<span class="c1">// 3. 核心判断：我们要找的行 (pos) 在不在我手里？</span>
+<span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="k">auto</span><span class="w"> </span><span class="n">index</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">pos</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">index_range</span><span class="p">.</span><span class="n">start</span><span class="p">;</span>
+<span class="w">    </span><span class="n">index</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">index</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">index_range</span><span class="p">.</span><span class="n">length</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="c1">// 🟢 情况 A: 在范围内 (Hit)</span>
+<span class="w">    </span><span class="c1">// 计算在 Input 矩阵中的精确内存偏移量</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="k">auto</span><span class="w"> </span><span class="n">which</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">index</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">warp_count</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">warp_id</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="n">warp_count</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// 从 Input 读数据 (一次读 128 bit)</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="k">auto</span><span class="w"> </span><span class="n">i_ptr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">input</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">which</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">32</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">lane_id</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// 写入 Output</span>
+<span class="w">    </span><span class="o">*</span><span class="n">o_ptr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">*</span><span class="n">i_ptr</span><span class="p">;</span><span class="w"> </span>
+
+<span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 🔴 情况 B: 不在范围内 (Miss)</span>
+<span class="w">    </span><span class="c1">// 填 0</span>
+<span class="w">    </span><span class="o">*</span><span class="n">o_ptr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">make_uint4</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span><span class="w"> </span>
+<span class="p">}</span>
+</code></pre></div>
+
+<hr />
+<h3>🟢 Task 5：理解 "Fused" 和 "Range"</h3>
+<p>你可能会问：<em>“为什么会有 <code>if/else</code> 判断不在范围内填 0？直接报错不行吗？”</em></p>
+<p>这涉及到 <strong>大模型分布式训练（Tensor Parallelism）</strong>：
+假设词表（Vocab）有 10 万个词。
+*   <strong>GPU 0</strong> 存了第 0 - 50,000 个词。
+*   <strong>GPU 1</strong> 存了第 50,001 - 100,000 个词。</p>
+<p>现在我要找第 60,000 个词。
+*   对于 <strong>GPU 0</strong>：60,000 超出了它的范围，它应该输出 <strong>全 0</strong>。
+*   对于 <strong>GPU 1</strong>：60,000 在它的范围内，它输出 <strong>向量值</strong>。</p>
+<p>最后，系统会把 GPU 0 和 GPU 1 的结果加起来（All-Reduce），$0 + \text{Vector} = \text{Vector}$，就得到了正确结果。</p>
+<p>这就是代码中 <code>index_range</code> 和 <code>else { *o_ptr = 0 }</code> 的作用：<strong>只处理属于当前 GPU 分片的数据，其他的置零。</strong></p>
+<hr />
+<h3>🟢 Task 6：Python 接口</h3>
+<p>最后是 <code>fused_indexing</code> 函数，它是 C++ 和 Python 的桥梁。</p>
+<ol>
+<li><strong>安全检查 (<code>TORCH_CHECK</code>):</strong> 确保输入是 CUDA Tensor，内存连续，数据类型正确。</li>
+<li><strong>计算 Grid/Block:</strong> 决定启动多少个 CUDA Block。<ul>
+<li><code>block_size</code> 默认 256 (8 个 warp)。</li>
+<li><code>num_blocks</code> = 总工作量 / 每个 Block 能干的活。</li>
+</ul>
+</li>
+<li><strong>启动内核:</strong> 调用 <code>indexing_kernel_1_fold</code>。</li>
+</ol>
+<hr />
+<h3>总结</h3>
+<p>这个文件的功能是：
+<strong>一个针对 CUDA 优化过的、支持模型并行的 Embedding 查找内核。</strong></p>
+<p>它相比 PyTorch 原生 <code>index_select</code> 或 <code>embedding</code> 的优势在于：
+1.  <strong>访存优化：</strong> 强制使用 <code>uint4</code> (128-bit) 读写，速度极快。
+2.  <strong>功能特化：</strong> 内置了 <code>index_range</code> 检查，专门用于多卡分布式推理/训练场景（如果索引不在当前卡负责的词表范围内，自动填 0）。</p>

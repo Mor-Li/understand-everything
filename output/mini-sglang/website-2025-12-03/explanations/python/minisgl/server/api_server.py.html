@@ -1,0 +1,121 @@
+<h1>python/minisgl/server/api_server.py</h1>
+<p>这份代码其实是一个 <strong>大模型推理系统的“前台经理”（Web 服务器）</strong>。它的主要工作是接收用户的 HTTP 请求（比如“帮我写首诗”），把任务派发给后台的 AI 模型去计算，然后把 AI 生成的字一个个流式地（Streaming）传回给用户。</p>
+<p>为了让你更容易理解，我把你当作这个“前台经理”，列一份你的 <strong>工作清单 (Todo List)</strong>，我们顺着代码逻辑一步步来完成这些任务。</p>
+<hr />
+<h3>任务清单：打造一个 AI API 服务器</h3>
+<h4>Phase 1: 开店准备（初始化）</h4>
+<p><strong>目标</strong>：建立与外界（用户）和内部（AI 后端）的连接。</p>
+<ol>
+<li>
+<p><strong>Task 1: 搭建通讯管道 (<code>FrontendManager</code> 类)</strong></p>
+<ul>
+<li><strong>代码位置</strong>：<code>FrontendManager</code> 类, <code>run_api_server</code> 函数。</li>
+<li><strong>解释</strong>：你需要两根管道：<ul>
+<li><code>send_tokenizer</code>: <strong>传声筒</strong>。用来把用户的文字发给后台（Tokenizer/Model）。代码里用的是 ZMQ (ZeroMQ) 这种消息队列。</li>
+<li><code>recv_tokenizer</code>: <strong>收信箱</strong>。用来接收后台算好发回来的结果。</li>
+</ul>
+</li>
+<li><strong>动作</strong>：初始化这两个队列，准备好收发数据。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 2: 准备记账本 (<code>uid</code>, <code>ack_map</code>, <code>event_map</code>)</strong></p>
+<ul>
+<li><strong>代码位置</strong>：<code>FrontendManager</code> 类中的 <code>new_user</code> 方法。</li>
+<li><strong>解释</strong>：因为同时会有很多人来请求，你不能搞混。<ul>
+<li><code>uid_counter</code>: 给每个进来的请求发一个号码牌（User ID）。</li>
+<li><code>ack_map</code>: 这是一个储物柜，用来暂存后台发回来的属于某个 ID 的结果。</li>
+<li><code>event_map</code>: 这是一个信号灯系统（Asyncio Event），当后台有结果回来时，亮灯通知负责该用户的协程“货到了”。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 3: 启动监听后台 (<code>listen</code> 方法)</strong></p>
+<ul>
+<li><strong>代码位置</strong>：<code>FrontendManager.listen</code>。</li>
+<li><strong>解释</strong>：你需要派一个分身一直盯着“收信箱”。一旦后台发来消息，立刻看是哪个 ID 的，放进对应的储物柜（<code>ack_map</code>），并按下信号灯（<code>event.set()</code>）通知等待的线程。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>Phase 2: 接待客人（处理请求）</h4>
+<p><strong>目标</strong>：当用户发来请求时，如何流转。</p>
+<ol>
+<li>
+<p><strong>Task 4: 定义服务菜单 (Pydantic Models)</strong></p>
+<ul>
+<li><strong>代码位置</strong>：<code>GenerateRequest</code>, <code>OpenAICompletionRequest</code>。</li>
+<li><strong>解释</strong>：规定客人点菜的格式。<ul>
+<li>简单模式：给我一段话 (<code>prompt</code>) 和最大长度 (<code>max_tokens</code>)。</li>
+<li>OpenAI 模式：模仿 ChatGPT 的 API 格式（<code>messages</code>, <code>model</code>, <code>stream</code> 等），这样现有的软件能直接用你的服务。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 5: 开门迎客 (FastAPI Routes)</strong></p>
+<ul>
+<li><strong>代码位置</strong>：<code>@app.post("/generate")</code> 和 <code>@app.post("/v1/chat/completions")</code>。</li>
+<li><strong>解释</strong>：这是你的柜台。<ul>
+<li>当有人访问 <code>/generate</code> 时，执行 <code>generate</code> 函数。</li>
+<li><strong>步骤 A</strong>：拿号 (<code>state.new_user()</code>)。</li>
+<li><strong>步骤 B</strong>：把用户的文字打包成 <code>TokenizeMsg</code>，通过传声筒 (<code>send_one</code>) 扔给后台 AI 去跑。</li>
+<li><strong>步骤 C</strong>：<strong>关键点！</strong> 不要傻等结果全部跑完。直接返回一个 <code>StreamingResponse</code>（流式响应）。这就像给客人一根管子，告诉他：“结果会像水流一样一点点流出来”。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>Phase 3: 上菜（流式传输）</h4>
+<p><strong>目标</strong>：把后台算出来的字，实时推给用户。</p>
+<ol>
+<li>
+<p><strong>Task 6: 盯着信号灯并上菜 (<code>wait_for_ack</code> &amp; <code>stream_generate</code>)</strong></p>
+<ul>
+<li><strong>代码位置</strong>：<code>FrontendManager</code> 中的 <code>wait_for_ack</code>, <code>stream_generate</code>。</li>
+<li><strong>解释</strong>：这是最核心的逻辑。<ul>
+<li><code>wait_for_ack</code> 是一个生成器。它会盯着 <code>event</code> 信号灯。</li>
+<li>灯一亮（后台算出新字了），它就去储物柜拿数据，<code>yield</code>（产出）给外层。</li>
+<li><code>stream_generate</code> 把拿到的数据包装成 SSE (Server-Sent Events) 格式（就是 <code>data: ...</code> 这种格式），通过网络发给用户。</li>
+<li>如果不这样做，用户就要等几十秒才能一次性看到整段话；这样做，用户能看到字一个个蹦出来。</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 7: 兼容 OpenAI 格式 (<code>stream_chat_completions</code>)</strong></p>
+<ul>
+<li><strong>代码位置</strong>：<code>FrontendManager.stream_chat_completions</code>。</li>
+<li><strong>解释</strong>：逻辑和上面一样，只是上菜的盘子不一样。把数据包装成 OpenAI 规定的 JSON 格式（比如包含 <code>choices</code>, <code>delta</code>, <code>finish_reason</code> 等字段）。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h4>Phase 4: 打烊与杂项</h4>
+<p><strong>目标</strong>：错误处理和关闭。</p>
+<ol>
+<li>
+<p><strong>Task 8: 处理客人中途离开 (<code>abort_user</code>)</strong></p>
+<ul>
+<li><strong>代码位置</strong>：<code>_abort</code> 函数, <code>BackgroundTask</code>。</li>
+<li><strong>解释</strong>：如果客人浏览器关了（断开连接），你需要把他的号码牌作废，清理内存，不再处理他的后续数据。</li>
+</ul>
+</li>
+<li>
+<p><strong>Task 9: 命令行测试模式 (<code>shell</code>)</strong></p>
+<ul>
+<li><strong>代码位置</strong>：<code>shell</code> 函数。</li>
+<li><strong>解释</strong>：这是一个附赠功能。如果你不想启动 Web 服务器，只想在黑框框里测试 AI，这个函数会模拟一个终端聊天界面，自己发请求给自己处理。</li>
+</ul>
+</li>
+</ol>
+<hr />
+<h3>总结：这段代码讲了个啥？</h3>
+<p>简单来说，这个文件就是 <strong>MiniSGL 系统的网关</strong>。</p>
+<ul>
+<li><strong>对内</strong>：它通过 ZMQ 消息队列控制那个只会算数的“书呆子”后端（Tokenizer/Model）。</li>
+<li><strong>对外</strong>：它提供了一个标准的 Web API（类似 OpenAI），让用户可以发请求。</li>
+<li><strong>核心机制</strong>：利用 Python 的 <code>asyncio</code>（异步）特性，实现了 <strong>一边接收后台生成的 Token，一边实时推流给用户</strong> 的效果。</li>
+</ul>

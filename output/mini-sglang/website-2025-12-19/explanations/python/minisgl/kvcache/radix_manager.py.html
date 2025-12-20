@@ -1,0 +1,99 @@
+<h1>python/minisgl/kvcache/radix_manager.py</h1>
+<p>这份代码确实比较硬核，它实现了一个 <strong>Radix Tree（基数树/前缀树）</strong> 来管理大语言模型（LLM）的 <strong>KV Cache（键值缓存）</strong>。</p>
+<p>简单来说，它的目的是：<strong>为了省钱和省时间，把以前算过的 Prompt（提示词）缓存起来。当新的提示词和以前的很像时，直接复用，不用重新算。</strong></p>
+<p>为了让你读懂，我制定了一个 <strong>5步学习任务清单 (Task To-Do List)</strong>。我们把这个复杂的代码拆解开，每一步只关注一个核心概念。</p>
+<hr />
+<h3>📋 学习任务清单 (Task List)</h3>
+<ol>
+<li><strong>Task 01: 理解背景</strong> —— 为什么要用树来存 Cache？</li>
+<li><strong>Task 02: 认识积木 (<code>RadixTreeNode</code>)</strong> —— 树的节点里存了啥？</li>
+<li><strong>Task 03: 核心操作一 (<code>match_prefix</code>)</strong> —— 怎么查找能不能复用？</li>
+<li><strong>Task 04: 核心操作二 (<code>_split_at</code>)</strong> —— 遇到分叉怎么办？（最难理解的部分）</li>
+<li><strong>Task 05: 垃圾回收 (<code>evict</code>)</strong> —— 内存满了删谁？</li>
+</ol>
+<hr />
+<h3>🟢 Task 01: 理解背景 —— 为什么要用树？</h3>
+<p>在 LLM 推理中，KV Cache 占很大显存。
+假设你先问了：<code>"美国的首都是哪里？"</code>
+模型计算了一遍，生成了 KV Cache。</p>
+<p>接着你又问：<code>"美国的首都是哪里？它有多少人口？"</code>
+这句话的前半部分和上面一样。如果我们能把 <code>"美国的首都是哪里？"</code> 这一段的计算结果存下来，第二次问的时候就不用重算了。</p>
+<p><strong>Radix Tree（基数树）</strong> 就是用来存这些句子的。它比普通的树更省空间，因为它会把连续的公共部分合并。
+*   普通树：<code>美</code> -&gt; <code>国</code> -&gt; <code>的</code> （每个字一个节点）
+*   Radix树：<code>美国的</code> （三个字可以压缩在一个节点里，直到出现分叉）</p>
+<hr />
+<h3>🟢 Task 02: 认识积木 (<code>RadixTreeNode</code>)</h3>
+<p>请看代码中的 <code>class RadixTreeNode</code>。想象它是一个文件夹。</p>
+<ul>
+<li><strong><code>_key</code></strong>: 这个节点代表的 Token 序列（比如 "美国" 对应的数字 ID）。</li>
+<li><strong><code>_value</code></strong>: 这些 Token 计算出的 KV Cache 在显存里的物理地址（索引）。</li>
+<li><strong><code>children</code></strong>: 子节点。是个字典，指向下一层。</li>
+<li><strong><code>ref_count</code></strong>: 引用计数。表示当前有多少个请求正在用这个节点。如果 &gt; 0，说明正在用，绝对不能删。</li>
+<li><strong><code>timestamp</code></strong>: 时间戳。记录最后一次访问时间，为了以后删掉最久没用的节点。</li>
+</ul>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">RadixTreeNode</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">...</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">children</span> <span class="o">=</span> <span class="p">{}</span>      <span class="c1"># 子节点</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_key</span> <span class="o">=</span> <span class="o">...</span>         <span class="c1"># Token ID (内容)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_value</span> <span class="o">=</span> <span class="o">...</span>       <span class="c1"># 显存地址 (物理位置)</span>
+</code></pre></div>
+
+<hr />
+<h3>🟢 Task 03: 核心操作一 —— 查找复用 (<code>match_prefix</code>)</h3>
+<p>这是最常用的功能。当一个新的 Prompt 进来，我们要看树里有没有能复用的前缀。</p>
+<p><strong>流程演示：</strong>
+1.  树里有节点：<code>["Hello", " world"]</code> (假设这是一个节点)。
+2.  新输入：<code>"Hello world, how are you"</code>。
+3.  <strong><code>_walk</code> 函数</strong>开始工作：从根节点出发，拿着输入去比对。
+4.  发现输入的前缀 <code>"Hello world"</code> 和节点匹配！
+5.  <strong><code>match_prefix</code></strong> 返回：匹配到了长度为 2 的前缀，以及对应的 KV Cache 地址。
+6.  LLM 只需要计算后面 <code>"how are you"</code> 的部分。</p>
+<p><strong>代码对应：</strong>
+看 <code>RadixCacheManager</code> 里的 <code>match_prefix</code> 和 <code>_walk</code>。
+*   <code>_walk</code> 负责在树上走，直到走不通或者不匹配为止。</p>
+<hr />
+<h3>🟢 Task 04: 核心操作二 —— 节点分裂 (<code>_split_at</code>)</h3>
+<p>这是 Radix Tree 最特别也最难懂的地方。<strong>当新的输入和缓存“部分匹配”时，必须把原来的节点劈开。</strong></p>
+<p><strong>场景演示：</strong>
+1.  树里有一个节点 A，存着：<code>"ABCDE"</code>。
+2.  新输入来了：<code>"ABCXY"</code>。
+3.  系统发现：<code>"ABC"</code> 是一样的，但后面不一样（<code>D</code> vs <code>X</code>）。
+4.  <strong>必须分裂 (Split)</strong>：
+    *   原来的节点 A 被切一刀，变成父节点 <code>P("ABC")</code>。
+    *   原来的 A 剩下的部分变成子节点 <code>C1("DE")</code>。
+    *   新的输入这就好办了，挂在 <code>P</code> 下面，变成子节点 <code>C2("XY")</code>。</p>
+<p>这就是 <code>_split_at</code> 做的事情。它保证了树结构的灵活性，最大限度保留公共前缀。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">_split_at</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">pos</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">RadixTreeNode</span><span class="p">:</span>
+    <span class="c1"># 1. 创建新节点 new_node (作为父节点)</span>
+    <span class="c1"># 2. 把当前节点的前 pos 个内容给 new_node</span>
+    <span class="c1"># 3. 把当前节点剩下的内容留给自己</span>
+    <span class="c1"># 4. 建立父子关系</span>
+</code></pre></div>
+
+<hr />
+<h3>🟢 Task 05: 垃圾回收 (<code>evict</code>)</h3>
+<p>显存是有限的。如果 Cache 存满了，必须删掉一些旧的。</p>
+<p><strong>怎么删？（LRU 策略）</strong>
+1.  <strong><code>evictable_size</code></strong>: 记录了有多少缓存是可以删的（<code>ref_count == 0</code> 的节点）。
+2.  <strong><code>_collect_leave_nodes_for_evict</code></strong>: 收集所有的叶子节点（最末端的节点）。
+3.  <strong><code>heapq</code> (堆)</strong>: 这是一个优先级队列。它根据节点的 <code>timestamp</code> 排序。
+4.  <strong><code>evict</code> 函数</strong>:
+    *   每次从堆里弹出时间戳最小（最老）的叶子节点。
+    *   把它删掉，释放显存。
+    *   删掉后，它的父节点如果变成了叶子节点，也加入到待删除队列中（层层向上回溯）。</p>
+<p><strong>代码对应：</strong>
+看 <code>evict</code> 方法。
+*   <code>heapq.heappop(leave_nodes)</code>: 拿出最老的节点。
+*   <code>del parent.children[...]</code>: 从树上摘除。
+*   <code>evicted_indices.append(node.value)</code>: 记录下这些被释放的显存地址，最后退还给显存管理器。</p>
+<hr />
+<h3>📝 总结 (Summary)</h3>
+<p>这个文件的逻辑就是：</p>
+<ol>
+<li><strong>存 (Insert)</strong>: 把计算过的 Token 和显存地址存进树里。如果遇到部分匹配，就把节点<strong>劈开 (<code>split</code>)</strong>。</li>
+<li><strong>取 (Match)</strong>: 新请求来了，在树上<strong>走 (<code>walk</code>)</strong>，看能匹配多长，返回匹配的显存地址。</li>
+<li><strong>删 (Evict)</strong>: 显存满了，挑<strong>最久没用 (<code>timestamp</code>)</strong> 且 <strong>没人正在用 (<code>ref_count==0</code>)</strong> 的叶子节点删掉。</li>
+</ol>
+<p>这是一种典型的<strong>空间换时间</strong>策略，专门用于加速类似 ChatGPT 这种生成式 AI 的推理速度。</p>

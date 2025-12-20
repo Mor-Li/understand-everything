@@ -1,0 +1,61 @@
+<h1>python/minisgl/server/args.py</h1>
+<p>没问题。这份代码文件 <code>args.py</code> 的核心作用就是 <strong>“配置中心”</strong>。它负责定义服务器启动时需要哪些参数，并处理这些参数。</p>
+<p>想象你正在开一家餐厅（启动一个 AI 推理服务），你需要一张清单来决定餐厅怎么开：几点开门？雇几个厨师？菜谱在哪里？</p>
+<p>我们可以把理解这份代码的过程拆解为 <strong>5 个 Task</strong>，一步步来完成：</p>
+<hr />
+<h3>✅ Task 1: 理解核心容器 (<code>ServerArgs</code> 类)</h3>
+<p><strong>目标</strong>：弄清楚在这个代码里，配置信息最后都存在哪里。</p>
+<p>代码的前半部分定义了一个类 <code>ServerArgs</code>。
+*   <strong>观点</strong>：这是一个“数据盒子”（Data Class）。它的作用就是把所有的配置项（IP地址、端口、模型路径等）打包在一起，方便在代码的其他地方传递。
+*   <strong>细节</strong>：
+    *   它继承自 <code>SchedulerConfig</code>，说明它包含调度器（Scheduler）的配置。
+    *   <code>frozen=True</code> 表示一旦配置生成，就不允许随意修改，保证安全性。</p>
+<h3>✅ Task 2: 理解“内部对讲机” (ZMQ 地址逻辑)</h3>
+<p><strong>目标</strong>：理解 <code>ServerArgs</code> 类中那些带有 <code>@property</code> 的奇怪函数。</p>
+<p>你看到很多 <code>zmq_frontend_addr</code>, <code>zmq_tokenizer_addr</code> 之类的代码。
+*   <strong>观点</strong>：MiniSGL 这个系统不是单打独斗，它内部有不同的部门（Frontend 前端、Tokenizer 分词器、Detokenizer 反分词器）。这些 <code>@property</code> 定义了它们之间<strong>内部通信的“电话号码”</strong>（IPC 地址）。
+*   <strong>关键逻辑 (<code>share_tokenizer</code>)</strong>：
+    *   这里有一个重要的开关：<code>num_tokenizer</code>。
+    *   如果 <code>num_tokenizer == 0</code>，意思是“不单独雇人做分词”，于是分词（Tokenizer）和反分词（Detokenizer）共享同一个进程（省钱/省资源）。
+    *   代码逻辑：<code>if self.share_tokenizer: return self.zmq_detokenizer_addr</code>。意思就是：如果共享，分词器的电话号码就是反分词器的号码。如果不共享，就分配一个新的号码。</p>
+<h3>✅ Task 3: 理解“点菜员” (<code>parse_args</code> 函数)</h3>
+<p><strong>目标</strong>：理解代码是如何从命令行读取用户输入的。</p>
+<p>函数 <code>parse_args(args: List[str]...)</code> 是这个文件的苦力。
+*   <strong>观点</strong>：这是标准的 Python <code>argparse</code> 用法。它的工作是将用户在终端输入的命令（比如 <code>--model-path llama3 --port 8080</code>）转化成 Python 能看懂的变量。
+*   <strong>关键参数解读</strong>：
+    1.  <strong>基础设置</strong>：
+        *   <code>--model-path</code>: 模型的权重文件在哪里（也就是“菜谱”）。
+        *   <code>--port</code>: 餐厅开在哪个端口。
+    2.  <strong>性能/显存设置</strong>：
+        *   <code>--tp-size</code> (Tensor Parallel): 把一个大模型切分成几块放在不同的 GPU 上（几个厨师一起做一个菜）。
+        *   <code>--dtype</code>: 数据精度（FP16, BF16），决定了计算速度和显存占用。
+        *   <code>--memory-ratio</code>: 允许占用多少比例的显存作为 KV Cache（缓存池大小）。
+        *   <code>--cuda-graph</code>: 一种 GPU 加速技术。
+    3.  <strong>高级架构设置</strong>：
+        *   <code>--cache-type</code>: 缓存策略。<code>naive</code> 是朴素策略，<code>radix</code> 是更高级的前缀树缓存（能复用之前的对话历史）。
+        *   <code>--attention-backend</code>: 具体的注意力算子实现（FlashInfer 还是 FlashAttention3）。</p>
+<h3>✅ Task 4: 理解“自动修正”逻辑 (参数后处理)</h3>
+<p><strong>目标</strong>：看懂 <code>parse_args</code> 函数末尾的那些 <code>if</code> 和逻辑判断。</p>
+<p>拿到用户输入后，代码并没有直接返回，而是做了一波“清洗”和“推断”。
+*   <strong>观点</strong>：用户有时候很懒或者填得不规范，代码需要自动补全或修正。
+*   <strong>具体步骤</strong>：
+    1.  <strong>Shell 模式</strong>：如果用户开了 <code>--shell-mode</code>（调试用），代码会自动把 <code>max_running_req</code> 设为 1，并静音输出。这就像把餐厅切换成“单人测试模式”。
+    2.  <strong>路径展开</strong>：<code>os.path.expanduser</code> 把路径里的 <code>~</code> 变成 <code>/home/user</code>，防止找不到文件。
+    3.  <strong>自动推断精度 (<code>dtype="auto"</code>)</strong>：
+        *   如果用户没指定精度（选了 auto），代码会去读取 HuggingFace 的 <code>config.json</code>，看看模型原本是用什么精度训练的，然后自动匹配（比如自动选 float16 或 bfloat16）。
+    4.  <strong>分布式信息</strong>：创建 <code>DistributedInfo</code>，告诉系统当前的 GPU 编号和总并行数。</p>
+<h3>✅ Task 5: 总结全流程</h3>
+<p><strong>目标</strong>：把上面 4 步串起来，形成一个完整的画面。</p>
+<p>当你运行启动命令时：
+1.  <strong>用户输入</strong>：<code>python server.py --model-path /data/llama3 --tp-size 2</code>
+2.  <strong>触发 <code>parse_args</code></strong>：
+    *   它识别出模型路径和并行度。
+    *   它发现你没填 <code>dtype</code>，于是自动去查模型配置，定为 <code>float16</code>。
+    *   它发现你没填 <code>num_tokenizer</code>，默认为 0，于是决定让 Tokenizer 和 Backend 共享进程。
+3.  <strong>生成 <code>ServerArgs</code></strong>：
+    *   将清洗好的数据打包进 <code>ServerArgs</code> 对象。
+    *   自动计算出内部通信的 ZMQ 地址（比如 <code>ipc:///tmp/minisgl_3...</code>）。
+4.  <strong>返回结果</strong>：把这个配置对象交给服务器的主程序，服务器根据这些设定正式启动。</p>
+<hr />
+<p><strong>一句话总结：</strong>
+这个文件就是 <strong>MiniSGL 服务器的“设置面板”</strong>。它负责定义有哪些选项可调，读取你的选项，并根据你的选项自动计算出系统内部组件该如何连接和配置。</p>

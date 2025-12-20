@@ -1,0 +1,107 @@
+<h1>python/minisgl/distributed/info.py</h1>
+<p>这段代码看起来很抽象，是因为它在处理<strong>分布式系统（Distributed System）</strong>的基础设施。</p>
+<p>简单来说，这段代码就是给当前的程序（通常是一个运行在某个 GPU 上的进程）发一张<strong>“身份证”</strong>，并把这张身份证存在一个<strong>全局都能拿到的地方</strong>。</p>
+<p>为了让你彻底搞懂，我制定了一个 <strong>5步走的 Task List（任务清单）</strong>。我们一步步来完成这些任务，就能看懂这段代码了。</p>
+<hr />
+<h3>📋 Task 1: 理解背景——为什么要发“身份证”？</h3>
+<p>在深度学习（比如大模型推理/训练）中，一个模型太大，一张显卡装不下，我们需要用多张显卡（比如 8 张）一起跑。这就是所谓的“分布式”。</p>
+<p>假设有 8 个人（8 个进程）一起干活，每个人都需要知道两件事：
+1.  <strong>我是谁？</strong>（我的编号是几？是第 0 号，还是第 7 号？）-&gt; 代码里叫 <code>rank</code>。
+2.  <strong>我们要多少人？</strong>（总共有几个人在干活？）-&gt; 代码里叫 <code>size</code>。</p>
+<p><strong>代码对应：</strong>
+文件名叫 <code>distributed/info.py</code>，意思就是“分布式信息”。这里的 <code>TP</code> 通常指 <strong>Tensor Parallel</strong>（张量并行），是一种多卡并行的技术。</p>
+<hr />
+<h3>📋 Task 2: 制作“身份证”模板</h3>
+<p>我们需要一个数据结构来存上面提到的两个信息（我是谁，总共几人）。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">DistributedInfo</span><span class="p">:</span>
+    <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span>  <span class="c1"># 我的编号 (0, 1, 2...)</span>
+    <span class="n">size</span><span class="p">:</span> <span class="nb">int</span>  <span class="c1"># 总人数 (比如 8)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="c1"># 检查逻辑：编号必须大于等于0，且必须小于总人数</span>
+        <span class="k">assert</span> <span class="mi">0</span> <span class="o">&lt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">rank</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">size</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">is_primary</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="c1"># 谁是组长？通常规定编号为 0 的是组长（主进程）</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">rank</span> <span class="o">==</span> <span class="mi">0</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲解：</strong><ul>
+<li><code>@dataclass(frozen=True)</code>：意思是这张身份证一旦打印出来（初始化），上面的字就<strong>不能改了</strong>（只读）。</li>
+<li><code>is_primary</code>：这是一个方便的方法，用来判断“我”是不是老大。有些活（比如打印日志、保存模型）只需要老大干，其他人看着就行。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📋 Task 3: 设立一个“公共公告栏”</h3>
+<p>身份证做好了，但如果我们在代码的几百个函数里传来传去太麻烦了。我们需要一个<strong>全局变量</strong>，就像公司大厅的公告栏一样，把身份证贴在那，谁需要谁就去看。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 这是一个全局变量，刚开始是空的 (None)</span>
+<span class="n">_TP_INFO</span><span class="p">:</span> <span class="n">DistributedInfo</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲解：</strong><ul>
+<li><code>_TP_INFO</code> 就是那个公告栏。下划线开头表示这是一个内部变量，不建议外面直接乱改。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📋 Task 4: 把身份证贴上去（初始化）</h3>
+<p>程序刚启动时，需要把当前的身份信息填好，贴到公告栏上。</p>
+<p><strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">set_tp_info</span><span class="p">(</span><span class="n">rank</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">global</span> <span class="n">_TP_INFO</span>
+    <span class="c1"># 如果公告栏上已经有东西了，报错！(防止重复初始化)</span>
+    <span class="k">if</span> <span class="n">_TP_INFO</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="s2">&quot;TP info has been set&quot;</span><span class="p">)</span>
+
+    <span class="c1"># 创建身份证，并贴到全局变量上</span>
+    <span class="n">_TP_INFO</span> <span class="o">=</span> <span class="n">DistributedInfo</span><span class="p">(</span><span class="n">rank</span><span class="p">,</span> <span class="n">size</span><span class="p">)</span>
+</code></pre></div>
+
+<ul>
+<li><strong>讲解：</strong><ul>
+<li>这个函数通常在程序启动的最开始调用一次。</li>
+<li>它保证了全局只有一个 <code>_TP_INFO</code>。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>📋 Task 5: 从公告栏读取信息（获取）</h3>
+<p>现在代码的其他角落（比如模型的某一层）需要知道“我是第几号显卡”，它就得去读公告栏。这里提供了两种读取方式：</p>
+<p><strong>方式 A：强制读取（必须有，没有就报错）</strong>
+<strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">get_tp_info</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">DistributedInfo</span><span class="p">:</span>
+    <span class="c1"># 如果公告栏是空的，说明程序还没初始化好，直接报错</span>
+    <span class="k">if</span> <span class="n">_TP_INFO</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="s2">&quot;TP info has not been set&quot;</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">_TP_INFO</span>
+</code></pre></div>
+
+<ul>
+<li><strong>场景：</strong> 核心计算代码里用这个。因为如果不知道自己是谁，计算就没法进行了，必须报错停止。</li>
+</ul>
+<p><strong>方式 B：尝试读取（有没有都行）</strong>
+<strong>代码对应：</strong></p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">try_get_tp_info</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">DistributedInfo</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="c1"># 直接返回，可能是身份证，也可能是 None</span>
+    <span class="k">return</span> <span class="n">_TP_INFO</span>
+</code></pre></div>
+
+<ul>
+<li><strong>场景：</strong> 辅助代码里用。比如打印调试信息，如果有分布式信息就打印 rank，没有就算了，不强求。</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>把这个 List 串起来，这段代码讲的就是：</p>
+<ol>
+<li>定义了一个不可修改的<strong>身份证类</strong> (<code>DistributedInfo</code>)，存着 <code>rank</code> 和 <code>size</code>。</li>
+<li>弄了个<strong>全局变量</strong> (<code>_TP_INFO</code>) 当容器。</li>
+<li>提供了 <code>set</code> 函数来<strong>存</strong>。</li>
+<li>提供了 <code>get</code> 函数来<strong>取</strong>。</li>
+</ol>
+<p>这就是一种典型的<strong>单例模式（Singleton Pattern）</strong>或者叫<strong>全局状态管理</strong>，目的是为了让程序里的任何地方都能方便地知道：“<strong>我在哪？我有多少队友？</strong>”</p>

@@ -1,0 +1,79 @@
+<h1>python/minisgl/benchmark/perf.py</h1>
+<p>没问题，这段代码初看确实涉及很多 GPU 底层的概念（比如 Stream, Event, CUDA Graph）。</p>
+<p>简单来说，这个文件的作用就是<strong>“专门给 GPU 程序用来跑分（测速）的工具”</strong>。它不仅测量运行时间（Latency），还计算数据传输速度（Bandwidth），并且对比“基准代码”和“优化代码”的性能差距。</p>
+<p>我们可以把你（作为一个开发者）想要写出这段代码的过程，拆解成一个 <strong>5步走的 To-Do List</strong>。我们一步步来看：</p>
+<hr />
+<h3>✅ Task 1: 制作一个能在 GPU 上精准计时的“秒表”</h3>
+<p><strong>痛点</strong>：在 Python 里测速通常用 <code>time.time()</code>，但这在 GPU 上不管用。因为 Python (CPU) 发出指令后，GPU 是异步执行的（CPU 发完指令就溜了，GPU 还在干活）。
+<strong>解决</strong>：必须使用 GPU 专用的“打点器”。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>perf_cuda</code> 函数的开头。</li>
+<li><strong>解读</strong>：<ul>
+<li><code>torch.cuda.Event(enable_timing=True)</code>: 这就是我们创建的“秒表按键”。</li>
+<li><code>tic</code> 是开始键，<code>toc</code> 是结束键。</li>
+<li><code>torch.cuda.synchronize()</code>: 这句代码的意思是“CPU 你等一下，等 GPU 把手头的活儿全干完再继续”。这是为了保证测试开始前环境是干净的。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 2: 排除 CPU 的“指挥延迟” (CUDA Graph)</h3>
+<p><strong>痛点</strong>：如果你只是跑一个很小的计算任务，CPU 发号施令的时间可能比 GPU 真正干活的时间还长。这就像在大厨（GPU）旁边，经理（CPU）每切一刀都要喊一声“切！”，效率极低。
+<strong>解决</strong>：使用 <strong>CUDA Graph</strong>。相当于经理把整张菜谱（所有指令）一次性录好，直接扔给大厨，大厨自己照着狂做，不需要经理在那儿喊了。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>perf_cuda</code> 函数中间的 <code>if N := cuda_graph_repetitions:</code> 代码块。</li>
+<li><strong>解读</strong>：<ul>
+<li><code>g = torch.cuda.CUDAGraph()</code>: 创建一张“菜谱”。</li>
+<li><code>with torch.cuda.graph(g): ... f()</code>: 这里并没有真正执行多次，而是在<strong>录制</strong>函数 <code>f</code> 的动作到 <code>g</code> 里面。</li>
+<li><code>replay = g.replay</code>: 之后我们只要调用 <code>replay</code>，GPU 就会自动回放刚才录制的动作，速度极快，没有 CPU 的干扰。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 3: 多次运行取平均值，减少误差</h3>
+<p><strong>痛点</strong>：只跑一次可能因为电脑突然卡顿而不准。
+<strong>解决</strong>：先热身，再连跑很多次，最后算总时间除以次数。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>perf_cuda</code> 函数的后半部分。</li>
+<li><strong>解读</strong>：<ul>
+<li><code>replay()</code> (在 tic 之前): 先跑一次“热身”，防止第一次运行有额外的初始化开销。</li>
+<li><code>tic.record()</code>: 按下秒表开始。</li>
+<li><code>for _ in range(repetitions): replay()</code>: 疯狂重复跑任务。</li>
+<li><code>toc.record()</code>: 按下秒表结束。</li>
+<li><code>toc.synchronize()</code>: <strong>关键点</strong>。CPU 必须在这里死等，直到 GPU 说“我刚才那几十次循环真的跑完了”，才能去读时间。</li>
+<li><code>return dur / (N * repetitions)</code>: 返回单次运行的平均耗时（毫秒）。</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 4: 将“时间”转化为“速度” (GB/s)</h3>
+<p><strong>痛点</strong>：老板通常不关心“用了几毫秒”，只关心“每秒能处理多少 G 的数据”（带宽）。
+<strong>解决</strong>：写一个新函数，利用物理公式：$速度 = 数据量 / 时间$。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>compare_memory_kernel_perf</code> 函数。</li>
+<li><strong>解读</strong>：<ul>
+<li>参数 <code>memory_footprint</code>: 也就是这个任务涉及了多少字节的数据（数据量）。</li>
+<li><code>dur = perf_cuda(...)</code>: 调用上面做好的秒表，拿到时间。</li>
+<li><code>bandwidth = memory_footprint / (dur * 1e6)</code>: <ul>
+<li><code>dur</code> 是毫秒，乘 <code>1e6</code> (10的6次方) 换算成纳秒级别对应的分母，或者理解为把毫秒换算成秒再结合字节换算成 GB。</li>
+<li>最终算出 <strong>GB/s</strong> (千兆字节每秒)。</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h3>✅ Task 5: 最终对决：基准 vs 我们的实现</h3>
+<p><strong>痛点</strong>：写这个脚本的最终目的是吹牛——证明“我们的代码”比“PyTorch原生的/旧的代码”更快。
+<strong>解决</strong>：同时测两个函数，打印对比结果。</p>
+<ul>
+<li><strong>代码对应</strong>：<code>compare_memory_kernel_perf</code> 函数的最后部分。</li>
+<li><strong>解读</strong>：<ul>
+<li>它先测 <code>baseline</code> (基准/旧方法)，算出带宽。</li>
+<li>再测 <code>our_impl</code> (我们的新方法)，算出带宽。</li>
+<li><code>logger.info(...)</code>: 打印出类似这样的战报：
+    &gt; "Baseline: 100 GB/s | Our Impl: 150 GB/s"</li>
+<li>最后返回这两个数值供后续分析。</li>
+</ul>
+</li>
+</ul>
+<hr />
+<h3>总结</h3>
+<p>这个脚本其实就干了两件事：
+1.  <strong><code>perf_cuda</code></strong>: 一个<strong>极其专业</strong>的 GPU 计时器。它利用了“录像回放”（CUDA Graph）技术来消除 CPU 的干扰，确保测出来的是 GPU 的纯粹实力。
+2.  <strong><code>compare_memory_kernel_perf</code></strong>: 一个<strong>裁判</strong>。它用上面的计时器，分别测试两个选手的速度（GB/s），并宣布比赛结果。</p>

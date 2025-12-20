@@ -1,0 +1,75 @@
+<h1>python/minisgl/benchmark/perf.py</h1>
+<p>这份代码确实包含了不少 GPU 编程和 PyTorch 底层优化的概念，初看会觉得很抽象。</p>
+<p>简单来说，这个文件的作用就是<strong>“专门用来给 GPU 代码测速的秒表”</strong>。它不仅能测时间，还能计算显存带宽（GB/s），用来对比两个算法哪个更快。</p>
+<p>按照你的要求，我列了一个<strong>学习任务清单 (Todo List)</strong>，我们一步一步来拆解这个文件：</p>
+<h3>📝 学习任务清单 (Todo List)</h3>
+<ol>
+<li><strong>Task 01：理解核心目标</strong> —— 这段代码到底是干嘛的？</li>
+<li><strong>Task 02：拆解核心工具 (<code>perf_cuda</code>)</strong> —— 怎么给 GPU 测速？（为什么不能直接用 Python 的 <code>time.time()</code>？）</li>
+<li><strong>Task 03：理解“黑科技”优化 (<code>CUDA Graph</code>)</strong> —— 代码里的一大坨 <code>g = torch.cuda.CUDAGraph()</code> 是在做什么？</li>
+<li><strong>Task 04：理解应用场景 (<code>compare_memory_kernel_perf</code>)</strong> —— 如何用测出的时间来计算“带宽”并进行 PK？</li>
+</ol>
+<hr />
+<h3>🚀 逐步讲解</h3>
+<h4>Task 01：理解核心目标</h4>
+<p><strong>观点：</strong> 这是一个基准测试（Benchmark）工具文件。
+<strong>解释：</strong> 比如你写了一个新的 GPU 算子（Our Impl），你想证明它比 PyTorch 原生的（Baseline）更快。你需要一个严谨的工具来跑分。这个文件就是那个“跑分软件”。</p>
+<hr />
+<h4>Task 02：拆解核心工具 (<code>perf_cuda</code> 函数)</h4>
+<p>这是文件里最复杂的函数。它的作用是：<strong>精准测量函数 <code>f</code> 运行一次需要多少毫秒。</strong></p>
+<ul>
+<li><strong>为什么要专门写个函数？</strong>
+    GPU 是异步运行的。你在 Python 里发号施令说“跑！”，Python 代码瞬间就执行完了，但 GPU 可能还在后台慢慢算。所以不能用普通的 Python 计时器。</li>
+<li><strong>代码里的关键点：</strong><ul>
+<li><code>tic</code> 和 <code>toc</code> (<code>torch.cuda.Event</code>): 这就是 GPU 专用的“秒表”。<code>tic</code> 是开始，<code>toc</code> 是结束。</li>
+<li><code>torch.cuda.synchronize()</code>: 意思是“等待 GPU 把手头的活儿全干完”。这确保计时的准确性。</li>
+<li><code>stream</code>: 就像给测试专门开辟一条“跑道”，防止被其他任务干扰。</li>
+</ul>
+</li>
+</ul>
+<p><strong>结论：</strong> 这个函数的核心逻辑是：<strong>预热 -&gt; 按下秒表(tic) -&gt; 跑很多次(repetitions) -&gt; 按下停止(toc) -&gt; 算出平均时间</strong>。</p>
+<hr />
+<h4>Task 03：理解“黑科技”优化 (<code>CUDA Graph</code>)</h4>
+<p>在 <code>perf_cuda</code> 函数中间，有一段很长的 <code>if N := cuda_graph_repetitions:</code> 逻辑。</p>
+<ul>
+<li><strong>这是什么？</strong>
+    这是 PyTorch 的 <strong>CUDA Graph（图模式）</strong>。</li>
+<li><strong>为什么要用它？</strong>
+    GPU 算得特别快，有时候 Python 发指令的速度（CPU）反而跟不上 GPU 的计算速度。这就像“法拉利（GPU）”在等“老牛（CPU）”发号施令。</li>
+<li><strong>代码在做什么？</strong><ul>
+<li><code>with torch.cuda.graph(g): ... f()</code>: 这相当于<strong>录像</strong>。它不真的跑，而是把 <code>f()</code> 里面所有的 GPU 指令录制下来。</li>
+<li><code>replay = g.replay</code>: 以后要跑的时候，直接<strong>回放录像</strong>。这样就不需要 Python 一句句发指令了，直接把整个任务包丢给 GPU，速度极快，消除了 CPU 的指挥延迟。</li>
+</ul>
+</li>
+</ul>
+<p><strong>结论：</strong> 这段代码为了测出 GPU 的<strong>极限性能</strong>，使用了“录制-回放”的机制来排除 Python 语言本身的慢速干扰。</p>
+<hr />
+<h4>Task 04：理解应用场景 (<code>compare_memory_kernel_perf</code> 函数)</h4>
+<p>这个函数是给用户直接调用的“PK 场”。</p>
+<ul>
+<li><strong>输入：</strong><ul>
+<li><code>baseline</code>: 原始方法（比如 PyTorch 自带的）。</li>
+<li><code>our_impl</code>: 你写的新方法。</li>
+<li><code>memory_footprint</code>: 数据量大小（比如 1GB）。</li>
+</ul>
+</li>
+<li><strong>计算逻辑：</strong><ol>
+<li>调用 <code>perf_cuda</code> 测出 baseline 耗时 <code>dur</code> (毫秒)。</li>
+<li><strong>计算带宽 (GB/s)：</strong> 公式是 <code>数据量 / 时间</code>。<ul>
+<li>代码：<code>bandwidth = memory_footprint / (dur * 1e6)</code>。</li>
+</ul>
+</li>
+<li>对 <code>our_impl</code> 做同样的事。</li>
+<li>打印对比结果（比如：Baseline 跑了 500GB/s，我们跑了 800GB/s）。</li>
+</ol>
+</li>
+</ul>
+<hr />
+<h3>💡 总结回顾</h3>
+<p>如果你要把这个文件讲给别人听，你可以这样概括：</p>
+<ol>
+<li><strong>它是一个测速器：</strong> 专门用来测 GPU 代码跑得有多快。</li>
+<li><strong>它很严谨：</strong> 使用了 <code>cuda.Event</code> 和 <code>synchronize</code> 确保计时准确，不是瞎猜的。</li>
+<li><strong>它用了加速挂（CUDA Graph）：</strong> 为了测出纯粹的 GPU 性能，它把计算过程“录制”下来反复回放，去掉了 Python 的指挥延迟。</li>
+<li><strong>它最终输出带宽：</strong> 它的最终目的是告诉你，你的代码每秒能处理多少 GB 的数据，这是衡量高性能计算（HPC）最硬核的指标。</li>
+</ol>
